@@ -103,4 +103,26 @@ int pthread_mutex_lock(pthread_mutex_t* m) { AcquireSRWLockExclusive((PSRWLOCK)m
 int pthread_mutex_trylock(pthread_mutex_t* m) { return TryAcquireSRWLockExclusive((PSRWLOCK)m) ? 0 : EBUSY; }
 int pthread_mutex_unlock(pthread_mutex_t* m) { ReleaseSRWLockExclusive((PSRWLOCK)m); return 0; }
 
+static __declspec(thread) char s_dlerr[256];
+
+void* dlopen(const char* file, int mode)
+{
+    (void)mode;
+    HMODULE h = file ? LoadLibraryA(file) : GetModuleHandleA(NULL);
+    if (!h)
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, GetLastError(),
+                       0, s_dlerr, sizeof s_dlerr, NULL);
+    return (void*)h;
+}
+void* dlsym(void* handle, const char* name)
+{
+    FARPROC f = GetProcAddress((HMODULE)handle, name);
+    if (!f)
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, GetLastError(),
+                       0, s_dlerr, sizeof s_dlerr, NULL);
+    return (void*)(uintptr_t)f;
+}
+int dlclose(void* handle) { return FreeLibrary((HMODULE)handle) ? 0 : -1; }
+char* dlerror(void) { return s_dlerr[0] ? s_dlerr : (char*)"unknown error"; }
+
 #endif /* _WIN32 */

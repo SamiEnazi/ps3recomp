@@ -47,11 +47,11 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux, Windows)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    if(APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN: macOS uses the Metal backend")
     endif()
     find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
@@ -213,6 +213,21 @@ if(PS3RECOMP_RSX_VULKAN)
     # PUBLIC: ps3recomp_host selects its backend on this definition.
     target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
     target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
+    if(WIN32)
+        # Windows: the backend's window and VkSurface come from SDL2 (pass
+        # -DSDL2_DIR=<SDL2-devel-VC>/cmake), vulkan-1.dll is loaded through
+        # win32_posix_min's dlopen, and guest programs need glslang (pass
+        # -Dglslang_DIR=<install>/lib/cmake/glslang). The backend includes
+        # <SDL2/SDL.h>: PS3RECOMP_SDL2_INCLUDE_PARENT is the directory that holds
+        # an SDL2/ folder of the headers.
+        find_package(SDL2 CONFIG REQUIRED)
+        target_link_libraries(ps3recomp_runtime PUBLIC SDL2::SDL2)
+        target_compile_definitions(ps3recomp_runtime PUBLIC SDL_MAIN_HANDLED)
+        if(PS3RECOMP_SDL2_INCLUDE_PARENT)
+            target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_SDL2_INCLUDE_PARENT}")
+        endif()
+        find_package(glslang CONFIG QUIET)
+    endif()
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
 endif()
 

@@ -101,6 +101,18 @@ int pthread_mutex_lock(pthread_mutex_t* m);
 int pthread_mutex_trylock(pthread_mutex_t* m);
 int pthread_mutex_unlock(pthread_mutex_t* m);
 
+/* ---- dlopen family over LoadLibrary (the Vulkan backend loads vulkan-1.dll) */
+#ifndef RTLD_LAZY
+#define RTLD_LAZY   0x1
+#define RTLD_NOW    0x2
+#define RTLD_LOCAL  0x0
+#define RTLD_GLOBAL 0x100
+#endif
+void* dlopen(const char* file, int mode);
+void* dlsym(void* handle, const char* name);
+int   dlclose(void* handle);
+char* dlerror(void);
+
 #ifdef __cplusplus
 }
 #endif

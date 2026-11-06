@@ -38,7 +38,7 @@
  * with spaces.
  */
 
-#ifndef _WIN32
+#if !defined(_WIN32) || defined(PS3RECOMP_RSX_VULKAN)   /* Windows: opt-in build */
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -226,7 +226,11 @@ static vk_state s_vk;
  * -------------------------------------------------------------------------*/
 static int vk_load_library(void)
 {
+#ifdef _WIN32
+    static const char* names[] = { "vulkan-1.dll" };   /* the system Vulkan loader */
+#else
     static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
+#endif
     for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++)
         s_vk.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
     if (!s_vk.lib) {
@@ -3188,4 +3192,4 @@ u32 rsx_vulkan_backend_guest_draws(void)
     return s_vk.eng_active ? rsx_draw_engine_guest_draws() : s_g.last_draws;
 }
 
-#endif /* !_WIN32 */
+#endif /* !_WIN32 || PS3RECOMP_RSX_VULKAN */
