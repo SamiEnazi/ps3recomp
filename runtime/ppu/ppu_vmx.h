@@ -60,7 +60,18 @@ VMX_INL uint32_t vmx_sat_u(int64_t x, int64_t hi, uint32_t* vscr) {
 }
 
 /* ---- float helpers ---- */
+#ifndef PPU_FP_AUDIT_INC
+#ifdef PPU_FP_AUDIT
+extern uint64_t ppu_fp_audit[16];
+#define PPU_FP_AUDIT_INC(i) __atomic_fetch_add(&ppu_fp_audit[i], 1, __ATOMIC_RELAXED)
+#else
+#define PPU_FP_AUDIT_INC(i) ((void)0)
+#endif
+#endif
 VMX_INL uint32_t vmx_flush(uint32_t x, uint32_t vscr) {
+#ifdef PPU_FP_AUDIT
+    if ((x & 0x7F800000u) == 0 && (x & 0x007FFFFFu) != 0) PPU_FP_AUDIT_INC(vscr & VMX_NJ ? 8 : 9);
+#endif
     return ((vscr & VMX_NJ) && (x & 0x7F800000u) == 0) ? (x & 0x80000000u) : x;
 }
 VMX_INL int vmx_isnan(uint32_t x) { return (x & 0x7FFFFFFFu) > 0x7F800000u; }
@@ -337,12 +348,25 @@ VMX_CMP(vmx_vcmpgtuw, 4, vmx_w, vmx_sw64, x > y)
 VMX_CMP(vmx_vcmpgtsb, 16, vmx_b, vmx_sb64, (int8_t)x > (int8_t)y)
 VMX_CMP(vmx_vcmpgtsh, 8, vmx_h, vmx_sh64, (int16_t)x > (int16_t)y)
 VMX_CMP(vmx_vcmpgtsw, 4, vmx_w, vmx_sw64, (int32_t)x > (int32_t)y)
-VMX_CMP(vmx_vcmpeqfp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) == vmx_f((uint32_t)y))
-VMX_CMP(vmx_vcmpgefp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) >= vmx_f((uint32_t)y))
-VMX_CMP(vmx_vcmpgtfp, 4, vmx_w, vmx_sw64, vmx_f((uint32_t)x) > vmx_f((uint32_t)y))
+/* Float compares: VSCR[NJ] flushes denormal operands to signed zero here too
+ * (AltiVec PEM; RPCS3's interpreter compares them unflushed). */
+VMX_INL float vmx_fcmp_in(uint32_t x, uint32_t vscr) {
+    uint32_t f = vmx_flush(x, vscr);
+#ifdef PPU_FP_AUDIT
+    PPU_FP_AUDIT_INC(6); if (f != x) PPU_FP_AUDIT_INC(7);
+#endif
+    return vmx_f(f);
+}
+#define VMX_CMPF(name, test) \
+VMX_INL uint32_t name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { VMX_ARGS_PREP; int all = 1, none = 1; \
+    for (int i = 0; i < 4; i++) { float x = vmx_fcmp_in(vmx_w(a, i), vscr), y = vmx_fcmp_in(vmx_w(b, i), vscr); \
+        int t = (test); all &= t; none &= !t; vmx_sw(r, i, t ? ~0u : 0u); } VMX_OUT; return (uint32_t)(all << 3 | none << 1); }
+VMX_CMPF(vmx_vcmpeqfp, x == y)
+VMX_CMPF(vmx_vcmpgefp, x >= y)
+VMX_CMPF(vmx_vcmpgtfp, x > y)
 /* vcmpbfp: bit 31 = !(a <= b), bit 30 = !(a >= -b); CR6 EQ = every lane in bounds */
-VMX_INL uint32_t vmx_vcmpbfp(VMX_D, VMX_A, VMX_B) { VMX_ARGS_PREP; int inb = 1;
-    for (int i = 0; i < 4; i++) { float x = vmx_f(vmx_w(a, i)), y = vmx_f(vmx_w(b, i));
+VMX_INL uint32_t vmx_vcmpbfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { VMX_ARGS_PREP; int inb = 1;
+    for (int i = 0; i < 4; i++) { float x = vmx_fcmp_in(vmx_w(a, i), vscr), y = vmx_fcmp_in(vmx_w(b, i), vscr);
         uint32_t v = (!(x <= y) ? 0x80000000u : 0) | (!(x >= -y) ? 0x40000000u : 0);
         inb &= v == 0; vmx_sw(r, i, v); } VMX_OUT; return (uint32_t)(inb << 1); }
 

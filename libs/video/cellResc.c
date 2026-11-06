@@ -7,6 +7,7 @@
  */
 
 #include "cellResc.h"
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: translate + byte-swap */
 #include "ps3emu/guest_call.h"   /* ps3_invoke_guest: handlers are guest OPDs */
 #include <stdio.h>
@@ -204,7 +205,7 @@ s32 cellRescSetConvertAndFlip(s32 index)
     s_last_flip_time++;
 
     { static int n = 0;
-      if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 4)
+      if (PS3_LOG_FIRST(n, 4))
           printf("[cellResc] SetConvertAndFlip(src=%d) -> flip, %u display buffer(s)\n",
                  index, nbuf); }
 

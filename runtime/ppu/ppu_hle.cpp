@@ -17,6 +17,7 @@
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
 #include "ppu_recomp.h"   /* ppu_context */
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdlib.h>       /* getenv */
@@ -269,7 +270,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
     if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-        static int _tn = 0; if (__atomic_fetch_add(&_tn, 1, __ATOMIC_RELAXED) < 3)
+        static int _tn = 0; if (PS3_LOG_FIRST(_tn, 3))
             fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
         return;
     }
@@ -310,7 +311,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                       s_ha = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_ha && nid == (uint32_t)s_ha) {
         static int _n = 0;
-        if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 6)
+        if (PS3_LOG_FIRST(_n, 6))
           fprintf(stderr, "[hle-args] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X "
                           "r7=0x%08X r8=0x%08X r9=0x%08X r10=0x%08X lr=0x%08X\n",
                   nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
@@ -405,7 +406,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * -> the SPURS task workload never attaches -> no movie decode. Return not-loaded. */
         if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
             ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-            static int _tn = 0; if (__atomic_fetch_add(&_tn, 1, __ATOMIC_RELAXED) < 3)
+            static int _tn = 0; if (PS3_LOG_FIRST(_tn, 3))
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
@@ -420,7 +421,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * game's statCallback (r8 OPD) with a CellSaveDataStatGet{isNewData=1}, honor
          * its result, return CELL_SAVEDATA_RET_OK(0). Legit HLE (real first-run behavior). */
         if (nid==0xCDC6AEFDu) { static std::atomic<int> _sdi=-1; if(_sdi<0)_sdi=getenv("YDKJ_SAVEDATA")?1:0;
-          if(_sdi){ static int _once=0; if(__atomic_fetch_add(&_once, 1, __ATOMIC_RELAXED)<2){
+          if(_sdi){ static int _once=0; if(PS3_LOG_FIRST(_once, 2)){
             uint32_t statCb=(uint32_t)ctx->gpr[8];               /* statCallback OPD */
             uint32_t SC=0x02000000u, SG=0x02000100u, SS=0x02000900u; /* scratch structs */
             for(uint32_t a=0x02000000u;a<0x02001000u;a+=4) vm_write32(a,0);
@@ -436,7 +437,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             ctx->gpr[3]=0; /* CELL_SAVEDATA_RET_OK */
             return;
           } } }
-        if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if(__atomic_fetch_add(&_sd, 1, __ATOMIC_RELAXED)<3){
+        if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if(PS3_LOG_FIRST(_sd, 3)){
             extern uint32_t vm_read32(uint64_t);
             uint32_t r7=(uint32_t)ctx->gpr[7], r8=(uint32_t)ctx->gpr[8];
             uint32_t r7c=r7?vm_read32(r7):0, r8c=r8?vm_read32(r8):0;
@@ -465,7 +466,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
-        static int _g=0; if (__atomic_fetch_add(&_g, 1, __ATOMIC_RELAXED) < 8)
+        static int _g=0; if (PS3_LOG_FIRST(_g, 8))
             fprintf(stderr, "[hle-trace] %s lr=0x%08X cia=0x%08X r3..r8=%08X %08X %08X %08X %08X %08X\n",
                     e->name, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
                     (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
@@ -483,7 +484,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { static std::atomic<int> _pl=-1; if(_pl<0)_pl=getenv("PS3_HLE_PTRCHECK")?1:0;
       if(_pl){ uint32_t rv=(uint32_t)r;
         if(rv>=0x10000000u && (rv & 0xFFFF0000u)!=0x80010000u && (rv & 0xFFFF0000u)!=0x80020000u){
-          static int _n=0; if(__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<40) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
+          static int _n=0; if(PS3_LOG_FIRST(_n, 40)) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
             nid, e->name?e->name:"?", rv); } } }
 }
 

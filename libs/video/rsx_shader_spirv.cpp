@@ -15,6 +15,7 @@
  *   - The vertex stage flips Y (setInvertY): D3D clip space is +y up.
  */
 
+#include <cstdlib>
 #include "rsx_shader_spirv.h"
 
 #include <stdio.h>
@@ -80,6 +81,13 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
     shader.setEnvInput(glslang::EShSourceHlsl, lang, glslang::EShClientVulkan, 100);
     shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
     shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
+    /* SPIR-V FragCoord.w is 1/w (FXC's SV_POSITION.w is w): tells the FP
+     * decompiler's _rsx_inv_w helper which one it gets. */
+    /* PS3RECOMP_FRAGCOORD_W=w: treat the fragment position's w as the clip w
+     * (the decompiler then emits 1/w) instead of its reciprocal -- a switch
+     * to settle which one this stage's position carries, by looking. */
+    { static int rcp = -1; if (rcp < 0) { const char* e = getenv("PS3RECOMP_FRAGCOORD_W"); rcp = (e && *e == 'w') ? 0 : 1; }
+      if (rcp) shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n"); }
     shader.setEntryPoint("main");
     shader.setAutoMapBindings(true);
     shader.setAutoMapLocations(true);

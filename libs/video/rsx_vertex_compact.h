@@ -116,6 +116,13 @@ void rsx_vertex_fetch_plan_init(
 void rsx_vertex_fetch_plan_prepare(
     rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count);
 
+/* The same, told that refs[i].vertex_id == refs[0].vertex_id + i with one
+ * base_index (what rsx_vertex_remap_build_range leaves): the span of every
+ * ordinary per-vertex attribute is then its first and last reference. */
+void rsx_vertex_fetch_plan_prepare_ex(
+    rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    int consecutive);
+
 /* Fetch one compact vertex in layout order.  Disabled attributes use their
  * RSX current/default value.  Enabled non-position attributes retain the
  * legacy fallback-to-default behavior on an unsupported/invalid fetch; an

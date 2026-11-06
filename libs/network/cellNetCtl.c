@@ -49,6 +49,9 @@ static int netctl_online(void)
     return v;
 }
 
+/* For the libraries that answer the same question (cellSysutilNpEula.c). */
+int ps3_netctl_online(void) { return netctl_online(); }
+
 typedef struct {
     int              in_use;
     cellNetCtlHandler handler;
@@ -361,11 +364,19 @@ s32 cellNetCtlNetStartDialogAbortAsync(void)
 
 s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
 {
+    /* Offline (the default), the dialog ends as if the player cancelled it:
+     * reporting "connected" while GetState says there is no network sent
+     * inFAMOUS 2 on to a PSN terms-of-service check (cellSysutilNpEula) that
+     * never answers, behind an endless "Please wait..." box. A cancelled
+     * connection is a path every title handles. PS3_NET_ONLINE=1: connected. */
+    const u32 res = netctl_online() ? 0u : CELL_NET_CTL_ERROR_DIALOG_CANCELED;
     if (result) {
         result = GUEST_PTR(result, CellNetCtlNetStartDialogResult*);
-        result->result = 0;   /* 0 = connected; endian-safe */
+        uint8_t* r = (uint8_t*)&result->result;   /* guest memory is big-endian */
+        r[0] = (uint8_t)(res >> 24); r[1] = (uint8_t)(res >> 16); r[2] = (uint8_t)(res >> 8); r[3] = (uint8_t)res;
     }
-    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0 (connected)\n");
+    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0x%08X (%s)\n", res,
+           res ? "cancelled: offline" : "connected");
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
 }

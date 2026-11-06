@@ -36,6 +36,39 @@ int  rsx_metal_backend_pump_messages(void);
  * RSX clear method, then hand it to the compositor. */
 void rsx_metal_backend_present(void);
 
+/* Optional diagnostics: PS3RECOMP_METAL_FPS=1 adds display FPS and frame times
+ * to the native window title and stderr once per second. Call this exactly once
+ * per guest FLIP submission, excluding boot redraws. It never drives rendering.
+ * Without calls the separate guest submission rate stays zero. Headless mode
+ * does not claim any display presentations and leaves the tracker disabled. */
+void rsx_metal_backend_note_guest_frame(void);
+
+/* The window (windowed runs only), set up from the environment at init:
+ *   PS3_WINDOW_MODE=windowed|fullscreen|borderless   start mode (windowed);
+ *       fullscreen is macOS's own (a Space of its own), borderless covers the
+ *       screen in place with the menu bar and Dock hidden.
+ *   PS3_WINDOW_SIZE=<w>x<h>   windowed content size in points (the guest's
+ *       resolution by default), shrunk to fit the screen.
+ *   PS3_WINDOW_ICON=<file>|game|none   the Dock / app switcher icon: an image
+ *       file, or "game" for $PS3_VFS_ROOT/PS3_GAME/ICON0.PNG (none by default).
+ *   PS3_DISPLAY=<n>|<name>    the screen it opens on (and fullscreen or
+ *       borderless covers): 1 = the one with the menu bar, 2 = the next in the
+ *       system's order, or a screen's name (exact, any case, or a part of
+ *       it). The main screen when unset or not found.
+ *   PS3_VSYNC=0               present without waiting for the screen's
+ *       refresh (CAMetalLayer displaySyncEnabled off); the game's frame pacing
+ *       comes from the host's vblank clock and does not change.
+ *   PS3_MOUSE_CAPTURE=0       the mouse camera works without capturing the
+ *       cursor (the old behaviour); there is no capture with PS3_MOUSE=0.
+ *       [mouse] capture / camera in PS3_INPUT_MAP do the same when the
+ *       variables are not set (libs/input/pad_input_map.h).
+ * The window is resizable and the game's image keeps its aspect ratio,
+ * letterboxed in black. Shortcuts: Cmd+F or Option+Return toggles fullscreen
+ * (borderless when PS3_WINDOW_MODE=borderless, macOS fullscreen otherwise),
+ * Cmd+Ctrl+F toggles macOS fullscreen. A click in the game captures the
+ * mouse (hidden cursor, motion drives the camera); Esc, Cmd or leaving the
+ * window releases it. */
+
 /* --- test hooks ---------------------------------------------------------- */
 
 /* The clear colour most recently set via NV4097_SET_COLOR_CLEAR_VALUE, in the

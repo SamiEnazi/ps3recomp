@@ -401,6 +401,15 @@ static void test_swizzle_offset(void)
     CHECK_EQ(rsx_swizzle_offset(1, 1, 2, 2), 3);
     CHECK_EQ(rsx_swizzle_offset(2, 0, 2, 2), 4);
     CHECK_EQ(rsx_swizzle_offset(3, 3, 2, 2), 15);
+    /* 3D: x, y, z bits interleave in that order; a flat volume degenerates
+     * to the 2D order. */
+    CHECK_EQ(rsx_swizzle_offset_3d(1, 0, 0, 1, 1, 1), 1);
+    CHECK_EQ(rsx_swizzle_offset_3d(0, 1, 0, 1, 1, 1), 2);
+    CHECK_EQ(rsx_swizzle_offset_3d(0, 0, 1, 1, 1, 1), 4);
+    CHECK_EQ(rsx_swizzle_offset_3d(1, 1, 1, 1, 1, 1), 7);
+    CHECK_EQ(rsx_swizzle_offset_3d(3, 3, 3, 2, 2, 2), 63);
+    CHECK_EQ(rsx_swizzle_offset_3d(2, 0, 1, 2, 2, 2), 4 + 8);
+    CHECK_EQ(rsx_swizzle_offset_3d(3, 3, 0, 2, 2, 0), rsx_swizzle_offset(3, 3, 2, 2));
 
     /* Every texel of a 4x4 image maps to a distinct offset in [0,16). */
     int seen[16] = {0};
@@ -666,12 +675,74 @@ static void test_remap_g8b8_lanes(void)
 /* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
  * NOT a bent table cancelling a reversed crossbar, which is how the old bug
  * hid on DXT while breaking everything else. */
+/* X16, X32_FLOAT and the DEPTH formats are one real channel, uploaded as
+ * R16/R32F and presented on every lane, so a crossbar that reads B gets the
+ * value and not an empty component. inFAMOUS 2 binds its X16 lighting ramp
+ * with 0xAAEE (R from B); through the ARGB table that read zero and nothing
+ * in the main menu was lit. */
+static void test_remap_one_channel_lanes(void)
+{
+    u8 m[4];
+    rsx_texture_component_remap(0xAAEEu, FMT_X16, m);
+    CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0); CHECK_EQ(m[A_], 0);
+    rsx_texture_component_remap(0xAAE4u, FMT_X16 | FMT_LN, m);
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    rsx_texture_component_remap(0xAAE4u, FMT_X32F, m);
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    rsx_texture_component_remap(0xAAE4u, FMT_DEPTH16, m);
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    rsx_texture_component_remap(0xAAE4u, FMT_DEPTH24, m);
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    /* A forced constant still wins over the crossbar. */
+    rsx_texture_component_remap(0xA9EEu, FMT_X16, m);     /* op for A = 1 */
+    CHECK_EQ(m[A_], RSX_REMAP_ONE); CHECK_EQ(m[R_], 0);
+    /* Two-channel and four-channel formats keep their own tables. */
+    rsx_texture_component_remap(0xAAEEu, FMT_A8R8G8B8, m);
+    CHECK_EQ(m[R_], 2);                                    /* R from B = comp 2 */
+    /* Y16_X16: 0xE4 presents R-G-R-G (RGBA = X,Y,X,Y); with CONTROL1's
+     * high word set, R-R-R-G (X,X,X,Y). 0x4E swaps the pair. */
+    rsx_texture_component_remap(0xAAE4u, 0x95u, m);
+    CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 1); CHECK_EQ(m[B_], 0); CHECK_EQ(m[A_], 1);
+    rsx_texture_component_remap(0x0001AAE4u, 0x95u, m);
+    CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 0); CHECK_EQ(m[A_], 1);
+    rsx_texture_component_remap(0xAA4Eu, 0x95u, m);
+    CHECK_EQ(m[R_], 1); CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 1); CHECK_EQ(m[A_], 0);
+    rsx_texture_component_remap(0x0001AA4Eu, 0x95u, m);
+    CHECK_EQ(m[R_], 1); CHECK_EQ(m[G_], 1); CHECK_EQ(m[B_], 1); CHECK_EQ(m[A_], 0);
+}
+
 static void test_remap_dxt_matches_argb(void)
 {
     u8 a[4], d[4];
     rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, a);
     rsx_texture_component_remap(0xAAE4u, FMT_DXT1,     d);
     for (int i = 0; i < 4; i++) CHECK_EQ(d[i], a[i]);
+}
+
+/* --- _bx2 expansion (SET_TEXTURE_ADDRESS UNSIGNED_REMAP_BIASED, bit 12) --- */
+
+static void test_expand_mask(void)
+{
+    /* Biased unsigned remap on an identity crossbar: every lane. */
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0u, 0x1000u), 0xF);
+    /* UNSIGNED_REMAP_NORMAL: nothing to expand. */
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0u, 0u), 0);
+    /* A lane the crossbar forces to ONE (0xA9E4: A's op = 1) is not a
+     * source and stays out. */
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xA9E4u, 0u, 0x1000u), 0x7);
+    /* A source channel SET_TEXTURE_FILTER flags signed takes the
+     * sign-extension read instead: b signed (bit 31) drops the B lane. */
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0x80000000u, 0x1000u), 0xB);
+    /* Float formats never expand (DEPTH24_D8 and X16 do, as on RPCS3); a
+     * zero control1 is the identity crossbar. */
+    CHECK_EQ(rsx_texture_expand_mask(0x9Au, 0xAAE4u, 0u, 0x1000u), 0);
+    CHECK_EQ(rsx_texture_expand_mask(0x9Bu, 0xAAE4u, 0u, 0x1000u), 0);
+    CHECK_EQ(rsx_texture_expand_mask(0x90u, 0xAAE4u, 0u, 0x1000u), 0xF);
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0u, 0u, 0x1000u), 0xF);
+    /* 16-bit channels (X16, Y16_X16) carry bit 4; DEPTH24_D8 above did not. */
+    CHECK_EQ(rsx_texture_expand_mask(0x94u, 0xAAE4u, 0u, 0x1000u) & 0x10u, 0x10u);
+    CHECK_EQ(rsx_texture_expand_mask(0x95u, 0xAAE4u, 0u, 0x1000u) & 0x10u, 0x10u);
+    CHECK_EQ(rsx_texture_expand_mask(0x94u, 0xAAE4u, 0u, 0u), 0);
 }
 
 static void test_remap_rejects_null(void)
@@ -705,8 +776,10 @@ int main(void)
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
+    test_remap_one_channel_lanes();
     test_remap_dxt_matches_argb();
     test_remap_rejects_null();
+    test_expand_mask();
 
     if (g_fail) { printf("\nRSX texture layout: %d FAILED\n", g_fail); return 1; }
     printf("RSX texture layout tests: all passed\n");

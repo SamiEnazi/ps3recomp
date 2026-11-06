@@ -11,6 +11,7 @@
 #define SPU_CONTEXT_H
 
 #include "../../include/ps3emu/ps3types.h"
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -55,7 +56,7 @@ unsigned* spu_ls_watch_list(int* out_n);   /* the armed lines (n may be 0) */
  * recorded, 0 when ring mode is off (caller prints). T-0001. */
 int spu_ls_watch_ring_dma(struct spu_context* spu, uint32_t line, uint32_t ea,
                          uint32_t size, const uint8_t* q16);
-static inline void spu_ls_watch_hit2(const struct spu_context* c, uint32_t lsa, int is_write,
+static __attribute__((noinline, cold)) void spu_ls_watch_hit2(const struct spu_context* c, uint32_t lsa, int is_write,
                                      const uint8_t* p, uint32_t pc, uint32_t lr) {
     if (__builtin_expect(g_spu_ls_watch_n == 0, 1)) return;
     spu_ls_watch_slow(c, lsa, is_write, p, pc, lr);
@@ -182,6 +183,11 @@ typedef struct spu_channel {
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
+/* Independently streamed code buffers resident at once (a job batch can stage
+ * eight or nine relocatable modules beside the policy module). */
+#define SPU_RESIDENT_CODE_SLOTS 16
+#define SPU_IB_CACHE_SIZE 256   /* spu_indirect_branch inline cache entries (power of two) */
+
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -322,10 +328,18 @@ typedef struct spu_context {
     void (*tramp_fn)(struct spu_context*);
     /* Independently streamed code buffers can coexist with the policy overlay.
      * Each mapping records which translated image owns that local-store span. */
+    /* reloc: the image was lifted at LS 0 (spu_overlay_register_region_reloc)
+     * and runs wherever the GET put it; dispatch looks its functions up at
+     * pc - lsa and sets code_base = lsa for the lifted code. */
     struct {
         uint32_t lsa, size, source_ea;
         int image_id;
-    } resident_code[4];
+        uint32_t reloc;
+    } resident_code[SPU_RESIDENT_CODE_SLOTS];
+    /* Load address of the relocatable lift now running (see resident_code).
+     * Code lifted with spu_lifter.py --relocatable adds it to every LS
+     * address it derives from its own position. */
+    uint32_t code_base;
 
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
      * for co-resident tasks. A taskset may hold several tasks that all lift at the
@@ -442,6 +456,21 @@ typedef struct spu_context {
     /* The SPURS kernel instance running on this SPU (libs/spurs/spurs_kernel.c),
      * or NULL: a policy module's selectWorkload call is answered by it. */
     void* spurs_vspu;
+    /* spu_indirect_branch's inline cache (spu_channels.c, PS3_SPU_IBCACHE):
+     * the function a target resolved to, keyed by everything the resolution
+     * reads -- pc, image_id, resident_ovl, resident_task, ib_gen (bumped on
+     * every resident_code change) and the registry generation -- plus, when a
+     * resident code slot owned the pc, that slot, whose word is re-checked on
+     * each hit exactly as the resolver checks it. fn == NULL is empty. */
+    uint32_t ib_gen;
+    /* Index + 1 of the MFC slot this context last held (spu_channels.c
+     * mfc_for); 0 = none. Checked against the slot's owner on every use. */
+    uint32_t mfc_hint;
+    struct {
+        uint32_t pc, gen, reg_gen;
+        int32_t  img, ovl, task, slot;
+        void (*fn)(struct spu_context*);
+    } ib_cache[SPU_IB_CACHE_SIZE];
 } spu_context;
 
 /* The SPURS kernel's own service entry points, which it plants as
@@ -584,7 +613,11 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     }
 }
 
-static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+/* always_inline: clang left an out-of-line copy in every lifted SPU file, so
+ * each LS access paid a call (spu_ls_write128 alone was ~4% of SPU time in the
+ * docks cutscene). The debug paths are cold calls, so the inlined body is a
+ * mask, four loads and four byte swaps. */
+static inline __attribute__((always_inline)) u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
     if (__builtin_expect(g_spu_ls_dbg != 0, 0)) {
@@ -657,14 +690,14 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
         const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
       if (s >= 0 && (uint32_t)ctx->image_id == img && lsa >= lo && lsa < hi) {
           static int _n = 0;
-          if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 48)
+          if (PS3_LOG_FIRST(_n, 48))
               fprintf(stderr, "[spu-SMC] img=%d WROTE CODE @0x%05X (pc=0x%05X) = %02X%02X%02X%02X\n",
                       ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
                       p[0], p[1], p[2], p[3]);
       } }
 }
 
-static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+static inline __attribute__((always_inline)) void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
@@ -1043,6 +1076,35 @@ static inline void spu_pchist_tick(const spu_context* ctx)
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful
  * to CBEA `bi` (branch to word 0 of RA). pc set unconditionally. */
+/* A lifted cross-function branch with a known target (br, the conditional
+ * branches, a fall-through into the next function). It used to set the
+ * trampoline and return, and the enclosing drain loop called the target: a
+ * host return, a loop pass and an indirect call per transfer. Now it
+ * tail-calls the target directly (no host stack growth) when nothing the
+ * drain does per step applies: the target is not LS 0 (a job's end), not in
+ * the stack-reset hint table, and no interrupt is pending with interrupts
+ * enabled. Anything else takes the trampoline as before.
+ * PS3_SPU_DIRECT=0 (environment or PS3_TOGGLE_FILE) = always the trampoline;
+ * diagnostics that watch each drain step turn it off (spu_drain.c). */
+extern volatile int g_spu_direct;       /* -1 not read yet, 0 off, 1 on */
+extern uint8_t g_spu_stack_reset_hint[1024];
+#if defined(__clang__)
+#  define SPU_DIRECT_TAIL(ctx, fn) __attribute__((musttail)) return fn(ctx)
+#else
+#  define SPU_DIRECT_TAIL(ctx, fn) do { fn(ctx); return; } while (0)
+#endif
+#define SPU_DIRECT(ctx, PC, FN) do {                                         \
+        const uint32_t _dpc = (uint32_t)(PC);                                \
+        (ctx)->pc = _dpc;                                                    \
+        if (__builtin_expect(g_spu_direct > 0, 1) && (_dpc & SPU_LS_MASK) &&  \
+            !g_spu_stack_reset_hint[(_dpc >> 2) & 1023u] &&                  \
+            !((ctx)->int_enable && !(ctx)->irq_saved &&                      \
+              (spu_ev_get((ctx)) & (ctx)->event_mask)))                       \
+            SPU_DIRECT_TAIL(ctx, FN);                                        \
+        g_spu_trampoline_fn = FN;                                            \
+        return;                                                              \
+    } while (0)
+
 #define SPU_RET(ctx) do {                                      \
         (ctx)->pc = (ctx)->gpr[0]._u32[0];                     \
         if ((ctx)->host_depth == 0)                            \

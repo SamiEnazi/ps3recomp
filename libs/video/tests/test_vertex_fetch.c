@@ -92,7 +92,7 @@ int main(void)
     static rsx_vertex_ref refs[MAXV];
     static u8 a[MAXV * 16 * 16], b[MAXV * 16 * 16];
     static u8 inl[8192];
-    int ok_runs = 0, fail_runs = 0, inline_runs = 0, prepared = 0;
+    int ok_runs = 0, fail_runs = 0, inline_runs = 0, prepared = 0, consecutive_runs = 0;
 
     for (int n = 0; n < PLANS; n++) {
         for (int l = 0; l < 2; l++) {
@@ -106,11 +106,29 @@ int main(void)
 
         const u32 count = 1 + rnd() % MAXV;
         const u32 base = (rnd() % 4 == 0) ? rnd() % 64u : 0;
+        /* A third of the runs are one consecutive run of ids (the ranged
+         * remap's output), some just below the 20-bit element wrap, prepared
+         * through the consecutive shortcut: its spans must equal the walk's. */
+        const int run = rnd() % 3 == 0;
+        const u32 start = (rnd() % 4 == 0) ? 0x000FFFFFu - rnd() % 400u - base : rnd() % 300u;
         for (u32 i = 0; i < count; i++) {
-            refs[i].vertex_id = (rnd() % 8 == 0) ? rnd() : rnd() % 300u;
+            refs[i].vertex_id = run ? start + i : (rnd() % 8 == 0) ? rnd() : rnd() % 300u;
             refs[i].base_index = base;
         }
-        if (rnd() % 4 != 0) { rsx_vertex_fetch_plan_prepare(&plan, refs, count); prepared++; }
+        if (run) {
+            rsx_vertex_fetch_plan walk = plan, fast = plan;
+            rsx_vertex_fetch_plan_prepare(&walk, refs, count);
+            rsx_vertex_fetch_plan_prepare_ex(&fast, refs, count, 1);
+            for (u32 at = 0; at < RSX_DSP_NUM_VERTEX_ATTR; at++)
+                CHECK(walk.attr[at].stable_base == fast.attr[at].stable_base &&
+                      walk.attr[at].stable_first == fast.attr[at].stable_first &&
+                      walk.attr[at].stable_last == fast.attr[at].stable_last,
+                      "plan %d attr %u: consecutive span %u..%u, walk %u..%u", n, at,
+                      fast.attr[at].stable_first, fast.attr[at].stable_last,
+                      walk.attr[at].stable_first, walk.attr[at].stable_last);
+            consecutive_runs++;
+        }
+        if (rnd() % 4 != 0) { rsx_vertex_fetch_plan_prepare_ex(&plan, refs, count, run); prepared++; }
         if (use_inline) inline_runs++;
 
         const u32 stride = plan.layout.stride;
@@ -139,7 +157,8 @@ int main(void)
     }
 
     printf("test_vertex_fetch: %d plans (%d succeeded, %d failed on both sides, %d prepared,"
-           " %d inline), %d failure(s)\n", PLANS, ok_runs, fail_runs, prepared, inline_runs, fails);
+           " %d inline, %d consecutive), %d failure(s)\n", PLANS, ok_runs, fail_runs, prepared, inline_runs,
+           consecutive_runs, fails);
     if (ok_runs < PLANS / 4 || fail_runs < 50 || inline_runs < 200) {
         printf("FAIL: too few cases exercised a path\n");
         return 1;

@@ -493,13 +493,202 @@ def compute_link_returns(insns, bounds) -> set:
     return returns
 
 
+# ---------------------------------------------------------------------------
+# Register locals (opt-in: SPU_LIFT_REG_LOCALS=1 / --reg-locals; off by default)
+# ---------------------------------------------------------------------------
+# The per-instruction translation reads and writes the register file in memory
+# (ctx->gpr[n]). The port builds with -fno-strict-aliasing, so every LS store
+# (a uint8_t* write) and every out-of-line call -- the float helpers' cold
+# fix-ups included -- forces the compiler to keep each ctx->gpr[n] in memory:
+# one store per instruction, and the registers reloaded after any such call.
+# reg_localize() rewrites one lifted function so its SPU registers live in C
+# locals (R_<n>, which never escape, so the compiler keeps them in host vector
+# registers and hoists loop-invariant work such as a shufb control's
+# preparation): loaded once at entry (loads the compiler finds dead go away),
+# written back only where the register file can be observed -- before any
+# statement that leaves the function or calls into the runtime with ctx --
+# and re-read after such a call. Only the registers that may have changed
+# since the last write-back on some path to that point are stored (a forward
+# may-dirty dataflow over the function's labels and gotos). Statements other
+# than the plain ones keep their ctx->gpr form exactly as before and run with
+# the register file up to date, so the runtime sees what it always saw. A
+# function with a statement the pass does not recognise is left in the old form.
+# Measured on the inFAMOUS 2 walk (2026-11-05): no gain on its own -- the write-backs
+# at every exit of a loop and the extra spills of keeping ~40 registers live cost what
+# the saved per-instruction stores bought (SPU busy +2%, and the lean-float tree was
+# faster without it) -- so it is not the default; kept, bit-exact, for other titles
+# and for a later pass with liveness across functions.
+_RL_GPR = re.compile(r'ctx->gpr\[(\d+)\]')
+_RL_DEF = re.compile(r'ctx->gpr\[(\d+)\] =(?!=)')
+_RL_LABEL = re.compile(r'^(loc_[0-9A-F]+):$')
+_RL_GOTO = re.compile(r'^goto (loc_[0-9A-F]+);$')
+_RL_LINK = re.compile(r'^(ctx->gpr\[\d+\] = spu_link\([^;]*\);) (.+)$')
+_RL_EXIT_END = re.compile(r'(return;|SPU_DIRECT\([^;]*\);|SPU_RET\(ctx\);|'
+                          r'SPU_RET_REG\(ctx, \d+\);)\s*\}?$')
+
+
+def _rl_ctx_free(s: str) -> bool:
+    """s touches ctx only through ctx->gpr[n], the inline LS accessors and
+    ctx->code_base (none of which reads the register file)."""
+    t = _RL_GPR.sub('', s)
+    for k in ('spu_ls_read128(ctx,', 'spu_ls_write128(ctx,', 'ctx->code_base'):
+        t = t.replace(k, '')
+    return 'ctx' not in t and 'g_spu_' not in t and 'spu_unsupported' not in t
+
+
+def _rl_split_if(s: str):
+    """'if (<cond>) <rest>' -> (cond, rest) with balanced parentheses, else None."""
+    if not s.startswith('if ('):
+        return None
+    depth = 0
+    for i in range(3, len(s)):
+        if s[i] == '(':
+            depth += 1
+        elif s[i] == ')':
+            depth -= 1
+            if depth == 0:
+                return s[4:i], s[i + 1:].strip()
+    return None
+
+
+def reg_localize(body_lines: list) -> list:
+    """Rewrite one lifted function body to keep SPU registers in C locals.
+    Returns the new body lines, or the input unchanged when the body has a
+    statement shape the pass does not handle."""
+    items = []                      # (kind, a, b)
+    for raw in body_lines:
+        s = raw.strip()
+        m = _RL_LINK.match(s)       # `brsl` emits the link and the transfer on one line
+        parts = [m.group(1), m.group(2)] if m else [s]
+        for s in parts:
+            m = _RL_LABEL.match(s)
+            if m:
+                items.append(('label', m.group(1), None)); continue
+            m = _RL_GOTO.match(s)
+            if m:
+                items.append(('goto', m.group(1), None)); continue
+            sp = _rl_split_if(s)
+            if sp is not None and _rl_ctx_free(sp[0]) and '"' not in sp[0]:
+                cond, rest = sp
+                m = _RL_GOTO.match(rest)
+                if m:
+                    items.append(('cgoto', cond, m.group(1))); continue
+                if (rest.startswith('{') and rest.endswith('}') and 'goto' not in rest
+                        and _RL_EXIT_END.search(rest[1:-1].strip())):
+                    items.append(('cexit', cond, rest)); continue
+            if 'goto' in s or s.endswith(':'):
+                return body_lines   # a transfer the pass does not model: old form
+            if 'if (' not in s and _RL_EXIT_END.search(s):
+                items.append(('exit', s, None)); continue
+            if (not s.startswith('if') and '{' not in s and 'return' not in s
+                    and _rl_ctx_free(s)):
+                d = 0
+                for r in _RL_DEF.findall(s):
+                    d |= 1 << int(r)
+                items.append(('pure', s, d)); continue
+            items.append(('barrier', s, None))
+
+    labels = {a: i for i, (k, a, _) in enumerate(items) if k == 'label'}
+    for k, a, b in items:
+        t = a if k == 'goto' else b if k == 'cgoto' else None
+        if t is not None and t not in labels:
+            return body_lines
+    used = set()
+    for k, a, b in items:
+        if k in ('pure', 'cgoto', 'cexit'):
+            used.update(int(r) for r in _RL_GPR.findall(a))
+    if not used:
+        return body_lines
+
+    # may-dirty dataflow: registers whose local may be newer than ctx->gpr
+    n = len(items)
+    din = [None] * (n + 1)          # n = falling off the end of the function
+    din[0] = 0
+    changed = True
+    while changed:
+        changed = False
+        for i, (k, a, b) in enumerate(items):
+            if din[i] is None:
+                continue
+            out = din[i] | b if k == 'pure' else 0 if k == 'barrier' else din[i]
+            succ = []
+            if k in ('label', 'pure', 'cgoto', 'cexit', 'barrier'):
+                succ.append(i + 1)
+            if k == 'goto':
+                succ.append(labels[a])
+            elif k == 'cgoto':
+                succ.append(labels[b])
+            for j in succ:
+                nv = out if din[j] is None else din[j] | out
+                if nv != din[j]:
+                    din[j] = nv
+                    changed = True
+
+    def loc(s):
+        return _RL_GPR.sub(lambda m: f"R_{m.group(1)}", s)
+
+    def flush(mask):
+        return [f"ctx->gpr[{r}] = R_{r};" for r in range(128) if mask >> r & 1]
+
+    regs = sorted(used)
+    reload = [" ".join(f"R_{r} = ctx->gpr[{r}];" for r in regs)]
+    out = ["u128 " + ", ".join(f"R_{r} = ctx->gpr[{r}]" for r in regs) + ";"]
+    pending = False                 # locals behind ctx->gpr (after a runtime call)
+    for i, (k, a, b) in enumerate(items):
+        d = din[i] or 0
+        if k == 'exit':
+            out += flush(d) + [a]
+            pending = False
+            continue
+        if pending and k != 'barrier':
+            out += reload
+            pending = False
+        if k == 'label':
+            out.append(f"{a}:")
+        elif k == 'goto':
+            out.append(f"goto {a};")
+        elif k == 'cgoto':
+            out.append(f"if ({loc(a)}) goto {b};")
+        elif k == 'cexit':
+            out.append(f"if ({loc(a)}) {{ " + " ".join(flush(d)) + (" " if d else "") + b + " }")
+        elif k == 'pure':
+            out.append(loc(a))
+        else:                       # barrier: the old statement, register file current
+            out += flush(d) + [a]
+            pending = True
+    if din[n]:
+        out += flush(din[n])        # falling off the end returns to the caller
+    return out
+
+
+def _reg_locals_default() -> bool:
+    return os.environ.get("SPU_LIFT_REG_LOCALS", "0") == "1"
+
+
+# Single-precision ops lifted to the lean helpers (spu_helpers.h, spu_*_lean: bit-identical,
+# about half the instructions); SPU_LIFT_LEAN_FLOAT=0 / --no-lean-float = the plain helpers.
+_LEAN_FLOAT = ("fa", "fs", "fm", "fma", "fms", "fnms", "fceq", "fcgt", "fcmeq", "fcmgt")
+
+
+def _lean_float_default() -> bool:
+    return os.environ.get("SPU_LIFT_LEAN_FLOAT", "1") != "0"
+
 
 # lv2 stop-and-signal syscalls that resume at the next instruction (the same
 # set as find_spu_functions.LV2_RESUMING_STOPS, which decides function extents).
 LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
 
 class SPULifter:
-    def __init__(self, trace: bool = False, prefix: str = ""):
+    def __init__(self, trace: bool = False, prefix: str = "", reloc: bool = False,
+                 reg_locals: bool = None, lean_float: bool = None):
+        # Register locals (reg_localize): only with SPU_LIFT_REG_LOCALS=1 or
+        # --reg-locals; never with --trace (its hooks read ctx->gpr).
+        self.reg_locals = (_reg_locals_default() if reg_locals is None else reg_locals) and not trace
+        self.lean_float = _lean_float_default() if lean_float is None else lean_float
+        # --relocatable: the image is lifted at LS 0 and runs wherever it is
+        # loaded; every LS address derived from its own position adds
+        # ctx->code_base (spu_overlay_register_region_reloc).
+        self.reloc = reloc
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
@@ -572,8 +761,7 @@ class SPULifter:
                          and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ ctx->pc = 0x{end:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{end:08X}; return; }}")
+                f"    {{ SPU_DIRECT(ctx, {self._A(end)}, {self.prefix}spu_func_{end:08X}); }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -595,6 +783,16 @@ class SPULifter:
 
         self.functions.append(func)
         return func
+
+    def _A(self, x: int) -> str:
+        """An LS address derived from this image's own position."""
+        return f"(ctx->code_base + 0x{x:X}u)" if self.reloc else f"0x{x:X}"
+
+    def _link(self, rt: int, addr: int) -> str:
+        """rt = the link address addr + 4, preferred word only (wraps at the end of LS)."""
+        if self.reloc:
+            return f"ctx->gpr[{rt}] = spu_link((ctx->code_base + 0x{addr + 4:X}u) & 0x3FFFCu);"
+        return f"ctx->gpr[{rt}] = spu_link(0x{(addr + 4) & 0x3FFFC:X});"
 
     @staticmethod
     def _branch_target(insn: SPUInstruction):
@@ -754,7 +952,8 @@ class SPULifter:
             "cwx": "spu_cwx", "cdx": "spu_cdx",
         }
         if mn in rr_bin:
-            return f"{g(rt())} = {rr_bin[mn]}({g(ra())}, {g(rb())});"
+            fn = rr_bin[mn] + ("_lean" if self.lean_float and mn in _LEAN_FLOAT else "")
+            return f"{g(rt())} = {fn}({g(ra())}, {g(rb())});"
 
         # ---- unary (register) ----
         rr_un = {
@@ -832,7 +1031,8 @@ class SPULifter:
             return f"{g(rt())} = spu_shufb({g(ra())}, {g(rb())}, {g(rc)});"
         if mn in ("fma", "fms", "fnms", "mpya"):
             rc = _reg(ops[3])
-            return f"{g(rt())} = spu_{mn}({g(ra())}, {g(rb())}, {g(rc)});"
+            fn = f"spu_{mn}" + ("_lean" if self.lean_float and mn in _LEAN_FLOAT else "")
+            return f"{g(rt())} = {fn}({g(ra())}, {g(rb())}, {g(rc)});"
         # sfx: extended subtract — RT is also a source (carry-in = low bit of old RT).
         if mn == "sfx":
             return f"{g(rt())} = spu_sfx({g(ra())}, {g(rb())}, {g(rt())});"
@@ -856,8 +1056,12 @@ class SPULifter:
             if disp is not None:
                 return f"spu_ls_write128(ctx, {g(base)}._u32[0] + {disp}, {g(rt())});"
         if mn in ("lqa", "lqr"):
+            if mn == "lqr" and self.reloc:
+                return f"{g(rt())} = spu_ls_read128(ctx, ctx->code_base + ({_imm(ops[1])}));"
             return f"{g(rt())} = spu_ls_read128(ctx, {_imm(ops[1])});"
         if mn in ("stqa", "stqr"):
+            if mn == "stqr" and self.reloc:
+                return f"spu_ls_write128(ctx, ctx->code_base + ({_imm(ops[1])}), {g(rt())});"
             return f"spu_ls_write128(ctx, {_imm(ops[1])}, {g(rt())});"
         if mn == "lqx":
             return f"{g(rt())} = spu_ls_read128(ctx, {g(ra())}._u32[0] + {g(rb())}._u32[0]);"
@@ -878,6 +1082,9 @@ class SPULifter:
         # ---- branches ----
         if mn in ("br", "bra"):
             tgt = self._branch_target(insn)
+            if self.reloc and mn == "bra" and tgt is not None:
+                return (f"{{ ctx->pc = 0x{tgt:X}u; "
+                        f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
             # SELF-LOOP TRAP: `br .` (target == this instruction) is an infinite
             # hang on real SPU -- a deliberate trap, no forward progress. Emitting
             # `goto loc_self` busy-spins the host thread forever; stop the SPU
@@ -892,7 +1099,14 @@ class SPULifter:
             tgt = self._branch_target(insn)
             # Link register: preferred word only, other slots ZERO (real HW /
             # RPCS3 v128::from32r) -- splatting corrupts full-quadword link use.
-            link = f"{g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X});"   # wraps at the end of LS
+            link = self._link(link_rt, addr)   # wraps at the end of LS
+            if self.reloc and insn.mnemonic == "brasl":
+                # Absolute call out of a relocatable image (a fixed kernel
+                # entry): dispatch it by address, never as one of our offsets.
+                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; uint32_t _cb = ctx->code_base; "
+                        f"ctx->pc = 0x{tgt:X}u; ctx->host_depth++; spu_indirect_branch(ctx); "
+                        f"spu_drain_call(ctx, {self._A(addr + 4)}); ctx->host_depth--; "
+                        f"spu_img_restore(ctx, _si); ctx->code_base = _cb; }}") if tgt is not None else f"{link} /* TODO spu: brasl unresolved */;"
             # SELF-LOOP TRAP: `brsl rX, .` (target == this instruction) is an
             # infinite loop on real SPU (re-sets the link each pass, never
             # advances) -- a trap, NOT a call. Emitting a host call recurses
@@ -917,6 +1131,11 @@ class SPULifter:
                 # `bi $r0` returns via host return) + SPU_DRAIN (drains the
                 # callee's own tail-chains so they don't grow the caller frame)
                 # + image save/restore (adopt-on-serve cannot leak upward).
+                if self.reloc:
+                    return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; uint32_t _cb = ctx->code_base; "
+                            f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); ctx->code_base = _cb; "
+                            f"spu_drain_call(ctx, {self._A(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si); "
+                            f"ctx->code_base = _cb; }}")
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
                         f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
                         f"spu_drain_call(ctx, 0x{addr + 4:X}); ctx->host_depth--; spu_img_restore(ctx, _si); }}")
@@ -932,8 +1151,8 @@ class SPULifter:
             self.branch_targets.add(tgt)
             # Cross-function conditional branch = conditional tail: hand the
             # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
-            return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
-                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+            return (f"if ({cond}) {{ SPU_DIRECT(ctx, {self._A(tgt)}, "
+                    f"{self.prefix}spu_func_{tgt:08X}); }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -980,17 +1199,19 @@ class SPULifter:
             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
             # here and its `bi $r0` returns via host return.
             # read the target BEFORE writing the link: rt may be the same register as ra
-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
-                    f"int32_t _si = (int32_t)ctx->image_id; "
+            _cbs = "uint32_t _cb = ctx->code_base; " if self.reloc else ""
+            _cbr = " ctx->code_base = _cb;" if self.reloc else ""
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {self._link(link_rt, addr)} "
+                    f"int32_t _si = (int32_t)ctx->image_id; {_cbs}"
                     f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, 0x{addr + 4:X}); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+                    f"spu_indirect_branch(ctx);{_cbr} spu_drain_call(ctx, {self._A(addr + 4)}); "
+                    f"ctx->host_depth--; spu_img_restore(ctx, _si);{_cbr} }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link
             tgt_reg = (insn.raw >> 7) & 0x7F     # ra = target (the disassembler's last operand is rb, not the target)
             # read the target before writing the link: rt may alias ra
-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link(0x{(addr + 4) & 0x3FFFC:X}); "
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {self._link(link_rt, addr)} "
                     f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
                     f"{_ied}ctx->pc = _tg; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }} }}")
@@ -1044,8 +1265,9 @@ class SPULifter:
         self.branch_targets.add(tgt)
         # Cross-function unconditional tail: hand the target to the trampoline
         # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
-        return (f"{{ ctx->pc = 0x{tgt:X}; "
-                f"g_spu_trampoline_fn = {self.prefix}spu_func_{tgt:08X}; return; }}")
+        # SPU_DIRECT (spu_context.h): a tail call when the drain has nothing
+        # to do on this step, the trampoline otherwise.
+        return (f"{{ SPU_DIRECT(ctx, {self._A(tgt)}, {self.prefix}spu_func_{tgt:08X}); }}")
 
     # ------------------------------------------------------------------ #
     def emit_header(self) -> str:
@@ -1070,7 +1292,8 @@ class SPULifter:
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         for f in self.functions:
             lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
-            for b in f.body_lines:
+            body = reg_localize(f.body_lines) if self.reg_locals else f.body_lines
+            for b in body:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
             lines.append("")
@@ -1089,7 +1312,7 @@ class SPULifter:
             lines.append(" * branches that escape a function's range). */")
             for t in externs:
                 lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx) {{")
-                lines.append(f"    ctx->pc = 0x{t:X}u; "
+                lines.append(f"    ctx->pc = {self._A(t) if self.reloc else f'0x{t:X}u'}; "
                              f"g_spu_trampoline_fn = spu_indirect_branch; return;")
                 lines.append("}")
             lines.append("")
@@ -1133,6 +1356,15 @@ def main() -> None:
                         "targets + STT_FUNC symbols). When set, .text is "
                         "read from this ELF and the positional <input> arg "
                         "is ignored.")
+    p.add_argument("--relocatable", action="store_true",
+                   help="lift at --base 0 for code that runs at any LS address: every "
+                        "address derived from its own position adds ctx->code_base")
+    p.add_argument("--reg-locals", action="store_true",
+                   help="keep SPU registers in C locals within each lifted function "
+                        "(reg_localize, opt-in); SPU_LIFT_REG_LOCALS=1 does the same")
+    p.add_argument("--no-lean-float", action="store_true",
+                   help="lift fa/fs/fm/fma/fms/fnms/fceq/fcgt/fcmeq/fcmgt to the plain "
+                        "helpers instead of spu_*_lean; SPU_LIFT_LEAN_FLOAT=0 does the same")
     p.add_argument("--trace", action="store_true",
                    help="Emit spu_trace_pc/spu_trace_rt around each instruction "
                         "for §3 diff-vs-RPCS3 validation. Output goes to stderr "
@@ -1297,7 +1529,9 @@ def main() -> None:
 
     insns = disassemble_spu(data, base)
 
-    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
+    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix, reloc=args.relocatable,
+                       reg_locals=True if args.reg_locals else None,
+                       lean_float=False if args.no_lean_float else None)
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "

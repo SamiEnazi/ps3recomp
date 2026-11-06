@@ -3,6 +3,7 @@
  */
 
 #include "sys_semaphore.h"
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -276,7 +277,7 @@ int64_t sys_semaphore_create(ppu_context* ctx)
      * LBP movie stall was a 2369-waits/0-posts semaphore whose OWNER took
      * grep archaeology to guess -- the name would have said it instantly. */
     { static int _n = 0;
-      if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 48)
+      if (PS3_LOG_FIRST(_n, 48))
           fprintf(stderr, "[sem] create id=%u name='%.8s' init=%d max=%d id_out=0x%08X lr=0x%08X\n",
                   sem_id, s->name, initial, max_val, id_out_addr, (uint32_t)ctx->lr); }
 
@@ -330,7 +331,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 {
     int64_t r = sys_semaphore_wait_impl(ctx);
     static _Atomic int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
-    if (d && r) { static int n = 0; if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 12)
+    if (d && r) { static int n = 0; if (PS3_LOG_FIRST(n, 12))
         fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
                 (unsigned)ctx->gpr[3], (long long)r, 10); }
     return r;
@@ -338,7 +339,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 {
     { static _Atomic int _d = -1; if (_d < 0) _d = getenv("SEM_WAITDBG") ? 1 : 0;
-      if (_d) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 20)
+      if (_d) { static int _n = 0; if (PS3_LOG_FIRST(_n, 20))
           fprintf(stderr, "[sem] wait(id=%u) tid=%llu%c", (unsigned)ctx->gpr[3],
                   (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
@@ -348,7 +349,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
      * writes, so a port can satisfy them here. Defined weakly below, so this is
      * a no-op for a port that does not need it. */
     { extern void ps3_spu_job_complete_pending(void); ps3_spu_job_complete_pending(); }
-    { static int _n = 0; if (getenv("SEMTID") && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 60000)
+    { static int _n = 0; if (getenv("SEMTID") && PS3_LOG_FIRST(_n, 60000))
         fprintf(stderr, "[WAIT tid=%llu] semaphore_wait(sem=%u timeout=%llu cia=0x%08X lr=0x%08X)\n",
                 (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us,
                 (unsigned)ctx->cia, (unsigned)ctx->lr);
@@ -364,7 +365,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
      * "loading done" wait) to locate its loop -- is it meant to re-post sem=3? */
     if (getenv("SEMCHAIN") && sem_id == 7 && ctx->thread_id == 0) {
         static int _c = 0;
-        if (__atomic_fetch_add(&_c, 1, __ATOMIC_RELAXED) < 2) { extern void ppu_log_host_chain(const char*); ppu_log_host_chain("sem7-wait-tid0"); }
+        if (PS3_LOG_FIRST(_c, 2)) { extern void ppu_log_host_chain(const char*); ppu_log_host_chain("sem7-wait-tid0"); }
     }
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX) {
         /* SEM_BADID=1: a wait/post on a handle that was never created means
@@ -464,7 +465,7 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
 
     sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
     if (!s->active) {
-        static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 6)
+        static int _n = 0; if (PS3_LOG_FIRST(_n, 6))
             fprintf(stderr, "[sem] post(id=%u) -> ESRCH: slot inactive"
                             " (value=%d max=%d)%c",
                     sem_id, s->value, s->max_value, 10);
@@ -513,7 +514,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
      * loading thread starves on) -- reveals which thread/loop produces it. */
     if (getenv("SEMCHAIN") && sem_id == 3) {
         static int _c = 0;
-        if (__atomic_fetch_add(&_c, 1, __ATOMIC_RELAXED) < 3) { extern void ppu_log_host_chain(const char*);
+        if (PS3_LOG_FIRST(_c, 3)) { extern void ppu_log_host_chain(const char*);
             fprintf(stderr, "[SEMCHAIN] sem=3 post by tid=%llu\n", (unsigned long long)ctx->thread_id);
             ppu_log_host_chain("sem3-post"); }
     }
@@ -537,7 +538,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
     if (s->value + count > s->max_value) {
-        if (getenv("PS3_SEMTRACE")) { static int _n=0; if(__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<6)
+        if (getenv("PS3_SEMTRACE")) { static int _n=0; if(PS3_LOG_FIRST(_n, 6))
             fprintf(stderr, "[SEMTRACE] post OVERFLOW id=%u value=%d+%d > max=%d\n",
                     sem_id, s->value, count, s->max_value); }
         LeaveCriticalSection(&s->value_lock);

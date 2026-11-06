@@ -169,11 +169,35 @@ if(APPLE)
         "-framework QuartzCore"
         "-framework Foundation"
         "-framework AppKit"
+        # PS3_UPSCALE=metalfx (macOS 13+); weak, so older systems still start.
+        "-weak_framework MetalFX"
     )
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
+
+    # The in-game menu / HUD (libs/video/ps3_overlay.mm) on Dear ImGui
+    # (third_party/imgui, v1.92.9b, MIT): the core and its Metal renderer.
+    enable_language(OBJCXX)
+    set(PS3_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui")
+    target_sources(ps3recomp_runtime PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/ps3_overlay.mm"
+        "${PS3_IMGUI_DIR}/imgui.cpp"
+        "${PS3_IMGUI_DIR}/imgui_draw.cpp"
+        "${PS3_IMGUI_DIR}/imgui_tables.cpp"
+        "${PS3_IMGUI_DIR}/imgui_widgets.cpp"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_metal.mm")
+    # The include path only for these files (the folder holds a VERSION.txt
+    # and other names that must not shadow system headers elsewhere).
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/ps3_overlay.mm"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_metal.mm"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc" INCLUDE_DIRECTORIES "${PS3_IMGUI_DIR}")
+    set_source_files_properties(
+        "${PS3_IMGUI_DIR}/imgui.cpp" "${PS3_IMGUI_DIR}/imgui_draw.cpp"
+        "${PS3_IMGUI_DIR}/imgui_tables.cpp" "${PS3_IMGUI_DIR}/imgui_widgets.cpp"
+        PROPERTIES COMPILE_OPTIONS "-w" INCLUDE_DIRECTORIES "${PS3_IMGUI_DIR}")   # upstream code
 endif()
 
 if(PS3RECOMP_RSX_VULKAN)
@@ -368,6 +392,10 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    # The FIFO walker's JUMP forms (libs/video/gcm_fifo_decode.h), header only.
+    add_executable(test_gcm_fifo_decode tests/gcm_fifo_decode/main.c)
+    target_include_directories(test_gcm_fifo_decode PRIVATE libs/video)
+    add_test(NAME gcm_fifo_decode COMMAND test_gcm_fifo_decode)
 endif()
 
 # ---------------------------------------------------------------------------

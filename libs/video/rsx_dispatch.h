@@ -150,6 +150,11 @@ struct rsx_dispatch {
     u32   imm_dropped;                /* vertices past RSX_DSP_IMM_MAX      */
     u32   pair_packets;               /* array/index/inline packets this pair */
     float imm_vert[RSX_DSP_IMM_MAX][RSX_DSP_NUM_VERTEX_ATTR][4];
+
+    /* Bumped whenever a word of vp[] changes value (the upload window, a
+     * seed), so a consumer that derived something from the transform
+     * program can tell it is still the same without comparing the words. */
+    u32 vp_gen;
 };
 
 /* ---- lifecycle -------------------------------------------------------- */

@@ -13,6 +13,7 @@
  * Context-aware HLE: guest pointers (path, buffers, out params) are read/written
  * through vm_base in big-endian.
  */
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #ifndef _WIN32
 #include <atomic>
 #include <execinfo.h>
@@ -24,8 +25,10 @@
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>    /* trace timestamps */
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
@@ -53,6 +56,10 @@ extern "C" void     vm_write64(uint64_t a, uint64_t v);
 /* Host root that the PS3 mount points map into (dir containing PS3_GAME). */
 extern "C" const char* ppu_vfs_root = ".";
 
+/* PS3_VOICE_LANG / PS3_TEXT_LANG: voice and text in different languages
+ * (redirected language archives, see the header). */
+#include "ppu_fs_lang.h"
+
 /* CELL_FS return / mode / flag constants. */
 #define CELL_OK              0
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
@@ -63,9 +70,14 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_O_RDONLY     0
 #define CELL_FS_O_WRONLY     1
 #define CELL_FS_O_RDWR       2
-#define CELL_FS_O_CREAT      0x0200
-#define CELL_FS_O_TRUNC      0x0400
-#define CELL_FS_O_APPEND     0x0100
+/* Open flags: the PS3 SDK values (octal), as libs/filesystem/cellFs.h
+ * declares them. The hex guesses that were here (CREAT 0x200, TRUNC 0x400,
+ * APPEND 0x100) put TRUNC's and APPEND's numbers on CREAT and TRUNC, so an
+ * O_RDWR|O_CREAT open (0x42) never created the file. As
+ * sp00nznet/ps3recomp#349. */
+#define CELL_FS_O_CREAT      0x0040   /* 000100 */
+#define CELL_FS_O_TRUNC      0x0200   /* 001000 */
+#define CELL_FS_O_APPEND     0x0400   /* 002000 */
 #define CELL_FS_SEEK_SET     0
 #define CELL_FS_SEEK_CUR     1
 #define CELL_FS_SEEK_END     2
@@ -91,7 +103,7 @@ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
 
 /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
  * prefixes are stripped; the rest is appended to the root. */
-static void host_path(char* out, size_t cap, const char* guest)
+static void host_path_mount(char* out, size_t cap, const char* guest)
 {
     const char* rel = guest;
     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
@@ -151,8 +163,17 @@ static void host_path(char* out, size_t cap, const char* guest)
     ps3_vfs_ps3game_fallback(out, cap);
 }
 
+/* The host file the guest gets: its translated path, then a language archive
+ * swapped for the chosen language's (ppu_fs_lang.h; open and stat agree). */
+static void host_path(char* out, size_t cap, const char* guest)
+{
+    host_path_mount(out, cap, guest);
+    lang_redirect_host(out, cap);
+}
+
 /* ---- fd / dir handle tables ---- */
 #define FS_MAX 256
+static_assert(FS_MAX == LANG_FD_MAX, "ppu_fs_lang.h keeps per-fd state for every descriptor");
 static FILE* g_files[FS_MAX];
 static uint8_t g_fd_usm[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
@@ -212,7 +233,7 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
+        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)
@@ -229,6 +250,7 @@ static void cellFsOpen(ppu_context* ctx)
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
+    lang_on_open(fd, hpath);   /* a language's archive TOC / movie tracks to patch on read */
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
      * streaming layer opens a file and never reads it (You Don't Know Jack's
      * movies) is diagnosed from the opener: its sibling read path is the one
@@ -349,6 +371,7 @@ static void cellFsClose(ppu_context* ctx)
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
         fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
+        lang_on_close(fd);
     }
     ctx->gpr[3] = CELL_OK;
 }
@@ -387,6 +410,7 @@ static void cellFsRead(ppu_context* ctx)
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    if (fpos_before >= 0) lang_apply(fd, (uint64_t)fpos_before, vm_base + buf, n);
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -410,9 +434,9 @@ static void cellFsRead(ppu_context* ctx)
       if (wfd >= 0 && fd == wfd)
           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
                   fd, (unsigned long long)nbytes, n, fpos_before); }
-    if (getenv("PS3_FSLOG")) { static int _fd=0; if(__atomic_fetch_add(&_fd, 1, __ATOMIC_RELAXED)<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
+    if (getenv("PS3_FSLOG")) { static int _fd=0; if(PS3_LOG_FIRST(_fd, 20)) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
 #ifdef _WIN32
-    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(__atomic_fetch_add(&_b, 1, __ATOMIC_RELAXED)<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
+    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(PS3_LOG_FIRST(_b, 2)){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
 #endif
     /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
      * opened and never read" unfalsifiable: reads on a later-opened fd fall off
@@ -424,10 +448,13 @@ static void cellFsRead(ppu_context* ctx)
       tot+=n;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
       int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
-      if(__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<50 || first_for_fd || getenv("FS_READ_ALL"))
-        fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
+      if(PS3_LOG_FIRST(_n, 50) || first_for_fd || getenv("FS_READ_ALL"))
+        { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);   /* t= lines up with [lwc]/[ww] */
+        fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu) tid=%llu t=%.3f%s\n",
                 fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
-                (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
+                (unsigned long long)tot, (unsigned long long)ctx->thread_id,
+                (double)_ts.tv_sec + _ts.tv_nsec / 1e9,
+                first_for_fd?"  <= FIRST READ ON THIS FD":""); }
       if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
           fprintf(stderr, "        from %s\n", g_fd_path[fd]);
 #ifndef _WIN32
@@ -545,7 +572,8 @@ static void cellFsLseek(ppu_context* ctx)
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
-        fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
+        fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u tid=%llu  (by %s)\n", fd, (long long)off, wh,
+                (unsigned long long)ctx->thread_id, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
     fseek(g_files[fd], (long)off, worigin);
     long p = ftell(g_files[fd]);
@@ -621,7 +649,7 @@ static void cellFsFstat(ppu_context* ctx)
               sz = c; } } }
     struct stat hst; const int have_st = fstat(fileno(g_files[fd]), &hst) == 0;
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz, have_st ? &hst : nullptr);
-    if (getenv("PS3_FSLOG")) { static int _n=0; if(__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+    if (getenv("PS3_FSLOG")) { static int _n=0; if(PS3_LOG_FIRST(_n, 12)) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -661,6 +689,61 @@ static void cellFsReaddir(ppu_context* ctx)
     vm_base[dirent + 2 + nl] = 0;
     if (nread_ptr) vm_write64(nread_ptr, 0x102);
     ctx->gpr[3] = CELL_OK;
+}
+
+/* CellFsDirectoryEntry is a 52-byte stat followed by a 258-byte dirent,
+ * rounded to four-byte alignment: 312 bytes. entries_size is bytes, while
+ * data_count is a big-endian u32 count of complete entries. The stream is
+ * shared with cellFsReaddir and cellFsClosedir. */
+static void cellFsGetDirectoryEntries(ppu_context* ctx)
+{
+    const uint32_t fd = (uint32_t)ctx->gpr[3];
+    const uint32_t entries = (uint32_t)ctx->gpr[4];
+    const uint32_t bytes = (uint32_t)ctx->gpr[5];
+    const uint32_t count_ptr = (uint32_t)ctx->gpr[6];
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    if (!entries || !count_ptr || uint64_t(entries) + bytes > limit ||
+        uint64_t(count_ptr) + 4 > limit) {
+        ctx->gpr[3] = 0x8001000Du; // CELL_EFAULT
+        return;
+    }
+    if (fd < 3 || fd >= FS_MAX || !g_dirs[fd]) {
+        ctx->gpr[3] = 0x8001002Au; // CELL_EBADF
+        return;
+    }
+    uint32_t count = 0;
+    ctx->gpr[3] = CELL_OK;
+    for (; count < bytes / 312; ++count) {
+        errno = 0;
+        struct dirent* entry = readdir(g_dirs[fd]);
+        if (!entry) {
+            if (errno) ctx->gpr[3] = 0x8001002Bu; // CELL_EIO
+            break;
+        }
+        char path[1300];
+        snprintf(path, sizeof path, "%s/%s", g_dir_path[fd], entry->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            ctx->gpr[3] = 0x8001002Bu; // entry disappeared or cannot be inspected
+            break;
+        }
+        uint32_t out = entries + count * 312;
+        memset(vm_base + out, 0, 312);
+        bool directory = (st.st_mode & S_IFDIR) != 0;
+        /* The fork's write_stat also takes the host stat for the times
+         * (upstream PR #247 writes them itself below). */
+        write_stat(out, (directory ? CELL_FS_S_IFDIR : CELL_FS_S_IFREG) |
+                        (uint32_t(st.st_mode) & 0777), uint64_t(st.st_size), &st);
+        vm_write64(out + 0x0C, uint64_t(st.st_atime));
+        vm_write64(out + 0x14, uint64_t(st.st_mtime));
+        vm_write64(out + 0x1C, uint64_t(st.st_ctime));
+        size_t length = strlen(entry->d_name);
+        if (length > 255) length = 255;
+        vm_base[out + 52] = directory ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;
+        vm_base[out + 53] = uint8_t(length);
+        memcpy(vm_base + out + 54, entry->d_name, length);
+    }
+    vm_write32(count_ptr, count);
 }
 
 static void cellFsClosedir(ppu_context* ctx)
@@ -781,6 +864,7 @@ static void cellFsAioRead(ppu_context* ctx)
          * position, and the guest interleaves them freely across threads. */
         if (HOST_FSEEK64(g_files[fd], offset) == 0)
             n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+        lang_apply(fd, offset, vm_base + buf, n);
         err = CELL_OK;
     }
     if (getenv("PS3_FSLOG"))
@@ -808,6 +892,7 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFstat"),    "cellFsFstat",    cellFsFstat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpendir"),  "cellFsOpendir",  cellFsOpendir);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetDirectoryEntries"), "cellFsGetDirectoryEntries", cellFsGetDirectoryEntries);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsReaddir"),  "cellFsReaddir",  cellFsReaddir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClosedir"), "cellFsClosedir", cellFsClosedir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsMkdir"),    "cellFsMkdir",    cellFsMkdir);

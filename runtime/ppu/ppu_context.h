@@ -12,6 +12,7 @@
 #include "../../include/ps3emu/ps3types.h"
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv (ppu_vscr_default) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,9 +104,22 @@ typedef struct ppu_context {
 /* ---------------------------------------------------------------------------
  * Initialization
  * -----------------------------------------------------------------------*/
+/* VSCR at thread start. The PS3 starts every PPU thread with VSCR[NJ] = 1
+ * (non-Java mode: VMX float ops flush denormal operands and results to zero),
+ * as RPCS3's ppu_thread does (nj = true). A zeroed context left NJ = 0, so
+ * every vmaddfp/vaddfp/... kept denormals the PS3 flushes; inFAMOUS 2 never
+ * writes VSCR itself. PS3_VSCR_NJ=0 restores the old zero value (A/B). */
+static inline uint32_t ppu_vscr_default(void)
+{
+    static int nj = -1;
+    if (nj < 0) { const char* e = getenv("PS3_VSCR_NJ"); nj = (e && e[0] == '0') ? 0 : 1; }
+    return nj ? 0x00010000u : 0u;
+}
+
 static inline void ppu_context_init(ppu_context* ctx)
 {
     memset(ctx, 0, sizeof(*ctx));
+    ctx->vscr = ppu_vscr_default();
     /* r1 (stack pointer) gets set during thread creation.
      * r2 (TOC) gets set from the ELF entry descriptor.
      * r13 (SDA base) gets set from the module loader. */

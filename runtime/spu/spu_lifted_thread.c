@@ -101,7 +101,8 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
             "-> status=%d%s%s\n",
             ctx->spu_id, ctx->status, ctx->pc, ctx->stop_code, r.exit_status,
             r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
-    if (r.faulted) spu_ls_watch_dump("thread-fault");
+    if (r.faulted) { extern void spu_irq_ring_dump(spu_context*); spu_irq_ring_dump(ctx);
+                     spu_ls_watch_dump("thread-fault"); }
     fflush(stderr);
 
     /* The SPU has stopped, so its MFC engine is idle and the slot it holds in

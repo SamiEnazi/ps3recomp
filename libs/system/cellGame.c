@@ -131,7 +131,7 @@ static int dir_exists(const char* path)
 
 /* Content may not exist on first boot. Query its nearest existing ancestor
  * so installation checks use the destination volume, without creating data. */
-static s32 content_free_kb(void)
+static s32 content_free_kb_raw(void)
 {
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s", s_content_path[0] ? s_content_path : ".");
@@ -182,6 +182,19 @@ static s32 content_free_kb(void)
         }
     }
     return 0;
+}
+
+/* Games compute hddFreeSizeKB * 1024 in 32 bits (inFAMOUS 2 does), so a real
+ * free space between 4 GiB and a few hundred GiB wraps to an arbitrary byte
+ * count and the install check fails at random ("not enough space" at boot,
+ * depending on how much the disk happens to have free). Above 4 GiB report
+ * RPCS3's 40 GiB - 256 KiB, whose x1024 is 0xFFFC0000 in 32 bits: plenty
+ * either way. Below that the real value cannot wrap. */
+static s32 content_free_kb(void)
+{
+    const s32 kb = content_free_kb_raw();
+    if (kb >= 4 * 1024 * 1024 - 256) return 40 * 1024 * 1024 - 256;
+    return kb;
 }
 
 /* ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@
  * without hand-written NID literals.
  */
 #include "ppu_recomp.h"     /* ppu_context */
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
 #include <stdint.h>
 #include <stdio.h>
@@ -290,7 +291,7 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
             ctx->gpr[3] = 0;
             return;
         }
-        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
+        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; } // CELL_EBUSY (0x8001000B is ETIMEDOUT)
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
 #endif
@@ -411,7 +412,7 @@ static int lwc_log()
     if (n < 0) { const char* e = getenv("PS3_LWCOND_LOG"); n = e ? atoi(e) : 0; }
     return n;
 }
-static std::atomic<int> s_lwc_logged{0};
+static int s_lwc_logged;   /* PS3_LOG_FIRST counter */
 
 /* signal releases the oldest waiter registered on this lwcond, signal_all
  * every one registered now. Released waiters leave the queue at once, so a
@@ -431,7 +432,7 @@ static void lwc_signal(uint32_t ea, bool all, uint32_t tid = 0)
             p = &w->next;
         }
     }
-    if (lwc_log() && s_lwc_logged++ < lwc_log())
+    if (lwc_log() && PS3_LOG_FIRST(s_lwc_logged, lwc_log()))
         fprintf(stderr, "[lwcond] signal%s ea=0x%08X woke=%u tid=%u lwm_owner=0x%X\n", all ? "_all" : "", ea,
                 n, tid, vm_read32(vm_read32(ea) + LWM_OWNER));
     if (n) s_lwc_cv.notify_all();
@@ -451,7 +452,7 @@ static void sys_lwcond_wait(ppu_context* ctx)
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
         const bool poll = lwc_poll_mode();
-        if (lwc_log() && s_lwc_logged++ < lwc_log())
+        if (lwc_log() && PS3_LOG_FIRST(s_lwc_logged, lwc_log()))
             fprintf(stderr, "[lwcond] wait ea=0x%08X lwm=0x%08X timeout=%llu tid=%u\n", lwcond, lwmutex,
                     (unsigned long long)timeout, (unsigned)ctx->thread_id);
         LwcondWaiter me{lwcond, false, nullptr};
@@ -473,7 +474,7 @@ static void sys_lwcond_wait(ppu_context* ctx)
                 if (!s_lwc_cv.wait_for(lk, std::chrono::microseconds(timeout), ready)) {
                     lwc_unlink(&me);
                     rc_out = (int32_t)0x8001000B;   /* CELL_ETIMEDOUT */
-                    if (getenv("PS3_LWCOND_TOLOG")) { static std::atomic<int> n{0}; if (n++ < 400)
+                    if (getenv("PS3_LWCOND_TOLOG")) { static int n; if (PS3_LOG_FIRST(n, 400))
                         fprintf(stderr, "[lwcond] TIMEOUT ea=0x%08X tid=%u after %lluus lr=0x%08X\n", lwcond,
                                 (unsigned)ctx->thread_id, (unsigned long long)timeout, (uint32_t)ctx->lr); }
                 }
@@ -649,6 +650,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
 #define SYS_NET_EWOULDBLOCK_V 35
 extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
 extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
+extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
 static uint32_t g_net_errno_ea = 0;
 static void hle_net_errno_loc(ppu_context* ctx)
 {
@@ -993,9 +995,12 @@ static void hle_sys_spu_printf_detach_thread(ppu_context* ctx) { lv2_spu_printf_
  */
 #define SPINLOCK_BE1  0x01000000u          /* be32(1) */
 
-static inline volatile long* spin_word(uint32_t ea)
+static inline volatile LONG* spin_word(uint32_t ea)
 {
-    return (volatile long*)(vm_base + ea);
+    /* LONG, not long: the lock is one 32-bit word, and an LP64 `long` made the
+     * exchange an 8-byte RMW that also zeroed the guest word after the lock
+     * (and needed the word to be 8-aligned). As sp00nznet/ps3recomp#326. */
+    return (volatile LONG*)(vm_base + ea);
 }
 
 /* Test-and-set, not compare-and-swap: writing "locked" over an already-locked
@@ -1003,7 +1008,7 @@ static inline volatile long* spin_word(uint32_t ea)
  * Exchange is the one RMW the POSIX shim in win32_compat.h already provides. */
 static inline int spin_try(uint32_t ea)
 {
-    return _InterlockedExchange(spin_word(ea), (long)SPINLOCK_BE1) == 0;
+    return _InterlockedExchange(spin_word(ea), (LONG)SPINLOCK_BE1) == 0;
 }
 
 static void sys_spinlock_initialize(ppu_context* ctx)
@@ -1063,7 +1068,7 @@ static void sys_spinlock_lock(ppu_context* ctx)
             unsigned long owner = spin_owner_of(ea);
             unsigned long me    = GetCurrentThreadId();
             static int reported = 0;
-            if (__atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) < 8)
+            if (PS3_LOG_FIRST(reported, 8))
                 fprintf(stderr,
                         "[spinlock] STUCK on 0x%08X after 200k spins: guest lr=0x%08X, "
                         "held by tid %lu, this is tid %lu%s\n",
@@ -1119,6 +1124,8 @@ extern "C" void ppu_sysprx_register(void)
     /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
      * come off the stack, so they need the full context. */
     np_score_register_ctx();
+    /* cellVideoOutSetGamma's float argument is in f1. */
+    avconf_register_ctx();
     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
      * sys_net NID LBP imports so none fall to the unresolved-NID default. */
     ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);

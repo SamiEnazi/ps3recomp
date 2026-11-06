@@ -383,7 +383,17 @@ static void test_resident_code_regions(void)
     spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
     if (!ctx) { check(0, "allocate streamed code context"); return; }
     spu_context_init(ctx, 0);
+    /* The slot bookkeeping compares local store with the modules' source
+     * bytes at their EAs (0x500000..0x700000): give it a guest of its own --
+     * this test runs before main() maps the guarded arena (vm_base NULL). */
+    uint8_t* const saved_vm = vm_base;
+    uint8_t* const guest = (uint8_t*)calloc(1, 0x800000);
+    if (!guest) { check(0, "allocate streamed code guest"); free(ctx); return; }
+    vm_base = guest;
     const uint32_t a = 0x11000, b = 0x12000;
+    /* What the GETs bring in: each module's own (non-zero) code bytes. */
+    memset(guest + 0x500000, 0x11, 0x400); memcpy(ctx->ls + a, guest + 0x500000, 0x400);
+    memset(guest + 0x600000, 0x22, 0x400); memcpy(ctx->ls + b, guest + 0x600000, 0x400);
     spu_begin_image(81); spu_register_function(a, code_a);
     spu_begin_image(82); spu_register_function(b, code_b);
     spu_begin_image(83); spu_register_function(a, code_stale);
@@ -399,12 +409,46 @@ static void test_resident_code_regions(void)
     check(ctx->gpr[3]._u32[0] == 81, "first streamed job survives second job and continuation DMA");
     ctx->pc = b; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] == 82, "second streamed job overrides stale base-image code");
+    memset(ctx->ls + a, 0x33, 0x100);
     spu_overlay_note_get(ctx, 0x700000, ctx->ls + a, 0x100);
     ctx->pc = a; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] != 81, "overwriting a code buffer invalidates its old image");
     ctx->pc = b; spu_indirect_branch(ctx);
     check(ctx->gpr[3]._u32[0] == 82, "overwriting one buffer preserves the other");
+
+    /* A module whose image has zeros where other code later lands keeps its
+     * slot through that GET (the hole reads as a buffer it fills itself), so
+     * dispatch there went to the module's lift -- or, with none, to the
+     * interpreter -- instead of the resident overlay that owns the address
+     * now (the Edge geometry job's rare fault). Dispatch must check the word. */
+    const uint32_t c = 0x14000;
+    memset(guest + 0x580000, 0x44, 0x100);            /* code, then a zero hole */
+    memcpy(ctx->ls + c, guest + 0x580000, 0x800);
+    spu_begin_image(84); spu_register_function(c + 0x400, code_stale);
+    spu_begin_image(85); spu_register_function(c + 0x400, code_b);
+    spu_begin_image(0);
+    spu_overlay_register_region(0x580000, 0x800, 84);
+    spu_overlay_note_get(ctx, 0x580000, ctx->ls + c, 0x800);
+    memset(ctx->ls + c + 0x400, 0x55, 0x100);         /* the job lands in the hole */
+    spu_overlay_note_get(ctx, 0x590000, ctx->ls + c + 0x400, 0x100);
+    ctx->resident_ovl = 85;
+    ctx->gpr[3]._u32[0] = 0;
+    ctx->pc = c + 0x400; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 82, "code streamed into a module's zero hole dispatches to its own lift");
+    /* ...and when what landed there is itself a registered code span (a
+     * relocatable job module put at that address), its own slot answers. */
+    ctx->resident_ovl = 0;
+    memset(guest + 0x5A0000, 0x55, 0x100);
+    spu_begin_image(86); spu_register_function(c + 0x400, code_a);
+    spu_begin_image(0);
+    spu_overlay_register_region(0x5A0000, 0x100, 86);
+    spu_overlay_note_get(ctx, 0x5A0000, ctx->ls + c + 0x400, 0x100);
+    ctx->gpr[3]._u32[0] = 0;
+    ctx->pc = c + 0x400; spu_indirect_branch(ctx);
+    check(ctx->gpr[3]._u32[0] == 81, "a later code span answers where an earlier one is stale");
     g_spu_trampoline_fn = 0;
+    vm_base = saved_vm;
+    free(guest);
     free(ctx);
 }
 

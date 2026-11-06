@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "spu_coherency.h"
 #ifndef _WIN32
 #include <execinfo.h>
@@ -463,7 +464,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t c = (uintptr_t)__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_RELAXED);
         if (c >= lo && c < hi) {
             static int _n = 0;
-            if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 16)
+            if (PS3_LOG_FIRST(_n, 16))
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, ((spu_context*)c)->image_id);
             __atomic_store_n(&s_coh_ctxs[i], NULL, __ATOMIC_RELEASE);

@@ -21,6 +21,11 @@
 #include "../platform/win32_compat.h"
 #include <limits.h>
 #include <string.h>
+#include <stdio.h>    /* LWCOND_TRACE */
+#include <stdlib.h>
+#include <time.h>
+static int lwc_trace_on(void);
+static int lwc_is_traced(uint32_t id);
 
 extern uint8_t* vm_base;
 int32_t ppu_thread_priority_of(uint64_t tid);   /* sys_ppu_thread.c */
@@ -340,6 +345,10 @@ static int64_t sys_lwcond_signal(ppu_context* ctx)
     } else {
         w = schedule(&c->sq, c->protocol);
     }
+    if (lwc_trace_on() && lwc_is_traced(id))
+        fprintf(stderr, "[lwc] signal cond=%u mtx=%u mode=%u by tid=%llu -> %s%llu\n", id, mid, mode,
+                (unsigned long long)ctx->thread_id, w ? "woke tid=" : "NO WAITER ",
+                w ? (unsigned long long)w->tid : 0ull);
     if (!w) {
         ReleaseSRWLockExclusive(&s_lock);
         if (tid != 0xFFFFFFFFu) return (int32_t)CELL_EPERM;
@@ -376,6 +385,9 @@ static int64_t sys_lwcond_signal_all(ppu_context* ctx)
         if (mode == 2) { w->ret = (int32_t)CELL_EBUSY; awake(w); }
         else enqueue(&m->sq, w);
     }
+    if (lwc_trace_on() && lwc_is_traced(id))
+        fprintf(stderr, "[lwc] signal_all cond=%u mode=%u by tid=%llu -> %d woken\n",
+                id, mode, (unsigned long long)ctx->thread_id, n);
     ReleaseSRWLockExclusive(&s_lock);
     return mode == 1 ? n : CELL_OK;
 }
@@ -384,6 +396,34 @@ static int64_t sys_lwcond_signal_all(ppu_context* ctx)
  * condition and release the mutex (handing it to its next sleeper, or leaving
  * a signal), then sleep until signalled -- woken owning the mutex, or with
  * EBUSY if signalled in mode 2 -- or until the timeout (ETIMEDOUT). */
+/* LWCOND_TRACE=<lo>-<hi>: trace every wait and signal on the lwconds that
+ * guest threads with ids in [lo, hi] ever wait on -- a streaming library's
+ * worker/scheduler handshake, say -- so a lost wake-up (a signal that found
+ * no waiter, then a wait that nothing follows) can be read off the log.
+ * Off unless set; conds nobody in the range waits on stay silent. */
+static int lwc_trace_lo = -1, lwc_trace_hi = -1;
+static uint32_t lwc_traced[32]; static int lwc_traced_n;
+static int lwc_trace_on(void)
+{
+    if (lwc_trace_lo == -1) {
+        const char* e = getenv("LWCOND_TRACE");
+        int lo = 0, hi = 0;
+        if (e && sscanf(e, "%d-%d", &lo, &hi) == 2) { lwc_trace_lo = lo; lwc_trace_hi = hi; }
+        else { lwc_trace_lo = -2; lwc_trace_hi = -2; }
+    }
+    return lwc_trace_lo >= 0;
+}
+static int lwc_is_traced(uint32_t id)            /* under s_lock */
+{
+    for (int i = 0; i < lwc_traced_n; i++) if (lwc_traced[i] == id) return 1;
+    return 0;
+}
+static void lwc_mark(uint32_t id, uint64_t tid)   /* under s_lock */
+{
+    if ((int64_t)tid < lwc_trace_lo || (int64_t)tid > lwc_trace_hi || lwc_is_traced(id)) return;
+    if (lwc_traced_n < 32) lwc_traced[lwc_traced_n++] = id;
+}
+
 static int64_t sys_lwcond_queue_wait(ppu_context* ctx)
 {
     const uint32_t id = LV2_ARG_U32(ctx, 0), mid = LV2_ARG_U32(ctx, 1);
@@ -394,6 +434,11 @@ static int64_t sys_lwcond_queue_wait(ppu_context* ctx)
     lwcond* c = find_cnd(id);
     lwmutex* m = find_mtx(mid);
     if (!c || !m) { ReleaseSRWLockExclusive(&s_lock); return (int32_t)CELL_ESRCH; }
+    const int traced = lwc_trace_on() && (lwc_mark(id, w.tid), lwc_is_traced(id));
+    if (traced) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        fprintf(stderr, "[lwc] wait cond=%u mtx=%u tid=%llu timeout=%llu (mtx sleepers=%s) t=%.3f\n",
+                id, mid, (unsigned long long)w.tid, (unsigned long long)timeout, m->sq ? "yes" : "no",
+                (double)ts.tv_sec + ts.tv_nsec / 1e9); }
     m->lwcond_waiters++;
     c->lwmutex_waiters++;
     enqueue(&c->sq, &w);
@@ -402,6 +447,7 @@ static int64_t sys_lwcond_queue_wait(ppu_context* ctx)
 
     if (!sleep_on(&w, timeout) && (unqueue(&c->sq, &w) || unqueue(&m->sq, &w)))
         w.ret = (int32_t)CELL_ETIMEDOUT;
+    if (traced) fprintf(stderr, "[lwc] woke cond=%u tid=%llu ret=%d\n", id, (unsigned long long)w.tid, w.ret);
 
     if (--m->lwcond_waiters == INT_MIN) WakeAllConditionVariable(&s_destroy_cv);
     if (--c->lwmutex_waiters == INT_MIN) WakeAllConditionVariable(&s_destroy_cv);

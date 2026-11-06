@@ -40,6 +40,19 @@
 
 static int s_trophy_initialized = 0;
 static char s_storage_path[512] = "gamedata/trophies";
+static int  s_storage_path_set = 0;
+
+/* $PS3_GAMEDATA_ROOT (see cellSaveData.c) moves the default next to the saves;
+ * an explicit sceNpTrophySetStoragePath still wins. */
+static void trophy_adopt_gamedata_root(void)
+{
+    static int s_done = 0;
+    if (s_done || s_storage_path_set) return;
+    s_done = 1;
+    const char* env = getenv("PS3_GAMEDATA_ROOT");
+    if (env && *env)
+        snprintf(s_storage_path, sizeof(s_storage_path), "%s/trophies", env);
+}
 
 /* Per-context data */
 typedef struct {
@@ -68,6 +81,7 @@ static void trophy_ensure_dir(void)
     char tmp[512];
     char* p;
 
+    trophy_adopt_gamedata_root();
     strncpy(tmp, s_storage_path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
 
@@ -85,6 +99,7 @@ static void trophy_ensure_dir(void)
 static void trophy_get_filepath(const SceNpCommunicationId* commId,
                                  char* buf, size_t bufsize)
 {
+    trophy_adopt_gamedata_root();
     snprintf(buf, bufsize, "%s/%s.json", s_storage_path, commId->data);
 }
 
@@ -174,6 +189,7 @@ void sceNpTrophySetStoragePath(const char* path)
     if (path) {
         strncpy(s_storage_path, path, sizeof(s_storage_path) - 1);
         s_storage_path[sizeof(s_storage_path) - 1] = '\0';
+        s_storage_path_set = 1;
     }
 }
 
@@ -463,6 +479,117 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
     return CELL_OK;
 }
 
+/* ---- trophy names for an unlock notice ------------------------------------
+ * The names live in the game's own TROPHY.TRP (<vfs>/dev_hdd0/game/<title>/
+ * TROPDIR/<commId>_00/, or PS3_GAME/TROPDIR): a flat archive whose TROP*.SFM
+ * entries are XML per language. Read once, on the first unlock, in the
+ * language PS3_LANG asks for (TROP_<id>.SFM) or English (TROP.SFM). The
+ * in-game menu shows "Trophy unlocked: <name>" (ps3_overlay_notice, weak, so
+ * a build without the overlay just logs). */
+#if !defined(_WIN32)
+#include <dirent.h>
+extern const char* ppu_vfs_root;
+void ps3_overlay_notice(const char* text) __attribute__((weak));
+
+static char* trp_read_entry(const char* trp, const char* want, u32* out_size)
+{
+    FILE* f = fopen(trp, "rb");
+    if (!f) return NULL;
+    unsigned char h[0x40];
+    char* res = NULL;
+    if (fread(h, 1, sizeof h, f) == sizeof h &&
+        h[0] == 0xDC && h[1] == 0xA2 && h[2] == 0x4D && h[3] == 0x00) {
+        const u32 count = (u32)h[16] << 24 | (u32)h[17] << 16 | (u32)h[18] << 8 | h[19];
+        const u32 esz   = (u32)h[20] << 24 | (u32)h[21] << 16 | (u32)h[22] << 8 | h[23];
+        for (u32 i = 0; i < count && i < 4096 && esz >= 48; i++) {
+            unsigned char e[64];
+            if (fseek(f, 0x40 + (long)i * esz, SEEK_SET) || fread(e, 1, 48, f) != 48) break;
+            if (strncmp((const char*)e, want, 32)) continue;
+            u64 off = 0, sz = 0;
+            for (int k = 0; k < 8; k++) { off = off << 8 | e[32 + k]; sz = sz << 8 | e[40 + k]; }
+            if (sz > (8u << 20) || fseek(f, (long)off, SEEK_SET)) break;
+            res = (char*)malloc((size_t)sz + 1);
+            if (res && fread(res, 1, (size_t)sz, f) == sz) { res[sz] = 0; *out_size = (u32)sz; }
+            else { free(res); res = NULL; }
+            break;
+        }
+    }
+    fclose(f);
+    return res;
+}
+
+static int trp_find(const char* commId, char* out, size_t cap)
+{
+    snprintf(out, cap, "%s/PS3_GAME/TROPDIR/%s_00/TROPHY.TRP", ppu_vfs_root, commId);
+    FILE* f = fopen(out, "rb");
+    if (f) { fclose(f); return 1; }
+    char games[1024];
+    snprintf(games, sizeof games, "%s/dev_hdd0/game", ppu_vfs_root);
+    DIR* d = opendir(games);
+    if (!d) return 0;
+    struct dirent* de;
+    int found = 0;
+    while (!found && (de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        snprintf(out, cap, "%s/%s/TROPDIR/%s_00/TROPHY.TRP", games, de->d_name, commId);
+        f = fopen(out, "rb");
+        if (f) { fclose(f); found = 1; }
+    }
+    closedir(d);
+    return found;
+}
+
+/* PS3 system language ids of the TROP_<id>.SFM files, by PS3_LANG prefix. */
+static const char* trp_lang_file(void)
+{
+    static const struct { const char* lang; const char* file; } k[] = {
+        { "ja", "TROP_00.SFM" }, { "fr", "TROP_02.SFM" }, { "es", "TROP_03.SFM" },
+        { "de", "TROP_04.SFM" }, { "it", "TROP_05.SFM" }, { "nl", "TROP_06.SFM" },
+        { "pt", "TROP_07.SFM" }, { "ru", "TROP_08.SFM" }, { "ko", "TROP_09.SFM" },
+        { "zh", "TROP_11.SFM" }, { "fi", "TROP_12.SFM" }, { "sv", "TROP_13.SFM" },
+        { "da", "TROP_14.SFM" }, { "no", "TROP_15.SFM" }, { "pl", "TROP_16.SFM" },
+    };
+    const char* l = getenv("PS3_LANG");
+    if (!l) return "TROP.SFM";
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+        if (!strncmp(l, k[i].lang, 2)) return k[i].file;
+    return "TROP.SFM";
+}
+
+static void trophy_notice(const char* commId, int id)
+{
+    static char* xml;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        char trp[1200];
+        u32 n = 0;
+        if (trp_find(commId, trp, sizeof trp)) {
+            xml = trp_read_entry(trp, trp_lang_file(), &n);
+            if (!xml) xml = trp_read_entry(trp, "TROP.SFM", &n);
+        }
+    }
+    char name[160] = "";
+    if (xml) {
+        char key[32];
+        snprintf(key, sizeof key, "<trophy id=\"%03d\"", id);
+        const char* p = strstr(xml, key);
+        const char* a = p ? strstr(p, "<name>") : NULL;
+        const char* b = a ? strstr(a, "</name>") : NULL;
+        if (a && b && b - a - 6 < (long)sizeof name) { memcpy(name, a + 6, (size_t)(b - a - 6)); name[b - a - 6] = 0; }
+    }
+    const char* l = getenv("PS3_LANG");
+    const int pt = l && !strncmp(l, "pt", 2);
+    char text[256];
+    if (name[0]) snprintf(text, sizeof text, pt ? "Troféu desbloqueado: %s" : "Trophy unlocked: %s", name);
+    else snprintf(text, sizeof text, pt ? "Troféu desbloqueado (#%d)" : "Trophy unlocked (#%d)", id);
+    printf("[sceNpTrophy] %s\n", text);
+    if (ps3_overlay_notice) ps3_overlay_notice(text);
+}
+#else
+static void trophy_notice(const char* commId, int id) { (void)commId; (void)id; }
+#endif
+
 s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
                             SceNpTrophyHandle handle,
                             SceNpTrophyId trophyId,
@@ -499,6 +626,7 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
 
     /* Save immediately */
     trophy_save(&s_contexts[context]);
+    trophy_notice(s_contexts[context].commId.data, trophyId);
 
     /* Check if all non-platinum trophies are unlocked -> platinum */
     if (platinumId) {

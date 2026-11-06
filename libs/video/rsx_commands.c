@@ -15,10 +15,12 @@
  */
 
 #include "rsx_commands.h"
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
+#include <time.h>     /* RSX_LABELSTAT */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 
 /* ---------------------------------------------------------------------------
@@ -152,7 +154,7 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_TARGET:
-        { static int _ct=0; if (__atomic_fetch_add(&_ct, 1, __ATOMIC_RELAXED) < 24 && getenv("RTT_DUMP"))
+        { static int _ct=0; if (PS3_LOG_FIRST(_ct, 24) && getenv("RTT_DUMP"))
             fprintf(stderr, "[RSXCT] color_target=0x%X offA=0x%X offB=0x%X offC=0x%X offD=0x%X%s",
                     data, state->surface_color_offset[0], state->surface_color_offset[1],
                     state->surface_color_offset[2], state->surface_color_offset[3], "\n"); }
@@ -339,7 +341,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * the first real draw -- exactly the ones worth seeing -- were never traced. */
     { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
-      if(_rt){ static int _m=0; if(__atomic_fetch_add(&_m, 1, __ATOMIC_RELAXED)<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+      if(_rt){ static int _m=0; if(PS3_LOG_FIRST(_m, _rt)) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
      * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
      * buffering). Real hardware DOES this; without it the game's frame-fence
@@ -365,7 +367,25 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
-        { static int _l=0; if(__atomic_fetch_add(&_l, 1, __ATOMIC_RELAXED)<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
+        { extern void rsx_snap_event(int which, u32 offset); rsx_snap_event(0, s_sem_off); }
+        /* RSX_LABELSTAT=1: label writes per ~5 s with the last one, so an SPU
+         * job spinning on a label (Edge's output ring) can be checked against
+         * what the RSX side is still producing. */
+        { static int s_on = -1; if (s_on < 0) s_on = getenv("RSX_LABELSTAT") ? 1 : 0;
+          if (s_on) {
+              static unsigned n; static u32 last_off, last_val; static unsigned long long t0;
+              struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+              const unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+              n++; last_off = s_sem_off; last_val = val;
+              if (!t0) t0 = now;
+              if (now - t0 >= 5000) {
+                  fprintf(stderr, "[label-stat] %u label writes in %.1fs, last @0x%08X = 0x%08X\n",
+                          n, (now - t0) / 1000.0, VM_HLE_INJECT_BASE + (last_off & 0x00FFFFFFu), last_val);
+                  n = 0; t0 = now;
+              } } }
+        { static int _l=0, _cap=-1;
+          if (_cap < 0) { const char* e = getenv("GCM_SEMA_TRACE"); _cap = e ? atoi(e) : 8; }
+          if(PS3_LOG_FIRST(_l, _cap)) fprintf(stderr,"[RSX] label write @0x%08X (off 0x%X) = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), s_sem_off & 0xFFFFFF, val, data); }
         return 0;
       }
       if (method == 0x1D74) {
@@ -462,7 +482,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
-        { static int _c=0; if (__atomic_fetch_add(&_c, 1, __ATOMIC_RELAXED) < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
+        { static int _c=0; if (PS3_LOG_FIRST(_c, 12)) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
             u8 stencil = state->zstencil_clear_value & 0xFF;
@@ -635,7 +655,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
-        { static int _n=0, _e=-1; if (_e < 0) _e = getenv("LOAD_DBG") ? 1 : 0; if (_e && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200)
+        { static int _n=0, _e=-1; if (_e < 0) _e = getenv("LOAD_DBG") ? 1 : 0; if (_e && PS3_LOG_FIRST(_n, 200))
             fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
         state->transform_constant_load = data;
         return 0;
@@ -676,9 +696,18 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               static int _n=0;
               static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
               int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
+              /* TCONST_SLOT=<n>: every write to that one constant (with TCONST_DBG),
+               * up to TCONST_MAX lines, to see who sets or clears it. */
+              { static long _slot = -2, _after; static int _sn; static unsigned long long _t0;
+                if (_slot == -2) { const char* v = getenv("TCONST_SLOT"); _slot = v ? atol(v) : -1;
+                                   const char* a = getenv("TCONST_AFTER"); _after = a ? atol(a) : 0; }
+                if (_en && _slot >= 0 && (u32)_slot == slot && _sn < _max) {
+                    extern unsigned long long ps3_ms_now(void);
+                    if (!_t0) _t0 = ps3_ms_now();
+                    if (ps3_ms_now() - _t0 >= (unsigned long long)_after * 1000ull) { _hit = 1; _sn++; } } }
               if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
             state->vertex_constants[slot][lane] = f;
-            { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && __atomic_fetch_add(&_sq, 1, __ATOMIC_RELAXED) < 500)
+            { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && PS3_LOG_FIRST(_sq, 500))
                 fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
             if (!state->vertex_constants_dirty) {
                 state->vertex_constants_lo = slot;
@@ -748,8 +777,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_DRAW_ARRAYS) {
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
-        { static int _d=0; if (__atomic_fetch_add(&_d, 1, __ATOMIC_RELAXED) < 32) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
-        { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && __atomic_fetch_add(&_sq, 1, __ATOMIC_RELAXED) < 500)
+        { static int _d=0; if (PS3_LOG_FIRST(_d, 32)) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
+        { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && PS3_LOG_FIRST(_sq, 500))
             fprintf(stderr, "[SEQ] DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
                     state->surface_color_offset[0], state->vertex_constants[256][0],
                     state->vertex_constants[257][1]); }
@@ -775,7 +804,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     if (method == NV4097_SET_SHADER_CONTROL) {
-        { static int _sc=0; if (__atomic_fetch_add(&_sc, 1, __ATOMIC_RELAXED) < 12 && getenv("RTT_DUMP"))
+        { static int _sc=0; if (PS3_LOG_FIRST(_sc, 12) && getenv("RTT_DUMP"))
             fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }
         state->shader_control = data;
         state->shader_dirty = 1;
@@ -793,7 +822,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
-        { static int _d=0; if (__atomic_fetch_add(&_d, 1, __ATOMIC_RELAXED) < 8) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
+        { static int _d=0; if (PS3_LOG_FIRST(_d, 8)) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
         ps3_ms("rsx:draw_indexed");
         if (s_backend && s_backend->draw_indexed)
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
@@ -848,7 +877,7 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
     u32 pos = 0;
     u32 count = size / 4; /* size in dwords */
 
-    { static int _c=0; if (count && __atomic_fetch_add(&_c, 1, __ATOMIC_RELAXED) < 16) fprintf(stderr, "[RSX] process_cmd_buffer words=%u first_hdr=0x%08X\n", count, buf[0]); }
+    { static int _c=0; if (count && PS3_LOG_FIRST(_c, 16)) fprintf(stderr, "[RSX] process_cmd_buffer words=%u first_hdr=0x%08X\n", count, buf[0]); }
     while (pos < count) {
         u32 header = buf[pos++];
         u32 type = (header >> 29) & 0x7;

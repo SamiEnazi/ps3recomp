@@ -13,13 +13,16 @@
  */
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "cellAudio.h"
+#include "../../include/ps3emu/ps3_toggles.h"   /* PS3_AUDIO_VOLUME live (PS3_TOGGLE_FILE) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include <ctype.h>
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -160,9 +163,117 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
  * Host audio output backend
  * -----------------------------------------------------------------------*/
 
+/* PS3_AUDIO_VOLUME=0..100: the host's master volume in percent (100 = the
+ * title's own mix, unchanged). Applied to the final mix just before the
+ * device, on a squared curve so the slider sounds even (50 is about -12 dB,
+ * 25 about -24 dB); 0 is silence. Like PS3_AUDIO_MUTE it only touches what the
+ * host plays, never what the title sees. */
+static float audio_volume_gain(const char* e)
+{
+    if (!e || !*e) return 1.0f;
+    char* end = NULL;
+    double v = strtod(e, &end);
+    if (end == e || v != v) return 1.0f;
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    return (float)((v / 100.0) * (v / 100.0));
+}
+
+/* The gain in use, file scope so the in-game menu (ps3_overlay.mm) can set
+ * the volume live: < 0 until PS3_AUDIO_VOLUME is first read. */
+static volatile float s_host_gain = -1.0f;
+static volatile int   s_host_volume = -1;   /* percent, as the menu shows it */
+/* PS3_TOGGLE_FILE can change PS3_AUDIO_VOLUME while the game runs: the
+ * watcher only marks it, and the next mixed block re-reads the text. The
+ * in-game menu's slider sets the gain directly; whichever moved last wins. */
+static volatile int   s_host_volume_dirty;
+static void audio_volume_changed(int id, int v) { (void)id; (void)v; s_host_volume_dirty = 1; }
+static float cellAudio_host_gain(void)
+{
+    float gain = s_host_gain;
+    if (__builtin_expect(s_host_volume_dirty, 0) && gain >= 0) {
+        s_host_volume_dirty = 0;
+        char buf[PS3_TOGGLE_STR];
+        const char* e = ps3_toggle_str(PS3T_AUDIO_VOLUME, buf, sizeof buf);
+        gain = audio_volume_gain(e);
+        s_host_volume = (int)(sqrt((double)gain) * 100.0 + 0.5);
+        s_host_gain = gain;
+        printf("[cellAudio] volume %d%% (gain %.3f)\n", s_host_volume, gain);
+    }
+    if (gain < 0) {
+        ps3_toggle_watch(PS3T_AUDIO_VOLUME, audio_volume_changed);
+        s_host_volume_dirty = 0;
+        char buf[PS3_TOGGLE_STR];
+        const char* e = ps3_toggle_str(PS3T_AUDIO_VOLUME, buf, sizeof buf);
+        gain = audio_volume_gain(e);
+        if (gain != 1.0f) printf("[cellAudio] PS3_AUDIO_VOLUME=%s: gain %.3f\n", e, gain);
+        if (s_host_volume < 0) s_host_volume = (int)(sqrt((double)gain) * 100.0 + 0.5);
+        s_host_gain = gain;
+    }
+    return gain;
+}
+int cellAudio_host_volume(void) { cellAudio_host_gain(); return s_host_volume; }
+void cellAudio_host_set_volume(int pct)
+{
+    char v[16];
+    pct = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+    snprintf(v, sizeof v, "%d", pct);
+    s_host_volume = pct;
+    s_host_gain = audio_volume_gain(v);
+}
+
 #if AUDIO_BACKEND_SDL2
 
 static SDL_AudioDeviceID s_sdl_audio_dev = 0;
+
+/* Case-insensitive strstr (ASCII), for audio_match_device. */
+static const char* audio_find_nocase(const char* hay, const char* needle)
+{
+    for (; *hay; hay++) {
+        size_t k = 0;
+        while (needle[k] && hay[k] &&
+               tolower((unsigned char)hay[k]) == tolower((unsigned char)needle[k])) k++;
+        if (!needle[k]) return hay;
+    }
+    return NULL;
+}
+
+/* PS3_AUDIO_DEVICE=<name>: which output device the host plays to. The name
+ * is matched exactly first, then ignoring case, then as a part of a device's
+ * name ("AirPods" finds "Erik's AirPods Pro"); unset or no match = the
+ * system default output (which SDL follows when it changes). SDL backend
+ * only; WASAPI keeps the default endpoint. Returns the index of the device
+ * in names[], or -1. */
+static int audio_match_device(const char* want, const char* const* names, int n)
+{
+    if (!want || !*want) return -1;
+    for (int i = 0; i < n; i++) if (names[i] && !strcmp(names[i], want)) return i;
+    for (int i = 0; i < n; i++)
+        if (names[i] && strlen(names[i]) == strlen(want) && audio_find_nocase(names[i], want) == names[i])
+            return i;
+    for (int i = 0; i < n; i++) if (names[i] && audio_find_nocase(names[i], want)) return i;
+    return -1;
+}
+
+/* The SDL output device PS3_AUDIO_DEVICE names, or NULL for the default. */
+static const char* audio_sdl_pick_device(void)
+{
+    static char picked[256];
+    const char* want = getenv("PS3_AUDIO_DEVICE");
+    if (!want || !*want) return NULL;
+    const char* names[32];
+    int n = SDL_GetNumAudioDevices(0);
+    if (n > 32) n = 32;
+    for (int i = 0; i < n; i++) names[i] = SDL_GetAudioDeviceName(i, 0);
+    const int k = audio_match_device(want, names, n < 0 ? 0 : n);
+    if (k < 0) {
+        printf("[cellAudio] PS3_AUDIO_DEVICE=%s: no such output, using the default. Outputs:\n", want);
+        for (int i = 0; i < n; i++) printf("[cellAudio]   %s\n", names[i] ? names[i] : "?");
+        return NULL;
+    }
+    snprintf(picked, sizeof picked, "%s", names[k]);
+    return picked;
+}
 
 static int audio_backend_init(void)
 {
@@ -181,11 +292,18 @@ static int audio_backend_init(void)
     want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
     want.callback = NULL; /* We'll use SDL_QueueAudio */
 
-    s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    const char* dev = audio_sdl_pick_device();
+    s_sdl_audio_dev = SDL_OpenAudioDevice(dev, 0, &want, &have, 0);
+    if (s_sdl_audio_dev == 0 && dev) {
+        printf("[cellAudio] cannot open \"%s\" (%s), using the default output\n", dev, SDL_GetError());
+        dev = NULL;
+        s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    }
     if (s_sdl_audio_dev == 0) {
         printf("[cellAudio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         return -1;
     }
+    printf("[cellAudio] output: %s\n", dev ? dev : "system default");
 
     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
     return 0;
@@ -373,7 +491,7 @@ static int audio_backend_room(void)
     if (FAILED(hr)) {
         /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
          * change, sleep, ...): pace on the clock rather than spin. */
-        static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 4)
+        static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
             fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
         return -1;
     }
@@ -416,7 +534,12 @@ static inline float ld_be_f32(const float* p)
  *   PS3_AUDIO_MUTE=1  silence the HOST output only; the title still sees a
  *                     working device and every mix/pacing path runs as normal
  *                     (unlike PS3_NO_AUDIO, which changes what the guest does).
- *                     AUDIO_WAV still records the real mix. */
+ *                     AUDIO_WAV still records the real mix.
+ *   PS3_AUDIO_VOLUME  0..100, the host's master volume (audio_volume_gain);
+ *                     AUDIO_WAV records the mix before it too. Live from
+ *                     PS3_TOGGLE_FILE. Every sound the title makes, its
+ *                     movies' soundtracks included, leaves through this one
+ *                     mix, so it covers them all. */
 static void audio_submit_mix(void)
 {
     { static FILE* _wf = (FILE*)-1;
@@ -424,6 +547,9 @@ static void audio_submit_mix(void)
       if (_wf) { fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); fflush(_wf); } }
     { static int mute = -1; if (mute < 0) mute = getenv("PS3_AUDIO_MUTE") ? 1 : 0;
       if (mute) memset(s_mix_buffer, 0, sizeof(s_mix_buffer)); }
+    { float gain = cellAudio_host_gain();
+      if (gain != 1.0f)
+          for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) s_mix_buffer[i] *= gain; }
     audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
 }
 
@@ -1101,7 +1227,7 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     vm_write32(cfg + 24, port->buf_size);                                   /* portSize */
     vm_write32(cfg + 28, (u32)port->port_addr);                             /* portAddr */
 
-    { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 24)
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
         fprintf(stderr, "[cellAudio] GetPortConfig(port=%u) status=%s bufEA=0x%08X ridxEA=0x%08X\n",
                 portNum, port->running ? "RUN" : "READY",
                 (u32)port->port_addr, (u32)port->read_idx_addr); }

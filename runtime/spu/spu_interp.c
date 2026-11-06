@@ -6,6 +6,7 @@
  * bit-identical. Uncommon opcodes trap loudly (never silently wrong).
  */
 #include "spu_interp.h"
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -364,13 +365,17 @@ static int spu_step(spu_context* ctx) {
          * it publishes lives in LS/channels. On a genuine return to the
          * take point, restore the interrupted register file. */
         SPU_IED_BITS();                              /* E/D bits, like the lift */
+        { extern void spu_irq_ring_note(spu_context*, char, uint32_t, uint32_t);
+          if (ctx->irq_saved)
+              spu_irq_ring_note(ctx, next == (ctx->irq_resume_pc & SPU_LS_MASK) ? 'I' : 'M',
+                                next, ctx->irq_resume_pc & SPU_LS_MASK); }
         if (ctx->irq_saved) {
             if (next == (ctx->irq_resume_pc & SPU_LS_MASK)) {
                 memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
                 ctx->irq_saved = 0;
             } else {
                 static int _n = 0;
-                if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8)
+                if (PS3_LOG_FIRST(_n, 8))
                     fprintf(stderr, "[t0001-irq] INTERP IRET to %05X but save "
                             "resume=%05X -- mismatch, snapshot stays armed\n",
                             next, ctx->irq_resume_pc & SPU_LS_MASK);
@@ -495,7 +500,7 @@ static void spu_xfer_log(const spu_context* ctx, const char* kind, uint32_t from
     if (s_left < 0) { const char* e = getenv("SPU_INTERP_XFER_LOG"); s_left = e ? atol(e) : 0; }
     if (s_left <= 0 || s_left-- <= 0) return;
     int owner = ctx->image_id, slot_hit = -1;
-    for (unsigned k = 0; k < 4; ++k)
+    for (unsigned k = 0; k < SPU_RESIDENT_CODE_SLOTS; ++k)
         if (ctx->resident_code[k].image_id && to - ctx->resident_code[k].lsa < ctx->resident_code[k].size) {
             owner = ctx->resident_code[k].image_id; slot_hit = (int)k; break; }
     uint32_t w = ((uint32_t)ctx->ls[to] << 24) | ((uint32_t)ctx->ls[to+1] << 16) |
@@ -524,10 +529,39 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
 
+/* One big-endian LS word, for the rejoin diagnostic. */
+static inline uint32_t interp_ls_w(const spu_context* c, uint32_t a)
+{
+    a &= SPU_LS_MASK & ~3u;
+    return (uint32_t)c->ls[a] << 24 | (uint32_t)c->ls[a + 1] << 16 | (uint32_t)c->ls[a + 2] << 8 | c->ls[a + 3];
+}
+
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
+    /* SPU_INTERP_ENTRY_LOG=1: every distinct (image, start pc) the interpreter
+     * is entered at, once each, up to 512. The "branched into unlifted" report
+     * only covers one dispatch path and the "interpreting unlifted" one stops
+     * after eight, so a lift missing a whole region of a job module showed two
+     * or three entries per run; this lists them all for one re-lift. */
+    { static _Atomic int s_el = -1; if (s_el < 0) s_el = getenv("SPU_INTERP_ENTRY_LOG") ? 1 : 0;
+      if (s_el) {
+          enum { ENTRY_LOG_MAX = 512 };
+          static uint64_t s_keys[ENTRY_LOG_MAX]; static int s_n = 0;
+          const uint64_t key = ((uint64_t)(uint32_t)ctx->image_id << 32) | (start_lsa & SPU_LS_MASK);
+          int n = __atomic_load_n(&s_n, __ATOMIC_ACQUIRE), known = 0;
+          for (int i = 0; i < n && i < ENTRY_LOG_MAX; i++)
+              if (s_keys[i] == key) { known = 1; break; }
+          if (!known) {
+              const int slot = __atomic_fetch_add(&s_n, 1, __ATOMIC_ACQ_REL);
+              if (slot < ENTRY_LOG_MAX) {
+                  s_keys[slot] = key;
+                  fprintf(stderr, "[interp-entry] img=%d ovl=%d pc=0x%05X lr=0x%05X\n",
+                          ctx->image_id, ctx->resident_ovl, start_lsa & SPU_LS_MASK,
+                          ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+              }
+          } } }
     /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
      * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
     static _Atomic int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
@@ -563,8 +597,11 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) {
             { static _Atomic int s_rj = -1; if (s_rj < 0) { const char* e = getenv("SPU_REJOIN_DBG"); s_rj = e ? atoi(e) : 0; }
-              if (s_rj > 0 && steps > 1000) { s_rj--; fprintf(stderr, "[rejoin] img=%d pc=0x%05X after %llu steps (from 0x%05X)\n",
-                  ctx->image_id, ctx->pc, (unsigned long long)steps, start_lsa & 0x3FFFC); } }
+              if (s_rj > 0 && steps > 1000) { s_rj--; { const uint32_t s0 = start_lsa & 0x3FFF0;
+                  fprintf(stderr, "[rejoin] img=%d ovl=%d pc=0x%05X after %llu steps (from 0x%05X) LS[from]=%08X %08X %08X %08X LS[4000]=%08X %08X %08X %08X\n",
+                  ctx->image_id, ctx->resident_ovl, ctx->pc, (unsigned long long)steps, start_lsa & 0x3FFFC,
+                  interp_ls_w(ctx, s0), interp_ls_w(ctx, s0 + 4), interp_ls_w(ctx, s0 + 8), interp_ls_w(ctx, s0 + 12),
+                  interp_ls_w(ctx, 0x4000), interp_ls_w(ctx, 0x4004), interp_ls_w(ctx, 0x4008), interp_ls_w(ctx, 0x400C)); } } }
             spu_xfer_log(ctx, "rejoin", g_spu_interp_last_pc, ctx->pc);
             g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
@@ -602,6 +639,16 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                     ctx->pc, (unsigned long long)steps, rn);
             for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
             fprintf(stderr,"\n");
+            /* The loop's code words, so the module it belongs to can be found
+             * by byte search when the LS address alone is ambiguous (every WWS
+             * job module loads at 0x4000). */
+            { uint32_t lo = ctx->pc & SPU_LS_MASK;
+              for (int k = 0; k < rn; k++) { uint32_t q = ring[(rc-1-k)&63]; if (q < lo) lo = q; }
+              lo &= ~15u;
+              fprintf(stderr,"[spu-trace] img=%d ovl=%d LS[0x%05X]:", ctx->image_id, ctx->resident_ovl, lo);
+              for (uint32_t o = 0; o < 32 && lo + o + 3 < SPU_LS_SIZE; o += 4)
+                  fprintf(stderr," %02X%02X%02X%02X", ctx->ls[lo+o], ctx->ls[lo+o+1], ctx->ls[lo+o+2], ctx->ls[lo+o+3]);
+              fprintf(stderr,"\n"); }
             /* dump the LS 0x2700 SpursTasksetContext the poll reads -- compare to the
              * working RPCS3 SPU0 dump (RUNNING/READY/ENABLED=0x80000000, SIGNALLED=0). */
             #define LB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
@@ -630,6 +677,20 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                       if (hist[i][j] > tot / 50) fprintf(stderr, "[spu-hist]   img %d page 0x%05X: %.1f%%\n",
                                                         i == 63 ? -1 : i, j << 12, 100.0 * hist[i][j] / tot);
               } } }
+        /* SPU_INTERP_WHERE=<n>: every n interpreted steps (all SPUs), print the
+         * pc, the resident overlay, the job header at LS 0x4000 (a WWS job
+         * module starts 00005400 .. C0DEC0DE) and the data-module window at
+         * 0x6C00 -- which module a long interpreted stretch is in, so it can be
+         * lifted or given the entry it is missing. */
+        { static _Atomic long long every = -1; static _Atomic unsigned long long cnt;
+          if (every < 0) { const char* e = getenv("SPU_INTERP_WHERE"); every = e ? atoll(e) : 0; }
+          if (every > 0 && (++cnt % (unsigned long long)every) == 0) {
+              #define IW(o) (((uint32_t)ctx->ls[(o)] << 24) | ((uint32_t)ctx->ls[(o)+1] << 16) | ((uint32_t)ctx->ls[(o)+2] << 8) | ctx->ls[(o)+3])
+              fprintf(stderr, "[interp-where] img=%d ovl=%d pc=0x%05X lr=0x%05X LS[4000]=%08X %08X %08X %08X %08X %08X LS[6C00]=%08X %08X\n",
+                      ctx->image_id, ctx->resident_ovl, _tpc, ctx->gpr[0]._u32[0] & 0x3FFFF,
+                      IW(0x4000), IW(0x4004), IW(0x4008), IW(0x400C), IW(0x4010), IW(0x4014), IW(0x6C00), IW(0x6C04));
+              #undef IW
+          } }
         if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED)) {   /* group terminated */
             ctx->status = SPU_STATUS_STOPPED_BY_HALT; ctx->stop_code = 0;
             g_spu_interp_steps = steps;

@@ -178,8 +178,22 @@ void rsx_vertex_fetch_plan_set_inline(
 void rsx_vertex_fetch_plan_prepare(
     rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count)
 {
+    rsx_vertex_fetch_plan_prepare_ex(plan, refs, count, 0);
+}
+
+void rsx_vertex_fetch_plan_prepare_ex(
+    rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    int consecutive)
+{
     if (!plan)
         return;
+    /* Ordinary per-vertex attributes (frequency 0/1) all span the same
+     * elements: find them once for the draw instead of once per attribute,
+     * and not at all for a consecutive run that does not wrap the 20-bit
+     * element index. The per-attribute walk was 2.2 ms of the RSX thread a
+     * frame in New Marais. */
+    int plain_known = 0;
+    u32 plain_first = UINT_MAX, plain_last = 0;
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         const u32 attr = plan->layout.attrs[slot];
         rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
@@ -215,7 +229,26 @@ void rsx_vertex_fetch_plan_prepare(
 
         u32 first = UINT_MAX;
         u32 last = 0;
-        for (u32 i = 0; i < count; i++) {
+        if (fetch->desc.frequency <= 1) {
+            if (!plain_known) {
+                plain_known = 1;
+                const u32 e0 = rsx_vertex_element_index(
+                    refs[0].vertex_id, refs[0].base_index, 0, 0);
+                if (consecutive && (u64)e0 + count - 1u <= 0x000FFFFFu) {
+                    plain_first = e0;
+                    plain_last = e0 + count - 1u;
+                } else {
+                    for (u32 i = 0; i < count; i++) {
+                        const u32 element = rsx_vertex_element_index(
+                            refs[i].vertex_id, refs[i].base_index, 0, 0);
+                        if (element < plain_first) plain_first = element;
+                        if (element > plain_last) plain_last = element;
+                    }
+                }
+            }
+            first = plain_first;
+            last = plain_last;
+        } else for (u32 i = 0; i < count; i++) {
             const u32 element = rsx_vertex_element_index(
                 refs[i].vertex_id, refs[i].base_index,
                 fetch->desc.frequency,
@@ -414,6 +447,25 @@ int rsx_vertex_fetch_all(
             RSX_FETCH_LOOP({
                 v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
                 for (u32 k = 0; k < size; k++) v[k] = src[k] / 255.0f;
+            })
+        } else if (type == RSX_VTX_TYPE_SNORM16 && size <= 4) {
+            /* inFAMOUS 2's most common attribute (snorm16x3 positions and
+             * normals) used to take the per-element reference decoder. */
+            RSX_FETCH_LOOP({
+                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                for (u32 k = 0; k < size; k++)
+                    v[k] = (s16)rsx_be16(src + k * 2u) / 32767.0f;
+            })
+        } else if (type == RSX_VTX_TYPE_SINT16 && size <= 4) {
+            RSX_FETCH_LOOP({
+                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                for (u32 k = 0; k < size; k++)
+                    v[k] = (float)(s16)rsx_be16(src + k * 2u);
+            })
+        } else if (type == RSX_VTX_TYPE_UINT8 && size <= 4) {
+            RSX_FETCH_LOOP({
+                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+                for (u32 k = 0; k < size; k++) v[k] = (float)src[k];
             })
         } else {
             /* Everything else, and any size the decoder clamps: the

@@ -6,9 +6,11 @@
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
 #include "../memory/guest_mem_atomic.h"
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
+#include "../platform/host_qos.h"   /* PS3_QOS: SPU job threads at USER_INTERACTIVE */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -461,7 +463,7 @@ static void spu_async_run(spu_async_job* j)
 #endif
         if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
         ls = ts_slot->ls;
-        { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 24)
+        { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
             fprintf(stderr, "[persist-ls] taskset=0x%08X task=%u image=%d %s\n",
                     j->taskset_ea, j->taskid, j->image_id,
                     ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
@@ -777,7 +779,12 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     return 0;
 }
 #else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+static void* spu_async_thread(void* p)
+{
+    ps3_host_qos_self(1);   /* PS3_QOS (host_qos.h) */
+    spu_async_run((spu_async_job*)p);
+    return NULL;
+}
 #endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
@@ -976,22 +983,50 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
     return n;
 }
 
+/* Set or clear a task's bit in the guest `signalled` bitset from a host thread
+ * (as sp00nznet/ps3recomp#340).
+ *
+ * SPU tasks update this same line with GETLLAR/PUTLLC (a task signalling
+ * another, or a barrier releasing its waiters), and those commits are
+ * serialised by the lock-line lock, not by s_sig_lock. spurs_bitset_set/clear
+ * did vm_read32 outside that lock and vm_write32 under it, so an SPU commit
+ * landing between the two was overwritten with the stale word and that task
+ * never woke (Twisted Metal's post-FX barrier). Do the whole read-modify-write
+ * under the line's lock, as a PPU atomic would, and drop the reservations on
+ * the line. gm_load32/gm_store32 rather than vm_read32/vm_write32: vm_write32
+ * takes the lock-line lock itself when the line is reserved, and it does not
+ * nest. */
+static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
+{
+    extern uint8_t* vm_base;
+    const uint32_t word = taskset_ea + CSTS_SIGNALLED + (taskId / 32u) * 4u;
+    const uint32_t mask = (1u << 31) >> (taskId % 32u);
+    const uint64_t llm  = spu_lockline_mask_range(word, 4u);
+    const uint32_t bmask = __builtin_bswap32(mask);   /* the word stays big-endian */
+    uint8_t* p = vm_base + word;
+    spu_lockline_lock_mask(llm);
+    const uint32_t v = gm_load32(p);
+    gm_store32(p, set ? (v | bmask) : (v & ~bmask));
+    spu_coh_notify_write_from_ppu(word);
+    spu_lockline_unlock_mask(llm);
+}
+
 /* Deliver a signal to a task (callable from any PPU/host thread). */
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return;
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    spu_signalled_update(taskset_ea, taskId, 1);
     WakeAllConditionVariable(&s_sig_cv);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    spu_signalled_update(taskset_ea, taskId, 1);
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 24)
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
     /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
@@ -1030,8 +1065,9 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     static _Thread_local unsigned long long s_wait_exit_ms;
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
-      static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200 || (_n % 500) == 0)
-        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
+      static unsigned _n = 0; /* unsigned: a signed counter wraps negative and then logs every call (as sp00nznet/ps3recomp#364) */
+      if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 200 || (_n % 500) == 0)
+        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%u enter task=%u taskset=0x%08X ran=%llums\n",
                 _n, taskId, taskset_ea,
                 s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
     /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
@@ -1058,7 +1094,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
                     }
                 }
             }
-            { static int _a = 0; if (__atomic_fetch_add(&_a, 1, __ATOMIC_RELAXED) < 8)
+            { static int _a = 0; if (PS3_LOG_FIRST(_a, 8))
                 fprintf(stderr, "[sync-ack] lanes advanced to tickets (sync=0x%08X)\n", b); }
         }
     }
@@ -1087,7 +1123,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
@@ -1101,10 +1137,10 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    if (drained) { static int _d = 0; if (__atomic_fetch_add(&_d, 1, __ATOMIC_RELAXED) < 24)
+    if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     spu_serial_acquire();       /* resume: re-take the serial lock */
@@ -1178,7 +1214,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
-        static int _d=0; if (__atomic_fetch_add(&_d, 1, __ATOMIC_RELAXED) < 1) {
+        static int _d=0; if (PS3_LOG_FIRST(_d, 1)) {
             /* Dump a larger window of the task context buffer + scan for any word
              * that looks like the LS[0xBEC0] target (i.e. a small LS-range value),
              * to see if the kernel-restored LS data lives here (real game data). */
@@ -1292,7 +1328,7 @@ static void spu_task_interp_run(spu_task_interp_job* j)
                 if (sc == 0) break;                            /* CELL_SPURS_TASK_SYSCALL_EXIT */
                 if (sc != 1) {                                 /* yield is a no-op here */
                     static int n = 0;
-                    if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
+                    if (PS3_LOG_FIRST(n, 8))
                         fprintf(stderr, "[spurs-task] task syscall %u not modelled (returning 0)\n", sc);
                 }
                 ctx->gpr[3] = spu_make_preferred_u32(0);
@@ -1317,6 +1353,7 @@ static void* spu_task_interp_thread(void* p)
 #endif
 {
     spu_task_interp_job* j = (spu_task_interp_job*)p;
+    ps3_host_qos_self(1);   /* PS3_QOS (host_qos.h) */
     spu_task_interp_run(j);
     free(j);
     return 0;

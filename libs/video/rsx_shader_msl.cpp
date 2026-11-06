@@ -25,6 +25,7 @@
  *     not predict. Only options that exist in the spirv-cross Debian and
  *     Ubuntu package are used.
  */
+#include <cstdlib>
 #include "rsx_shader_msl.h"
 #include <stdio.h>
 #include <string.h>
@@ -69,6 +70,13 @@ bool hlsl_to_spirv(const char* hlsl, EShLanguage lang, std::vector<unsigned int>
     shader.setEnvInput(glslang::EShSourceHlsl, lang, glslang::EShClientVulkan, 100);
     shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1);
     shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
+    /* SPIR-V FragCoord.w is 1/w (FXC's SV_POSITION.w is w): tells the FP
+     * decompiler's _rsx_inv_w helper which one it gets. */
+    /* PS3RECOMP_FRAGCOORD_W=w: treat the fragment position's w as the clip w
+     * (the decompiler then emits 1/w) instead of its reciprocal -- a switch
+     * to settle which one this stage's position carries, by looking. */
+    { static int rcp = -1; if (rcp < 0) { const char* e = getenv("PS3RECOMP_FRAGCOORD_W"); rcp = (e && *e == 'w') ? 0 : 1; }
+      if (rcp) shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n"); }
     shader.setEntryPoint("main");
     shader.setAutoMapBindings(true);
     shader.setAutoMapLocations(true);
@@ -101,7 +109,7 @@ bool hlsl_to_spirv(const char* hlsl, EShLanguage lang, std::vector<unsigned int>
 
 /* SPIR-V -> MSL into `out`. Returns false with the reason in `log`. */
 bool spirv_to_msl(const std::vector<unsigned int>& spirv, char* out, u32 out_size,
-                  char* log, u32 log_size)
+                  char* log, u32 log_size, bool fbfetch)
 {
     spvc_context ctx = nullptr;
     if (spvc_context_create(&ctx) != SPVC_SUCCESS || !ctx) {
@@ -129,7 +137,12 @@ bool spirv_to_msl(const std::vector<unsigned int>& spirv, char* out, u32 out_siz
     }
     /* MSL 2.1: arrays of textures need 2.0, and every Apple Silicon Mac
      * speaks 2.3 or later, so nothing in range is excluded. */
-    spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_VERSION, 20100u);
+    /* A subpass input (rsx_fp_apply_fbfetch) becomes a [[color(k)]] fragment
+     * input: Metal framebuffer fetch, MSL 2.3 on macOS. Other programs keep
+     * 2.1, so their translation does not change. */
+    spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_VERSION, fbfetch ? 20300u : 20100u);
+    if (fbfetch)
+        spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_FRAMEBUFFER_FETCH_SUBPASS, SPVC_TRUE);
     spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_MACOS);
     spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_ENABLE_DECORATION_BINDING, SPVC_TRUE);
     if (spvc_compiler_install_compiler_options(comp, opt) != SPVC_SUCCESS) {
@@ -141,12 +154,25 @@ bool spirv_to_msl(const std::vector<unsigned int>& spirv, char* out, u32 out_siz
         goto done;
     }
     {
-        const size_t len = strlen(msl);
-        if (len + 1 > out_size) {
+        /* spirv-cross spells GLSL.std.450 FMax/FMin/FClamp/Normalize as
+         * fast::max/min/clamp/normalize, whose NaN behaviour Metal leaves
+         * undefined even under MTLMathModeSafe. D3D's max/min return the
+         * number when one operand is NaN and saturate(NaN) is 0, and the
+         * guest programs were written against hardware that never produced
+         * NaN from those. inFAMOUS 2's sky/bloom pass did, only on Metal.
+         * The precise:: overloads follow IEEE fmax/fmin. PS3RECOMP_MSL_FAST=1
+         * keeps the fast:: spelling. */
+        static int keep_fast = -1;
+        if (keep_fast < 0) keep_fast = getenv("PS3RECOMP_MSL_FAST") ? 1 : 0;
+        std::string text(msl);
+        if (!keep_fast)
+            for (size_t at = 0; (at = text.find("fast::", at)) != std::string::npos; at += 9)
+                text.replace(at, 6, "precise::");
+        if (text.size() + 1 > out_size) {
             put_log(log, log_size, "MSL output buffer too small", nullptr);
             goto done;
         }
-        memcpy(out, msl, len + 1);
+        memcpy(out, text.c_str(), text.size() + 1);
     }
     ok = true;
 done:
@@ -176,7 +202,8 @@ extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
     const EShLanguage lang = (stage == RSX_SHADER_STAGE_VERTEX) ? EShLangVertex : EShLangFragment;
     std::vector<unsigned int> spirv;
     if (!hlsl_to_spirv(hlsl, lang, spirv, log, log_size)) return -1;
-    if (!spirv_to_msl(spirv, out, out_size, log, log_size)) return -1;
+    if (!spirv_to_msl(spirv, out, out_size, log, log_size,
+                      lang == EShLangFragment && strstr(hlsl, "SubpassInput<") != nullptr)) return -1;
     return 0;
 }
 

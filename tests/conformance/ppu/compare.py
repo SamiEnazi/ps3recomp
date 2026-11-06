@@ -151,6 +151,55 @@ def fpscr_reference(c):
     return out
 
 
+STFS_FAMILY = {"STFS", "STFSU", "STFSX", "STFSUX"}
+LFS_FAMILY = {"LFS", "LFSU", "LFSX", "LFSUX"}
+VCMPF = {"VCMPEQFP", "VCMPGEFP", "VCMPGTFP", "VCMPBFP"}
+
+
+def isa_stfs_word(v):
+    """PowerISA Book I 4.6.3 double -> single store conversion of raw bits v:
+    bit selection (no rounding); the single denormal range is denormalised by
+    shifting. Above the single range the ISA leaves the result undefined and
+    the signed infinity RPCS3 stores is used."""
+    e = (v >> 52) & 0x7FF
+    sign = (v >> 32) & 0x80000000
+    if 1150 < e < 2047:
+        return sign | 0x7F800000
+    if e > 896 or (v << 1) & ((1 << 64) - 1) == 0:
+        return ((v >> 32) & 0xC0000000) | ((v >> 29) & 0x3FFFFFFF)
+    if e < 874:
+        return sign
+    frac = ((v & ((1 << 52) - 1)) | (1 << 52)) >> (897 - e)
+    return sign | ((frac >> 29) & 0x7FFFFF)
+
+
+def isa_vcmpf(c):
+    """(vd, result bytes, CR6 nibble) of a VMX float compare per the AltiVec
+    PEM: VSCR[NJ] flushes denormal operands to signed zero (RPCS3's
+    interpreter compares them unflushed)."""
+    w = c["words"][0] if c["words"] else 0
+    inp = bytes.fromhex(c["input"])
+    nj = struct.unpack(">I", inp[0x43C:0x440])[0] & 0x00010000
+    vd, va, vb = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31
+    lane = lambda r, i: struct.unpack(">I", inp[S_VR + 16 * r + 4 * i:S_VR + 16 * r + 4 * i + 4])[0]
+    fl = lambda x: (x & 0x80000000) if nj and not x & 0x7F800000 else x
+    f = lambda x: struct.unpack(">f", struct.pack(">I", x))[0]
+    op = c["op"].rstrip(".")
+    out, allt, nonet, inb = b"", 1, 1, 1
+    for i in range(4):
+        x, y = f(fl(lane(va, i))), f(fl(lane(vb, i)))
+        if op == "VCMPBFP":
+            r = (0 if x <= y else 0x80000000) | (0 if x >= -y else 0x40000000)
+            inb &= r == 0
+        else:
+            t = x == y if op == "VCMPEQFP" else (x >= y if op == "VCMPGEFP" else x > y)
+            r = 0xFFFFFFFF if t else 0
+            allt &= t; nonet &= not t
+        out += struct.pack(">I", r)
+    c6 = (inb << 1) if op == "VCMPBFP" else (allt << 3 | nonet << 1)
+    return vd, out, c6
+
+
 def allowed(c, diffs):
     """Known, documented oracle deviations (README: 'Known oracle limitations').
     Returns (remaining diffs, reasons)."""
@@ -202,6 +251,21 @@ def allowed(c, diffs):
                         exp = struct.unpack("f", struct.pack("f", 1 / fb))[0]
                         if abs(fu - exp) <= abs(exp) * tol + 2.0 ** -149:
                             why.append("fres/frsqrte denormal edge (RPCS3 PPE model flushes)"); continue
+        # lfs of a signalling NaN: the ISA copies the bits (fraction << 29, still
+        # signalling); RPCS3 converts with the host, which quiets it.
+        if op in LFS_FAMILY and name.startswith("f") and len(o) == 16:
+            vo, vu = int(o, 16), int(u, 16)
+            if (vu >> 52) & 0x7FF == 0x7FF and not vu & (1 << 51) and vu & ((1 << 51) - 1) \
+                    and not vu & ((1 << 29) - 1) and vo == vu | (1 << 51):
+                why.append("lfs keeps an SNaN (ISA; RPCS3 quiets it)"); continue
+        # VMX float compares under VSCR[NJ]: accept ours iff it is the PEM's result.
+        if op in VCMPF:
+            vd, ref, c6 = isa_vcmpf(c)
+            if name == "v%d" % vd and bytes.fromhex(u) == ref:
+                why.append("vcmp*fp flush denormals under VSCR[NJ] (RPCS3 does not)"); continue
+            if name == "cr" and c["op"].endswith(".") and (int(o, 16) ^ int(u, 16)) & ~0xF0 == 0 \
+                    and (int(u, 16) >> 4) & 0xF == c6:
+                why.append("vcmp*fp flush denormals under VSCR[NJ] (RPCS3 does not)"); continue
         if name == "cr" and c["op"].startswith("F") and c["op"].endswith("."):
             # FP record forms set CR1 = FPSCR[FX FEX VX OX]; RPCS3 writes FPCC
             # there and does not model FPSCR. Pending an FPSCR reference: mask CR1.
@@ -264,6 +328,18 @@ def main():
         diffs, why = allowed(c, diffs)
         for w in why:
             allowed_tally[w] += 1
+        if c["mem"] and sco != scu and c["op"] in STFS_FAMILY:
+            # stfs truncates (ISA bit selection); RPCS3 rounds with a cast.
+            # Accept ours iff it is the oracle's buffer with the stored word
+            # replaced by the ISA conversion of FRS.
+            w0 = c["words"][0]
+            inp = bytes.fromhex(c["input"])
+            frs = (w0 >> 21) & 31
+            isa = struct.pack(">I", isa_stfs_word(struct.unpack(">Q", inp[S_FPR + 8 * frs:S_FPR + 8 * frs + 8])[0]))
+            k0 = next(i for i in range(len(sco)) if sco[i] != scu[i])
+            if any(scu == sco[:k] + isa + sco[k + 4:] for k in range(max(0, k0 - 3), k0 + 1)):
+                allowed_tally["stfs truncates (ISA; RPCS3 rounds with a cast)"] += 1
+                sco = scu
         if c["mem"] and sco != scu:
             k = next(i for i in range(len(sco)) if sco[i] != scu[i])
             diffs.append(("mem+0x%x" % k, sco[k:k + 16].hex(), scu[k:k + 16].hex(), ""))

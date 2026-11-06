@@ -60,6 +60,19 @@ Every allowance is counted and printed at the end of a run.
 - **fnmsub / fnmadd zero sign**: the ISA negates after rounding, so an exact
   +0 from A*C -/+ B becomes -0. RPCS3's compiled interpreter returns +0 (its
   source is right; the build folds the negation). ps3recomp's -0 is accepted.
+- **stfs family**: the ISA converts by bit selection (extra fraction bits are
+  truncated, the single denormal range is shifted); RPCS3 stores a host
+  `(float)` cast, which rounds. Accepted only when our buffer is the oracle's
+  with the stored word replaced by `isa_stfs_word(FRS)`. Above the single
+  range the ISA leaves the word undefined; both sides store the signed
+  infinity.
+- **lfs of a signalling NaN**: the ISA copies the bits (still signalling);
+  RPCS3's host conversion quiets it. Accepted only when the oracle is ours
+  with the quiet bit set.
+- **vcmpeqfp / vcmpgefp / vcmpgtfp / vcmpbfp under VSCR[NJ]**: the AltiVec
+  PEM flushes denormal operands to signed zero in non-Java mode, as for
+  every other VMX float op; RPCS3's interpreter compares them unflushed.
+  Accepted only when ours equals `isa_vcmpf` (vector and CR6).
 - **VSCR**: RPCS3 reads/writes it in big-endian word 0 of the vector; the ISA
   says word 3 (VRB bits 96:127). The harness feeds both words and compares
   RPCS3's word 0 with ps3recomp's word 3.

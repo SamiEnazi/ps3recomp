@@ -65,6 +65,14 @@ typedef enum {
 typedef struct rsx_be_sampler_desc {
     u8  min_linear, mag_linear, mip_linear, mip_present;
     u8  wrap_s, wrap_t, wrap_r;
+    /* What BORDER-type wraps (4, 5, 7, 8) return outside 0..1, reduced to
+     * the colours every backend can express: SET_TEXTURE_BORDER_COLOR read
+     * as the unit's format reads it (a depth format takes its 24-bit depth
+     * from the low bits). 0 transparent black (also the old behaviour),
+     * 1 opaque black, 2 opaque white, 3 any other colour: the backend clamps
+     * to the edge texel instead, which is nearer than black for the colours
+     * seen (inFAMOUS 2's video chroma planes border at 0x80 = neutral). */
+    u8  border;
     float min_lod, max_lod;
 } rsx_be_sampler_desc;
 
@@ -79,6 +87,10 @@ typedef struct rsx_be_render_state {
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
     u32 color_mask;
+    /* Targets 1..3 of an MRT set: COLOR_MASK_MRT (0x0370), one nibble per
+     * target at [4i..4i+3] = A,R,G,B, and BLEND_ENABLE_MRT (0x036C), bit i.
+     * Target 0 keeps color_mask/blend_enable. Both reset to 0 (RPCS3). */
+    u32 color_mask_mrt, blend_mrt;
     u32 rt_fp16;                    /* the target is an FP16 HDR surface */
     u32 stencil_enable, stencil_two_sided;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
@@ -223,7 +235,92 @@ typedef struct rsx_draw_backend {
     void (*bind_vs_constants_range)(void* user, const void* rows, u32 first,
                                     u32 count, const void* tail,
                                     u32 tail_bytes, u32 total_bytes);
+
+    /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):
+     * a volume of `depth` slices per level, each slice one upload of decoded
+     * rows. A backend that leaves these NULL gets the first slice as a 2D
+     * texture through texture_create/texture_upload, as before. */
+    u32  (*texture_create_3d)(void* user, rsx_be_format fmt, u32 w, u32 h,
+                              u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
+    void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
+                              u32 w, u32 h, const void* src, u32 row_bytes);
+
+    /* Optional. A title's deferred light pass done on the GPU (see
+     * rsx_draw_engine_gpu_light_data): reads a copy of the normals target and
+     * a resolved depth, writes the diffuse and specular buffers in the title's
+     * byte encoding into two backend-owned RGBA8 textures, recorded in stream
+     * order. `params` is rsx_gpu_light_params. Returns the diffuse texture and
+     * stores the specular one; 0 when the backend cannot. */
+    u32  (*light_pass)(void* user, u32 normals, u32 depth, u32 w, u32 h,
+                       const void* params, u32 param_bytes, u32* spec_out);
+    /* Optional. A title's SSAO pipeline on the GPU (rsx_draw_engine_gpu_ssao_data):
+     * from the resolved depth and the normals copy, through the backend's own
+     * passes, into a backend-owned texture whose every channel holds the AO
+     * byte (so any crossbar reads it). Returns it, or 0. */
+    u32  (*ssao_pass)(void* user, u32 depth, u32 normals, const void* consts, u32 const_bytes,
+                      u32 full_w, u32 full_h, u32 half_w, u32 half_h);
+    /* Optional. Persistent vertex buffers: the engine keeps the decoded
+     * vertices of geometry that did not change since the last frame and draws
+     * from them instead of fetching and staging it again. vbuf_create copies
+     * `bytes` and returns a handle (0 when it cannot); a released handle stays
+     * valid for draws already recorded. draw_vbuf is draw() with the vertices
+     * taken from such a buffer. */
+    u32  (*vbuf_create)(void* user, const void* data, u32 bytes);
+    void (*vbuf_release)(void* user, u32 vbuf);
+    void (*draw_vbuf)(void* user, rsx_topology topology, u32 vbuf,
+                      u32 vertex_count, u32 stride, const u32* indices,
+                      u32 index_count);
+    /* Optional. Image files for texture packs (PS3_MODS) and their dump
+     * (PS3_MODS_DUMP). image_load reads a PNG into malloc'd, tightly packed
+     * R,G,B,A rows with straight (not premultiplied) alpha, the bytes as the
+     * file holds them (no colour management); the caller frees them.
+     * image_save writes such rows as a PNG; it copies them and may finish
+     * later. Both return 1 on success. A backend that leaves them NULL has
+     * no texture packs. */
+    int  (*image_load)(void* user, const char* path, u8** rgba, u32* w, u32* h);
+    int  (*image_save)(void* user, const char* path, const u8* rgba,
+                       u32 w, u32 h, u32 row_bytes);
+    /* Optional. PS3_ASPECT (anamorphic wide targets): what the draw whose
+     * viewport and scissor follow is. `hud` 1: the title's 2D overlay drawn
+     * into a display-sized target `target_w` guest pixels wide, which the
+     * backend keeps at 16:9, centred, instead of stretching it with the 3D
+     * picture; 2: a 3D-frame draw into a display-sized target (it fills the
+     * wide picture); 0: anything else. Called before set_viewport on every
+     * draw (PS3_ASPECT_HUD_AFTER, rsx_draw_engine.c). Before a present that
+     * drew: 3 when the frame was overlay alone (a menu, a comic, a movie:
+     * black bars beside its 16:9 picture), 4 otherwise. */
+    void (*set_hud)(void* user, int hud, u32 target_w);
+    /* Optional. The draw's polygon offset (SET_POLY_OFFSET_FILL_ENABLE,
+     * SET_POLYGON_OFFSET_SCALE_FACTOR / _BIAS), 0/0 when off: `constant` in
+     * units of the guest depth format's resolution (2^-24 for D24), `slope`
+     * times the primitive's depth slope. Encoder state, like set_stencil_ref:
+     * called before every draw, never part of the pipeline key. */
+    void (*set_depth_bias)(void* user, float constant, float slope);
+    /* Optional. 1: clamp the draw's depth to [0, 1] instead of clipping at
+     * the near/far planes (NV4097_SET_ZMIN_MAX_CONTROL, see
+     * eng_apply_depth_clip). Encoder state, called before every draw. */
+    void (*set_depth_clamp)(void* user, int clamp);
+    /* Optional. draw_vbuf with the indices taken from a persistent buffer
+     * as well (a vbuf_create'd copy of index_count u32 indices): the
+     * engine's resident index lists (PS3RECOMP_ENG_ICACHE). */
+    void (*draw_vbuf_ib)(void* user, rsx_topology topology, u32 vbuf,
+                         u32 vertex_count, u32 stride, u32 ibuf, u32 index_count);
 } rsx_draw_backend;
+
+/* The light pass's constants, as the backend's shader reads them. */
+#define RSX_GPU_LIGHT_MAX 128
+typedef struct {
+    float m[16];            /* depth -> camera-relative position: h = u*m[0..3] + v*m[4..7] + z*m[8..11] + m[12..15] */
+    float scale;            /* colour multiplier (inFAMOUS 2: 1.6) */
+    float count;            /* lights used */
+    float width, height;
+    struct {
+        float pos[3], type;             /* type 1 point, 2 spot */
+        float col[3], inner;
+        float outer, cone_a, cone_b, near_;
+        float dir[3], pad;
+    } light[RSX_GPU_LIGHT_MAX];
+} rsx_gpu_light_params;
 
 /* ---- the engine --------------------------------------------------------- */
 
@@ -260,6 +357,30 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* The guest's SET_REFERENCE sync point: submit and wait, so a title spinning
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
+
+/* GPU -> guest memory. The 2D engine's reads and the SPUs see guest memory,
+ * which never holds what the GPU drew. Write the newest colour target or the
+ * depth buffer whose rows cover (local, offset) back into it as the RSX would
+ * have stored it -- A8R8G8B8 as bytes A,R,G,B, Z24S8 as the big-endian
+ * D << 8 | S word -- `pitch` bytes per row (0: the target's own width). Pending
+ * work is submitted and waited for first. A target already written back since
+ * it was last drawn is skipped. Returns 1 when guest memory was written.
+ * inFAMOUS 2 NV3089-copies its normal and depth buffers to main memory every
+ * frame for the SPUs' deferred lighting; without this the SPUs lit nothing. */
+int rsx_draw_engine_write_back(int local, u32 offset, u32 pitch);
+/* Same, knowing where the blit lands (-1/0 when unknown): a blit into a buffer
+ * the GPU light pass replaces needs no write-back (PS3RECOMP_ENG_GPU_LIGHT). */
+int rsx_draw_engine_write_back_to(int local, u32 offset, u32 pitch, int dst_local, u32 dst_offset);
+/* PS3RECOMP_ENG_GPU_LIGHT: hand the engine the light job's frame block (its
+ * 0x100 bytes, big-endian: matrix at +0x10, scale at +0x98) and light records
+ * (0x30 bytes each), as the SPU job would read them this frame. Any thread. */
+void rsx_draw_engine_gpu_light_data(const void* frame_be, const void* lights_be, u32 count);
+/* PS3RECOMP_ENG_GPU_SSAO=<local offset>: hand the engine the SSAO shader
+ * constants for this frame (an opaque block for the backend's ssao_pass, at
+ * most 512 bytes) and the full/half sizes. Needs PS3RECOMP_ENG_GPU_LIGHT's
+ * input copies. Any thread. */
+void rsx_draw_engine_gpu_ssao_data(const void* consts, u32 bytes, u32 full_w, u32 full_h,
+                                   u32 half_w, u32 half_h);
 
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */

@@ -3,6 +3,7 @@
  */
 
 #include <setjmp.h>
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 
 /* sys_ppu_thread_exit never returns on hardware. Returning CELL_OK to the
  * guest lets it run on past the call: Twisted Metal has a thread that exits
@@ -25,6 +26,8 @@ static PPU_TLS int     s_exit_done = 0;
 #include <stddef.h>
 #include "sys_ppu_thread.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
+#include "../platform/host_qos.h"       /* PS3_QOS: guest threads at USER_INTERACTIVE */
+#include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
@@ -128,6 +131,12 @@ static void* ppu_host_thread_proc(void* param)
 #endif
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
+
+    /* PS3_QOS (host_qos.h): a new pthread starts at QOS_CLASS_DEFAULT on
+     * macOS, where the game's own frame, SPURS and streaming threads can land
+     * on the efficiency cores. Its low-priority background threads get
+     * USER_INITIATED. */
+    ps3_host_qos_self(info->priority < PS3_HOST_QOS_PPU_INTERACTIVE_BELOW);
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
@@ -281,6 +290,7 @@ uint64_t ppu_thread_register_main(void)
         t->joinable = 0;                    /* nobody joins the main thread */
         t->priority = g_ppu_primary_prio;
         strncpy(t->name, "main", sizeof(t->name) - 1);
+        ps3_ft_name(1, "main");
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
 #else
@@ -430,6 +440,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         const char* name = (const char*)vm_to_host(name_addr);
         strncpy(t->name, name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = '\0';
+        ps3_ft_name((uint32_t)(t - g_ppu_threads) + 1u, t->name);
     }
 
     /* Create synchronization for join */
@@ -654,7 +665,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static int n=0; if(__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED)<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -1280,6 +1291,7 @@ int64_t sys_ppu_thread_rename(ppu_context* ctx)
         const char* name = (const char*)vm_to_host(name_addr);
         strncpy(t->name, name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = '\0';
+        ps3_ft_name((uint32_t)(t - g_ppu_threads) + 1u, t->name);
     }
 
     table_unlock();
@@ -1391,12 +1403,12 @@ static uint32_t td_rd32(uint32_t a)
     const uint8_t* p = vm_base + a;
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
-static void* thread_dump_main(void* arg)
+/* One dump now ("why" goes into the header): the periodic thread below, and
+ * PS3_HANG_DUMP=1's hang detectors (cellGcmSys's stuck ref). */
+void ps3_thread_dump_now(const char* why)
 {
-    const unsigned sec = (unsigned)(uintptr_t)arg;
-    for (;;) {
-        sleep(sec);
-        fprintf(stderr, "[tdump] ---- guest threads ----\n");
+    {
+        fprintf(stderr, "[tdump] ---- guest threads%s%s ----\n", why ? ": " : "", why ? why : "");
         for (int i = 0; i < PPU_THREAD_MAX; i++) {
             ppu_thread_info* t = &g_ppu_threads[i];
             if (t->state != PPU_THREAD_STATE_RUNNING && t->state != PPU_THREAD_STATE_DETACHED) continue;
@@ -1413,6 +1425,14 @@ static void* thread_dump_main(void* arg)
             fputc('\n', stderr);
         }
         fflush(stderr);
+    }
+}
+static void* thread_dump_main(void* arg)
+{
+    const unsigned sec = (unsigned)(uintptr_t)arg;
+    for (;;) {
+        sleep(sec);
+        ps3_thread_dump_now(NULL);
     }
     return NULL;
 }
@@ -1447,6 +1467,8 @@ static void memdump_start(const char* spec)
         if (pthread_create(&th, NULL, memdump_main, r) == 0) pthread_detach(th); else free(r);
     }
 }
+#else
+void ps3_thread_dump_now(const char* why) { (void)why; }
 #endif
 
 void sys_ppu_thread_init(lv2_syscall_table* tbl)

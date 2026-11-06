@@ -11,13 +11,16 @@
  *
  * Programs:
  *   VP  MOV o0, v0 ; MOV o1, v3 (END)      position through, colour through
+ *   VP  MOV o0, v0 ; MOV o5, v3 (END)      + user clip planes (o5.yzw, o6.yzw)
  *   FP  MOV r0, COL0 (END)                 colour out
  *   FP  MOV r0, COL0.zyxw (END)            colour out, red and blue swapped:
  *                                          what the host's --shader mode runs
+ *   FP  MOV r0, -abs(COL1.zyxw) (END)      colour clamp before source modifiers
  *   FP  TEX r0, TC0 unit 0 (END)           texture unit 0 sampled at texcoord0
  *   FP  TEX r0, TC0 unit 0, CUBE (END)     ... with unit 0 a cube map
  *   VP  MOV o0, v0 ; TXL o1, v8 (END)      a vertex texture sampled at t16
  *   FP  MOV r0, COL0 ; MOV r2, COL0.zyxw   two colour targets: what --mrt runs
+ *   FP  (both FPs above) + depth export    SHADER_CONTROL & 0xE: depth = r1.z
  *
  * Each program's HLSL is checked for what was meant before the MSL is looked
  * at, so a wrong bit in an encoder shows up as a decompiler-level failure
@@ -43,6 +46,18 @@ static void check(const char* what, const char* text, const char* needle)
         g_pass++;
     } else {
         printf("[FAIL] %s -- missing \"%s\"\n", what, needle);
+        if (!g_verbose && text) printf("----\n%s\n----\n", text);
+        g_fail++;
+    }
+}
+
+static void check_absent(const char* what, const char* text, const char* needle)
+{
+    if (text && !strstr(text, needle)) {
+        printf("[PASS] %s -- no \"%s\"\n", what, needle);
+        g_pass++;
+    } else {
+        printf("[FAIL] %s -- unexpected \"%s\"\n", what, needle);
         if (!g_verbose && text) printf("----\n%s\n----\n", text);
         g_fail++;
     }
@@ -115,6 +130,39 @@ int main(int argc, char** argv)
         }
     }
 
+    /* ---- user clip planes: MOV o0, v0 ; MOV o5, v3 ------------------------
+     * The distances live in o5.yzw / o6.yzw and the planes are register
+     * state (NV4097 0x1478), so they are added to the decompiled text:
+     * plane 0 ENABLE_GE keeps d >= 0, plane 1 ENABLE_LT keeps d <= 0, the
+     * rest of the vector never clips, and the varyings keep their slots. */
+    {
+        u8 vp[32];
+        rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0 */
+        rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 5, 1);   /* MOV o5, v3, END */
+        check_count("clip VP", rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl), 2);
+        const int none = rsx_vp_apply_user_clip(g_hlsl, sizeof g_hlsl, 0);
+        const int small = rsx_vp_apply_user_clip(g_hlsl, strlen(g_hlsl) + 8, 2u);
+        const int two = rsx_vp_apply_user_clip(g_hlsl, sizeof g_hlsl, 2u | (1u << 2));
+        if (none == 0 && small == -1 && two == 0) { printf("[PASS] clip VP patch results\n"); g_pass++; }
+        else { printf("[FAIL] clip VP patch results %d %d %d (want 0 -1 0)\n", none, small, two); g_fail++; }
+        check("clip VP HLSL", g_hlsl, "float4 clipd0:SV_ClipDistance0;");
+        check("clip VP HLSL", g_hlsl, "Out.clipd0 = float4(o[5].y, -(o[5].z), 0.5, 0.5);");
+        check_absent("clip VP HLSL", g_hlsl, "SV_ClipDistance1");
+        if (translate("clip VP", RSX_SHADER_STAGE_VERTEX) == 0) {
+            check("clip VP MSL", g_msl, "[[clip_distance]]");
+            check("clip VP MSL", g_msl, "[[user(locn0)]]");    /* COLOR0 */
+            check("clip VP MSL", g_msl, "[[user(locn10)]]");   /* TEXCOORD7 */
+        }
+        /* Plane 5 (o6.w) adds the second vector. */
+        check_count("clip VP 6", rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl), 2);
+        if (rsx_vp_apply_user_clip(g_hlsl, sizeof g_hlsl, 2u << 10) == 0) { printf("[PASS] clip VP 6 patch\n"); g_pass++; }
+        else { printf("[FAIL] clip VP 6 patch\n"); g_fail++; }
+        check("clip VP 6 HLSL", g_hlsl, "float2 clipd1:SV_ClipDistance1;");
+        check("clip VP 6 HLSL", g_hlsl, "Out.clipd1 = float2(0.5, o[6].w);");
+        if (translate("clip VP 6", RSX_SHADER_STAGE_VERTEX) == 0)
+            check("clip VP 6 MSL", g_msl, "[[clip_distance]]");
+    }
+
     /* ---- fragment program: MOV r0, COL0 ---------------------------------- */
     {
         u8 fp[16];
@@ -122,7 +170,7 @@ int main(int argc, char** argv)
         u32 nconst = 0;
         check_count("FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u /* r0 exports */, 0,
                                                        g_hlsl, sizeof g_hlsl, &nconst), 1);
-        check("FP HLSL", g_hlsl, "(input.col0).xyzw");
+        check("FP HLSL", g_hlsl, "(saturate(input.col0)).xyzw");
         check("FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
         check("FP HLSL", g_hlsl, "cbuffer PSConstants : register(b1)");
         /* The alpha test patch must survive translation as well. */
@@ -147,10 +195,76 @@ int main(int argc, char** argv)
         rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ(2, 1, 0, 3));
         check_count("swizzled FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
                                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
-        check("swizzled FP HLSL", g_hlsl, "(input.col0).zyxw");
+        check("swizzled FP HLSL", g_hlsl, "(saturate(input.col0)).zyxw");
         check("swizzled FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
         if (translate("swizzled FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
             check("swizzled FP MSL", g_msl, "fragment ");
+    }
+
+    /* ---- fragment program: MOV r0, -abs(COL1.zyxw) ------------------------
+     * Clamp the interpolated colour before abs/negate: clamping a negated
+     * colour instead would discard the negative result. DWORD1 bits 29 and
+     * 17 are source abs and negate, respectively. */
+    {
+        u8 fp[16];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC(2) /* COL1 */ | RSX_TEST_FP_END,
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ(2, 1, 0, 3) |
+                          (1u << 29) /* abs */ | (1u << 17) /* negate */);
+        check_count("modified COL1 FP",
+                    rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("modified COL1 FP HLSL", g_hlsl,
+              "-(abs((saturate(input.col1)).zyxw))");
+        if (translate("modified COL1 FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("modified COL1 FP MSL", g_msl, "fragment ");
+            check("modified COL1 FP MSL", g_msl, "[[user(locn1)]]");
+            check("modified COL1 FP MSL", g_msl, "[[color(0)]]");
+        }
+    }
+
+    /* ---- fragment program: MOV r0, FACING ---------------------------------
+     * Input 0xE is the face flag, +1 front / -1 back. Two-sided materials
+     * multiply the normal by it; it used to read as zero. */
+    {
+        u8 fp[16];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC(0xE) | RSX_TEST_FP_END,
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("FACING FP",
+                    rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("FACING FP HLSL", g_hlsl, "bool _rsx_front : SV_IsFrontFace;");
+        check("FACING FP HLSL", g_hlsl, "input._rsx_front ? float4(1,1,1,1) : float4(-1,-1,-1,-1)");
+        if (translate("FACING FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("FACING FP MSL", g_msl, "[[front_facing]]");
+    }
+
+    /* ---- fragment program: MOV r0, TC8 / TC9 ------------------------------
+     * They follow TEXCOORD7 (locn10), and the VP writes them from o15 / o6. */
+    for (u32 n = 8; n <= 9; n++) {
+        u8 fp[16];
+        rsx_test_fp_instr(fp,
+                          RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                          RSX_TEST_FP_INSRC(0xC + (n - 8)) | RSX_TEST_FP_END,
+                          RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("TC8/9 FP",
+                    rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("TC8/9 FP HLSL", g_hlsl, n == 8 ? "(input.tc8).xyzw" : "(input.tc9).xyzw");
+        check("TC8/9 FP HLSL", g_hlsl, "float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;");
+        if (translate("TC8/9 FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("TC8/9 FP MSL", g_msl, n == 8 ? "[[user(locn11)]]" : "[[user(locn12)]]");
+    }
+    {
+        u8 vp[16];
+        rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 15, 1);   /* MOV o15, v0, END */
+        rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl);
+        check("TC8 VP HLSL", g_hlsl, "Out.t8=o[15]; Out.t9=o[6];");
+        if (translate("TC8 VP", RSX_SHADER_STAGE_VERTEX) == 0)
+            check("TC8 VP MSL", g_msl, "[[user(locn11)]]");
     }
 
     /* ---- fragment program: TEX r0, TC0 (unit 0) --------------------------- */
@@ -160,6 +274,8 @@ int main(int argc, char** argv)
         check_count("TEX FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
                                                            g_hlsl, sizeof g_hlsl, NULL), 1);
         check("TEX FP HLSL", g_hlsl, "rsx_tex[0].Sample(rsx_samp[0]");
+        /* Colour input clamping must not affect texture coordinates. */
+        check("TEX FP HLSL", g_hlsl, "(input.tc0).xyzw");
         check("TEX FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
 
         if (translate("TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
@@ -236,6 +352,57 @@ int main(int argc, char** argv)
         }
     }
 
+    /* ---- fragment program: TEX r0, TC0 with perspective_corr --------------
+     * SRC2 bit 31 scales the texcoord by 1/w. Through glslang SV_POSITION.w
+     * becomes FragCoord.w, which is already 1/w, so the helper must resolve
+     * to the bare .w here (RSX_FRAGCOORD_W_IS_RCP) -- a division would undo
+     * the correction and inFAMOUS 2's river would sample outside its copy. */
+    {
+        u8 fp[16];
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        rsx_test_fp_put_word(fp + 12, 1u << 31);
+        check_count("persp TEX FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0,
+                                                                 g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("persp TEX FP HLSL", g_hlsl, "(input.tc0 * _rsx_inv_w(input.position))");
+        if (translate("persp TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("persp TEX FP MSL", g_msl, "gl_FragCoord.w");
+            check_absent("persp TEX FP MSL", g_msl, "1.0 / gl_FragCoord.w");
+        }
+    }
+
+    /* ---- fragment program: TEX r0, TC0 on a 3D unit ------------------------
+     * A volume texture (SET_TEXTURE_FORMAT dimension 3): Texture3D in HLSL,
+     * texture3d in MSL, sampled with three coordinates -- inFAMOUS 2's
+     * occlusion volumes look their 8x8x8 cone LUT up this way. */
+    {
+        u8 fp[16];
+        rsx_test_fp_tex_r0_tc0(fp, 0);
+        check_count("3D TEX FP",
+                    rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp, sizeof fp, 0x40u,
+                        0, 1u /* unit 0 is 3D */, NULL, NULL, NULL, g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("3D TEX FP HLSL", g_hlsl, "Texture3D   rsx_tex0 : register(t0);");
+        check("3D TEX FP HLSL", g_hlsl, "rsx_tex0.Sample(rsx_samp[0]");
+        if (translate("3D TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("3D TEX FP MSL", g_msl, "texture3d");
+    }
+
+    /* ---- fragment program: TEX r0, TC0 with EXP_TEX on a biased unit -----
+     * The _bx2 fetch: the lanes the unit's biased remap names come back as
+     * x*2-1. The helper must survive glslang/spirv-cross intact. */
+    {
+        u8 fp[16];
+        u8 expand[16] = {0};
+        expand[0] = 0x7;
+        rsx_test_fp_instr(fp, RSX_TEST_FP_OPC(RSX_TEST_FP_OP_TEX) | RSX_TEST_FP_MASK_XYZW |
+                              RSX_TEST_FP_INSRC_TC0 | RSX_TEST_FP_TEXU(0) | (1u << 21) | RSX_TEST_FP_END,
+                              RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        check_count("expand TEX FP", rsx_fp_decompile_buffered_shadow_color_expand_ex(fp, sizeof fp, 0x40u, 0,
+                        NULL, NULL, expand, g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("expand TEX FP HLSL", g_hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 15u, true)");
+        if (translate("expand TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("expand TEX FP MSL", g_msl, "* 2.0");
+    }
+
     /* ---- fragment program writing TWO colour targets ---------------------
      * MOV r0, COL0 ; MOV r2, COL0.zyxw (END). With 32-bit exports r0 is
      * target A and r2 is target B, so the decompiler returns a struct of two
@@ -255,12 +422,158 @@ int main(int argc, char** argv)
         check("MRT FP HLSL", g_hlsl, "PSOutput main(PSInput input) {");
         check("MRT FP HLSL", g_hlsl, "r[0].xyzw = _v.xyzw;");
         check("MRT FP HLSL", g_hlsl, "r[2].xyzw = _v.xyzw;");
-        check("MRT FP HLSL", g_hlsl, "(input.col0).zyxw");
+        check("MRT FP HLSL", g_hlsl, "(saturate(input.col0)).zyxw");
 
         if (translate("MRT FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
             check("MRT FP MSL", g_msl, "fragment ");
             check("MRT FP MSL", g_msl, "[[color(0)]]");
             check("MRT FP MSL", g_msl, "[[color(1)]]");
+        }
+    }
+
+    /* ---- depth export: SHADER_CONTROL & 0xE replaces depth with r1.z -----
+     * Single target behind the alpha-test wrapper, then the MRT form. */
+    {
+        u8 fp[16];
+        rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ_IDENT);
+        check_count("depth FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u | RSX_FP_CTRL_DEPTH_EXPORT, 0,
+                                                             g_hlsl, sizeof g_hlsl, NULL), 1);
+        const int at = rsx_fp_apply_alpha_test_buffered(g_hlsl, sizeof g_hlsl, 0x204u /* GREATER */);
+        const int de = rsx_fp_apply_depth_export(g_hlsl, sizeof g_hlsl);
+        const int again = rsx_fp_apply_depth_export(g_hlsl, sizeof g_hlsl);   /* refuses twice */
+        if (at == 1 && de == 1 && again == -1) { printf("[PASS] depth FP patches\n"); g_pass++; }
+        else { printf("[FAIL] depth FP patches %d %d %d (want 1 1 -1)\n", at, de, again); g_fail++; }
+        check("depth FP HLSL", g_hlsl, "float d : SV_Depth;");
+        check("depth FP HLSL", g_hlsl, "_rsx_dout.c = _rsx_out;");
+        check("depth FP HLSL", g_hlsl, "_rsx_dout.d = saturate(r[1].z);");
+        check("depth FP HLSL", g_hlsl, "discard");
+        if (translate("depth FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("depth FP MSL", g_msl, "[[depth(any)]]");
+            check("depth FP MSL", g_msl, "[[color(0)]]");
+        }
+    }
+    {
+        u8 fp[32];
+        rsx_test_fp_mrt_col0(fp, RSX_TEST_FP_SWZ_IDENT, RSX_TEST_FP_SWZ(2, 1, 0, 3));
+        check_count("depth MRT FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u | RSX_FP_CTRL_DEPTH_EXPORT, 0,
+                                                                 g_hlsl, sizeof g_hlsl, NULL), 2);
+        if (rsx_fp_apply_depth_export(g_hlsl, sizeof g_hlsl) == 1) { printf("[PASS] depth MRT FP patch\n"); g_pass++; }
+        else { printf("[FAIL] depth MRT FP patch\n"); g_fail++; }
+        check("depth MRT FP HLSL", g_hlsl, "float _rsx_depth : SV_Depth;");
+        check("depth MRT FP HLSL", g_hlsl, "_rsx_dout._rsx_depth = saturate(r[1].z);");
+        if (translate("depth MRT FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("depth MRT FP MSL", g_msl, "[[depth(any)]]");
+            check("depth MRT FP MSL", g_msl, "[[color(1)]]");
+        }
+    }
+
+    /* ---- depth bounds (NV4097 0x0380): emulated in the program ----------
+     * The stored depth comes from a copy on a unit the program does not
+     * sample (15 here); outside [fp_dbounds.x, fp_dbounds.y] the fragment is
+     * discarded before anything else runs. Single target behind the
+     * alpha-test wrapper, then the MRT form; a cube slot is refused. */
+    {
+        u8 fp[16];
+        rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ_IDENT);
+        check_count("dbounds FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0, g_hlsl, sizeof g_hlsl, NULL), 1);
+        const int at = rsx_fp_apply_alpha_test_buffered(g_hlsl, sizeof g_hlsl, 0x204u /* GREATER */);
+        const int db = rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 15);
+        const int again = rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 15);   /* refuses twice */
+        if (at == 1 && db == 1 && again == -1) { printf("[PASS] dbounds FP patches\n"); g_pass++; }
+        else { printf("[FAIL] dbounds FP patches %d %d %d (want 1 1 -1)\n", at, db, again); g_fail++; }
+        check("dbounds FP HLSL", g_hlsl, "    float4 fp_alpha;\n    float4 fp_dbounds;\n};");
+        check("dbounds FP HLSL", g_hlsl, "round(rsx_tex[15].Load(int3(int2(input.position.xy), 0)) * 255.0)");
+        check("dbounds FP HLSL", g_hlsl, "_rsx_zs > fp_dbounds.y) discard;");
+        if (translate("dbounds FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("dbounds FP MSL", g_msl, "rsx_tex [[texture(0)]]");
+            check("dbounds FP MSL", g_msl, "discard_fragment()");
+            check("dbounds FP MSL", g_msl, "fp_dbounds");
+        }
+    }
+    {
+        u8 fp[32];
+        rsx_test_fp_mrt_col0(fp, RSX_TEST_FP_SWZ_IDENT, RSX_TEST_FP_SWZ(2, 1, 0, 3));
+        check_count("dbounds MRT FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0, g_hlsl, sizeof g_hlsl, NULL), 2);
+        if (rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 12) == 1) { printf("[PASS] dbounds MRT FP patch\n"); g_pass++; }
+        else { printf("[FAIL] dbounds MRT FP patch\n"); g_fail++; }
+        check("dbounds MRT FP HLSL", g_hlsl, "PSOutput main(PSInput input) {\n    { const float4 _rsx_zb = round(rsx_tex[12].Load(");
+        if (translate("dbounds MRT FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("dbounds MRT FP MSL", g_msl, "[[color(1)]]");
+        }
+        rsx_test_fp_mov_r0_col0(fp, RSX_TEST_FP_SWZ_IDENT);
+        rsx_fp_decompile_buffered_ex(fp, 16, 0x40u, 1u << 3 /* unit 3 a cube */, g_hlsl, sizeof g_hlsl, NULL);
+        if (rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 3) == -1) { printf("[PASS] dbounds refuses a cube slot\n"); g_pass++; }
+        else { printf("[FAIL] dbounds took a cube slot\n"); g_fail++; }
+        if (rsx_fp_apply_depth_bounds(g_hlsl, sizeof g_hlsl, 15) == 1) { printf("[PASS] dbounds beside a cube\n"); g_pass++; }
+        else { printf("[FAIL] dbounds beside a cube\n"); g_fail++; }
+        check("dbounds cube FP HLSL", g_hlsl, "round(rsx_tex15.Load(int3(int2(input.position.xy), 0)) * 255.0)");
+        if (translate("dbounds cube FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("dbounds cube FP MSL", g_msl, "[[texture(15)]]");
+    }
+
+    /* ---- WPOS with wide targets (PS3_RES_SCALE x PS3_ASPECT) -----------
+     * MOV r0, WPOS: at 1x the position goes through untouched; with x and y
+     * scaled apart (21:9 targets at 2x: x 2.625, y 2) each axis divides back
+     * by its own factor, and back at 1x the program is byte-identical. */
+    {
+        u8 fp[16];
+        rsx_test_fp_instr(fp, RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                              RSX_TEST_FP_INSRC(0) | RSX_TEST_FP_END,
+                              RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        static char base[sizeof g_hlsl];
+        check_count("WPOS FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0, g_hlsl, sizeof g_hlsl, NULL), 1);
+        check_absent("WPOS FP HLSL", g_hlsl, "_rsx_wpos");
+        memcpy(base, g_hlsl, sizeof base);
+        rsx_fp_set_wpos_scale_xy(2.625f, 2.0f);
+        check_count("WPOS wide FP", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0, g_hlsl, sizeof g_hlsl, NULL), 1);
+        check("WPOS wide FP HLSL", g_hlsl, "float4((p).x * 0.380952381, ((p).y * 0.5) * fp_alpha.y + fp_alpha.z, (p).zw)");
+        check("WPOS wide FP HLSL", g_hlsl, "_rsx_wpos(input.position)");
+        if (translate("WPOS wide FP", RSX_SHADER_STAGE_FRAGMENT) == 0)
+            check("WPOS wide FP MSL", g_msl, "fragment ");
+        rsx_fp_set_wpos_scale(1.0f);
+        check_count("WPOS FP again", rsx_fp_decompile_buffered_ex(fp, sizeof fp, 0x40u, 0, g_hlsl, sizeof g_hlsl, NULL), 1);
+        if (!strcmp(base, g_hlsl)) { printf("[PASS] WPOS FP at 1x unchanged\n"); g_pass++; }
+        else { printf("[FAIL] WPOS FP at 1x changed\n"); g_fail++; }
+    }
+
+    /* ---- framebuffer fetch (rsx_fp_apply_fbfetch): a decal in inFAMOUS 2's
+     * shape reads two of its own targets at the projected screen texcoord
+     * (units 2 and 3 -> attachments 0 and 1, unit 3 through a crossbar) and
+     * one ordinary texture (unit 0, untouched); unit 1 is a candidate but is
+     * also sampled at a plain texcoord, so it stays a texture. */
+    {
+        snprintf(g_hlsl, sizeof g_hlsl, "%s",
+            "struct PSInput { float4 position : SV_POSITION; float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3; };\n"
+            "struct PSOutput { float4 t0 : SV_TARGET0; float4 t1 : SV_TARGET1; };\n"
+            "Texture2D    rsx_tex[16] : register(t0);\n"
+            "SamplerState rsx_samp[16] : register(s0);\n"
+            "float4 _rsx_inv_w(float4 p) { return (float4)(1.0 / p.w); }\n"
+            "PSOutput main(PSInput input) {\n"
+            "    PSOutput o;\n"
+            "    float4 a = rsx_tex[2].Sample(rsx_samp[2], (((input.tc3 * _rsx_inv_w(input.position))).xyzw).xy);\n"
+            "    float4 b = rsx_tex[3].Sample(rsx_samp[3], (((input.tc3 * _rsx_inv_w(input.position))).xyzw).xy);\n"
+            "    float4 c = rsx_tex[0].Sample(rsx_samp[0], ((input.tc2).xyzw).xy);\n"
+            "    float4 d = rsx_tex[1].Sample(rsx_samp[1], (((input.tc3 * _rsx_inv_w(input.position))).xyzw).xy)\n"
+            "             + rsx_tex[1].Sample(rsx_samp[1], ((input.tc2).xyzw).xy);\n"
+            "    o.t0 = lerp(a, c, 0.5) + d; o.t1 = b;\n"
+            "    return o;\n"
+            "}\n");
+        u8 att[16] = {0}, sel[16][4] = {{0}};
+        att[1] = 0; att[2] = 0; att[3] = 1;
+        for (int u = 0; u < 16; u++) { sel[u][0] = 3; sel[u][1] = 0; sel[u][2] = 1; sel[u][3] = 2; }
+        sel[3][0] = 0; sel[3][1] = 1; sel[3][2] = 2; sel[3][3] = 5;   /* A <- R, R <- G, G <- B, B <- 1 */
+        u32 applied = 0;
+        const int rc = rsx_fp_apply_fbfetch(g_hlsl, sizeof g_hlsl, 0xEu, att, sel, &applied);
+        if (rc == 0 && applied == 0xCu) { printf("[PASS] fbfetch units 0x%X\n", applied); g_pass++; }
+        else { printf("[FAIL] fbfetch rc %d units 0x%X (want 0 0xC)\n", rc, applied); g_fail++; }
+        check("fbfetch HLSL", g_hlsl, "SubpassInput<float4> _rsx_att0;");
+        check("fbfetch HLSL", g_hlsl, "return float4(c.y, c.z, 1.0, c.x);");
+        check("fbfetch HLSL", g_hlsl, "float4 a = _rsx_fb2();");
+        check("fbfetch HLSL", g_hlsl, "rsx_tex[1].Sample(rsx_samp[1], ((input.tc2).xyzw).xy)");
+        check("fbfetch HLSL", g_hlsl, "rsx_tex[0].Sample(rsx_samp[0]");
+        if (translate("fbfetch FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
+            check("fbfetch MSL", g_msl, "[[color(0)]]");
+            check("fbfetch MSL", g_msl, "_rsx_att1 [[color(1)]]");
         }
     }
 

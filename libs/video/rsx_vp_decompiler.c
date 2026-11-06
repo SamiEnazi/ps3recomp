@@ -624,6 +624,7 @@ static int rsx_vp_decompile_impl(
         "    float4 fog:FOG;\n"
         "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
         "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
         "};\n"
         /* b0: 512 vec4 transform constants + the RSX viewport transform,
          * pre-mapped by the harness to D3D clip space:
@@ -689,7 +690,9 @@ static int rsx_vp_decompile_impl(
     if (has_flow) emit(&o, "    }\n");
 
     /* Output register map (see header comment): o0 = HPOS through the RSX
-     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7. */
+     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7,
+     * o15 = TEX8, o6 = TEX9 (RPCS3's reg_table: TEX9 shares the point-size
+     * register). */
     emit(&o,
         "    VSOutput Out;\n"
         "    float4 _p = o[0];\n"
@@ -697,6 +700,7 @@ static int rsx_vp_decompile_impl(
         "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
         "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"
         "    Out.t4=o[11]; Out.t5=o[12]; Out.t6=o[13]; Out.t7=o[14];\n"
+        "    Out.t8=o[15]; Out.t9=o[6];\n"
         "    return Out;\n"
         "}\n");
 
@@ -704,4 +708,42 @@ static int rsx_vp_decompile_impl(
     (void)n_flow_skipped;
     if (o.overflow) return -1;
     return instrs;
+}
+
+/* See rsx_vp_decompiler.h. The distances go after the last declared output,
+ * so the user varyings keep their locations. */
+int rsx_vp_apply_user_clip(char* hlsl, size_t cap, u32 ops)
+{
+    if (!ops) return 0;
+    if (!hlsl) return -1;
+    static const char decl_at[] = "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n";
+    static const char ret_at[] = "    return Out;\n";
+    char* d = strstr(hlsl, decl_at);
+    char* r = NULL;
+    for (char* q = strstr(hlsl, ret_at); q; q = strstr(q + 1, ret_at)) r = q;
+    if (!d || !r || r < d) return -1;
+    const int hi = (ops >> 8) != 0;   /* planes 4/5 */
+    char decl[128], body[512];
+    snprintf(decl, sizeof decl, "    float4 clipd0:SV_ClipDistance0;%s\n",
+             hi ? " float2 clipd1:SV_ClipDistance1;" : "");
+    static const char* comp[6] = { "o[5].y", "o[5].z", "o[5].w", "o[6].y", "o[6].z", "o[6].w" };
+    char lane[6][48];
+    for (u32 p = 0; p < 6; p++) {
+        const u32 op = (ops >> (p * 2u)) & 3u;
+        if (op == 2u)      snprintf(lane[p], sizeof lane[p], "%s", comp[p]);
+        else if (op == 1u) snprintf(lane[p], sizeof lane[p], "-(%s)", comp[p]);
+        else               snprintf(lane[p], sizeof lane[p], "0.5");
+    }
+    int n = snprintf(body, sizeof body, "    Out.clipd0 = float4(%s, %s, %s, %s);\n",
+                     lane[0], lane[1], lane[2], lane[3]);
+    if (hi) snprintf(body + n, sizeof body - (size_t)n, "    Out.clipd1 = float2(%s, %s);\n", lane[4], lane[5]);
+    const size_t len = strlen(hlsl), dl = strlen(decl), bl = strlen(body);
+    if (len + dl + bl + 1 > cap) return -1;
+    const size_t doff = (size_t)(d - hlsl) + sizeof decl_at - 1, roff = (size_t)(r - hlsl);
+    /* The body first (it is further on), then the declaration. */
+    memmove(hlsl + roff + bl, hlsl + roff, len - roff + 1);
+    memcpy(hlsl + roff, body, bl);
+    memmove(hlsl + doff + dl, hlsl + doff, len + bl - doff + 1);
+    memcpy(hlsl + doff, decl, dl);
+    return 0;
 }

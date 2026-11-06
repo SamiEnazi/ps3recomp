@@ -342,6 +342,92 @@ static inline double ppu_frsp(double b)
     }
     return (double)(float)b;
 }
+/* PPU_FP_AUDIT (a diagnostic build, -DPPU_FP_AUDIT) counts, per helper, how
+ * often the exact result differs from the plain C conversion it replaced;
+ * the runtime prints the counters (runtime/host/host_posix.c). */
+#ifndef PPU_FP_AUDIT_INC
+#ifdef PPU_FP_AUDIT
+#ifdef __cplusplus
+extern "C" uint64_t ppu_fp_audit[16];
+#else
+extern uint64_t ppu_fp_audit[16];
+#endif
+#define PPU_FP_AUDIT_INC(i) __atomic_fetch_add(&ppu_fp_audit[i], 1, __ATOMIC_RELAXED)
+#else
+#define PPU_FP_AUDIT_INC(i) ((void)0)
+#endif
+#endif
+/* stfs/stfsx/stfsu/stfsux (Book I 4.6.3, "Floating-Point Store Single"): the
+ * word is SELECTED from the double's bits, never rounded. A value already in
+ * single format stores the same as a C (float) cast, but a double-precision
+ * result (fmadd, fdiv, lfd'd data) loses its extra fraction bits by
+ * TRUNCATION (RPCS3's interpreter rounds with a cast here; the ISA does
+ * not). Above the single range the result is undefined in the ISA and we
+ * store the signed infinity RPCS3 does. Doubles in the single denormal range are
+ * denormalised by shifting; below that the ISA leaves the result undefined
+ * and the shift leaves a signed zero. */
+static inline uint32_t ppu_stfs_bits(double v)
+{
+    uint64_t b; memcpy(&b, &v, 8);
+    uint32_t e = (uint32_t)(b >> 52) & 0x7FFu, w;
+    if (e > 1150u && e != 2047u) {
+        /* Beyond the single range the ISA leaves the result undefined;
+         * store the signed infinity a conversion gives (as RPCS3). */
+        w = ((uint32_t)(b >> 32) & 0x80000000u) | 0x7F800000u;
+    } else if (e > 896u || (b << 1) == 0) {
+        w = (uint32_t)((b >> 32) & 0xC0000000u) | (uint32_t)((b >> 29) & 0x3FFFFFFFu);
+    } else {
+        w = (uint32_t)(b >> 32) & 0x80000000u;
+        if (e >= 874u) {
+            uint64_t frac = (b & 0x000FFFFFFFFFFFFFull) | (1ull << 52);
+            frac >>= (897u - e);
+            w |= (uint32_t)(frac >> 29) & 0x007FFFFFu;
+        }
+    }
+#ifdef PPU_FP_AUDIT
+    { float f = (float)v; uint32_t c; memcpy(&c, &f, 4);
+      PPU_FP_AUDIT_INC(0); if (c != w) PPU_FP_AUDIT_INC(1); }
+#endif
+    return w;
+}
+/* lfs/lfsx/lfsu/lfsux: single -> double is exact for every number, but a C
+ * conversion QUIETS a signalling NaN (and raises invalid); the PPC copies the
+ * NaN's bits: sign, all-ones exponent, fraction << 29. */
+static inline double ppu_lfs_val(uint32_t w)
+{
+    double d;
+    if ((w & 0x7FFFFFFFu) > 0x7F800000u) {
+        uint64_t b = ((uint64_t)(w & 0x80000000u) << 32) | 0x7FF0000000000000ull |
+                     ((uint64_t)(w & 0x007FFFFFu) << 29);
+        memcpy(&d, &b, 8);
+#ifdef PPU_FP_AUDIT
+        PPU_FP_AUDIT_INC(3); if (!(w & 0x00400000u)) PPU_FP_AUDIT_INC(2);
+#endif
+        return d;
+    }
+    float f; memcpy(&f, &w, 4);
+    return (double)f;
+}
+/* fsqrt/frsqrte: a NaN input propagates quieted; an invalid operation
+ * (negative non-zero input) gives the default +QNaN, not x86's negative one. */
+static inline double ppu_fsqrt(double b)
+{
+    if (b != b) return ppu_fp_quiet(b);
+    double r = sqrt(b);
+#ifdef PPU_FP_AUDIT
+    if (r != r) { uint64_t u; memcpy(&u, &r, 8); PPU_FP_AUDIT_INC(4); if (u != 0x7FF8000000000000ULL) PPU_FP_AUDIT_INC(5); }
+#endif
+    return r != r ? ppu_fp_default_qnan() : r;
+}
+static inline double ppu_frsqrte(double b)
+{
+    if (b != b) return ppu_fp_quiet(b);
+    double r = 1.0 / sqrt(b);
+#ifdef PPU_FP_AUDIT
+    if (r != r) { uint64_t u; memcpy(&u, &r, 8); PPU_FP_AUDIT_INC(4); if (u != 0x7FF8000000000000ULL) PPU_FP_AUDIT_INC(5); }
+#endif
+    return r != r ? ppu_fp_default_qnan() : r;
+}
 /* FPSCR (Book I 4.2.2), big-endian bit n = 1u << (31 - n). FEX (1) and VX (2)
  * are summaries and never written directly: VX = OR of the VX* bits (7-12,
  * 21-23), FEX = OR of each exception bit ANDed with its enable (VX/VE, OX/OE,
@@ -810,7 +896,9 @@ _MAX_MID_TAIL = 0x6000
 
 def _last_line_is_terminator(body_lines: list[str]) -> bool:
     """True if the function's last instruction is an unconditional terminator
-    (return / internal goto / direct call / syscall / unconditional tail-call)."""
+    (return / internal goto / direct call / unconditional tail-call). A syscall is
+    not one: `sc` returns to the next instruction, so a function that ends in `sc`
+    must fall through to it."""
     for line in reversed(body_lines):
         s = line.strip()
         if not s or s.endswith(":") or s.startswith("loc_") and s.endswith(": ;"):
@@ -825,7 +913,7 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
         if t.startswith("if ("):
             return False
         return (t.startswith("return") or "goto " in t or
-                t.startswith("func_") or t.startswith("lv2_syscall") or
+                t.startswith("func_") or
                 "{ func_" in t or t.startswith("{ g_trampoline_fn"))
     return False
 
@@ -1261,7 +1349,8 @@ class PPULifter:
         "vupkhsb": ("up", "vmx_vupksb", 0), "vupklsb": ("up", "vmx_vupksb", 1),
         "vupkhsh": ("up", "vmx_vupksh", 0), "vupklsh": ("up", "vmx_vupksh", 1),
         **{m: "cmp" for m in ("vcmpequb vcmpequh vcmpequw vcmpgtub vcmpgtuh vcmpgtuw vcmpgtsb "
-                              "vcmpgtsh vcmpgtsw vcmpeqfp vcmpgefp vcmpgtfp vcmpbfp").split()},
+                              "vcmpgtsh vcmpgtsw").split()},
+        **{m: "cmpF" for m in "vcmpeqfp vcmpgefp vcmpgtfp vcmpbfp".split()},
     }
 
     # Opcode-4 names by XO (from PowerISA / RPCS3 PPUOpcodes.h); the router keys
@@ -1295,11 +1384,13 @@ class PPULifter:
         if form == "bF":   return f"{fn}({D}, {B}, ctx->vscr);"
         if form == "u":    return f"{fn}({D}, {B}, {va});"
         if form == "uS":   return f"{fn}({D}, {B}, {va}, &ctx->vscr);"
-        if form == "cmp":
+        if form in ("cmp", "cmpF"):
+            # cmpF: float compares also take VSCR (NJ flushes denormal operands)
+            args = f"{D}, {A}, {B}" + (", ctx->vscr" if form == "cmpF" else "")
             if (raw >> 10) & 1:   # record form: CR6 = [all, 0, none, 0]
-                return (f"{{ uint32_t _c6 = {fn}({D}, {A}, {B}); "
+                return (f"{{ uint32_t _c6 = {fn}({args}); "
                         f"ctx->cr = (ctx->cr & ~0xF0u) | (_c6 << 4); }}")
-            return f"(void){fn}({D}, {A}, {B});"
+            return f"(void){fn}({args});"
         return None
 
     def _translate_xo_base(self, insn: Instruction, func: LiftedFunction) -> str:
@@ -1764,14 +1855,14 @@ class PPULifter:
             frd, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             single = mn in ("lfsx", "lfsux")
             if mn.endswith("ux") and ra_i != "0":
-                body = (f"uint32_t tmp = vm_read32(ea); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp;"
+                body = (f"ctx->fpr[{frd}] = ppu_lfs_val(vm_read32(ea));"
                         if single else
                         f"uint64_t tmp = vm_read64(ea); memcpy(&ctx->fpr[{frd}], &tmp, 8);")
                 return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
                         f"{body} ctx->gpr[{ra_i}] = ea; }}")
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             if single:
-                return f"{{ uint32_t tmp = vm_read32({ea}); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}"
+                return f"ctx->fpr[{frd}] = ppu_lfs_val(vm_read32({ea}));"
             else:
                 return f"{{ uint64_t tmp = vm_read64({ea}); memcpy(&ctx->fpr[{frd}], &tmp, 8); }}"
 
@@ -1780,14 +1871,14 @@ class PPULifter:
             # stfdx also contains 's' -- match single explicitly [fork eb5451b3]
             single = mn in ("stfsx", "stfsux")
             if mn.endswith("ux") and ra_i != "0":
-                body = (f"float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32(ea, tmp);"
+                body = (f"vm_write32(ea, ppu_stfs_bits(ctx->fpr[{frs}]));"
                         if single else
                         f"uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64(ea, tmp);")
                 return (f"{{ uint64_t ea = ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}]; "
                         f"{body} ctx->gpr[{ra_i}] = ea; }}")
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
             if single:
-                return f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32({ea}, tmp); }}"
+                return f"vm_write32({ea}, ppu_stfs_bits(ctx->fpr[{frs}]));"
             else:
                 return f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64({ea}, tmp); }}"
 
@@ -2146,8 +2237,7 @@ class PPULifter:
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 if mn in ("lfs", "lfsu"):
-                    line = (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
-                            f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
+                    line = f"ctx->fpr[{frd}] = ppu_lfs_val(vm_read32(ctx->gpr[{base}] + {disp}));"
                 else:
                     line = (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
@@ -2165,8 +2255,7 @@ class PPULifter:
                 # store, corrupting the double (breaks fctidz+stfd+ld float->GPR
                 # idioms and any stored double). [ps3recomp fork JonathanDC64 eb5451b3]
                 if mn in ("stfs", "stfsu"):
-                    line = (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
-                            f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
+                    line = f"vm_write32(ctx->gpr[{base}] + {disp}, ppu_stfs_bits(ctx->fpr[{frs}]));"
                 else:
                     line = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
                             f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
@@ -2273,15 +2362,15 @@ class PPULifter:
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             if mn_base.endswith("s"):
-                return f"ctx->fpr[{frd}] = (double)(float)sqrt(ctx->fpr[{frb}]);"
-            return f"ctx->fpr[{frd}] = sqrt(ctx->fpr[{frb}]);"
+                return f"ctx->fpr[{frd}] = ppu_frsp(ppu_fsqrt(ctx->fpr[{frb}]));"
+            return f"ctx->fpr[{frd}] = ppu_fsqrt(ctx->fpr[{frb}]);"
 
         if mn_base in ("frsqrte", "frsqrtes"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             if mn_base == "frsqrtes":
-                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / sqrt(ctx->fpr[{frb}]));"
-            return f"ctx->fpr[{frd}] = 1.0 / sqrt(ctx->fpr[{frb}]);"
+                return f"ctx->fpr[{frd}] = ppu_frsp(ppu_frsqrte(ctx->fpr[{frb}]));"
+            return f"ctx->fpr[{frd}] = ppu_frsqrte(ctx->fpr[{frb}]);"
 
         if mn_base in ("fre", "fres"):
             frd = _reg_idx(ops[0])
@@ -4191,9 +4280,41 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                         pass
         def _ends_block(x):     # a branch that does not return to the next insn
             return x.mnemonic.startswith('b') and x.mnemonic not in ('bl', 'bctrl', 'blrl')
+        # An epilogue that ends in a TAIL CALL leaves the function exactly as
+        # one that ends in `blr` does, and restores the same registers on the
+        # way out. inFAMOUS 2 func_000B9BD0 loads its table base register in
+        # the prologue (`lwz r30,-0x7E90(r2)`), has an early exit `ld r30,
+        # 0xE0(r1); ...; b 0xB8570`, and dispatches 19 instructions later
+        # through `lwz r11,-0x7F80(r30)`: the restore read as r30's nearest
+        # definition, no base resolved, and the switch lifted to an unresolved
+        # indirect call. A `b` leaves the function when it goes back past the
+        # function's entry, or forward past the dispatcher to another
+        # function's entry. Both need the real entries: without func_starts
+        # the scan is bounded by the nearest `blr`, which an early return puts
+        # in the middle of a function, so only `blr` is trusted there.
+        _lo_addr = all_insns[_scan_lo(i)].addr if func_starts else 0
+        _hi_addr = all_insns[i].addr
+        def _leaves(x):
+            if x.mnemonic == 'blr':
+                return True
+            if x.mnemonic != 'b' or not func_starts:
+                return False
+            last = x.operands.split(',')[-1].strip()
+            if not last.startswith('0x'):
+                return False
+            try:
+                t = int(last, 16)
+            except ValueError:
+                return False
+            if t < _lo_addr:
+                return True
+            if t > _hi_addr and func_starts:
+                k2 = _bisect.bisect_left(func_starts, t)
+                return k2 < len(func_starts) and func_starts[k2] == t
+            return False
         out, k = [], len(seg) - 1
         while k >= 0:
-            if seg[k].mnemonic == 'blr':
+            if _leaves(seg[k]):
                 # back to the block's first insn: a branch target, or the insn
                 # right after another branch (fallthrough entry)
                 while k > 0 and seg[k].addr not in targets and not _ends_block(seg[k - 1]):

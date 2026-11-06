@@ -9,13 +9,18 @@
  */
 
 #include "rsx_live_draw.h"
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "rsx_draw_engine.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+#include "../../runtime/spu/spu_coherency.h" /* lock-line bookkeeping for the blit row copy */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
+#include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
+#include "../../include/ps3emu/ps3_toggles.h" /* GCM_STALL_GAP_MS, live */
+#include "gcm_fifo_decode.h"                   /* JUMP forms */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -29,6 +34,7 @@ static u32 s_gcm_context_ea = 0;
 #include <windows.h>
 #else
 #include <time.h>
+#include <unistd.h>   /* getpid: PS3_HANG_SAMPLE */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -71,6 +77,23 @@ static u64 get_timestamp_ns(void)
 static int  s_gcm_initialized = 0;
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+/* Flip requests (each puts the status back to WAITING) and the request a
+ * pending flip completion was marked for: a completion delivered late must not
+ * mark DONE a flip requested after it (see ppu_gcm_pump). */
+static volatile u32 s_flip_req_seq, s_flip_tick_seq;
+/* The status's read-modify-write transitions (request, tick, completion) run
+ * on different threads; without a lock a completion could read "no newer
+ * request" just before a request stored WAITING and then overwrite it. */
+#ifdef _WIN32
+#include <windows.h>
+static volatile LONG s_flip_lock;
+#define FLIP_LOCK()   do { while (InterlockedCompareExchange(&s_flip_lock, 1, 0)) YieldProcessor(); } while (0)
+#define FLIP_UNLOCK() InterlockedExchange(&s_flip_lock, 0)
+#else
+static volatile int s_flip_lock;
+#define FLIP_LOCK()   do { while (__atomic_exchange_n(&s_flip_lock, 1, __ATOMIC_ACQUIRE)) {} } while (0)
+#define FLIP_UNLOCK() __atomic_store_n(&s_flip_lock, 0, __ATOMIC_RELEASE)
+#endif
 
 /* Count of guest flip requests (SetFlipCommand / SetPrepareFlip). The present
  * loop uses this as the frame boundary: presenting only when a flip arrived
@@ -101,10 +124,13 @@ static volatile int s_flip_pending = 0;
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
 
+/* Flips handed to the present (GCM_FLIP_STATS). */
+static volatile unsigned s_flips_shown;
 int cellGcm_take_flip_pending(void)
 {
     int v = s_flip_pending;
     s_flip_pending = 0;
+    if (v) s_flips_shown++;
     return v;
 }
 
@@ -199,7 +225,7 @@ static void ydkj_restore_handler_opd(u32 opd, u32 code) {
     extern u8* vm_base; if (!vm_base) return;
     if (vm_read32(opd) == 0) {
         u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
-        static int _n=0; if(__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<6) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
+        static int _n=0; if(PS3_LOG_FIRST(_n, 6)) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
     }
 }
 static void gcm_update_handler_mask(void)
@@ -587,7 +613,11 @@ void cellGcmSetWaitFlip(void)
 #endif  /* elsewhere: runtime/platform/win32_compat.h */
     for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
         Sleep(1);
-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    /* A flip still WAITING after the bound is left to the tick. Forcing DONE
+     * here skipped its completion: the tick only completes WAITING flips, so
+     * the flip handler never ran for it, and inFAMOUS 2, whose handler writes
+     * the FIFO put it deferred, hung with get == put whenever a frame took
+     * longer than the bound. */
 }
 
 /* NID: 0xDF6476BD. The same wait without libgcm's command-buffer space check;
@@ -599,9 +629,12 @@ void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
 void cellGcmResetFlipStatus(void)
 {
     { static int n = 0;
-      if (getenv("FLIP_DBG") && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 12)
+      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 12))
           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
+    FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    s_flip_req_seq++;
+    FLIP_UNLOCK();
 }
 
 /* NID: 0xE315A0B2 */
@@ -615,7 +648,7 @@ u32 cellGcmGetFlipStatus(void)
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
     { static int n = 0;
-      if (getenv("FLIP_DBG") && __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 24)
+      if (getenv("FLIP_DBG") && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
     return s_flip_status;
@@ -701,7 +734,17 @@ void ppu_gcm_pump(void)
                            0, 0, 0, 0, 0, 0, 0);
     }
     if (p & 2) {
-        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+        /* Delivery waits for a guest thread to reach an HLE call or a timer
+         * sleep, so a newer flip may have been requested (status WAITING
+         * again) since this completion was marked. Marking DONE then would
+         * erase that request: the ticker only completes WAITING flips, so its
+         * handler would never run. inFAMOUS 2 writes its next FIFO put from
+         * the flip handler, and hung with get == put on exactly that. Leave
+         * the newer flip WAITING for the next tick. */
+        FLIP_LOCK();
+        if (s_flip_tick_seq == s_flip_req_seq)
+            s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+        FLIP_UNLOCK();
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -732,8 +775,11 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
  * the callback IS the flip interrupt -- no flip, no callback. */
 void cellGcmTickFlip(void)
 {
-    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
-        GCM_PENDING_SET(2);
+    FLIP_LOCK();
+    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING;
+    if (waiting) s_flip_tick_seq = s_flip_req_seq;
+    FLIP_UNLOCK();
+    if (waiting) GCM_PENDING_SET(2);
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -773,15 +819,282 @@ unsigned long long ps3_ms_now(void)
 #ifdef _WIN32
     return (unsigned long long)GetTickCount64();
 #else
-    return 0;
+    /* Returned 0 here, which silently disabled every timeout built on it
+     * (GCM_PARK_GRACE_MS, GCM_SEMA_ACQUIRE_MS) and zeroed the rate logs
+     * (upstream 91ee29f). */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
 #endif
 }
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
+static int s_sema_live = 0;           /* the LAST drain pass ended on one (see cellGcm_drain_sema_blocked) */
+static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
+
+/* RSX_SNAP_AT=<sec>, RSX_SNAP_RANGES=<ea>:<len>[,<ea>:<len>...], RSX_SNAP_DIR=<dir>:
+ * photograph guest memory at two points of one frame, once, after <sec> s.
+ *   A: the RSX writes label RSX_SNAP_LABEL_A (offset, default 0x860)
+ *   B: an ACQUIRE on label RSX_SNAP_LABEL_B (default 0x890) is satisfied
+ * Files: <dir>/<a|b>_<ea>.bin, raw guest bytes. Written for inFAMOUS 2's SPU
+ * lighting, which turns the normals/depth copies into light in place between
+ * label 134 (copies done) and label 137 (light done): A holds the job's
+ * inputs, B its outputs, with the same frame's constants. */
+static struct timespec s_snap_t0;      /* process start, for RSX_SNAP_AT */
+__attribute__((constructor)) static void rsx_snap_t0_init(void) { clock_gettime(CLOCK_MONOTONIC, &s_snap_t0); }
+
+void rsx_snap_event(int which, u32 offset)
+{
+    static int on = -1; static double at; static u32 lab[2] = { 0x860, 0x890 };
+    static char dir[512], ranges[1024]; static int state;   /* 0 armed, 1 took A, 2 done */
+    const struct timespec t0 = s_snap_t0;
+    if (on < 0) {
+        const char* e = getenv("RSX_SNAP_AT"); const char* r = getenv("RSX_SNAP_RANGES");
+        const char* d = getenv("RSX_SNAP_DIR");
+        on = (e && r && d) ? 1 : 0;
+        if (on) { at = atof(e); snprintf(ranges, sizeof ranges, "%s", r); snprintf(dir, sizeof dir, "%s", d);
+                  const char* a = getenv("RSX_SNAP_LABEL_A"); if (a) lab[0] = (u32)strtoul(a, 0, 16);
+                  const char* b = getenv("RSX_SNAP_LABEL_B"); if (b) lab[1] = (u32)strtoul(b, 0, 16); }
+    }
+    if (!on || state == 2 || (offset & 0xFFFFu) != lab[which]) return;
+    if (which == 1 && state != 1) return;
+    if (which == 0) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((double)(now.tv_sec - t0.tv_sec) + (double)(now.tv_nsec - t0.tv_nsec) * 1e-9 < at) return;
+    }
+    extern uint8_t* vm_base;
+    char buf[1024]; snprintf(buf, sizeof buf, "%s", ranges);
+    for (char* tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+        char* c = strchr(tok, ':'); if (!c) continue;
+        const u32 ea = (u32)strtoul(tok, 0, 16), len = (u32)strtoul(c + 1, 0, 16);
+        char path[1100]; snprintf(path, sizeof path, "%s/%c_%08x.bin", dir, which ? 'b' : 'a', ea);
+        FILE* f = fopen(path, "wb");
+        if (f) { fwrite(vm_base + ea, 1, len, f); fclose(f); }
+    }
+    fprintf(stderr, "[rsx snap] %c at label offset 0x%X (label value 0x%08X) -> %s\n",
+            which ? 'B' : 'A', offset, vm_read32(GCM_LABEL_GUEST_BASE + (offset & 0xFFFFu)), dir);
+    state = which ? 2 : 1;
+}
+static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
+static u32 s_park_off;                 /* the park the walker is waiting on, and since when */
+static unsigned long long s_park_since;
+/* Drain timing for the "ref stuck" report: when the drain now running began
+ * (0 = none running), when the last one ended and why it stopped. */
+static volatile unsigned long long s_drain_in_ms, s_drain_end_ms;
+static const char* volatile s_drain_why = "";
+static volatile unsigned s_drain_count;
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
+/* Command bytes the walker has executed since the last flip word: the size of
+ * the frame that flip ends. */
+static u32 s_frame_bytes;
+static unsigned long long s_walk_bytes;   /* all of them, never reset */
+/* GCM_FLIP_STATS=1: every 10 s, what happened at the flip words since the
+ * last line -- frames' command bytes, the backlog (put - get) each flip met,
+ * how often the catch-up below drained on past a flip, how many flips were
+ * never shown (a flip reached while the one before was still unpresented), and
+ * the longest gap between two flips. Each catch-up also gets a line. */
+static int gcm_flip_stats_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("GCM_FLIP_STATS") != NULL;
+    return on;
+}
+static struct {
+    unsigned flips, catchups, merged, shown, wrapped, over64k;
+    unsigned long long t0, last_flip, max_gap; unsigned gaps100;
+    u32 max_backlog, nb; u32 bytes[4096];
+} s_fst;
+/* Flips requested through the import (not a FIFO word), and those of them
+ * requested while the one before was still unpresented. */
+static volatile unsigned s_flip_import, s_flip_import_merged;
+/* ...and the command bytes the walker had executed since the import flip
+ * before (sum and largest): a title that flips through the import has no flip
+ * word in its stream, so this is its frame size. */
+static unsigned long long s_imp_bytes_sum; static u32 s_imp_bytes_max;
+static int gcm_u32_cmp(const void* a, const void* b)
+{ const u32 x = *(const u32*)a, y = *(const u32*)b; return x < y ? -1 : x > y; }
+static void gcm_flip_stats_note(u32 put, u32 get, u32 bytes, int catchup, int merged)
+{
+    extern unsigned long long ps3_ms_now(void);
+    const unsigned long long now = ps3_ms_now();
+    if (!s_fst.t0) s_fst.t0 = now;
+    s_fst.flips++;
+    if (catchup) s_fst.catchups++;
+    if (merged) s_fst.merged++;
+    if (put < get) s_fst.wrapped++;
+    else { const u32 b = put - get;
+           if (b > s_fst.max_backlog) s_fst.max_backlog = b;
+           if (b >= GCM_FIFO_CATCHUP_BYTES) s_fst.over64k++; }
+    if (s_fst.nb < 4096) s_fst.bytes[s_fst.nb++] = bytes;
+    if (s_fst.last_flip) {
+        const unsigned long long g = now - s_fst.last_flip;
+        if (g > s_fst.max_gap) s_fst.max_gap = g;
+        if (g >= 100) s_fst.gaps100++;
+        static unsigned n;
+        if (g >= 250 && n++ < 100)
+            fprintf(stderr, "[gcm-flipstats] %llu ms since the last flip (frame %u bytes, backlog %d)\n",
+                    g, bytes, put < get ? -1 : (int)(put - get));
+    }
+    s_fst.last_flip = now;
+    if (catchup) {
+        static unsigned n;
+        if (n++ < 200)
+            fprintf(stderr, "[gcm-flipstats] catch-up at flip: backlog %u bytes (put=0x%08X get=0x%08X), "
+                            "frame %u bytes\n", put - get, put, get, bytes);
+    }
+}
+/* GCM_FIFO_JUMP_NEW=0: the walker decodes only the old JUMP form, as before
+ * (gcm_fifo_decode.h). Read once. */
+static int gcm_fifo_jump_new(void)
+{
+    static int on = -1;
+    if (__builtin_expect(on < 0, 0)) { const char* e = getenv("GCM_FIFO_JUMP_NEW"); on = (e && *e == '0') ? 0 : 1; }
+    return on;
+}
+/* New-form JUMPs the walker met at a command position (GCM_FLIP_STATS). */
+static unsigned s_new_jumps;
+static void gcm_note_new_jump(u32 at, u32 w)
+{
+    s_new_jumps++;
+    static unsigned n;
+    if (gcm_flip_stats_on() && n++ < 16)
+        fprintf(stderr, "[gcm-flipstats] new-form JUMP 0x%08X at io 0x%08X (%s)\n", w, at,
+                gcm_fifo_jump_new() ? "followed" : "read as a method header: GCM_FIFO_JUMP_NEW=0");
+}
+/* Called at the end of every drain: the 10 s line. */
+static void gcm_flip_stats_tick(void)
+{
+    if (!gcm_flip_stats_on()) return;
+    extern unsigned long long ps3_ms_now(void);
+    const unsigned long long now = ps3_ms_now();
+    if (!s_fst.t0) { s_fst.t0 = now; return; }
+    if (now - s_fst.t0 >= 10000) {
+        const unsigned imp = s_flip_import, imp_m = s_flip_import_merged;
+        static unsigned imp_last, imp_m_last;
+        static unsigned shown_last;
+        const unsigned shown_now = s_flips_shown;
+        s_fst.shown = shown_now - shown_last; shown_last = shown_now;
+        u32 lo = 0, med = 0, hi = 0;
+        if (s_fst.nb) { qsort(s_fst.bytes, s_fst.nb, sizeof(u32), gcm_u32_cmp);
+                        lo = s_fst.bytes[0]; med = s_fst.bytes[s_fst.nb / 2]; hi = s_fst.bytes[s_fst.nb - 1]; }
+        fprintf(stderr, "[gcm-flipstats] %llu s: %u flips, %u shown, %u never shown, %u catch-ups; "
+                        "frame bytes min/median/max %u/%u/%u; backlog at flip max %u, >=64K %u, put<get %u; "
+                        "longest flip gap %llu ms, %u gaps >= 100 ms; import flips %u (%u never shown, "
+                        "bytes per frame mean %llu max %u); new-form JUMPs %u\n",
+                (now - s_fst.t0) / 1000, s_fst.flips, s_fst.shown, s_fst.merged, s_fst.catchups,
+                lo, med, hi, s_fst.max_backlog, s_fst.over64k, s_fst.wrapped, s_fst.max_gap, s_fst.gaps100,
+                imp - imp_last, imp_m - imp_m_last,
+                imp != imp_last ? __atomic_exchange_n(&s_imp_bytes_sum, 0ull, __ATOMIC_RELAXED) / (imp - imp_last) : 0ull,
+                __atomic_exchange_n(&s_imp_bytes_max, 0u, __ATOMIC_RELAXED), s_new_jumps);
+        s_new_jumps = 0;
+        imp_last = imp; imp_m_last = imp_m;
+        memset(&s_fst, 0, sizeof s_fst);
+        s_fst.t0 = now; s_fst.last_flip = now;
+    }
+}
+/* How long a self-JUMP park may stand with `put` somewhere else before the
+ * drain gives up on it being patched and follows `put` instead. The hardware
+ * waits for ever; GCM_PARK_GRACE_MS=<ms> overrides the default. inFAMOUS 2
+ * needs more than 50 once its SPUs are the bottleneck: the PPU can sit in a
+ * light-task wait between moving put and patching the park, and a resync
+ * there drops the frame's fence and hangs the title for good. */
+static unsigned long long gcm_park_grace_ms(void)
+{
+    static unsigned long long ms = 0;
+    if (!ms) { const char* e = getenv("GCM_PARK_GRACE_MS"); ms = (e && atoi(e) > 0) ? (unsigned long long)atoi(e) : 50ull; }
+    return ms;
+}
+#define GCM_PARK_GRACE_MS gcm_park_grace_ms()
+/* The walker's two wall-clock bounds -- the park grace above and the
+ * semaphore acquire's (GCM_SEMA_ACQUIRE_MS) -- are there for a producer that
+ * never comes. They must not fire because the whole process stood still: on a
+ * starved Mac (load 13-16, mediaanalysisd and another recomp) a game thread
+ * can be off the CPU for seconds and frames came minutes apart. Measured in
+ * wall time, a park whose patch was one store away "expired" during such a
+ * stall, the jump-park resync dropped the frame's commands with its fence,
+ * and inFAMOUS 2 hung for good at the New Marais load. So they count only
+ * time the walker saw pass in small steps: the drain re-checks a park or an
+ * acquire every pass (about 1 ms), and a gap between two checks longer than
+ * GCM_STALL_GAP_MS (default 100) means nobody ran -- that gap is not counted.
+ * GCM_STALL_GAP_MS=0 counts all wall time, as before. Live (PS3_TOGGLE_FILE). */
+static int s_stall_gap_ms = -1;
+static void gcm_stall_gap_set(int id, int v) { (void)id; __atomic_store_n(&s_stall_gap_ms, v, __ATOMIC_RELAXED); }
+static unsigned gcm_stall_gap_ms(void)
+{
+    int v = __atomic_load_n(&s_stall_gap_ms, __ATOMIC_RELAXED);
+    if (__builtin_expect(v < 0, 0)) v = ps3_toggle_watch(PS3T_GCM_STALL_GAP, gcm_stall_gap_set);
+    return v < 0 ? 0u : (unsigned)v;
+}
+/* GCM_LEAN_STATE: is rsx_process_method's state dead weight? Only while the
+ * draw engine takes the stream and no vtable backend reads rsx_state. */
+static int s_lean_state = -1;
+static void gcm_lean_state_set(int id, int v) { (void)id; __atomic_store_n(&s_lean_state, v != 0, __ATOMIC_RELAXED); }
+static int gcm_lean_state(void)
+{
+    int v = __atomic_load_n(&s_lean_state, __ATOMIC_RELAXED);
+    if (__builtin_expect(v < 0, 0)) v = ps3_toggle_watch(PS3T_GCM_LEAN_STATE, gcm_lean_state_set);
+    if (!v) return 0;
+    static int eng = -1;
+    if (eng < 0) eng = rsx_draw_engine_enabled();
+    return eng && !rsx_get_backend();
+}
+/* Run time of one wait: restart it, then add each check's step. */
+typedef struct { unsigned long long last, run; } gcm_run_clock;
+static void gcm_run_clock_start(gcm_run_clock* c, unsigned long long now) { c->last = now; c->run = 0; }
+static unsigned long long gcm_run_clock_ms(gcm_run_clock* c, unsigned long long now)
+{
+    const unsigned long long step = now > c->last ? now - c->last : 0;
+    const unsigned cap = gcm_stall_gap_ms();
+    c->last = now;
+    if (!cap || step <= cap) c->run += step;
+    else {
+        static unsigned n;
+        if (n++ < 16)
+            fprintf(stderr, "[cellGcmSys] %llu ms with no drain pass (process stalled?) not counted "
+                            "against a park/acquire bound\n", step);
+    }
+    return c->run;
+}
+/* GCM_PARK_STATS=1: every 30 s, how the parks went since the last line:
+ * stops at a new park, parks left through their patch (and the longest wait
+ * for one), parks left another way, jump-park resyncs. */
+static unsigned s_ps_parks, s_ps_patched, s_ps_other, s_ps_resync;
+static unsigned long long s_ps_max_ms, s_ps_t0;
+static void gcm_park_stats(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("GCM_PARK_STATS") != NULL;
+    if (!on) return;
+    const unsigned long long now = ps3_ms_now();
+    if (!s_ps_t0) s_ps_t0 = now;
+    if (now - s_ps_t0 < 30000) return;
+    fprintf(stderr, "[cellGcmSys] park stats: %u parks, %u patched (longest %llu ms), %u left otherwise, %u jump-park resyncs\n",
+            s_ps_parks, s_ps_patched, s_ps_max_ms, s_ps_other, s_ps_resync);
+    s_ps_parks = s_ps_patched = s_ps_other = s_ps_resync = 0; s_ps_max_ms = 0; s_ps_t0 = now;
+}
+/* The walker has left the park it was waiting on (s_park_off). `patched`: it
+ * left from the park's own address, i.e. the word there is no longer the
+ * self-JUMP (a JUMP elsewhere, or commands written over it). Say so when
+ * the patch came later than the old fixed 50 ms grace, i.e. when that grace
+ * would have resynced past it. */
+static void gcm_park_left(int patched)
+{
+    extern unsigned long long ps3_ms_now(void);
+    if (patched && s_park_since) {
+        const unsigned long long waited = ps3_ms_now() - s_park_since;
+        static unsigned n;
+        if (waited >= 50 && n++ < 64)
+            fprintf(stderr, "[cellGcmSys] park at 0x%08X patched after %llu ms\n", s_park_off, waited);
+        if (waited > s_ps_max_ms) s_ps_max_ms = waited;
+    }
+    if (patched) s_ps_patched++; else s_ps_other++;
+    gcm_park_stats();
+    s_park_off = 0; s_park_since = 0;
+}
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -857,6 +1170,37 @@ static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
     return off;
 }
 
+/* A guest-memory row copy with the same lock-line bookkeeping as vm_write32
+ * (ppu_loader.cpp VM_WRITE_COH), per 128-byte line instead of per pixel: an
+ * SPU holding a reservation on a line the row overwrites loses it and gets
+ * its lost-reservation event. The two byte swaps a vm_read32/vm_write32 pair
+ * does cancel, so the bytes move verbatim. */
+static void gcm_row_copy(u32 d, u32 s, u32 n)
+{
+    extern u8* vm_base;
+    const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
+    u64 mask = 0; int locked = 0;
+    for (u32 a = l0; a <= l1; a += 128)
+        if (spu_coh_is_reserved(a)) {
+            mask = spu_lockline_mask_range(d, n); spu_lockline_lock_mask(mask); locked = 1; break; }
+    memmove(vm_base + d, vm_base + s, n);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    for (u32 a = l0; a <= l1; a += 128)
+        if (spu_coh_is_reserved(a)) {
+            if (!locked) { mask = spu_lockline_mask_range(d, n); spu_lockline_lock_mask(mask); locked = 1; }
+            spu_coh_notify_write_from_ppu(a);
+        }
+    if (locked) spu_lockline_unlock_mask(mask);
+}
+
+/* IMAGE_IN_POINT is 12.4 fixed point per axis, and DS_DX / DT_DY step the
+ * source with 20 fractional bits (1.0 = 0x100000), so the origin in the
+ * steps' scale is origin << 16: a one-texel origin (0x10) is 0x100000. It was
+ * `<< 8`, 256 times too small, which read a one-texel origin as texel 0 (as
+ * sp00nznet/ps3recomp#358). An origin below one texel (0x0-0xF, the usual
+ * corner or half-texel centre) truncates to texel 0 either way. */
+static inline u64 nv3089_origin(u32 p) { return (u64)p << 16; }
+
 static void nv3089_blit(void)
 {
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
@@ -864,6 +1208,15 @@ static void nv3089_blit(void)
     u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
     u32 dst_pitch = s_gcm2d.pitch >> 16;
     if (!out_w || !out_h || !in_pitch || !dst_pitch) return;
+    /* The source may be a target the register-file engine drew, which exists
+     * only on the GPU until it is written back: bring guest memory up to date
+     * before the copies below read it. */
+    { static int eng = -1;
+      if (eng < 0) eng = rsx_draw_engine_enabled();
+      if (eng) rsx_draw_engine_write_back_to(s_nv3089.src_dma != 0xFEED0001u, s_nv3089.in_off, in_pitch,
+                                             s_gcm2d.dst_dma != 0xFEED0001u,
+                                             s_gcm2d.dst_offset + (s_nv3089.out_pt >> 16) * dst_pitch
+                                                                + (s_nv3089.out_pt & 0xFFFF) * 4u); }
     /* NV3089_GATE=<file>: log every blit's geometry while <file> exists, so a
      * capture covers the scene of interest instead of the first N since boot. */
     { static const char* gate = (const char*)-1; static unsigned poll; static int open_gate;
@@ -938,10 +1291,10 @@ static void nv3089_blit(void)
           const u8* sbase = vm_base + src2;
           u8* dbase = vm_base + dst2;
           for (u32 y = 0; y < out_h; y++) {
-              u64 sv = ((u64)v0b << 8) + (u64)y * s_nv3089.dt_dy;
+              u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
               const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
               for (u32 x = 0; x < out_w; x++) {
-                  u64 su = ((u64)u0b << 8) + (u64)x * s_nv3089.ds_dx;
+                  u64 su = nv3089_origin(u0b) + (u64)x * s_nv3089.ds_dx;
                   memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
                          srow + (u32)(su >> 20) * 4, 4);
               }
@@ -975,7 +1328,7 @@ static void nv3089_blit(void)
                  cellGcmResolveLocated(_dl, s_gcm2d.dst_offset), dst_pitch, _dl?"LOCAL":"MAIN",
                  out_x, out_y, 10); }
         static int _w = 0;
-        if (__atomic_fetch_add(&_w, 1, __ATOMIC_RELAXED) < 4) printf("[NV3089] unsupported colour format 0x%X, blit skipped\n", f);
+        if (PS3_LOG_FIRST(_w, 4)) printf("[NV3089] unsupported colour format 0x%X, blit skipped\n", f);
         return;
     }
     int src_local = (s_nv3089.src_dma != 0xFEED0001u);
@@ -1000,15 +1353,43 @@ static void nv3089_blit(void)
     u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
+    /* NV3089_ROWCOPY (default 1): an unscaled blit goes a row at a time. The
+     * per-pixel loop below paid a vm_read32 and a vm_write32 per pixel -- OOB
+     * and null-store checks, the store watch, the reservation lookup and two
+     * byte swaps that cancel -- and inFAMOUS 2 copies its 1280x720 G-buffer
+     * surfaces to XDR this way every frame for the SPU lighting: a quarter of
+     * the RSX thread's time. NV3089_ROWCOPY=0 keeps the per-pixel copy (it is
+     * what the PPU_WWATCH / PPU_WVAL store diagnostics see). */
+    { static int rc = -1;
+      if (rc < 0) { const char* e = getenv("NV3089_ROWCOPY"); rc = e ? atoi(e) : 1; }
+      if (rc && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
+          /* the integer source start the per-pixel loop derives for x = y = 0 */
+          const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
+          u32 xa = 0, xb = out_w;                       /* destination x range after the clip */
+          if (out_x < cx0) xa = cx0 - out_x;
+          if (out_x + xb > cx1) xb = cx1 > out_x ? cx1 - out_x : 0;
+          if (xa < xb) {
+              const u32 n = (xb - xa) * bpp;
+              for (u32 y = 0; y < out_h; y++) {
+                  const u32 dy = out_y + y;
+                  if (dy < cy0 || dy >= cy1) continue;
+                  const u64 sa = (u64)src + (u64)(sy0 + y) * in_pitch + (u64)(sx0 + xa) * bpp;
+                  const u64 da = (u64)dst + (u64)dy * dst_pitch + (u64)(out_x + xa) * bpp;
+                  if (sa + n > 0x100000000ull || da + n > 0x100000000ull) continue;
+                  gcm_row_copy((u32)da, (u32)sa, n);
+              }
+          }
+          goto blit_done;
+      } }
     for (u32 y = 0; y < out_h; y++) {
         u32 dy = out_y + y;
         if (dy < cy0 || dy >= cy1) continue;
-        u64 sv = ((u64)v0 << 8) + (u64)y * s_nv3089.dt_dy;         /* 20.12 */
+        u64 sv = nv3089_origin(v0) + (u64)y * s_nv3089.dt_dy;   /* 12.20 */
         u32 sy = (u32)(sv >> 20);
         for (u32 x = 0; x < out_w; x++) {
             u32 dx = out_x + x;
             if (dx < cx0 || dx >= cx1) continue;
-            u64 su = ((u64)u0 << 8) + (u64)x * s_nv3089.ds_dx;
+            u64 su = nv3089_origin(u0) + (u64)x * s_nv3089.ds_dx;
             u32 sx = (u32)(su >> 20);
             u32 s = src + sy * in_pitch + sx * bpp;
             u32 d = dst + dy * dst_pitch + dx * bpp;
@@ -1017,6 +1398,7 @@ static void nv3089_blit(void)
             else               vm_write8(d, vm_read8(s));
         }
     }
+blit_done:
     { static int _n = 0; static int cap = -1;
       if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
       if (cap && _n < cap) { _n++;
@@ -1068,7 +1450,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
          * NV308A, so seeing it identifies the object bound here. */
         if (method == 0x0300) { s_nv309e.fmt = data; s_nv309e.active = 1;
                                 s_nv309e.subch = (int)subch;
-            { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 4)
+            { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
                 printf("[NV309E] format=0x%08X (log2 %ux%u fmt=0x%X)%c", data,
                        1u << ((data >> 16) & 0xFF), 1u << ((data >> 24) & 0xFF),
                        data & 0xFFFF, 10); }
@@ -1091,7 +1473,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
             int local = (s_gcm2d.dst_dma != 0xFEED0001u);
             u32 base = cellGcmResolveLocated(local, s_gcm2d.dst_offset);
             { static int _it = 0;
-              if (__atomic_fetch_add(&_it, 1, __ATOMIC_RELAXED) < 6)
+              if (PS3_LOG_FIRST(_it, 6))
                   printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
@@ -1153,6 +1535,7 @@ int cellGcm_take_flip_pending_synced(void)
     u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
     if (get != put) return 0;   /* frame not fully drained yet */
     s_flip_pending = 0;
+    s_flips_shown++;
     return 1;
 }
 
@@ -1181,7 +1564,7 @@ static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consu
 static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
 {
     static int n = 0;
-    if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
+    if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[cellGcmSys] FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
                 "-- not taken, drain stops here\n", kind, target, word);
 }
@@ -1294,7 +1677,7 @@ static u32 gcm_spu_block_for_put(u32 put)
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
     static int n = 0;
-    if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
+    if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
                 why, *getoff, put);
     /* If an SPU DMA'd a pushbuffer that ends just short of `put`, that is the
@@ -1305,7 +1688,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
      * by the backend as prim=0. */
     u32 land = gcm_spu_block_for_put(put);
     if (land == 0xFFFFFFFFu) land = put;
-    else { static int b = 0; if (__atomic_fetch_add(&b, 1, __ATOMIC_RELAXED) < 8)
+    else { static int b = 0; if (PS3_LOG_FIRST(b, 8))
         fprintf(stderr, "[cellGcmSys] resync landing on SPU pushbuffer "
                 "0x%08X (put 0x%08X) instead of skipping to put\n", land, put); }
 
@@ -1323,7 +1706,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             gcm_ref_push_at(vm_read32(dea), io);
             rescued++;
         }
-        if (rescued) { static int m = 0; if (__atomic_fetch_add(&m, 1, __ATOMIC_RELAXED) < 8)
+        if (rescued) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
             fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
                     " 0x%08X..0x%08X\n", rescued, from, land); }
     }
@@ -1332,8 +1715,12 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 
 static void gcm_fifo_dump_around(u32 getoff)
 {
+    /* Only ever called on a recovery (bad branch, stuck get), and capped, so
+     * it no longer hides behind GCM_RECDBG: the words the walker stopped on
+     * are the one thing a run that wedged once in three can still tell us,
+     * and GCM_RECDBG is far too loud to leave on for a 15-minute run. */
     static int d = 0;
-    if (!getenv("GCM_RECDBG") || d++ >= 3) return;
+    if (d++ >= 3) return;
     for (u32 t = 0; t < GCM_TRACE_N; t++) {
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
@@ -1359,7 +1746,7 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
         s_ref_qhead++;
         static int _o = 0;
-        if (__atomic_fetch_add(&_o, 1, __ATOMIC_RELAXED) < 4) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+        if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
     s_ref_qtail = t + 1;
@@ -1469,17 +1856,116 @@ void cellGcm_ref_on_poll(void)
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
     if (dry && s_gcm_kick_ev)
         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
+    /* A guest spinning on a ref that has stopped moving for 2 s, with nothing
+     * queued: say once where the FIFO walker stands. */
+    if (dry) {
+        static u32 last_ref; static LONGLONG since; static int told, reports;
+        const u32 ref = vm_read32(GCM_CONTROL_GUEST_ADDR + 8);
+        if (ref != last_ref || !since) { last_ref = ref; since = now.QuadPart; told = 0; }
+        else if (!told && reports < 8 && now.QuadPart - since > 2 * s_freq.QuadPart) {
+            told = 1; reports++;   /* again once ref has moved: loading stalls come first */
+            const u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+            const u32 gea = gcm_io2ea(s_fifo_getoff);
+            fprintf(stderr, "[cellGcmSys] ref stuck at 0x%X for 2 s: get=0x%08X put=0x%08X word@get=0x%08X "
+                            "park_off=0x%08X sema_off=0x%X labels 134/135/136/137 = %X/%X/%X/%X\n",
+                    ref, s_fifo_getoff, put, gea ? vm_read32(gea) : 0u, s_park_off, s_sema_offset,
+                    vm_read32(GCM_LABEL_GUEST_BASE + 0x860), vm_read32(GCM_LABEL_GUEST_BASE + 0x870),
+                    vm_read32(GCM_LABEL_GUEST_BASE + 0x880), vm_read32(GCM_LABEL_GUEST_BASE + 0x890));
+            /* Is the walker stopped (and why), or still inside one drain? */
+            { const unsigned long long ms = ps3_ms_now(), in = s_drain_in_ms, end = s_drain_end_ms;
+              static unsigned last_count;
+              const unsigned cnt = s_drain_count;
+              fprintf(stderr, "[cellGcmSys]   drain: %s %llu ms; last stop \"%s\" %llu ms ago; %u drains since the last report\n",
+                      in ? "running for" : "idle,", in ? ms - in : 0ull, s_drain_why,
+                      end ? ms - end : 0ull, cnt - last_count);
+              last_count = cnt; }
+            /* The flip side: a title that writes its next put from the flip
+             * handler (inFAMOUS 2) waits here when a completion never reaches
+             * it. Status, request/tick sequence, undelivered handler bits. */
+#ifdef _WIN32
+            { const unsigned pend = (unsigned)s_gcm_pending;
+#else
+            { const unsigned pend = (unsigned)atomic_load(&s_gcm_pending);
+#endif
+              fprintf(stderr, "[cellGcmSys]   flip: status=%u req_seq=%u tick_seq=%u requests=%u pending=0x%X\n",
+                      s_flip_status, s_flip_req_seq, s_flip_tick_seq, s_flip_request_count, pend); }
+            /* PS3_HANG_PEEK=<ea>:<len>[,...] (hex): guest words to print with
+             * the report -- a title's own sync state, read at the stall. */
+            { const char* pk = getenv("PS3_HANG_PEEK");
+              if (pk && *pk) { char buf[512]; strncpy(buf, pk, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+                  for (char* tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+                      unsigned ea = 0, len = 4;
+                      if (sscanf(tok, "%x:%x", &ea, &len) < 1) continue;
+                      if (len > 0x100) len = 0x100;
+                      fprintf(stderr, "[cellGcmSys]   peek 0x%08X:", ea);
+                      for (unsigned o = 0; o < len; o += 4) fprintf(stderr, " %08X", vm_read32(ea + o));
+                      fputc('\n', stderr);
+                  } } }
+            gcm_fifo_dump_around(s_fifo_getoff);
+            /* PS3_HANG_DUMP=1 (the launcher's debug mode): where every guest
+             * thread is at that moment, not up to a minute later. */
+            { static int hd = -1;
+              if (hd < 0) { const char* e = getenv("PS3_HANG_DUMP"); hd = e && *e == '1'; }
+              if (hd) { extern void ps3_thread_dump_now(const char* why);
+                        ps3_thread_dump_now("the GPU has had nothing to do for 2 s"); } }
+#if !defined(_WIN32)
+            /* PS3_HANG_SAMPLE=<prefix>: also a 2 s `sample` of the host
+             * threads (RSX, SPU, PPU) to <prefix>.<ref>.txt. macOS only. */
+            { const char* hs = getenv("PS3_HANG_SAMPLE");
+              if (hs && *hs) { char cmd[1200];
+                  snprintf(cmd, sizeof cmd, "/usr/bin/sample %d 2 -file '%s.%X.txt' >/dev/null 2>&1 &",
+                           (int)getpid(), hs, ref);
+                  if (system(cmd) != 0) { /* best effort */ } } }
+#endif
+        }
+    }
 }
 
 void cellGcm_rsx_process_fifo(void)
 {
+    const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    s_drain_in_ms = ps3_ms_now();
+#if !defined(_WIN32)
+    /* GCM_FLIP_STATS: a drain of 250 ms or more says how much of it this
+     * thread was on the CPU -- work (shader builds, uploads) or a host that
+     * did not run it -- and how many command bytes it walked. */
+    struct timespec cpu0 = { 0, 0 };
+    const int long_dbg = gcm_flip_stats_on();
+    const unsigned long long bytes0 = s_walk_bytes;
+    if (long_dbg) clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
+#endif
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_rsx_process_fifo_unlocked();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+    s_drain_end_ms = ps3_ms_now();
+#if !defined(_WIN32)
+    if (long_dbg && s_drain_end_ms - s_drain_in_ms >= 250) {
+        struct timespec cpu1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1);
+        static unsigned n;
+        if (n++ < 100)
+            fprintf(stderr, "[gcm-flipstats] drain of %llu ms (%lld ms on the CPU), %llu command bytes, stopped: %s\n",
+                    s_drain_end_ms - s_drain_in_ms,
+                    (long long)((cpu1.tv_sec - cpu0.tv_sec) * 1000 + (cpu1.tv_nsec - cpu0.tv_nsec) / 1000000),
+                    s_walk_bytes - bytes0, s_drain_why);
+    }
+#endif
+    s_drain_in_ms = 0; s_drain_count++;
+    if (ft_t0) {
+        const uint64_t t1 = ps3_ft_now();
+        if (t1 - ft_t0 >= ps3_ft_min_ns())
+            ps3_ft_span(PS3_FT_DRAIN, 0, (uint32_t)s_sema_live, 0, ft_t0, t1);
+    }
 }
+
+/* Did the last drain stop on a blocking semaphore acquire (GCM_SEMA_ACQUIRE)?
+ * What unblocks it is an SPU's DMA write of the label, which kicks nothing, so
+ * a present thread that sleeps a fixed 4 ms between drains adds up to 4 ms to
+ * every such wait; it can poll faster while this holds. */
+int cellGcm_drain_sema_blocked(void) { return s_sema_live; }
 
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    s_sema_live = 0;
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
@@ -1608,7 +2094,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             static u32 last_bad; static int n;
             if (s_fifo_getoff != last_bad || n < 4) {
                 last_bad = s_fifo_getoff;
-                if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 16)
+                if (PS3_LOG_FIRST(n, 16))
                     fprintf(stderr, "[cellGcmSys] FIFO get=0x%08X has no IO "
                             "mapping -- resyncing to put=0x%08X\n",
                             s_fifo_getoff, put);
@@ -1626,6 +2112,24 @@ static void gcm_rsx_process_fifo_unlocked(void)
         s_tr_w[s_tr_i % GCM_TRACE_N] = w;
         s_tr_i++;
         u32 type = w >> 29;
+        /* Both JUMP forms (gcm_fifo_decode.h). GCM_FIFO_JUMP_NEW=0 decodes
+         * the old form only, as before; a new-form word is counted either way
+         * (GCM_FLIP_STATS). */
+        u32 jump_tgt = 0;
+        const int is_jump = gcm_fifo_jump_target(w, &jump_tgt, gcm_fifo_jump_new());
+        if (__builtin_expect(gcm_fifo_is_new_jump(w), 0)) gcm_note_new_jump(s_fifo_getoff, w);
+        /* The walker is reading something other than the park it waited on:
+         * it has left it, whether by the patched word (a JUMP elsewhere, or
+         * commands written over the park) or by any resync. Forget it here,
+         * not only when a patched JUMP is followed: a park left another way
+         * kept its start time, so the next stop at the same address (the
+         * game reuses its blocks) reported the whole interval as one wait
+         * ("patched after 120946 ms" in a run with no stall), and with the
+         * same `put` it inherited a grace that had already run out, so the
+         * jump-park resync could fire on a park that was seconds old. */
+        if (s_park_off && (s_fifo_getoff != s_park_off || !is_jump ||
+                           jump_tgt != s_park_off))
+            gcm_park_left(s_fifo_getoff == s_park_off);
 
         if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
             /* lv1 driver flip: statically-linked libgcm cellGcmSetFlip writes
@@ -1647,6 +2151,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
                   fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
                           flips, 10); }
+            if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
+                               ps3_ft_span(PS3_FT_FLIP_FIFO, 0, w & 7u, 0, t, t); }
+            const int unshown = s_flip_pending;   /* the flip before is still not on screen */
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
@@ -1665,17 +2172,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * "Command Buffer Overflow" forever. Past the threshold keep
              * draining -- the intermediate presents are frames we are too far
              * behind to show anyway. No-op for a title that is keeping up. */
-            if (put < s_fifo_getoff ||
-                put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
-                { why = "flip"; break; }
+            const int stop = put < s_fifo_getoff ||
+                             put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES;
+            if (gcm_flip_stats_on())
+                gcm_flip_stats_note(put, s_fifo_getoff, s_frame_bytes, !stop, unshown);
+            s_frame_bytes = 0;
+            if (stop) { why = "flip"; break; }
             continue;
         }
 
-        if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+        if (is_jump) {                         /* JUMP: 0x20000000 | offset, or offset | 1 */
             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
-                               s_fifo_getoff, w & 0x1FFFFFFCu, put); }
-            { u32 tgt = w & 0x1FFFFFFCu;
+                               s_fifo_getoff, jump_tgt, put); }
+            { u32 tgt = jump_tgt;
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
               /* A JUMP to its own address is the "park the RSX here" idiom:
                * the title leaves it at the write head so the GPU stops if it
@@ -1690,8 +2200,34 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * park standing -- it only patches a park when it reuses that
                    * block. Waiting for a patch that will not come freezes the
                    * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                  /* ...but not at once. A title that links its segments by
+                   * patching the park moves `put` first and patches second:
+                   * inFAMOUS 2 ends each of its main-memory command blocks in
+                   * a park, writes the next commands at the ring start, sets
+                   * put, and only then rewrites the park as a JUMP to them. A
+                   * drain that lands between the two saw put elsewhere, went
+                   * straight to it, and dropped everything from the ring
+                   * start to put -- the frame's fence with it, so the title
+                   * waited on that label for the rest of the run. Give the
+                   * patch time to arrive, and resync only for a park that
+                   * has stood with the same put for longer than any title
+                   * takes between the two stores. */
+                  if (put != s_fifo_getoff) {
+                      extern unsigned long long ps3_ms_now(void);
+                      static u32 park_put;
+                      static gcm_run_clock grace;               /* restarts when put moves */
+                      const unsigned long long now = ps3_ms_now();
+                      if (s_park_off != s_fifo_getoff || park_put != put) {
+                          if (s_park_off != s_fifo_getoff) { s_park_since = now; s_ps_parks++; }
+                          s_park_off = s_fifo_getoff; park_put = put; gcm_run_clock_start(&grace, now);
+                      } else if (gcm_run_clock_ms(&grace, now) >= GCM_PARK_GRACE_MS) {
+                          s_park_off = 0; s_park_since = 0; s_ps_resync++;
+                          gcm_fifo_dump_around(s_fifo_getoff);
+                          gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
+                      }
+                  }
+                  why = "parked";
+                  s_park_pass = 1;
                   break;
               }
               s_fifo_getoff = tgt; }
@@ -1754,8 +2290,21 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0; if (getenv("GCM_RECDBG") && __atomic_fetch_add(&sn, 1, __ATOMIC_RELAXED) < 12)
-                        fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
+                    /* GCM_SEMA_TRACE=<n>: the first n NV406E semaphore methods with
+                     * the label's current value, to read a title's RSX<->SPU/PPU
+                     * sync protocol (GCM_RECDBG alone shows 12). */
+                    { static int sn = 0, cap = -1;
+                      if (cap < 0) { const char* e = getenv("GCM_SEMA_TRACE"); cap = e ? atoi(e) : (getenv("GCM_RECDBG") ? 12 : 0); }
+                      if (cap && PS3_LOG_FIRST(sn, cap))
+                        fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X label=0x%08X\n", m, v,
+                                m == 0x64u ? v : s_sema_offset,
+                                vm_read32(GCM_LABEL_GUEST_BASE + ((m == 0x64u ? v : s_sema_offset) & 0xFFFFu))); }
+                    if (m == 0x68u && vm_read32(la) == v) rsx_snap_event(1, s_sema_offset);
+                    /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
+                    if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
+                        ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
+                        s_ft_sema_t0 = 0;
+                    }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) vm_write32(la, v);
                     else if (m == 0x68u && vm_read32(la) != v) {
@@ -1763,12 +2312,39 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * the hardware does. Off by default: a title whose label nothing
              * ever writes would wedge the drain permanently, and RELEASE on
              * its own is the half that unblocks a waiting guest. */
-            static int blk = -1;
-            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
-            if (blk) { sem_blocked = 1; break; }
+            static int blk = -1; static unsigned blk_ms;
+            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0;
+                           const char* t = getenv("GCM_SEMA_ACQUIRE_MS"); blk_ms = t ? (unsigned)atoi(t) : 0; }
+            if (blk) {
+                /* GCM_SEMA_ACQUIRE_MS=<ms>: a bounded wait. The hardware waits
+                 * for ever; an emulated producer that never comes (a boot-time
+                 * label nobody services yet) would wedge the drain, so after
+                 * <ms> on the same acquire it is consumed and said so. inFAMOUS 2
+                 * acquires the label its SPU lighting writes each frame: waiting
+                 * here is what orders the RSX's sampling after that write. */
+                static u32 b_off, b_val; static unsigned long long b_t0;
+                static gcm_run_clock b_run;   /* time the wait ran (GCM_STALL_GAP_MS) */
+                extern unsigned long long ps3_ms_now(void);
+                const unsigned long long now = ps3_ms_now();
+                if (!b_t0 || b_off != s_sema_offset || b_val != v) { b_off = s_sema_offset; b_val = v; b_t0 = now;
+                                                                      gcm_run_clock_start(&b_run, now); }
+                if (!blk_ms || gcm_run_clock_ms(&b_run, now) < blk_ms) {
+                    if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+                    sem_blocked = 1; break;
+                }
+                if (s_ft_sema_t0) {
+                    ps3_ft_span(PS3_FT_SEMA_GAVEUP, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
+                    s_ft_sema_t0 = 0;
+                }
+                { static int tn; if (PS3_LOG_FIRST(tn, 12))
+                    fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
+                            s_sema_offset, v, blk_ms, vm_read32(la)); }
+                b_t0 = 0;
+            }
         }
                 }
-                if (sem_blocked) break;
+                if (sem_blocked) { s_sema_blocked_pass = 1; s_sema_live = 1; break; }
+                s_frame_bytes += 4 + count * 4; s_walk_bytes += 4 + count * 4;
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
@@ -1840,7 +2416,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   { static u32 vw = 1;
                     if (vw == 1) { const char* e = getenv("GCM_VAL_WATCH"); vw = e ? (u32)strtoul(e, 0, 16) : 0; }
                     if (vw && dw == vw) {
-                        static int vn; if (__atomic_fetch_add(&vn, 1, __ATOMIC_RELAXED) < 64)
+                        static int vn; if (PS3_LOG_FIRST(vn, 64))
                             printf("[valwatch] subch=%u method=0x%04X = 0x%08X get=0x%X%c", subch, m, vw, s_fifo_getoff, 10);
                     } }
                   /* ...and surface offsets (colour 0x210/0x218/0x288/0x28C, zeta 0x214) and texture 1 offset */
@@ -1895,7 +2471,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(dw & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    rsx_process_method(&s_state, m, dw);
+                    /* GCM_LEAN_STATE (live): with the draw engine fed and no
+                     * vtable backend registered, rsx_process_method's rsx_state
+                     * is read by nobody -- only its label/semaphore writes and
+                     * the reference fence leave it -- yet it decoded every word
+                     * again (13% of the RSX thread on the New Marais walk).
+                     * Those methods still go through; the rest is skipped.
+                     * 0 = every method, as before. */
+                    if (!gcm_lean_state() || m == 0x0050u || (m >= 0x1D6Cu && m <= 0x1D74u))
+                        rsx_process_method(&s_state, m, dw);
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
@@ -1906,7 +2490,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * tells the title every queried object is occluded. */
                     if (m == 0x1800) {
                         const u32 v = dw, idx = (v & 0xFFFFFFu) / 16u;
-                        { static int rn = 0; if (__atomic_fetch_add(&rn, 1, __ATOMIC_RELAXED) < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
+                        { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
                         if (idx < CELL_GCM_MAX_REPORT_COUNT) {
                             s_report_data[idx].timestamp = get_timestamp_ns();
                             s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
@@ -1916,10 +2500,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     gcm_2d_method(subch, m, dw);
                 }
             }
+            s_frame_bytes += 4 + count * 4; s_walk_bytes += 4 + count * 4;
             s_fifo_getoff += 4 + count * 4;
             continue;
         }
-        { static int _uw = 0; if (__atomic_fetch_add(&_uw, 1, __ATOMIC_RELAXED) < 16 && getenv("RTT_DUMP"))
+        { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
@@ -1955,7 +2540,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
       if (passes && budget <= 0 && s_fifo_getoff != put) {
           if (++burned >= passes) {
               static int n = 0;
-              if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
+              if (PS3_LOG_FIRST(n, 8))
                   fprintf(stderr, "[cellGcmSys] FIFO walker circling (get=0x%08X, "
                           "put=0x%08X, full budget burned x%d) -- following the "
                           "write head\n", s_fifo_getoff, put, burned);
@@ -1964,8 +2549,22 @@ static void gcm_rsx_process_fifo_unlocked(void)
           }
       } else burned = 0; }
 
+    /* A drain parked on a semaphore acquire (GCM_SEMA_ACQUIRE) holds `get`
+     * on purpose: that is the wait, not a stuck walker. The acquire's own
+     * bound (GCM_SEMA_ACQUIRE_MS) is what ends it.
+     *
+     * So does a self-JUMP park, and its grace (GCM_PARK_GRACE_MS) is what ends
+     * that. This counter counts drain passes, not time: a park stops every
+     * pass at the same `get`, so it fired a few milliseconds in -- before the
+     * title had patched the park into a JUMP to the commands it had just put
+     * at the ring start -- and the resync dropped them. inFAMOUS 2 stopped
+     * presenting for good that way ~40 s into the daytime pier ("stuck-get"
+     * at a 0x2055C940 self-jump with no "jump-park" before it), and in about
+     * one New Marais run in five. */
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
+      if (s_sema_blocked_pass || s_park_pass) {
+          stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
+      else if (s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
@@ -1974,6 +2573,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
+    s_drain_why = s_sema_live ? "sema-acquire" : why;
+    gcm_flip_stats_tick();
     if (getenv("GCM_DRAINDBG")) {
         static int n2 = 0;
         if (n2++ % 60 == 0)
@@ -2057,7 +2658,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff = io_begin;                          /* get */
                 put = io_begin;
                 static int n = 0;
-                if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
+                if (PS3_LOG_FIRST(n, 8))
                     fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
                             "(ctx=0x%08X begin=0x%08X end=0x%08X) -- its callback "
                             "does not%c", ctx, begin, end, 10);
@@ -2139,7 +2740,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
     if (spins >= 2000) {
         static int warned = 0;
-        if (__atomic_fetch_add(&warned, 1, __ATOMIC_RELAXED) < 4)
+        if (PS3_LOG_FIRST(warned, 4))
             printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X)\n",
                    g_gcm_fifo_drained_ea, begin);
     }
@@ -2247,7 +2848,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           }
       } }
 
-    { static int _n=0; if (getenv("FLIP_DBG") && __atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 20)
+    { static int _n=0; if (getenv("FLIP_DBG") && PS3_LOG_FIRST(_n, 20))
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
@@ -2260,14 +2861,27 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
      * the drain does this half when it reaches it (see the 0xFEAD case). */
     if (!in_fifo) {
+        s_flip_import++;
+        if (s_flip_pending) s_flip_import_merged++;
+        if (gcm_flip_stats_on()) {
+            const u32 b = __atomic_exchange_n(&s_frame_bytes, 0u, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&s_imp_bytes_sum, (unsigned long long)b, __ATOMIC_RELAXED);
+            u32 m = __atomic_load_n(&s_imp_bytes_max, __ATOMIC_RELAXED);
+            while (b > m && !__atomic_compare_exchange_n(&s_imp_bytes_max, &m, b, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+        }
         s_current_display_buffer_id = bufferId;
         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
         s_flip_request_count++;
     }
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
+    FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+    s_flip_req_seq++;
+    FLIP_UNLOCK();
     s_last_flip_time = get_timestamp_ns();
+    if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
+                       ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
 
     /* Invoke via OPD resolution, not a raw call into guest code.
      *
@@ -2310,9 +2924,19 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * while the guest may be between advancing current and flushing: put
      * then lands on begin, the guest's closing fence is never executed, and
      * it spins on `ref` for good. Safe when the walker has left the head of
-     * the ring well behind, which is the region the guest writes next. */
+     * the ring well behind, which is the region the guest writes next.
+     *
+     * Only for a ring the runtime owns, i.e. one whose buffer-full callback is
+     * still the runtime's (cellGcmSetupContext installs it). A title with its
+     * own callback manages its own buffers, and its context need not be a ring
+     * at all: Killzone 3 flips on a 0x30000-byte draw context whose `end`
+     * moves down as it allocates from the top, so it always looks nearly full.
+     * Rewinding it to `begin` in mid-frame cut the frame short, dropping the
+     * fence release in its tail, and the title then waited for it forever. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
-    if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+    const u32 cb_opd = vm_read32(ctx + 0xC);
+    const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+    if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
@@ -2571,7 +3195,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
     vm_write32(off_ea, 0);
     { static int _d = -1; if (_d < 0) _d = getenv("A2O_FAILDBG") ? 1 : 0;
-      if (_d) { static int _n = 0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 12)
+      if (_d) { static int _n = 0; if (PS3_LOG_FIRST(_n, 12))
           fprintf(stderr, "[A2O] FAILED ea=0x%08X (not in local or IO space)%c",
                   address, 10); } }
     return CELL_GCM_ERROR_FAILURE;
@@ -2818,7 +3442,7 @@ CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
  * walker fills it). Unregistered, every call returned a faked 0. */
 u32 cellGcmGetReport(u32 type, u32 index)
 {
-    { static int n = 0;
+    { static unsigned n = 0; /* unsigned: a signed counter wraps negative and then logs every call (as sp00nznet/ps3recomp#364) */
       if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8 || (n % 2000) == 0) printf("[cellGcmSys] GetReport(type=%u, index=%u) -> %u%c", type, index,
                           index < CELL_GCM_MAX_REPORT_COUNT ? s_report_data[index].value : 0u, 10); }
     if (index >= CELL_GCM_MAX_REPORT_COUNT) return 0;
@@ -2960,7 +3584,7 @@ u32 cellGcmGetTiledPitchSize(u32 size)
             if (s_valid_pitches[i] >= size) { r = s_valid_pitches[i]; break; }
         }
     }
-    { static int _n=0; if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED)<4) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
+    { static int _n=0; if (PS3_LOG_FIRST(_n, 4)) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
     return r;
 }
 

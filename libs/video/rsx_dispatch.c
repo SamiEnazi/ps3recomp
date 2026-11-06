@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include <stdio.h>
 /*
  * ps3recomp - NV4097 method dispatcher (Track B / LAYER 2)
@@ -173,6 +174,12 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
 
+    /* NV40 reset ZMIN_MAX_CONTROL (0x1D78) is 1: cull (clip) at the near and
+     * far planes on, depth clamp off, the GCM default of
+     * cellGcmSetZMinMaxControl(CELL_GCM_TRUE, CELL_GCM_FALSE, CELL_GCM_FALSE).
+     * Seeded so a raw 0 means a game that turned clipping off. */
+    rsx->regs[0x1D78 >> 2] = 0x00000001u;
+
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
@@ -244,6 +251,7 @@ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u3
     if (count > RSX_DSP_VP_WORDS)
         count = RSX_DSP_VP_WORDS;
     memcpy(rsx->vp, words, count * sizeof(u32));
+    rsx->vp_gen++;
 }
 
 void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -392,7 +400,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * constants. Drop it, and say what it was. */
     if (idx >= RSX_DSP_NUM_REGS) {
         static int n = 0;
-        if (n++ < 8)
+        if (PS3_LOG_FIRST(n, 8))
             fprintf(stderr, "[rsx-dispatch] method 0x%05X (arg 0x%08X) out of range -- dropped\n",
                     method, arg);
         return;
@@ -423,8 +431,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3;
         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
         const u32 pos = *load * 4 + lane;
-        if (pos < RSX_DSP_VP_WORDS)
+        if (pos < RSX_DSP_VP_WORDS && rsx->vp[pos] != arg) {
             rsx->vp[pos] = arg;
+            rsx->vp_gen++;
+        }
         if (lane == 3)
             (*load)++;
         return;

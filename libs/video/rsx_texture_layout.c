@@ -25,6 +25,17 @@ u32 rsx_swizzle_offset(u32 x, u32 y, u32 log2w, u32 log2h)
     return off;
 }
 
+u32 rsx_swizzle_offset_3d(u32 x, u32 y, u32 z, u32 log2w, u32 log2h, u32 log2d)
+{
+    u32 off = 0, shift = 0;
+    while (log2w || log2h || log2d) {
+        if (log2w) { off |= (x & 1u) << shift; x >>= 1; shift++; log2w--; }
+        if (log2h) { off |= (y & 1u) << shift; y >>= 1; shift++; log2h--; }
+        if (log2d) { off |= (z & 1u) << shift; z >>= 1; shift++; log2d--; }
+    }
+    return off;
+}
+
 void rsx_texture_layout(u32 rsx_fmt, u32 w, u32 h, rsx_tex_layout* out)
 {
     rsx_texture_layout_pitched(rsx_fmt, w, h, 0, out);
@@ -319,10 +330,44 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
      * inFamous's fog/DOF pass reads its 256x256 B8 lookup through B and drew
      * the whole scene black. */
     static const u8 lanes_b8[4]   = {3, 0, 0, 0};
+    /* X16, X32_FLOAT and the DEPTH16/DEPTH24 formats are one real channel
+     * too, uploaded as R16/R32F, and the sampler presents it on every lane
+     * (RPCS3's {R,R,R,R} for X32_FLOAT and DEPTH*), so a crossbar may read it
+     * through any of A,R,G,B. inFAMOUS 2 binds its 1024x8 X16 lighting ramp
+     * with 0xAAEE -- R from B -- and reads .x: through the ARGB table that is
+     * the empty B component of an R16 resource, zero, and every light in the
+     * main menu was multiplied by it, leaving Cole a black silhouette. (RPCS3
+     * lists X16 as {R,ONE,R,ONE}; that title's crossbar only makes sense with
+     * the value reachable from B, which both readings give for R.) */
+    static const u8 lanes_x[4]    = {0, 0, 0, 0};
     const u32 base = rsx_fmt & 0x9Fu;
-    const u8* src2res = base == 0x8Bu ? lanes_g8b8 : base == 0x81u ? lanes_b8 : lanes_argb;
+    const int one_channel = base == 0x90u || base == 0x91u || base == 0x92u ||
+                            base == 0x93u || base == 0x94u || base == 0x9Cu;
+    const u8* src2res = base == 0x8Bu ? lanes_g8b8 : base == 0x81u ? lanes_b8
+                      : one_channel   ? lanes_x    : lanes_argb;
 
     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
+
+    /* Y16_X16 (and HILO8): two 16-bit channels whose crossbar is encoded in
+     * 16-bit blocks -- 0xE4 or 0x4E only -- and presented interleaved
+     * R-G-R-G, or R-R-R-G when CONTROL1's high word (the remap override,
+     * bit 16) is set (RPCS3 fragment_texture::decoded_remap, verified on
+     * hardware with Virtua Fighter 5 / Mass Effect 3). inFAMOUS 2's water
+     * reads its 64x64 wave map through .yw with the override set: through
+     * the plain ARGB table .w was the resource's empty alpha, 1.0, which
+     * tilted every wave normal by a full unit and lost the sky reflection. */
+    if (base == 0x95u || base == 0x98u || base == 0x99u) {
+        const int ovr = (control1 >> 16) & 0xFFFFu;
+        u32 lo = control1 & 0xFFu;
+        switch (lo) {
+        case 0xE4: lo = ovr ? 0x56u : 0x66u; break;
+        case 0x4E: lo = ovr ? 0xA9u : 0x99u; break;
+        case 0xEE: lo = 0xAAu; break;
+        case 0x44: lo = 0x55u; break;
+        default: break;
+        }
+        control1 = (control1 & ~0xFFu) | lo;
+    }
 
     /* i runs A, R, G, B -- the crossbar's field order, LSB first. */
     for (int i = 0; i < 4; i++) {
@@ -332,4 +377,55 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
                : (op == 1) ? (u8)RSX_REMAP_ONE
                            : src2res[s];
     }
+}
+
+/* Texture input gamma (upstream PR #305, ported). ADDRESS gamma flags name
+ * final RGBA lanes, after remapping. Signed input interpretation wins; its
+ * FILTER ARGB flags follow the source crossbar. */
+u8 rsx_texture_gamma_mask(u32 format, u32 control1, u32 filter, u32 address)
+{
+    switch (format & 0x9Fu) {
+    case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
+    case 0x86: case 0x87: case 0x88: case 0x8B: case 0x8D: case 0x8E: case 0x8F:
+    case 0x97: case 0x9D: case 0x9E: break;
+    default: return 0;
+    }
+    u8 gamma = (u8)((address >> 20) & 15u);
+    if (!gamma) return 0;
+    if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;
+    u8 remap[4]; rsx_texture_component_remap(control1, format, remap);
+    static const u8 rgba_lane[4] = {3, 0, 1, 2};
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 source = (control1 >> (2u * i)) & 3u;
+        if (remap[i] < RSX_REMAP_ZERO && ((filter >> (28u + source)) & 1u))
+            gamma &= (u8)~(1u << rgba_lane[i]);
+    }
+    return gamma;
+}
+
+u8 rsx_texture_expand_mask(u32 format, u32 control1, u32 filter, u32 address)
+{
+    /* RPCS3 rsx::get_format_features, RSX_FORMAT_FEATURE_BIASED_NORMALIZATION:
+     * the 8-bit colour formats, the depth formats, X16, Y16_X16 and HILO8.
+     * Floats and the 32-bit depth-as-colour reads have nothing to expand. */
+    switch (format & 0x9Fu) {
+    case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
+    case 0x86: case 0x87: case 0x88: case 0x8B: case 0x8D: case 0x8E: case 0x8F:
+    case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x98:
+    case 0x97: case 0x9D: case 0x9E: break;
+    default: return 0;
+    }
+    if (!((address >> 12) & 1u)) return 0;          /* UNSIGNED_REMAP_NORMAL */
+    if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;
+    u8 remap[4]; rsx_texture_component_remap(control1, format, remap);
+    static const u8 rgba_lane[4] = {3, 0, 1, 2};
+    u8 mask = 0;
+    for (u32 i = 0; i < 4; ++i) {
+        const u32 source = (control1 >> (2u * i)) & 3u;
+        if (remap[i] < RSX_REMAP_ZERO && !((filter >> (28u + source)) & 1u))
+            mask |= (u8)(1u << rgba_lane[i]);
+    }
+    /* Bit 4: 16-bit channels (X16, Y16_X16) re-centre on 32768/32767. */
+    if (mask && ((format & 0x9Fu) == 0x94u || (format & 0x9Fu) == 0x95u)) mask |= 0x10u;
+    return mask;
 }

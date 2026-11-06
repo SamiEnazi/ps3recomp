@@ -20,6 +20,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 
@@ -4396,7 +4397,7 @@ static ID3D12PipelineState* get_pso(
             const int np = rsx_fp_apply_unnorm_scale(
                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask);
             { static int n = 0;
-              if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 8)
+              if (PS3_LOG_FIRST(n, 8))
                   fprintf(stderr, "[unnorm] mask=0x%X cube=0x%X dim0=%ux%u"
                                   " patched=%d\n",
                           unnorm_mask, cube_mask, unnorm_dim[0][0],

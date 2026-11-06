@@ -3,10 +3,13 @@
  */
 
 #include "sys_timer.h"
+#include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
+#include <sched.h>   /* sched_yield: the PS3_USLEEP_SPIN_US spin */
+#include <stdatomic.h> /* PS3_TB_SCALE: the scaled clock's lock */
 #include <stdlib.h>
 
 /* ---------------------------------------------------------------------------
@@ -54,7 +57,46 @@ int lv2_deadline_passed(int64_t deadline)
  * polled. Overflow-safe split multiply (rem < qpf, so
  * rem * 79.8e6 < ~8e14 << 2^63).
  * -----------------------------------------------------------------------*/
+static uint64_t ppu_timebase_raw(void);
+
+/* PS3_TB_SCALE=<percent> (default 100): the guest timebase runs at that
+ * percentage of real time. A diagnostic for frame-rate dependence: a title
+ * that derives its frame delta from mftb (inFAMOUS 2 does) then steps its
+ * simulation with deltas as small as at percent/100 x the real frame rate,
+ * whatever the host manages, so 25 shows what 4x the fps would compute --
+ * slowed down in wall time. ps3_tb_scale_pct may also be changed while the
+ * game runs (a port's live toggle); the clock stays continuous and monotonic.
+ * At 100 the cost is one load and a compare. */
+volatile int ps3_tb_scale_pct = 100;
+
 uint64_t ppu_timebase_now(void)
+{
+    static int env_done;
+    if (!env_done) {
+        const char* e = getenv("PS3_TB_SCALE");
+        if (e && atoi(e) > 0) ps3_tb_scale_pct = atoi(e);
+        env_done = 1;
+    }
+    static int s_scaled;                 /* ever left real time: offsets in use */
+    const int pct = ps3_tb_scale_pct;
+    if (pct == 100 && !s_scaled) return ppu_timebase_raw();
+    static atomic_flag lk = ATOMIC_FLAG_INIT;
+    static uint64_t base_raw, base_out, last_out; static int cur_pct = 100;
+    while (atomic_flag_test_and_set_explicit(&lk, memory_order_acquire)) { }
+    const uint64_t raw = ppu_timebase_raw();
+    if (!s_scaled) { base_raw = raw; base_out = raw; s_scaled = 1; }
+    if (pct != cur_pct && pct > 0) {
+        base_out = base_out + (raw - base_raw) * (uint64_t)cur_pct / 100u;
+        base_raw = raw; cur_pct = pct;
+    }
+    uint64_t out = base_out + (raw - base_raw) * (uint64_t)cur_pct / 100u;
+    if (out < last_out) out = last_out;
+    last_out = out;
+    atomic_flag_clear_explicit(&lk, memory_order_release);
+    return out;
+}
+
+static uint64_t ppu_timebase_raw(void)
 {
 #ifdef _WIN32
     static LONGLONG t0 = 0;
@@ -108,7 +150,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     { extern unsigned long long ps3_qpc_us(void);
-      static int n=0; if (__atomic_fetch_add(&n, 1, __ATOMIC_RELAXED) < 60)
+      static int n=0; if (PS3_LOG_FIRST(n, 60))
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
     /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
@@ -166,6 +208,39 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             pt_win = now;
           } } } }
 
+    /* PS3_STALL_DUMP=<lr hex>:<seconds>:<dir>:<ea>:<len>[,<ea>:<len>...]: when a
+     * thread has been polling with usleep from that return address for that
+     * long without leaving it, write the guest ranges to <dir>/stall_<ea>.bin
+     * once -- the state a hang is waiting on, taken while it waits. */
+    { static int on = -1; static uint32_t want_lr; static double secs; static char dir[512], ranges[1024];
+      static int done; static __thread uint32_t t_lr; static __thread unsigned long long t_since;
+      if (on < 0) {
+          const char* e = getenv("PS3_STALL_DUMP"); on = 0;
+          if (e) { char* q; want_lr = (uint32_t)strtoul(e, &q, 16);
+                   if (*q == ':') { secs = strtod(q + 1, &q);
+                       if (*q == ':') { const char* d = q + 1; const char* c = strchr(d, ':');
+                           if (c) { snprintf(dir, sizeof dir, "%.*s", (int)(c - d), d);
+                                    snprintf(ranges, sizeof ranges, "%s", c + 1); on = 1; } } } }
+      }
+      if (on && !done && (uint32_t)ctx->lr == want_lr) {
+          extern unsigned long long ps3_qpc_us(void);
+          const unsigned long long now = ps3_qpc_us();
+          if (t_lr != want_lr) { t_lr = want_lr; t_since = now; }
+          else if ((double)(now - t_since) > secs * 1e6) {
+              done = 1;
+              char buf[1024]; snprintf(buf, sizeof buf, "%s", ranges);
+              for (char* tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+                  char* c = strchr(tok, ':'); if (!c) continue;
+                  const uint32_t ea = (uint32_t)strtoul(tok, 0, 16), len = (uint32_t)strtoul(c + 1, 0, 16);
+                  char path[1200]; snprintf(path, sizeof path, "%s/stall_%08x.bin", dir, ea);
+                  FILE* f = fopen(path, "wb");
+                  if (f) { fwrite(vm_base + ea, 1, len, f); fclose(f); }
+              }
+              fprintf(stderr, "[stall-dump] tid %u polled at lr 0x%08X for %.0f s -> %s\n",
+                      (unsigned)ctx->thread_id, want_lr, secs, dir);
+          }
+      } else if ((uint32_t)ctx->lr != want_lr) t_lr = 0; }
+
     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
      * address, dump the registers and the object they point at. A poll loop
      * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
@@ -175,7 +250,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
                       s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
         static int _n = 0;
-        if (__atomic_fetch_add(&_n, 1, __ATOMIC_RELAXED) < 8) {
+        if (PS3_LOG_FIRST(_n, 8)) {
           /* Dump the words at EVERY plausible object register, not just r29.
            * Which register holds the object is per-title -- r29 was right for
            * the title this was written for and is a spin COUNTER in Guitar
@@ -245,6 +320,27 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
+    /* PS3_USLEEP_SPIN_US=<n>: a sleep of n microseconds or less spins to a
+     * CLOCK_MONOTONIC deadline, yielding each turn, instead of nanosleep.
+     * nanosleep(3 us) on macOS returns after ~50 us at best and after a
+     * coalesced timer tick at worst, so a title that paces a producer/consumer
+     * loop with usleep(3)/usleep(10) -- inFAMOUS 2's SPU light-task kicker and
+     * its main thread's wait for those tasks -- runs that loop 20-100x slower
+     * than on the console, with the SPUs starved between kicks. The Windows
+     * branch above has always done this for sub-millisecond sleeps. Off by
+     * default: two spinning threads cost cores an SPU-bound title may need. */
+    { static long spin_us = -1;
+      if (spin_us < 0) { const char* e = getenv("PS3_USLEEP_SPIN_US"); spin_us = e ? atol(e) : 0; if (spin_us < 0) spin_us = 0; }
+      if (usec > 0 && usec <= (uint64_t)spin_us) {
+          struct timespec t0, now;
+          clock_gettime(CLOCK_MONOTONIC, &t0);
+          const uint64_t deadline = (uint64_t)t0.tv_sec * 1000000000ull + (uint64_t)t0.tv_nsec + usec * 1000ull;
+          do {
+              sched_yield();
+              clock_gettime(CLOCK_MONOTONIC, &now);
+          } while ((uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec < deadline);
+          return CELL_OK;
+      } }
     if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
