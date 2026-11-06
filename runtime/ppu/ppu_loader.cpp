@@ -3214,7 +3214,19 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
-extern "C" __attribute__((weak)) void ppu_gcm_pump(void);   /* cellGcmSys.c */
+/* cellGcmSys.c, when linked. ppu_hle.cpp already holds a weak reference, and
+ * under COFF a second weak declaration emits a second fallback definition, so
+ * every port failed to link. On Windows use the linker's own default instead.
+ * (Backported from sp00nznet/ps3recomp main @ae92407.) */
+#if defined(_MSC_VER)   /* MSVC and clang-cl: link.exe/lld-link */
+extern "C" void ppu_gcm_pump(void);
+extern "C" void ppu_gcm_pump_absent(void) {}
+#pragma comment(linker, "/alternatename:ppu_gcm_pump=ppu_gcm_pump_absent")
+#define PPU_GCM_PUMP_LINKED 1
+#else
+extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
+#define PPU_GCM_PUMP_LINKED (ppu_gcm_pump != nullptr)
+#endif
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
@@ -3239,7 +3251,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * writes it) and then spins in 0x13ACE8 on the ref register with
      * sys_timer_usleep only; it used to be rescued by another thread's HLE
      * call, and hung once that thread had nothing left to poll. */
-    if ((num == 141 || num == 142) && ppu_gcm_pump) ppu_gcm_pump();
+    if ((num == 141 || num == 142) && PPU_GCM_PUMP_LINKED) ppu_gcm_pump();
     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */
