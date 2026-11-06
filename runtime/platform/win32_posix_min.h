@@ -60,6 +60,7 @@ extern "C" {
 #define CLOCK_MONOTONIC 1
 #endif
 typedef int ps3w_clockid_t;
+typedef unsigned int useconds_t;   /* POSIX: an unsigned integer type */
 
 int  ps3w_clock_gettime(ps3w_clockid_t id, struct timespec* ts);
 int  ps3w_nanosleep(const struct timespec* req, struct timespec* rem);

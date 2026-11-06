@@ -21,9 +21,10 @@
 /* Hoisted: code below was added above the original include block, so these
  * have to be visible from here rather than 160 lines further down. */
 #include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
-#ifndef _WIN32
 #include <atomic>
-#include "../memory/guest_mem_atomic.h"
+#include "../memory/guest_mem_atomic.h"   /* gm_load8..64 and gm_store_bytes: plain __atomic
+                                            * builtins, needed on Windows too (the LLE paths use them) */
+#ifndef _WIN32
 #include <execinfo.h>
 #endif
 #include <stdint.h>
@@ -3379,7 +3380,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 if (bt == (const char*)-1) bt = getenv("PS3_TTY_BT");
                 if (bt && !done && strstr(cur, bt)) {
                     done = 1;
-                    void* fr[32]; int n = backtrace(fr, 32); backtrace_symbols_fd(fr, n, 2);
+                    void* fr[32];
+#ifdef _WIN32
+                { unsigned short n = RtlCaptureStackBackTrace(0, 32, fr, 0);
+                  for (unsigned short i = 0; i < n; i++) fprintf(stderr, "  #%u %p\n", (unsigned)i, fr[i]); }
+#else
+                { int n = backtrace(fr, 32); backtrace_symbols_fd(fr, n, 2); }
+#endif
                     ppu_dump_guest_stack(ctx, "tty");
                 } }
               if (run_len && strcmp(cur, last) == 0) {
