@@ -22,6 +22,31 @@
 #include <time.h>      /* struct timespec (UCRT, C11) */
 #include <io.h>        /* _access */
 #include <process.h>   /* _getpid */
+#include <direct.h>    /* _mkdir -- included BEFORE the mkdir(p, m) macro below, so
+                        * direct.h's own one-argument mkdir declaration is already
+                        * parsed (and include-guarded) when the macro exists */
+#include <string.h>    /* _stricmp, _strnicmp */
+#include <sys/types.h>
+#include <sys/stat.h>  /* _S_IFDIR, _S_IFREG, _S_IFMT */
+
+/* GNU C `typeof` (C23 keyword); clang-cl in its default C mode only knows the
+ * spelling __typeof__. */
+#if !defined(__cplusplus) && !defined(typeof)
+#define typeof __typeof__
+#endif
+
+/* POSIX two-argument mkdir; the mode has no meaning on NTFS. */
+#define mkdir(p, m)   _mkdir(p)
+/* Same text as runtime/syscalls/sys_fs.c's own Windows definition, so its
+ * later #define is an identical redefinition, not a conflicting one. */
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFDIR) != 0)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#define strcasecmp    _stricmp
+#define strncasecmp   _strnicmp
 
 #ifdef __cplusplus
 extern "C" {

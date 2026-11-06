@@ -331,8 +331,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # without -mfma has nothing to contract into, so every validated
         # result came from separate multiplies and adds; arm64 has FMA in
         # the base ISA and Clang fuses by default there. A PPC fmadd is
-        # spelt as one where the lifter means one.
-        -ffp-contract=off
+        # spelt as one where the lifter means one. clang-cl ignores the GCC
+        # spelling ("unknown argument"), so it gets the /clang: form.
+        $<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/clang:-ffp-contract=off,-ffp-contract=off>
         # Explicit, because the per-config defaults cannot be trusted: this
         # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
