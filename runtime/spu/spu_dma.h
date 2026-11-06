@@ -233,8 +233,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
       if (s_hi && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo) {
           static int _n = 0;
           if (PS3_LOG_FIRST(_n, 64))
-              fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
-                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+              fprintf(stderr, "[dma-range] spu=0x%X img=%d ovl=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                      (unsigned)spu->spu_id, spu->image_id, spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
           /* ...and every 5 s, the bytes PUT into / GOT from the range. */
           { static volatile long long s_put, s_get; static unsigned long long s_t0;
             extern unsigned long long ps3_ms_now(void);
