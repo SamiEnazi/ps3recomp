@@ -17,7 +17,10 @@
  *   draw engine backend    rsx_draw_backend: targets, clears, present and
  *                          readback (E1), pipelines and draws (E2), textures,
  *                          surface views and samplers (E3), depth snapshots
- *                          (E4) -- the stage names in the commit history
+ *                          (E4), colour snapshots and the GPU light, SSAO
+ *                          and depth-decode passes (E5, GLSL in
+ *                          vulkan/rsx_vk_passes_glsl.h) -- the stage names
+ *                          in the commit history
  *   public entry points    init picks the path, shutdown undoes everything
  *
  * Deliberately synchronous: every clear, draw and present is one one-shot
@@ -52,6 +55,7 @@
 #include "rsx_draw_engine.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
+#include "vulkan/rsx_vk_passes_glsl.h"
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
@@ -99,7 +103,7 @@
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
     X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
-    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) X(vkCmdCopyImage)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
@@ -1885,13 +1889,15 @@ typedef struct vk_eng_obj {
     vk_image im;                     /* a VIEW owns only im.view            */
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
+    u32      tag;                    /* E5: which cache made it, 0 = none   */
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
 
-/* Defined with the E2 pipeline state further down. */
+/* Defined with the E2 pipeline state and the E5 passes further down. */
 static void vk_eng_drop_framebuffers(void);
 static void vk_eng2_shutdown(void* user);
+static void vk_eng5_shutdown(void);
 
 static struct {
     u32 rt[RSX_BE_MAX_COLOR_TARGETS], nrt, depth;
@@ -2023,6 +2029,7 @@ static void vk_eng_release(void* user, u32 handle)
 
 static void vk_eng_shutdown(void* user)
 {
+    vk_eng5_shutdown();
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
 }
@@ -2923,6 +2930,549 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     vk_submit_and_wait();
 }
 
+/* ---- E5: the GPU light path -----------------------------------------------
+ * color_snapshot, light_pass, ssao_pass and depth_snapshot_rgba8: what the
+ * engine's PS3RECOMP_ENG_GPU_LIGHT and PS3RECOMP_ENG_GPU_SSAO paths run on
+ * (rsx_draw_engine.c; eng_gpu_light_on wants light_pass, color_snapshot and
+ * depth_snapshot), as the Metal backend has them (rsx_metal_backend.m,
+ * eng_color_snapshot .. eng_depth_snapshot_rgba8). The passes are Metal's
+ * helper fragment functions ported to GLSL (vulkan/rsx_vk_passes_glsl.h),
+ * compiled on first use with glslang like the guest programs, and drawn as
+ * full-screen triangles with their constants in a UBO. Metal records a pass
+ * into the stream and encodes it later; this backend records, submits and
+ * waits at once, as for every other operation -- the call order IS the stream
+ * order, and each pass's one UBO and descriptor set can be rewritten on every
+ * call (Metal needs a ring of 8 for frames in flight).
+ *
+ * What a pass hands the engine is a COLOR object: RGBA8, sampleable, and
+ * surface_view can cut a crossbar view of it, as Metal's PixelFormatView
+ * textures allow. The engine never releases the light and SSAO outputs or the
+ * colour copies (they persist and are refilled, as on Metal); it does release
+ * a depth decode it has replaced, which `tag` lets the cache notice. */
+enum { VK_PASS_LIGHT, VK_PASS_SSAO_HD, VK_PASS_SSAO_AO, VK_PASS_SSAO_BLUR_H, VK_PASS_SSAO_BLUR_V,
+       VK_PASS_SSAO_UP, VK_PASS_ZRGBA, VK_PASS_COUNT };
+#define VK_PASS_TEXTURES  3u                /* bindings 1..3: MSL texture(0..2) */
+#define VK_SSAO_UBO_BYTES 512u              /* the engine's bound (s_gs.consts) */
+#define VK_PASS_SPV_WORDS 16384u
+#define VK_CSNAP_MAX      64u
+#define VK_ZRGBA_MAX      32u
+#define VK_TAG_CSNAP      0xC5000000u       /* a colour copy                      */
+#define VK_TAG_PASS       0xA0000000u       /* a light or SSAO output             */
+#define VK_TAG_ZRGBA      0x5A000000u       /* | depth handle: a depth decode     */
+
+static struct {
+    int                   tried, ok;
+    VkShaderModule        vs, fs[VK_PASS_COUNT];
+    VkPipeline            pipe[VK_PASS_COUNT];
+    u8                    failed[VK_PASS_COUNT];
+    VkDescriptorSetLayout set_layout;
+    VkPipelineLayout      pipe_layout;
+    VkDescriptorPool      pool;
+    VkDescriptorSet       set[VK_PASS_COUNT];      /* one per pass */
+    VkRenderPass          rp_light, rp_rgba8, rp_r8, rp_r32f;
+    vk_buffer             light_ubo, ssao_ubo;
+    u32                   light_out[2], light_w, light_h;
+    VkFramebuffer         light_fb;
+    vk_image              ssao_hd, ssao_a, ssao_b; /* R32F half depth, two R8 AO planes */
+    u32                   ssao_out, ssao_dims[4];
+    VkFramebuffer         ssao_fb[4];              /* hd, a, b, out */
+    vk_image              zr32;                    /* the depth decode's R32F copy */
+    u32                   zr32_w, zr32_h;
+} s_lp;
+
+static struct { u32 src, dst; } s_csnap[VK_CSNAP_MAX];
+static u32 s_csnap_count;
+static struct { u32 depth, w, h, dst; } s_zrgba[VK_ZRGBA_MAX];
+static u32 s_zrgba_count;
+
+static VkShaderModule vk_pass_module(const char* glsl, int stage, const char* what)
+{
+    static u32 spv[VK_PASS_SPV_WORDS];
+    char log[2048];
+    u32 n = 0;
+    if (rsx_glsl_to_spirv(glsl, stage, spv, VK_PASS_SPV_WORDS, &n, log, sizeof log) || !n) {
+        VK_LOG("engine: %s shader failed: %s\n", what, log);
+        return VK_NULL_HANDLE;
+    }
+    VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                    .codeSize = (size_t)n * 4u, .pCode = spv };
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (pvkCreateShaderModule(s_vk.device, &ci, NULL, &m) != VK_SUCCESS) {
+        VK_LOG("engine: %s: vkCreateShaderModule failed\n", what);
+        return VK_NULL_HANDLE;
+    }
+    return m;
+}
+
+/* What every pass shares: the vertex stage, one set layout (binding 0 the
+ * constants, 1..3 the textures, all fragment-stage), its pipeline layout, a
+ * set per pass, and the two constant buffers. Tried once. */
+static int vk_pass_init(void)
+{
+    if (s_lp.tried) return s_lp.ok ? 0 : -1;
+    s_lp.tried = 1;
+    if (!rsx_hlsl_to_spirv_available()) {
+        VK_LOG("engine: built without glslang: no GPU light, SSAO or depth-decode passes\n");
+        return -1;
+    }
+    if (!(s_lp.vs = vk_pass_module(kVkPassVS, RSX_SHADER_STAGE_VERTEX, "full-screen pass vertex")))
+        return -1;
+    VkDescriptorSetLayoutBinding b[1 + VK_PASS_TEXTURES];
+    b[0] = (VkDescriptorSetLayoutBinding){ 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                           VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    for (u32 k = 0; k < VK_PASS_TEXTURES; k++)
+        b[1 + k] = (VkDescriptorSetLayoutBinding){ 1 + k, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                                   VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                            .bindingCount = 1 + VK_PASS_TEXTURES, .pBindings = b };
+    if (pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_lp.set_layout) != VK_SUCCESS) return -1;
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                        .setLayoutCount = 1, .pSetLayouts = &s_lp.set_layout };
+    if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_lp.pipe_layout) != VK_SUCCESS) return -1;
+    VkDescriptorPoolSize ps[2] = {
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_PASS_COUNT },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_PASS_COUNT * VK_PASS_TEXTURES } };
+    VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                       .maxSets = VK_PASS_COUNT, .poolSizeCount = 2, .pPoolSizes = ps };
+    if (pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_lp.pool) != VK_SUCCESS) return -1;
+    VkDescriptorSetLayout layouts[VK_PASS_COUNT];
+    for (u32 k = 0; k < VK_PASS_COUNT; k++) layouts[k] = s_lp.set_layout;
+    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                        .descriptorPool = s_lp.pool, .descriptorSetCount = VK_PASS_COUNT,
+                                        .pSetLayouts = layouts };
+    if (pvkAllocateDescriptorSets(s_vk.device, &dai, s_lp.set) != VK_SUCCESS) return -1;
+    /* Coherent, as every host-written buffer here (vk_invalidate's note). */
+    if (vk_create_host_buffer(&s_lp.light_ubo, sizeof(rsx_gpu_light_params),
+                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp.light_ubo.coherent ||
+        vk_create_host_buffer(&s_lp.ssao_ubo, VK_SSAO_UBO_BYTES,
+                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp.ssao_ubo.coherent)
+        return -1;
+    s_lp.ok = 1;
+    return 0;
+}
+
+/* `n` attachments of one format, no depth; DONT_CARE in (the triangle covers
+ * every pixel, as Metal's MTLLoadActionDontCare), STORE out, GENERAL as
+ * everywhere in this backend. */
+static VkRenderPass vk_pass_render_pass(VkRenderPass* rp, VkFormat fmt, u32 n)
+{
+    if (*rp || n < 1 || n > 2) return *rp;
+    VkAttachmentDescription att[2];
+    VkAttachmentReference   ref[2];
+    for (u32 i = 0; i < n; i++) {
+        att[i] = (VkAttachmentDescription){
+            .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL };
+        ref[i] = (VkAttachmentReference){ i, VK_IMAGE_LAYOUT_GENERAL };
+    }
+    VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                 .colorAttachmentCount = n, .pColorAttachments = ref };
+    VkRenderPassCreateInfo rci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+                                   .attachmentCount = n, .pAttachments = att,
+                                   .subpassCount = 1, .pSubpasses = &sub };
+    if (pvkCreateRenderPass(s_vk.device, &rci, NULL, rp) != VK_SUCCESS) *rp = VK_NULL_HANDLE;
+    return *rp;
+}
+
+/* The full-screen pipeline of pass `which`, built on first use; a failure is
+ * logged once and not retried (the engine then falls back, as with Metal's
+ * nil pipeline state). */
+static VkPipeline vk_pass_pipeline(u32 which, const char* glsl, const char* what, VkRenderPass rp, u32 n_att)
+{
+    if (s_lp.pipe[which] || s_lp.failed[which] || !rp) return s_lp.pipe[which];
+    s_lp.failed[which] = 1;
+    if (!s_lp.fs[which] &&
+        !(s_lp.fs[which] = vk_pass_module(glsl, RSX_SHADER_STAGE_FRAGMENT, what)))
+        return VK_NULL_HANDLE;
+    VkPipelineShaderStageCreateInfo st[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = s_lp.vs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = s_lp.fs[which], .pName = "main" } };
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo vps = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo ras = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineColorBlendAttachmentState cba[2] = { { .colorWriteMask = 0xFu }, { .colorWriteMask = 0xFu } };
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = n_att, .pAttachments = cba };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkGraphicsPipelineCreateInfo gci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+        .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
+        .pColorBlendState = &cb, .pDynamicState = &dy,
+        .layout = s_lp.pipe_layout, .renderPass = rp, .subpass = 0 };
+    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
+                                   &s_lp.pipe[which]) != VK_SUCCESS) {
+        VK_LOG("engine: %s pipeline failed\n", what);
+        s_lp.pipe[which] = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    s_lp.failed[which] = 0;
+    return s_lp.pipe[which];
+}
+
+static VkFramebuffer vk_pass_framebuffer(VkRenderPass rp, const VkImageView* views, u32 n, u32 w, u32 h)
+{
+    VkFramebufferCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                                    .renderPass = rp, .attachmentCount = n, .pAttachments = views,
+                                    .width = w, .height = h, .layers = 1 };
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    return pvkCreateFramebuffer(s_vk.device, &fci, NULL, &fb) == VK_SUCCESS ? fb : VK_NULL_HANDLE;
+}
+
+/* Binding 0 the whole of `ubo`, bindings 1..3 the views (the dummy where a
+ * pass has fewer). The sampler is the nearest one: every pass reads with
+ * texelFetch, which ignores it, as Metal's texture.read() has none. */
+static void vk_pass_write_set(VkDescriptorSet set, const vk_buffer* ubo,
+                              VkImageView t0, VkImageView t1, VkImageView t2)
+{
+    const VkImageView v[VK_PASS_TEXTURES] = { t0, t1, t2 };
+    VkDescriptorBufferInfo bi = { ubo->buf, 0, ubo->size };
+    VkDescriptorImageInfo ii[VK_PASS_TEXTURES];
+    VkWriteDescriptorSet w[1 + VK_PASS_TEXTURES];
+    w[0] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+                                   .dstBinding = 0, .descriptorCount = 1,
+                                   .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi };
+    for (u32 k = 0; k < VK_PASS_TEXTURES; k++) {
+        ii[k] = (VkDescriptorImageInfo){ s_vk.sampler, v[k] ? v[k] : s_vk.dummy.view, VK_IMAGE_LAYOUT_GENERAL };
+        w[1 + k] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+                                           .dstBinding = 1 + k, .descriptorCount = 1,
+                                           .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                           .pImageInfo = &ii[k] };
+    }
+    pvkUpdateDescriptorSets(s_vk.device, 1 + VK_PASS_TEXTURES, w, 0, NULL);
+}
+
+/* One pass into the command buffer being recorded: ordered after everything
+ * before it (the previous pass's writes, the waited-on submissions), then the
+ * full-screen triangle over w x h. */
+static void vk_pass_record(VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe, VkDescriptorSet set,
+                           u32 w, u32 h)
+{
+    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                           .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                           .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                          0, 1, &mb, 0, NULL, 0, NULL);
+    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                  .renderPass = rp, .framebuffer = fb,
+                                  .renderArea = { { 0, 0 }, { w, h } } };
+    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { w, h } };
+    pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
+    pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
+    pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_lp.pipe_layout,
+                             0, 1, &set, 0, NULL);
+    pvkCmdDraw(s_vk.cmd, 3, 1, 0, 0);
+    pvkCmdEndRenderPass(s_vk.cmd);
+}
+
+/* A backend-owned RGBA8 COLOR object (cleared to transparent black). */
+static u32 vk_pass_color(void* user, u32 w, u32 h, u32 tag)
+{
+    const u32 hd = vk_eng_color_target_create(user, RSX_BE_FMT_R8G8B8A8, w, h, NULL, 0);
+    if (hd) s_eobj[hd].tag = tag;
+    return hd;
+}
+
+/* An intermediate attachment the engine never sees, left in GENERAL. */
+static int vk_pass_image(vk_image* im, VkFormat fmt, u32 w, u32 h)
+{
+    if (vk_create_image(im, fmt, w, h, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT) || vk_begin()) {
+        vk_destroy_image(im); return -1;
+    }
+    vk_barrier_image(im->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (vk_submit_and_wait()) { vk_destroy_image(im); return -1; }
+    return 0;
+}
+
+/* rsx_draw_backend.color_snapshot (Metal: eng_color_snapshot): one persistent
+ * copy per source surface, refilled by a copy wherever in the stream it is
+ * asked for, so the draw after it reads what the passes before it wrote.
+ * Kept by source handle; a source recreated at another size gets a new copy
+ * (Metal leaves the old one alive; here it is released first -- the engine
+ * only holds a copy until its next request for the same surface). */
+static u32 vk_eng_color_snapshot(void* user, u32 surface)
+{
+    const vk_eng_obj* s = vk_eng_get(surface, VK_ENG_COLOR);
+    if (!s) return 0;
+    if (s->fmt != VK_FORMAT_R8G8B8A8_UNORM) return 0;     /* the one target format (E1) */
+    u32 dst = 0, slot = VK_CSNAP_MAX;
+    for (u32 i = 0; i < s_csnap_count; i++)
+        if (s_csnap[i].src == surface) {
+            slot = i;
+            const vk_eng_obj* d = vk_eng_get(s_csnap[i].dst, VK_ENG_COLOR);
+            if (d && d->tag == VK_TAG_CSNAP && d->w == s->w && d->h == s->h && d->fmt == s->fmt)
+                dst = s_csnap[i].dst;
+            break;
+        }
+    if (!dst) {
+        if (slot < VK_CSNAP_MAX) {                         /* stale: the surface was recreated */
+            if (vk_eng_get(s_csnap[slot].dst, VK_ENG_COLOR) &&
+                s_eobj[s_csnap[slot].dst].tag == VK_TAG_CSNAP)
+                vk_eng_release(user, s_csnap[slot].dst);
+            s_csnap[slot].src = s_csnap[slot].dst = 0;
+        } else {
+            for (u32 i = 0; i < s_csnap_count && slot == VK_CSNAP_MAX; i++)
+                if (!s_csnap[i].src) slot = i;
+            if (slot == VK_CSNAP_MAX) {
+                if (s_csnap_count >= VK_CSNAP_MAX) return 0;
+                slot = s_csnap_count++;
+            }
+        }
+        if (!(dst = vk_pass_color(user, s->w, s->h, VK_TAG_CSNAP))) return 0;
+        s_csnap[slot].src = surface;
+        s_csnap[slot].dst = dst;
+    }
+    const vk_eng_obj* d = &s_eobj[dst];
+    if (vk_begin()) return 0;
+    vk_barrier_image(s->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(d->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkImageCopy r = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                      .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                      .extent = { s->w, s->h, 1 } };
+    pvkCmdCopyImage(s_vk.cmd, s->im.img, VK_IMAGE_LAYOUT_GENERAL, d->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    return vk_submit_and_wait() ? 0 : dst;
+}
+
+static void vk_pass_drop_light(void)
+{
+    if (s_lp.light_fb) pvkDestroyFramebuffer(s_vk.device, s_lp.light_fb, NULL);
+    s_lp.light_fb = VK_NULL_HANDLE;
+    for (u32 k = 0; k < 2; k++) {
+        if (vk_eng_get(s_lp.light_out[k], VK_ENG_COLOR) && s_eobj[s_lp.light_out[k]].tag == VK_TAG_PASS)
+            vk_eng_release(NULL, s_lp.light_out[k]);
+        s_lp.light_out[k] = 0;
+    }
+    s_lp.light_w = s_lp.light_h = 0;
+}
+
+static int vk_pass_out_live(u32 handle)
+{
+    const vk_eng_obj* o = vk_eng_get(handle, VK_ENG_COLOR);
+    return o && o->tag == VK_TAG_PASS;
+}
+
+/* rsx_draw_backend.light_pass (Metal: eng_light_pass, eng_light_fs): one
+ * full-screen pass with two RGBA8 targets, diffuse and specular, kept across
+ * frames and remade when the size changes. `normals` is the engine's colour
+ * copy, `depth` its depth snapshot (R32F); the u, v the shader divides by are
+ * params->width/height, which the engine sets to w, h (no PS3_RES_SCALE here,
+ * so Metal's override of them never applies). */
+static u32 vk_eng_light_pass(void* user, u32 normals, u32 depth, u32 w, u32 h,
+                             const void* params, u32 param_bytes, u32* spec_out)
+{
+    const VkImageView nv = vk_eng_sample_view(normals), zv = vk_eng_sample_view(depth);
+    if (!nv || !zv || !w || !h || w > 4096u || h > 4096u || !params || !spec_out) return 0;
+    if (vk_pass_init()) return 0;
+    VkRenderPass rp = vk_pass_render_pass(&s_lp.rp_light, VK_FORMAT_R8G8B8A8_UNORM, 2);
+    VkPipeline pipe = vk_pass_pipeline(VK_PASS_LIGHT, kVkLightFS, "GPU light", rp, 2);
+    if (!pipe) return 0;
+    if (!s_lp.light_fb || s_lp.light_w != w || s_lp.light_h != h ||
+        !vk_pass_out_live(s_lp.light_out[0]) || !vk_pass_out_live(s_lp.light_out[1])) {
+        vk_pass_drop_light();
+        for (u32 k = 0; k < 2; k++)
+            if (!(s_lp.light_out[k] = vk_pass_color(user, w, h, VK_TAG_PASS))) { vk_pass_drop_light(); return 0; }
+        const VkImageView views[2] = { s_eobj[s_lp.light_out[0]].im.view, s_eobj[s_lp.light_out[1]].im.view };
+        if (!(s_lp.light_fb = vk_pass_framebuffer(rp, views, 2, w, h))) { vk_pass_drop_light(); return 0; }
+        s_lp.light_w = w; s_lp.light_h = h;
+    }
+    const size_t cap = (size_t)s_lp.light_ubo.size;
+    memset(s_lp.light_ubo.ptr, 0, cap);
+    memcpy(s_lp.light_ubo.ptr, params, param_bytes < cap ? param_bytes : cap);
+    vk_pass_write_set(s_lp.set[VK_PASS_LIGHT], &s_lp.light_ubo, nv, zv, VK_NULL_HANDLE);
+    if (vk_begin()) return 0;
+    vk_pass_record(rp, s_lp.light_fb, pipe, s_lp.set[VK_PASS_LIGHT], w, h);
+    if (vk_submit_and_wait()) return 0;
+    *spec_out = s_lp.light_out[1];
+    return s_lp.light_out[0];
+}
+
+static void vk_pass_drop_ssao(void)
+{
+    for (u32 k = 0; k < 4; k++) {
+        if (s_lp.ssao_fb[k]) pvkDestroyFramebuffer(s_vk.device, s_lp.ssao_fb[k], NULL);
+        s_lp.ssao_fb[k] = VK_NULL_HANDLE;
+    }
+    vk_destroy_image(&s_lp.ssao_hd);
+    vk_destroy_image(&s_lp.ssao_a);
+    vk_destroy_image(&s_lp.ssao_b);
+    if (vk_pass_out_live(s_lp.ssao_out)) vk_eng_release(NULL, s_lp.ssao_out);
+    s_lp.ssao_out = 0;
+    memset(s_lp.ssao_dims, 0, sizeof s_lp.ssao_dims);
+}
+
+/* rsx_draw_backend.ssao_pass (Metal: eng_ssao_pass and its ENG_REC_SSAO
+ * encode): five full-screen passes over persistent targets -- half depth
+ * R32F, two R8 AO planes, the RGBA8 output -- in one submission:
+ *   hd <- depth;  a <- (hd, normals);  b <- blur_h(a);  a <- blur_v(b);
+ *   out <- up(a, hd, depth)
+ * Metal's PS3_RES_SSAO_FULL / ssao_up4s_fs variant exists for PS3_RES_SCALE
+ * only, which this backend does not have: the output is always fw x fh. */
+static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* consts, u32 const_bytes,
+                            u32 fw, u32 fh, u32 hw, u32 hh)
+{
+    const VkImageView zv = vk_eng_sample_view(depth), nv = vk_eng_sample_view(normals);
+    if (!zv || !nv || !consts || !const_bytes || !fw || !fh || !hw || !hh ||
+        fw > 4096u || fh > 4096u || hw > 4096u || hh > 4096u) return 0;
+    if (vk_pass_init()) return 0;
+    VkRenderPass rp_hd  = vk_pass_render_pass(&s_lp.rp_r32f, VK_FORMAT_R32_SFLOAT, 1);
+    VkRenderPass rp_ao  = vk_pass_render_pass(&s_lp.rp_r8, VK_FORMAT_R8_UNORM, 1);
+    VkRenderPass rp_out = vk_pass_render_pass(&s_lp.rp_rgba8, VK_FORMAT_R8G8B8A8_UNORM, 1);
+    const VkPipeline p_hd = vk_pass_pipeline(VK_PASS_SSAO_HD, kVkSsaoHdFS, "SSAO half depth", rp_hd, 1);
+    const VkPipeline p_ao = vk_pass_pipeline(VK_PASS_SSAO_AO, kVkSsaoAoFS, "SSAO occlusion", rp_ao, 1);
+    const VkPipeline p_bh = vk_pass_pipeline(VK_PASS_SSAO_BLUR_H, kVkSsaoBlurHFS, "SSAO blur h", rp_ao, 1);
+    const VkPipeline p_bv = vk_pass_pipeline(VK_PASS_SSAO_BLUR_V, kVkSsaoBlurVFS, "SSAO blur v", rp_ao, 1);
+    const VkPipeline p_up = vk_pass_pipeline(VK_PASS_SSAO_UP, kVkSsaoUp4FS, "SSAO upsample", rp_out, 1);
+    if (!p_hd || !p_ao || !p_bh || !p_bv || !p_up) return 0;
+
+    if (!s_lp.ssao_fb[3] || s_lp.ssao_dims[0] != fw || s_lp.ssao_dims[1] != fh ||
+        s_lp.ssao_dims[2] != hw || s_lp.ssao_dims[3] != hh || !vk_pass_out_live(s_lp.ssao_out)) {
+        vk_pass_drop_ssao();
+        if (vk_pass_image(&s_lp.ssao_hd, VK_FORMAT_R32_SFLOAT, hw, hh) ||
+            vk_pass_image(&s_lp.ssao_a, VK_FORMAT_R8_UNORM, hw, hh) ||
+            vk_pass_image(&s_lp.ssao_b, VK_FORMAT_R8_UNORM, hw, hh) ||
+            !(s_lp.ssao_out = vk_pass_color(user, fw, fh, VK_TAG_PASS))) { vk_pass_drop_ssao(); return 0; }
+        s_lp.ssao_fb[0] = vk_pass_framebuffer(rp_hd, &s_lp.ssao_hd.view, 1, hw, hh);
+        s_lp.ssao_fb[1] = vk_pass_framebuffer(rp_ao, &s_lp.ssao_a.view, 1, hw, hh);
+        s_lp.ssao_fb[2] = vk_pass_framebuffer(rp_ao, &s_lp.ssao_b.view, 1, hw, hh);
+        s_lp.ssao_fb[3] = vk_pass_framebuffer(rp_out, &s_eobj[s_lp.ssao_out].im.view, 1, fw, fh);
+        if (!s_lp.ssao_fb[0] || !s_lp.ssao_fb[1] || !s_lp.ssao_fb[2] || !s_lp.ssao_fb[3]) {
+            vk_pass_drop_ssao(); return 0;
+        }
+        s_lp.ssao_dims[0] = fw; s_lp.ssao_dims[1] = fh; s_lp.ssao_dims[2] = hw; s_lp.ssao_dims[3] = hh;
+    }
+    memset(s_lp.ssao_ubo.ptr, 0, VK_SSAO_UBO_BYTES);
+    memcpy(s_lp.ssao_ubo.ptr, consts, const_bytes < VK_SSAO_UBO_BYTES ? const_bytes : VK_SSAO_UBO_BYTES);
+    const VkImageView hd = s_lp.ssao_hd.view, a = s_lp.ssao_a.view, b = s_lp.ssao_b.view;
+    const struct { u32 set; VkPipeline pipe; VkRenderPass rp; VkFramebuffer fb; u32 w, h;
+                   VkImageView t0, t1, t2; } steps[5] = {
+        { VK_PASS_SSAO_HD,     p_hd, rp_hd,  s_lp.ssao_fb[0], hw, hh, zv, VK_NULL_HANDLE, VK_NULL_HANDLE },
+        { VK_PASS_SSAO_AO,     p_ao, rp_ao,  s_lp.ssao_fb[1], hw, hh, hd, nv, VK_NULL_HANDLE },
+        { VK_PASS_SSAO_BLUR_H, p_bh, rp_ao,  s_lp.ssao_fb[2], hw, hh, a, hd, VK_NULL_HANDLE },
+        { VK_PASS_SSAO_BLUR_V, p_bv, rp_ao,  s_lp.ssao_fb[1], hw, hh, b, hd, VK_NULL_HANDLE },
+        { VK_PASS_SSAO_UP,     p_up, rp_out, s_lp.ssao_fb[3], fw, fh, a, hd, zv } };
+    for (u32 k = 0; k < 5; k++)
+        vk_pass_write_set(s_lp.set[steps[k].set], &s_lp.ssao_ubo, steps[k].t0, steps[k].t1, steps[k].t2);
+    if (vk_begin()) return 0;
+    for (u32 k = 0; k < 5; k++)
+        vk_pass_record(steps[k].rp, steps[k].fb, steps[k].pipe, s_lp.set[steps[k].set], steps[k].w, steps[k].h);
+    return vk_submit_and_wait() ? 0 : s_lp.ssao_out;
+}
+
+/* rsx_draw_backend.depth_snapshot_rgba8 (Metal: eng_depth_snapshot_rgba8,
+ * eng_depth_rgba8_fs): the depth copied into an R32F scratch, then packed by
+ * a full-screen pass into one persistent RGBA8 target per (depth, w, h),
+ * re-rendered on every request. The engine releases a decode it replaces (a
+ * crop of another size, a recreated zeta) and the slot may then be handed to
+ * anything: an entry is reused only while its handle is still a COLOR object
+ * carrying this depth's tag. w, h are clamped to the depth target, as
+ * vk_eng_depth_snapshot does (Metal makes the w x h target regardless). */
+static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
+{
+    const vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
+    if (!z || !vk_eng_depth_copyable()) return 0;
+    if (w > z->w) w = z->w;
+    if (h > z->h) h = z->h;
+    if (!w || !h || vk_pass_init()) return 0;
+    VkRenderPass rp = vk_pass_render_pass(&s_lp.rp_rgba8, VK_FORMAT_R8G8B8A8_UNORM, 1);
+    VkPipeline pipe = vk_pass_pipeline(VK_PASS_ZRGBA, kVkDepthRgba8FS, "depth-as-RGBA8", rp, 1);
+    if (!pipe) return 0;
+
+    const u32 tag = VK_TAG_ZRGBA | depth;
+    u32 dst = 0, slot = VK_ZRGBA_MAX;
+    for (u32 i = 0; i < s_zrgba_count; i++)
+        if (s_zrgba[i].depth == depth && s_zrgba[i].w == w && s_zrgba[i].h == h) {
+            slot = i;
+            const vk_eng_obj* o = vk_eng_get(s_zrgba[i].dst, VK_ENG_COLOR);
+            if (o && o->tag == tag && o->w == w && o->h == h) dst = s_zrgba[i].dst;
+            break;
+        }
+    if (!dst) {
+        if (!(dst = vk_pass_color(user, w, h, tag))) return 0;
+        if (slot == VK_ZRGBA_MAX)
+            slot = s_zrgba_count < VK_ZRGBA_MAX ? s_zrgba_count++ : depth % VK_ZRGBA_MAX;
+        s_zrgba[slot].depth = depth; s_zrgba[slot].w = w; s_zrgba[slot].h = h; s_zrgba[slot].dst = dst;
+    }
+
+    VkImageLayout zl = VK_IMAGE_LAYOUT_GENERAL;
+    if (!s_lp.zr32.img || s_lp.zr32_w < w || s_lp.zr32_h < h) {
+        const u32 nw = w > s_lp.zr32_w ? w : s_lp.zr32_w, nh = h > s_lp.zr32_h ? h : s_lp.zr32_h;
+        vk_destroy_image(&s_lp.zr32);
+        s_lp.zr32_w = s_lp.zr32_h = 0;
+        if (vk_create_image(&s_lp.zr32, VK_FORMAT_R32_SFLOAT, nw, nh,
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT)) { vk_destroy_image(&s_lp.zr32); return 0; }
+        s_lp.zr32_w = nw; s_lp.zr32_h = nh;
+        zl = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    if (vk_eng_copy_depth(z, s_lp.zr32.img, zl, w, h)) return 0;
+
+    VkFramebuffer fb = vk_pass_framebuffer(rp, &s_eobj[dst].im.view, 1, w, h);
+    if (!fb) return 0;
+    vk_pass_write_set(s_lp.set[VK_PASS_ZRGBA], &s_lp.ssao_ubo, s_lp.zr32.view, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    int rc = vk_begin();
+    if (!rc) {
+        vk_pass_record(rp, fb, pipe, s_lp.set[VK_PASS_ZRGBA], w, h);
+        rc = vk_submit_and_wait();
+    }
+    pvkDestroyFramebuffer(s_vk.device, fb, NULL);
+    return rc ? 0 : dst;
+}
+
+/* Before the object table goes (vk_eng_shutdown): the passes' own objects.
+ * The COLOR handles they made go with the table. */
+static void vk_eng5_shutdown(void)
+{
+    if (s_vk.device) {
+        const VkDevice d = s_vk.device;
+        if (s_lp.light_fb) pvkDestroyFramebuffer(d, s_lp.light_fb, NULL);
+        for (u32 k = 0; k < 4; k++) if (s_lp.ssao_fb[k]) pvkDestroyFramebuffer(d, s_lp.ssao_fb[k], NULL);
+        vk_destroy_image(&s_lp.ssao_hd);
+        vk_destroy_image(&s_lp.ssao_a);
+        vk_destroy_image(&s_lp.ssao_b);
+        vk_destroy_image(&s_lp.zr32);
+        for (u32 k = 0; k < VK_PASS_COUNT; k++) {
+            if (s_lp.pipe[k]) pvkDestroyPipeline(d, s_lp.pipe[k], NULL);
+            if (s_lp.fs[k])   pvkDestroyShaderModule(d, s_lp.fs[k], NULL);
+        }
+        if (s_lp.vs) pvkDestroyShaderModule(d, s_lp.vs, NULL);
+        VkRenderPass* rps[4] = { &s_lp.rp_light, &s_lp.rp_rgba8, &s_lp.rp_r8, &s_lp.rp_r32f };
+        for (u32 k = 0; k < 4; k++) if (*rps[k]) pvkDestroyRenderPass(d, *rps[k], NULL);
+        vk_destroy_buffer(&s_lp.light_ubo);
+        vk_destroy_buffer(&s_lp.ssao_ubo);
+        if (s_lp.pool)        pvkDestroyDescriptorPool(d, s_lp.pool, NULL);
+        if (s_lp.pipe_layout) pvkDestroyPipelineLayout(d, s_lp.pipe_layout, NULL);
+        if (s_lp.set_layout)  pvkDestroyDescriptorSetLayout(d, s_lp.set_layout, NULL);
+    }
+    memset(&s_lp, 0, sizeof s_lp);
+    memset(s_csnap, 0, sizeof s_csnap);  s_csnap_count = 0;
+    memset(s_zrgba, 0, sizeof s_zrgba);  s_zrgba_count = 0;
+}
+
 static const rsx_draw_backend s_vk_engine_backend = {
     .user                 = NULL,
     .init                 = vk_eng_init,
@@ -2937,6 +3487,10 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .depth_target_create  = vk_eng_depth_target_create,
     .depth_target_release = vk_eng_release,
     .depth_snapshot       = vk_eng_depth_snapshot,
+    .color_snapshot       = vk_eng_color_snapshot,
+    .depth_snapshot_rgba8 = vk_eng_depth_snapshot_rgba8,
+    .light_pass           = vk_eng_light_pass,
+    .ssao_pass            = vk_eng_ssao_pass,
     .pipeline_create      = vk_eng_pipeline_create,
     .pipeline_release     = vk_eng_pipeline_release,
     .bind_targets         = vk_eng_bind_targets,

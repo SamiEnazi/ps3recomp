@@ -1,0 +1,271 @@
+/*
+ * ps3recomp - GLSL for the Vulkan backend's own full-screen passes
+ *
+ * Ports of the Metal backend's helper MSL (rsx_metal_backend.m, kEngHelperMSL)
+ * for the draw-engine hooks light_pass, ssao_pass and depth_snapshot_rgba8.
+ * The arithmetic is the MSL's, statement for statement; what changes is only
+ * the spelling:
+ *   texture.read(uint2)           texelFetch(sampler2D, ivec2, 0)
+ *   [[position]]                  gl_FragCoord (Vulkan: upper-left origin,
+ *                                 pixel centres at .5 -- Metal's convention)
+ *   saturate(x)                   clamp(x, 0.0, 1.0)
+ *   rint(x)                       roundEven(x)
+ *   round(x), x >= 0              floor(x + 0.5)  (MSL rounds half away from
+ *                                 zero; GLSL round() leaves .5 to the driver)
+ *   as_type<T>(x)                 floatBitsToUint / uintBitsToFloat
+ *   float X[12] in `constant`     vec4 X4[3] (std140 strides a float array at
+ *                                 16 bytes; MSL at 4, which is the C layout)
+ *   ulong in ssao_recip           u32 arithmetic on the same 33-bit value
+ * Every pass is a full-screen triangle that reads its inputs at its own pixel,
+ * so neither stage needs a Y flip: output pixel (x, y) comes from input texel
+ * (x, y), row 0 the first row in memory, in both APIs.
+ *
+ * The SSAO helpers reproduce the SPU's reciprocal estimate and rounding with
+ * fused multiply-adds whose rounding error they test (ssao_mul_rz, ssao_lin);
+ * those values are `precise` (SPIR-V NoContraction) so the driver may neither
+ * fuse the separate multiplies into neighbouring adds nor reassociate. The
+ * light pass is ordinary float math and has no such qualifiers, like its MSL.
+ *
+ * PS3_RES_SCALE does not exist on Vulkan: the MSL's `rs` scale is a constant
+ * 1 here, and ssao_up4s_fs (its scaled-output variant) is not ported.
+ */
+#ifndef PS3RECOMP_RSX_VK_PASSES_GLSL_H
+#define PS3RECOMP_RSX_VK_PASSES_GLSL_H
+
+/* eng_fullscreen_vs: one triangle over the whole target, no vertex input. */
+static const char kVkPassVS[] =
+"#version 450\n"
+"void main() {\n"
+"    vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));\n"
+"    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"}\n";
+
+/* eng_light_fs (rsx_metal_backend.m, after "The engine's GPU light pass"):
+ * inFAMOUS 2's SPU light job. Set 0: binding 0 the rsx_gpu_light_params block
+ * (its C layout is std140-compatible: vec4 groups, 64-byte light records),
+ * binding 1 the normals copy (RGBA8), binding 2 the resolved depth (R32F).
+ * Two RGBA8 outputs: diffuse (location 0) and specular (location 1). */
+static const char kVkLightFS[] =
+"#version 450\n"
+"struct GLight { vec4 pos_type; vec4 col_inner; vec4 oacbn; vec4 dir; };\n"
+"layout(std140, set = 0, binding = 0) uniform GLParams { vec4 m[4]; vec4 misc; GLight l[128]; } p;\n"
+"layout(set = 0, binding = 1) uniform sampler2D nt;\n"
+"layout(set = 0, binding = 2) uniform sampler2D zt;\n"
+"layout(location = 0) out vec4 o_diff;\n"
+"layout(location = 1) out vec4 o_spec;\n"
+"void main() {\n"
+"    uvec2 px = uvec2(gl_FragCoord.xy);\n"
+"    o_diff = vec4(0.0); o_spec = vec4(0.0);\n"
+"    uint z24 = uint(clamp(texelFetch(zt, ivec2(px), 0).x, 0.0, 1.0) * 16777215.0);\n"
+"    if (z24 >= 0xFFFFFFu) return;\n"
+"    float zf = float(z24) / 16777216.0;\n"
+"    float u = float(px.x) / p.misc.z, v = float(px.y) / p.misc.w;\n"
+"    vec4 h = u * p.m[0] + v * p.m[1] + zf * p.m[2] + p.m[3];\n"
+"    vec3 P = h.xyz / h.w;\n"
+"    vec4 nr = floor(texelFetch(nt, ivec2(px), 0) * 255.0 + 0.5);\n"
+"    vec3 N = normalize(nr.rgb * (2.0 / 255.0) - 1.0);\n"
+"    float s = exp2(nr.a * (8.0 / 255.0) - 0.88896);\n"
+"    vec3 V = -normalize(P);\n"
+"    vec3 acc = vec3(0.0); float sp = 0.0;\n"
+"    int n = min(int(p.misc.y), 128);\n"   /* the engine clamps to 128 already */
+"    for (int k = 0; k < n; k++) {\n"
+"        GLight L = p.l[k];\n"
+"        vec3 Lv = L.pos_type.xyz - P; float d = length(Lv); vec3 l = Lv / d;\n"
+"        float ndl = max(dot(N, l), 0.0);\n"
+"        float att = clamp((L.oacbn.x - d) / (L.oacbn.x - L.col_inner.w), 0.0, 1.0); att *= att;\n"
+"        if (L.pos_type.w > 1.5) {\n"
+"            float c = clamp((dot(-l, L.dir.xyz) - L.oacbn.z) * -L.oacbn.y, 0.0, 1.0);\n"
+"            att *= c * c * (d > L.oacbn.w ? 1.0 : 0.0);\n"
+"        }\n"
+"        float w = att * ndl;\n"
+"        if (w <= 0.0) continue;\n"
+"        vec3 C = L.col_inner.xyz * p.misc.x;\n"
+"        float ndh = max(dot(N, normalize(l + V)), 0.0);\n"
+"        acc += w * C;\n"
+"        sp += w * length(C) * (1.0 + 25.0 / 27.0 * s) * pow(1.0 + s * (1.0 - ndh), -8.0);\n"
+"    }\n"
+"    const float K = 0.35355339 * 255.0;\n"
+"    vec3 q = sqrt(acc);\n"
+"    float a = min(255.0, floor(max(1.0, max(q.r, max(q.g, q.b))) * K));\n"
+"    o_diff = vec4(min(vec3(255.0), floor(q * K * 255.0 / a)), a) / 255.0;\n"
+"    o_spec = vec4(0.0, 0.0, 0.0, min(255.0, floor(sqrt(sp) * K)) / 255.0);\n"
+"}\n";
+
+/* The SSAO passes' shared part: struct SsaoC (SsaoGpuConsts, 320 bytes) as a
+ * std140 block, and the SPU-exact helpers. Set 0: binding 0 the block,
+ * bindings 1..3 the pass's textures t0..t2 (MSL [[texture(0..2)]]). */
+#define VK_SSAO_GLSL_COMMON \
+"#version 450\n" \
+"layout(std140, set = 0, binding = 0) uniform SsaoC {\n" \
+"    vec4 depth_ab;\n" \
+"    vec4 X4[3]; vec4 Y4[3]; vec4 Z4[3];\n" \
+"    vec4 M[3];\n" \
+"    vec4 C0, D0, E0, F0;\n" \
+"    vec4 blur;\n" \
+"    vec4 up;\n" \
+"    uvec4 dims;\n" \
+"} c;\n" \
+"layout(set = 0, binding = 1) uniform sampler2D t0;\n" \
+"layout(set = 0, binding = 2) uniform sampler2D t1;\n" \
+"layout(set = 0, binding = 3) uniform sampler2D t2;\n" \
+"const vec2 rs = vec2(1.0);\n" \
+"float cX(int k) { return c.X4[k >> 2][k & 3]; }\n" \
+"float cY(int k) { return c.Y4[k >> 2][k & 3]; }\n" \
+"float cZ(int k) { return c.Z4[k >> 2][k & 3]; }\n" \
+"const uint ssao_frest_lut[32] = uint[32](\n" \
+"    0x7FFBE0u, 0x7F87A6u, 0x70EF72u, 0x708B40u, 0x638B12u, 0x633AEAu, 0x5792C4u, 0x574AA0u,\n" \
+"    0x4CCA7Eu, 0x4C9262u, 0x430A44u, 0x42D62Au, 0x3A2E12u, 0x39FDFAu, 0x3215E4u, 0x31F1D2u,\n" \
+"    0x2AA9BEu, 0x2A85ACu, 0x23D59Au, 0x23BD8Eu, 0x1D8576u, 0x1D8576u, 0x17AD5Au, 0x17AD5Au,\n" \
+"    0x124543u, 0x124543u, 0x0D392Du, 0x0D392Du, 0x08851Au, 0x08851Au, 0x041D07u, 0x041D07u);\n" \
+/* The MSL's m = ((8192 | base) << 19) - step * y is a 33-bit value: \
+ * 2^32 + L - P with L = base << 19 and P = step * y (< 2^29). It is below \
+ * 2^32 exactly when L < P, and then u32 wrap-around gives it exactly; the \
+ * MSL's (m >> 9) or, renormalised, ((m << 1) >> 9) = m >> 8, masked to 23 \
+ * bits, never sees bit 32. */ \
+"float ssao_recip(float x) {\n" \
+"    uint b = floatBitsToUint(x);\n" \
+"    uint sgn = b & 0x80000000u, e = (b >> 23) & 0xFFu;\n" \
+"    uint re = (e == 0u) ? 255u : (e >= 253u ? 0u : 253u - e);\n" \
+"    uint est = sgn | (re << 23) | (ssao_frest_lut[(b >> 18) & 31u] & 0x7FFFFFu);\n" \
+"    int ee = int((est >> 23) & 0xFFu);\n" \
+"    if (ee == 0) return 0.0;\n" \
+"    uint base = (est >> 10) & 0x1FFFu, stp = est & 0x3FFu, y = b & 0x7FFFFu;\n" \
+"    uint L = base << 19, P = stp * y, d = L - P;\n" \
+"    uint mant;\n" \
+"    if (L < P) { mant = (d >> 8) & 0x7FFFFFu; if (--ee == 0) return 0.0; }\n" \
+"    else       { mant = (d >> 9) & 0x7FFFFFu; }\n" \
+"    return uintBitsToFloat(sgn | (uint(ee) << 23) | mant);\n" \
+"}\n" \
+"float ssao_mul_rz(float a, float b) {\n" \
+"    precise float p = a * b;\n" \
+"    precise float r = fma(a, b, -p);\n" \
+"    return (r < 0.0 && p > 0.0) ? uintBitsToFloat(floatBitsToUint(p) - 1u) : p;\n" \
+"}\n" \
+"float ssao_sat(float x) { return x >= 1.0 ? uintBitsToFloat(0x3F7FFFFFu) : max(x, 0.0); }\n" \
+"float ssao_z24(float d01) { return float(uint(clamp(d01, 0.0, 1.0) * 16777215.0)); }\n" \
+"float ssao_lin(float z24, float A, float B) {\n" \
+"    float c1 = uintBitsToFloat(0x33800001u);\n" \
+"    precise float k = A * c1;\n" \
+"    precise float pe = fma(A, c1, -k);\n" /* round k toward zero like fm */ \
+"    if ((pe > 0.0 && k < 0.0) || (pe < 0.0 && k > 0.0)) k = uintBitsToFloat(floatBitsToUint(k) - 1u);\n" \
+"    precise float v = fma(z24, k, B);\n" \
+"    float r = ssao_recip(v);\n" \
+"    precise float res = fma(fma(-v, r, 1.0), r, r);\n" \
+"    return res;\n" \
+"}\n" \
+"float ssao_byte(sampler2D t, ivec2 p) { return roundEven(texelFetch(t, p, 0).r * 255.0); }\n" \
+"uvec2 ssao_sc(ivec2 p, vec2 s) { return uvec2((vec2(p) + 0.5) * s); }\n"
+
+/* ssao_hd_fs: half-res linear depth. t0 = resolved depth. R32F out. */
+static const char kVkSsaoHdFS[] = VK_SSAO_GLSL_COMMON
+"layout(location = 0) out float o;\n"
+"void main() {\n"
+"    uvec2 p = ssao_sc(ivec2(gl_FragCoord.xy) * 2, rs);\n"
+"    o = ssao_lin(ssao_z24(texelFetch(t0, ivec2(p), 0).r), c.depth_ab.x, c.depth_ab.y);\n"
+"}\n";
+
+/* ssao_ao_fs: 12-sample AO. t0 = half depth, t1 = normals copy. R8 out. */
+static const char kVkSsaoAoFS[] = VK_SSAO_GLSL_COMMON
+"layout(location = 0) out float o;\n"
+"void main() {\n"
+"    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+"    ivec2 hm = ivec2(c.dims.zw) - 1;\n"
+"    float d   = texelFetch(t0, p, 0).r;\n"
+"    float dc  = clamp(d, c.E0.z, c.E0.w);\n"
+"    float rcp = ssao_recip(dc);\n"
+"    precise float q = d * rcp;\n"
+"    vec3 nb = roundEven(texelFetch(t1, ivec2(ssao_sc(p * 2, rs)), 0).rgb * 255.0);\n"
+"    precise vec3 n  = fma(nb * (1.0 / 256.0), vec3(2.0078430175781), vec3(-1.0));\n"
+"    precise vec3 n2 = fma(vec3(n.z), c.M[2].xyz, fma(vec3(n.y), c.M[1].xyz, n.x * c.M[0].xyz));\n"
+"    precise float dref = fma(n2.z, q, d);\n"
+"    precise float bx = fma(n2.x, rcp, 0.5), by = fma(n2.y, rcp, 0.5);\n"
+"    precise float sx = c.D0.y * rcp, sy = c.D0.z * rcp;\n"
+"    precise float hz = c.D0.w * q;\n"
+"    precise float e0 = c.E0.x * ssao_recip(q), e1 = c.E0.y * q;\n"
+"    precise float acc = 0.0;\n"
+"    for (int k = 0; k < 12; k++) {\n"
+"        precise float fx = fma(cX(k), sx, bx), fy = fma(cY(k), sy, by);\n"
+"        int tx = p.x + int(floor(fx));\n"
+"        int ty = p.y + int(floor(fy));\n"
+"        float ds = texelFetch(t0, clamp(ivec2(tx, ty), ivec2(0), hm), 0).r;\n"
+"        precise float h = cZ(k) * hz;\n"
+"        precise float t = (ds - (dref - h)) * 0.5;\n"
+"        acc += fma(ssao_sat(fma(t, e0, e1)), h, clamp(t, 0.0, h));\n"
+"    }\n"
+"    acc *= ssao_recip(c.D0.x * q);\n"
+"    precise float vv = fma(acc, c.F0.x, c.F0.y);\n"
+"    float v = ssao_sat(vv);\n"
+"    o = floor(ssao_mul_rz(v, 255.0 / 256.0) * 256.0) / 255.0;\n"   /* <= 254 */
+"}\n";
+
+/* ssao_blur: the depth-aware 5-tap blur, along `dir`. t0 = AO, t1 = half
+ * depth. R8 out. */
+#define VK_SSAO_GLSL_BLUR \
+"float ssao_blur(ivec2 p, ivec2 dir) {\n" \
+"    ivec2 hm = ivec2(c.dims.zw) - 1;\n" \
+"    float d0 = texelFetch(t1, p, 0).r;\n" \
+"    precise float kk = c.blur.x * ssao_recip(d0);\n" \
+"    float w[5], a[5];\n" \
+"    for (int o = -2; o <= 2; o++) {\n" \
+"        ivec2 s = clamp(p + o * dir, ivec2(0), hm);\n" \
+"        a[o + 2] = ssao_byte(t0, s);\n" \
+"        precise float wo = max(0.0, fma(-abs(texelFetch(t1, s, 0).r - d0), kk, 1.0)) * ((o == -2 || o == 2) ? c.blur.y : c.blur.z);\n" \
+"        w[o + 2] = wo;\n" \
+"    }\n" \
+"    precise float num = fma(w[4], a[4], fma(w[3], a[3], fma(w[1], a[1], fma(w[0], a[0], a[2]))));\n" \
+"    precise float den = w[4] + (w[3] + (1.0 + (w[0] + w[1])));\n" \
+"    return floor(ssao_mul_rz(num, ssao_recip(den))) / 255.0;\n" \
+"}\n"
+
+/* ssao_blur_h_fs / ssao_blur_v_fs */
+static const char kVkSsaoBlurHFS[] = VK_SSAO_GLSL_COMMON VK_SSAO_GLSL_BLUR
+"layout(location = 0) out float o;\n"
+"void main() { o = ssao_blur(ivec2(gl_FragCoord.xy), ivec2(1, 0)); }\n";
+static const char kVkSsaoBlurVFS[] = VK_SSAO_GLSL_COMMON VK_SSAO_GLSL_BLUR
+"layout(location = 0) out float o;\n"
+"void main() { o = ssao_blur(ivec2(gl_FragCoord.xy), ivec2(0, 1)); }\n";
+
+/* ssao_up4_fs: the bilateral 2x upsample, the AO byte in every channel.
+ * t0 = AO, t1 = half depth, t2 = resolved depth. RGBA8 out. */
+static const char kVkSsaoUp4FS[] = VK_SSAO_GLSL_COMMON
+"layout(location = 0) out vec4 o;\n"
+"void main() {\n"
+"    ivec2 P  = ivec2(gl_FragCoord.xy);\n"
+"    ivec2 hm = ivec2(c.dims.zw) - 1;\n"
+"    float Z  = ssao_lin(ssao_z24(texelFetch(t2, ivec2(ssao_sc(P, rs)), 0).r), c.up.x, c.up.y);\n"
+"    precise float kz = c.up.z * ssao_recip(Z);\n"
+"    ivec2 b = P >> 1;\n"
+"    ivec2 s = ivec2((P.x & 1) != 0 ? 1 : -1, (P.y & 1) != 0 ? 1 : -1);\n"
+"    ivec2 off[4] = ivec2[4](ivec2(0, 0), ivec2(0, s.y), ivec2(s.x, 0), s);\n"
+"    float bw[4]  = float[4](9.0, 3.0, 3.0, 1.0);\n"
+"    float eps[4] = float[4](uintBitsToFloat(0x3A6BEDFAu), uintBitsToFloat(0x399D4952u),\n"
+"                            uintBitsToFloat(0x399D4952u), uintBitsToFloat(0x38D1B717u));\n"
+"    precise float num = 0.0, den = 0.0;\n"
+"    for (int k = 0; k < 4; k++) {\n"
+"        ivec2 t = clamp(b + off[k], ivec2(0), hm);\n"
+"        precise float w = fma(max(0.0, fma(-abs(texelFetch(t1, t, 0).r - Z), kz, 1.0)), bw[k], eps[k]);\n"
+"        num = fma(w, ssao_byte(t0, t), num);\n"
+"        den += w;\n"
+"    }\n"
+"    o = vec4(floor(ssao_mul_rz(num, ssao_recip(den))) / 255.0);\n"
+"}\n";
+
+/* eng_depth_rgba8_fs: Z24S8 read through A8R8G8B8 (RPCS3 decode_depth24):
+ * a = Z[23:16], r = Z[15:8], g = Z[7:0], b = stencil. t0 = resolved depth
+ * (R32F, read at this pixel: a target smaller than the depth buffer is its
+ * top-left corner). The Metal version reads b from the stencil aspect; this
+ * backend's depth formats (D32_SFLOAT, X8_D24, D16) have none -- its clears
+ * and draws keep no stencil either -- so b is the 0 such a buffer holds.
+ * RGBA8 out. */
+static const char kVkDepthRgba8FS[] =
+"#version 450\n"
+"layout(set = 0, binding = 1) uniform sampler2D zt;\n"
+"layout(location = 0) out vec4 o;\n"
+"void main() {\n"
+"    ivec2 px = ivec2(gl_FragCoord.xy);\n"
+"    uint v = uint(clamp(texelFetch(zt, px, 0).r, 0.0, 1.0) * 16777215.0);\n"
+"    uint sv = 0u;\n"
+"    o = vec4(float((v >> 8) & 255u), float(v & 255u), float(sv & 255u), float((v >> 16) & 255u)) / 255.0;\n"
+"}\n";
+
+#endif /* PS3RECOMP_RSX_VK_PASSES_GLSL_H */
