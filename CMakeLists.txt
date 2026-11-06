@@ -136,6 +136,14 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    # inFAMOUS 2 Windows port: the few POSIX calls the patch set uses
+    # unguarded (clock_gettime, nanosleep, sched_yield, access, static pthread
+    # mutexes), provided without <windows.h> leaking into every file. PUBLIC so
+    # the game target (runtime/ppu, lifted code) gets the same surface.
+    target_include_directories(ps3recomp_runtime PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/win32_include")
+    target_compile_options(ps3recomp_runtime PUBLIC
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/win32_posix_min.h>")
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
