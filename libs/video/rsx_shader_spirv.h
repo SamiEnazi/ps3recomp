@@ -58,6 +58,17 @@ int rsx_hlsl_to_spirv(const char* hlsl, int stage,
                       u32* words, u32 max_words, u32* out_words,
                       char* log, u32 log_size);
 
+/* Compile one GLSL shader (`#version 450`, entry point `main`) into SPIR-V
+ * 1.0 for a Vulkan 1.0 client: the backend's own full-screen passes (the GPU
+ * light pass, SSAO, depth decode), which are written in GLSL rather than run
+ * through the decompilers. None of the HLSL contract above applies: the
+ * source names its own sets, bindings and locations, nothing is shifted and
+ * nothing is flipped. Same arguments and return value as rsx_hlsl_to_spirv;
+ * the stub (no glslang) fails. */
+int rsx_glsl_to_spirv(const char* glsl, int stage,
+                      u32* words, u32 max_words, u32* out_words,
+                      char* log, u32 log_size);
+
 #ifdef __cplusplus
 }
 #endif
