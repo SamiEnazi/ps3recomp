@@ -1368,9 +1368,10 @@ skip_inject: ;
      * 0x20000 down, 0x40000 left, 0x80000 right -- so a hold walks: inFAMOUS 2
      * moves on the stick only, and its lit streets are a walk from the save.
      * Bits 20..23 drive the right stick the same way (0x100000 up, 0x200000
-     * down, 0x400000 left, 0x800000 right): the camera, to look at something. */
+     * down, 0x400000 left, 0x800000 right): the camera, to look at something.
+     * Up to 64 events (32 did not reach inFAMOUS 2's Beast fight). */
     { static int s_sc = -1;
-      static struct { double t; unsigned mask; double hold; int world; } ev[32]; static int n_ev = 0;
+      static struct { double t; unsigned mask; double hold; int world; } ev[64]; static int n_ev = 0;
       /* A time written "w<sec>" counts from the moment the file named by
        * PAD_SCRIPT_WAIT appears (the draw engine creates it on the first
        * world frame, PS3RECOMP_ENG_WORLD_MARK): a walk scripted from the
@@ -1385,7 +1386,7 @@ skip_inject: ;
           if (e && *e) {
               s_sc = 1; t0 = GetTickCount64();
               const char* p = e;
-              while (*p && n_ev < 32) {
+              while (*p && n_ev < 64) {
                   int world = 0;
                   if (*p == 'w') { world = 1; p++; }
                   double t = strtod(p, (char**)&p);
@@ -1411,7 +1412,7 @@ skip_inject: ;
            * happens. Fire on the first poll at or after the event time and
            * hold it for a fixed number of polls, which is what a real press
            * looks like regardless of poll rate. */
-          static int fired[32], held[32], stick_was;
+          static int fired[64], held[64], stick_was;
           int stick_on = 0; unsigned char lx = 128, ly = 128, rx = 128, ry = 128;
           for (int i = 0; i < n_ev; i++) {
               const double tn = ev[i].world ? now_world : now;
@@ -1430,7 +1431,7 @@ skip_inject: ;
                       if (ev[i].mask & 0x400000u) rx = 0;   if (ev[i].mask & 0x800000u) rx = 255;
                       if (ev[i].mask & 0x100000u) ry = 0;   if (ev[i].mask & 0x200000u) ry = 255;
                   }
-                  static int said[32];
+                  static int said[64];
                   if (!said[i]) { said[i] = 1;
                       if (ev[i].hold > 0)
                           printf("[cellPad] PAD_SCRIPT t=%.1fs hold 0x%04X for %.0fs\n", ev[i].t, ev[i].mask, ev[i].hold);
@@ -1477,9 +1478,20 @@ skip_inject: ;
                   if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
           }
+          /* Stick bits as in PAD_SCRIPT (0x10000.. left, 0x100000.. right
+           * stick): "0x10000 600" walks forward for 600 polls, so a driver can
+           * steer a character by looking at screenshots between steps. */
+          static int pf_stick;
           if (held_n > 0) { held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF);
+              if (held_mask & 0xFF0000u) {
+                  hs->analog_lx = (held_mask & 0x40000u) ? 0 : (held_mask & 0x80000u) ? 255 : 128;
+                  hs->analog_ly = (held_mask & 0x10000u) ? 0 : (held_mask & 0x20000u) ? 255 : 128;
+                  hs->analog_rx = (held_mask & 0x400000u) ? 0 : (held_mask & 0x800000u) ? 255 : 128;
+                  hs->analog_ry = (held_mask & 0x100000u) ? 0 : (held_mask & 0x200000u) ? 255 : 128;
+                  pf_stick = 1; } }
+          else if (pf_stick) { hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128; pf_stick = 0; }
       } }
 
     /* Analog sticks */
