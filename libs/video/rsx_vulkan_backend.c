@@ -76,6 +76,8 @@
 #ifndef _WIN32
 #include <sys/stat.h>       /* mkdir, stat */
 #include <unistd.h>         /* getpid */
+#include <pthread.h>        /* the background pipeline-cache save */
+#include <sched.h>
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -1795,13 +1797,12 @@ static void vk_sc_stats(const char* when)
     s_sc.stats_at = s_sc.hits + s_sc.misses + s_sc.pipes;
 }
 
-/* why: 0 periodic, 1 idle, 2 shutdown (the trace's b). */
+/* why: 0 periodic, 1 idle, 2 shutdown (the trace's b). The caller resets pc_new and
+ * pc_last_save: this also runs on the background saver (vk_sc_save_async). */
 static void vk_sc_save_pipelines(u32 why)
 {
     if (!s_sc.pc) return;
     const u64 t0 = ps3_ft_now();
-    s_sc.pc_new = 0;
-    s_sc.pc_last_save = t0;
     u32 kb = 0;
     size_t n = 0;
     u8* data = NULL;
@@ -1832,6 +1833,54 @@ static void vk_sc_save_pipelines(u32 why)
     if (PS3_FT_ON()) ps3_ft_span(PS3_FT_COMPILE, 5, kb, why, t0, t1);
 }
 
+/* Saves run on a short-lived background thread: reading the driver's cache data
+ * (vkGetPipelineCacheData, ~55 MB for inFAMOUS 2), hashing it and writing it took
+ * 20-76 ms of the RSX thread each time -- 21 times a run, the largest hitch source
+ * once the cache was warm. The pipeline cache is internally synchronised (created
+ * without EXTERNALLY_SYNCHRONIZED), so reading it while pipelines are created is
+ * legal. One save at a time: a trigger while one runs is left to the next. */
+static volatile int s_sc_saving;
+#ifdef _WIN32
+static DWORD WINAPI vk_sc_save_thread(LPVOID why)
+{
+    vk_sc_save_pipelines((u32)(uintptr_t)why);
+    __atomic_store_n(&s_sc_saving, 0, __ATOMIC_RELEASE);
+    return 0;
+}
+#else
+static void* vk_sc_save_thread(void* why)
+{
+    vk_sc_save_pipelines((u32)(uintptr_t)why);
+    __atomic_store_n(&s_sc_saving, 0, __ATOMIC_RELEASE);
+    return NULL;
+}
+#endif
+static void vk_sc_save_async(u32 why)
+{
+    if (__atomic_exchange_n(&s_sc_saving, 1, __ATOMIC_ACQ_REL)) return;
+    s_sc.pc_new = 0;
+    s_sc.pc_last_save = ps3_ft_now();
+#ifdef _WIN32
+    HANDLE h = CreateThread(NULL, 0, vk_sc_save_thread, (LPVOID)(uintptr_t)why, 0, NULL);
+    if (h) { CloseHandle(h); return; }
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, vk_sc_save_thread, (void*)(uintptr_t)why) == 0) { pthread_detach(t); return; }
+#endif
+    vk_sc_save_pipelines(why);                 /* no thread: as before */
+    __atomic_store_n(&s_sc_saving, 0, __ATOMIC_RELEASE);
+}
+static void vk_sc_save_wait(void)
+{
+    while (__atomic_load_n(&s_sc_saving, __ATOMIC_ACQUIRE)) {
+#ifdef _WIN32
+        Sleep(1);
+#else
+        sched_yield();
+#endif
+    }
+}
+
 static void vk_sc_maybe_stats(const char* when)
 {
     if (s_sc.stats_all || s_sc.hits + s_sc.misses + s_sc.pipes - s_sc.stats_at >= VK_SC_STATS_EVERY)
@@ -1849,11 +1898,15 @@ static VkResult vk_sc_create_pipeline(const VkGraphicsPipelineCreateInfo* gci,
     if (PS3_FT_ON()) ps3_ft_span(PS3_FT_COMPILE, 3, r == VK_SUCCESS ? 1u : 0u, site, t0, t1);
     s_sc.pipes++;
     s_sc.pipe_ns += t1 - t0;
-    if (r == VK_SUCCESS && s_sc.pc) {
+    /* Only a pipeline the driver had to build counts towards a save: one found in
+     * the cache comes back in ~0.1 ms, a real build takes 5-50 ms. With a warm cache
+     * every run used to re-save (and re-read) the whole file after each 64 pipelines
+     * it merely looked up. */
+    if (r == VK_SUCCESS && s_sc.pc && t1 - t0 > 1000000ull) {
         s_sc.pc_new++;
         s_sc.pc_last_new = t1;
         if (s_sc.pc_new >= VK_SC_SAVE_EVERY && t1 - s_sc.pc_last_save >= VK_SC_SAVE_GAP_NS) {
-            vk_sc_save_pipelines(0);
+            vk_sc_save_async(0);
             vk_sc_maybe_stats("periodic");
         }
     }
@@ -1864,7 +1917,7 @@ static VkResult vk_sc_create_pipeline(const VkGraphicsPipelineCreateInfo* gci,
 static void vk_sc_tick(void)
 {
     if (!s_sc.pc_new || ps3_ft_now() - s_sc.pc_last_new < VK_SC_IDLE_NS) return;
-    vk_sc_save_pipelines(1);
+    vk_sc_save_async(1);
     vk_sc_maybe_stats("idle");
 }
 
@@ -1927,7 +1980,8 @@ static void vk_sc_open(const char* title)
 /* Before the device goes: the last save, the stats, the cache object. */
 static void vk_sc_close(void)
 {
-    if (s_sc.pc && s_sc.pc_new) vk_sc_save_pipelines(2);
+    vk_sc_save_wait();                         /* a background save first */
+    if (s_sc.pc && s_sc.pc_new) { s_sc.pc_new = 0; vk_sc_save_pipelines(2); }
     if (s_sc.hits + s_sc.misses + s_sc.pipes) vk_sc_stats(s_sc.on ? "shutdown" : "shutdown, cache off");
     if (s_sc.pc) pvkDestroyPipelineCache(s_vk.device, s_sc.pc, NULL);
     memset(&s_sc, 0, sizeof s_sc);
