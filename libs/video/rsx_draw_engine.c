@@ -4855,9 +4855,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
                       rsx_dsp_reg(&g.rsx, M_BLEND_EQUATION), rsx_dsp_reg(&g.rsx, 0x031C), tex_mask);
               { const float* k = (const float*)g.fp_cb;   /* the fragment constants handed over */
                 const u32 nk = g.fp_constants->count;
-                for (u32 i = 0; i < nk && i < 4u; i++)
+                for (u32 i = 0; i < nk && i < 32u; i++)
                     fprintf(stderr, "[hudlog]   fpc[%u] = (%g %g %g %g)\n", i, k[i*4], k[i*4+1], k[i*4+2], k[i*4+3]);
-                if (!nk) fprintf(stderr, "[hudlog]   fpc: none\n"); }
+                if (!nk) fprintf(stderr, "[hudlog]   fpc: none\n");
+                char tb[256]; int tp = 0;
+                for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && tp < (int)sizeof tb - 16; u++)
+                    if (tex_mask & (1u << u)) tp += snprintf(tb + tp, sizeof tb - (size_t)tp, " u%u=h%u", u, textures[u]);
+                fprintf(stderr, "[hudlog]   textures:%s\n", tb); }
               for (u32 c = g.vpc_lo; c < g.vpc_lo + g.vpc_n && c < g.vpc_lo + 6u && c < RSX_DSP_NUM_CONSTANTS; c++) {
                   float v4[4]; memcpy(v4, g.rsx.constants[c], sizeof v4);
                   fprintf(stderr, "[hudlog]   c[%u] = (%g %g %g %g)\n", c, v4[0], v4[1], v4[2], v4[3]); }

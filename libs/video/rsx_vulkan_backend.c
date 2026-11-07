@@ -2480,6 +2480,45 @@ static void vk_rtd_write(u32 order, u32 h)
     vk_destroy_buffer(&b);
 }
 
+/* PS3RECOMP_VK_RT_DUMP_SEQ=<n>[,<n>..]: in the dumped frame, also read the
+ * targets back right after draw number n (the first-draw numbers of
+ * rt_list.txt) -- what one pass itself wrote, before later draws cover it.
+ * Files rt_s<n>_<k>_h<handle>_*.ppm. */
+static void vk_rtd_write(u32 order, u32 h);
+static void vk_rtd_after_draw(const u32* rts, u32 n)
+{
+    if (s_rtd.phase != 1) return;
+    static int init; static u32 seqs[8]; static u32 nseq;
+    if (!init) { init = 1;
+        const char* e = getenv("PS3RECOMP_VK_RT_DUMP_SEQ");
+        for (const char* p = e; p && *p && nseq < 8;) {
+            char* q; const unsigned long v = strtoul(p, &q, 10);
+            if (q == p) break;
+            seqs[nseq++] = (u32)v; p = *q == ',' ? q + 1 : q;
+        } }
+    const u32 this_draw = s_rtd.seq - 1u;      /* vk_rtd_note already counted it */
+    for (u32 i = 0; i < nseq; i++)
+        if (seqs[i] == this_draw) {
+            for (u32 k = 0; k < n; k++) vk_rtd_write(1000u * (this_draw + 1u) + k, rts[k]);
+            VK_LOG("RT dump: targets after draw %u\n", this_draw);
+        }
+    /* PS3RECOMP_VK_RT_DUMP_FIRST=<handle>:<count>: the target after each of
+     * the first <count> draws into it (a pass's own output, whatever its draw
+     * number this run). Files rt_f<handle>_<k>_d<draw>... via order 2000000+. */
+    static long fh = -2; static u32 fcount, fdone;
+    if (fh == -2) { const char* e = getenv("PS3RECOMP_VK_RT_DUMP_FIRST");
+                    fh = e ? strtol(e, NULL, 10) : -1;
+                    const char* c = e ? strchr(e, ':') : NULL; fcount = c ? (u32)atoi(c + 1) : 3u; }
+    if (fh > 0 && fdone < fcount)
+        for (u32 k = 0; k < n; k++)
+            if (rts[k] == (u32)fh) {
+                vk_rtd_write(2000000u + fdone * 1000u + this_draw, rts[k]);
+                VK_LOG("RT dump: target %ld after its draw %u (frame draw %u)\n", fh, fdone, this_draw);
+                fdone++;
+                break;
+            }
+}
+
 /* Called at every present, before it: arms one frame, then dumps it. */
 static void vk_rtd_frame(u32 presented)
 {
@@ -3560,7 +3599,11 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
-    if (batched) { s_batch.draws++; return; }   /* the pass stays open in the batch */
+    if (batched) {
+        s_batch.draws++;                        /* the pass stays open in the batch */
+        if (s_rtd.phase == 1) vk_rtd_after_draw(s_eng_bound.rt, n);
+        return;
+    }
     pvkCmdEndRenderPass(s_vk.cmd);
     vk_submit_and_wait();
 }
