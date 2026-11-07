@@ -6186,6 +6186,78 @@ void rsx_vulkan_backend_shutdown(void)
     memset(&s_vk, 0, sizeof s_vk);
 }
 
+/* ---- PS3RECOMP_PLAYLOG=<file>: a play session's frame record (tools/play.ps1) ----
+ * Light enough to leave on while playing: one line per second (fps, frame-time
+ * p50/p99/max, frames over 17/25/33/50 ms, guest draws per frame) and one per
+ * frame over 50 ms (HITCH), flushed once a second so a killed game loses at
+ * most a second; F9 in the game window writes a MARK ("that felt bad").
+ * Read by tools/playlog_report.py. */
+static struct {
+    int    state;                       /* 0 unread, 1 on, -1 off */
+    FILE*  f;
+    double t0, last, sec_start;
+    float  dt[4096];
+    u32    n;
+    u32    draws0;
+    int    mark;
+} s_pl;
+static double vk_pl_now(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER c;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)freq.QuadPart;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+#endif
+}
+static int vk_pl_cmp(const void* a, const void* b)
+{
+    const float x = *(const float*)a, y = *(const float*)b;
+    return (x > y) - (x < y);
+}
+u32 rsx_vulkan_backend_guest_draws(void);
+static void vk_playlog_frame(void)
+{
+    if (s_pl.state == 0) {
+        const char* path = getenv("PS3RECOMP_PLAYLOG");
+        s_pl.state = -1;
+        if (path && *path && (s_pl.f = fopen(path, "w")) != NULL) {
+            s_pl.state = 1;
+            s_pl.t0 = vk_pl_now();
+            fprintf(s_pl.f, "#t_s	fps	p50_ms	p99_ms	max_ms	n17	n25	n33	n50	draws_per_frame\n");
+            fflush(s_pl.f);
+        }
+    }
+    if (s_pl.state != 1) return;
+    const double now = vk_pl_now();
+    if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; s_pl.draws0 = rsx_vulkan_backend_guest_draws(); return; }
+    const double dt = now - s_pl.last;
+    s_pl.last = now;
+    if (s_pl.n < sizeof s_pl.dt / sizeof s_pl.dt[0]) s_pl.dt[s_pl.n++] = (float)(dt * 1000.0);
+    if (dt > 0.050) fprintf(s_pl.f, "HITCH	%.2f	%.1f\n", now - s_pl.t0, dt * 1000.0);
+    if (s_pl.mark) { fprintf(s_pl.f, "MARK	%.2f\n", now - s_pl.t0); s_pl.mark = 0; }
+    if (now - s_pl.sec_start < 1.0 || !s_pl.n) return;
+    const u32 draws = rsx_vulkan_backend_guest_draws();
+    u32 c17 = 0, c25 = 0, c33 = 0, c50 = 0;
+    for (u32 i = 0; i < s_pl.n; i++) {
+        const float d = s_pl.dt[i];
+        c17 += d > 17.5f; c25 += d > 25.0f; c33 += d > 33.4f; c50 += d > 50.0f;
+    }
+    qsort(s_pl.dt, s_pl.n, sizeof s_pl.dt[0], vk_pl_cmp);
+    const double span = now - s_pl.sec_start;
+    fprintf(s_pl.f, "%.1f	%.1f	%.1f	%.1f	%.1f	%u	%u	%u	%u	%.0f\n",
+            now - s_pl.t0, s_pl.n / span, s_pl.dt[s_pl.n / 2], s_pl.dt[(s_pl.n * 99) / 100],
+            s_pl.dt[s_pl.n - 1], c17, c25, c33, c50, (double)(draws - s_pl.draws0) / s_pl.n);
+    fflush(s_pl.f);
+    s_pl.draws0 = draws;
+    s_pl.n = 0;
+    s_pl.sec_start = now;
+}
+
 int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
@@ -6194,6 +6266,7 @@ int rsx_vulkan_backend_pump_messages(void)
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9 && !e.key.repeat) s_pl.mark = 1;
     }
     return quit ? -1 : 0;
 }
@@ -6203,6 +6276,7 @@ void rsx_vulkan_backend_present(void)
     if (s_vk.eng_active) rsx_draw_engine_present();
     else                 vk_cb_present(&s_vk, 0);
     vk_sc_tick();                    /* save the pipeline cache once a burst ends */
+    vk_playlog_frame();
 }
 
 u32 rsx_vulkan_backend_debug_color(void) { return s_vk.clear_argb; }
