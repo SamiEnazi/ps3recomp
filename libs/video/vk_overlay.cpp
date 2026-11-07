@@ -212,6 +212,7 @@ static void preload(void)
     /* PS3_OVERLAY_DEFAULTS="K=V;K=V": a launcher's defaults, below the file. */
     if (const char* d = getenv("PS3_OVERLAY_DEFAULTS")) {
         char buf[1024];
+        int n = 0;
         snprintf(buf, sizeof buf, "%s", d);
         for (char* tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
             char* eq = strchr(tok, '=');
@@ -222,7 +223,9 @@ static void preload(void)
             const int i = var_index(k);
             if (!*k || getenv(k) || (i >= 0 && in_file[i])) continue;
             ps3_setting_setenv(k, v);
+            n++;
         }
+        fprintf(stderr, "[overlay] PS3_OVERLAY_DEFAULTS: %d default(s) applied\n", n);
     }
     for (int i = 0; i < V_N; i++) {
         const char* e = getenv(kVar[i]);
