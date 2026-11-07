@@ -20,31 +20,32 @@ static int n_keys(const PadInputMap* m, int ctl)
     return n;
 }
 
-/* The defaults are the layout cellPad.c hard-coded before the file. */
+/* The defaults: inFAMOUS 2's PC layout (pim_defaults, docs/INPUT.md). */
 static void test_defaults(void)
 {
     PadInputMap m;
     pim_defaults(&m);
-    static const struct { int ctl; unsigned vk; } old[] = {
+    static const struct { int ctl; unsigned vk; } def[] = {
+        {PIM_LS_UP, 0x0D}, {PIM_LS_LEFT, 0x00}, {PIM_LS_DOWN, 0x01}, {PIM_LS_RIGHT, 0x02},
+        {PIM_RS_UP, 0x22}, {PIM_RS_LEFT, 0x26}, {PIM_RS_DOWN, 0x28}, {PIM_RS_RIGHT, 0x25},
+        {PIM_CROSS, 0x31}, {PIM_CIRCLE, 0x38}, {PIM_SQUARE, 0x03}, {PIM_TRIANGLE, 0x0C},
+        {PIM_R1, 0x0E}, {PIM_L1, 0x06}, {PIM_R2, 0x0F}, {PIM_L2, 0x08}, {PIM_L3, 0x09}, {PIM_R3, 0x07},
+        {PIM_UP, 0x12}, {PIM_DOWN, 0x13}, {PIM_LEFT, 0x14}, {PIM_RIGHT, 0x15},
         {PIM_UP, 0x7E}, {PIM_DOWN, 0x7D}, {PIM_LEFT, 0x7B}, {PIM_RIGHT, 0x7C},
-        {PIM_CROSS, 0x31}, {PIM_CIRCLE, 0x0C}, {PIM_SQUARE, 0x0E}, {PIM_TRIANGLE, 0x0F},
-        {PIM_L1, 0x20}, {PIM_R1, 0x1F}, {PIM_L2, 0x10}, {PIM_R2, 0x23},
-        {PIM_L3, 0x05}, {PIM_R3, 0x04}, {PIM_START, 0x24}, {PIM_START, 0x4C},
-        {PIM_SELECT, 0x30},
-        {PIM_LS_RIGHT, 0x02}, {PIM_LS_LEFT, 0x00}, {PIM_LS_DOWN, 0x01}, {PIM_LS_UP, 0x0D},
-        {PIM_RS_RIGHT, 0x25}, {PIM_RS_LEFT, 0x26}, {PIM_RS_DOWN, 0x28}, {PIM_RS_UP, 0x22},
+        {PIM_START, 0x24}, {PIM_START, 0x4C}, {PIM_SELECT, 0x2E}, {PIM_SELECT, 0x30},
     };
     int total = 0;
-    for (unsigned i = 0; i < sizeof old / sizeof old[0]; i++) assert(key_of(&m, old[i].ctl, old[i].vk));
+    for (unsigned i = 0; i < sizeof def / sizeof def[0]; i++) assert(key_of(&m, def[i].ctl, def[i].vk));
     for (int c = 0; c < PIM_N_CONTROLS; c++) total += n_keys(&m, c);
-    assert(total == (int)(sizeof old / sizeof old[0]));   /* nothing else bound */
-    assert(m.mouse[PIM_R1] == 1 && m.mouse[PIM_R2] == 2 && m.mouse[PIM_L1] == 0xFC);   /* middle, 4-8 */
+    assert(total == (int)(sizeof def / sizeof def[0]));   /* nothing else bound */
+    assert(m.mouse[PIM_R1] == 1 && m.mouse[PIM_L1] == 2 && m.mouse[PIM_R3] == 4);
+    assert(m.mouse[PIM_R2] == 8 && m.mouse[PIM_L2] == 16 && m.mouse[PIM_UP] == PIM_MOUSE_WHEEL_UP);
     for (int c = 0; c < PIM_N_CONTROLS; c++)
-        if (c != PIM_R1 && c != PIM_R2 && c != PIM_L1) assert(m.mouse[c] == 0);
+        if (c != PIM_R1 && c != PIM_R2 && c != PIM_L1 && c != PIM_L2 && c != PIM_R3 && c != PIM_UP) assert(m.mouse[c] == 0);
     /* controller: each SDL button its namesake, triggers L2/R2, sticks unbound */
     assert(m.pad[PIM_CROSS] == 1u << 0 && m.pad[PIM_CIRCLE] == 1u << 1);
     assert(m.pad[PIM_SQUARE] == 1u << 2 && m.pad[PIM_TRIANGLE] == 1u << 3);
-    assert(m.pad[PIM_SELECT] == 1u << 4 && m.pad[PIM_START] == 1u << 6);
+    assert(m.pad[PIM_SELECT] == ((1u << 4) | (1u << 20)) && m.pad[PIM_START] == 1u << 6);   /* + touchpad */
     assert(m.pad[PIM_L3] == 1u << 7 && m.pad[PIM_R3] == 1u << 8);
     assert(m.pad[PIM_L1] == 1u << 9 && m.pad[PIM_R1] == 1u << 10);
     assert(m.pad[PIM_UP] == 1u << 11 && m.pad[PIM_DOWN] == 1u << 12);

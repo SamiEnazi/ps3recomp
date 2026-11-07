@@ -26,19 +26,21 @@ static void press_only(const unsigned* vks, int n)
     for (int i = 0; i < n; i++) g_pad_host_keys[vks[i] >> 5] |= 1u << (vks[i] & 31);
 }
 
-/* What the hard-coded pad_poll_keys produced (before PS3_INPUT_MAP). */
+/* The built-in layout (pim_defaults: inFAMOUS 2's PC keys, docs/INPUT.md). */
 static void old_layout(const unsigned* vks, int n, u16* btns, int* lx, int* ly, int* rx, int* ry)
 {
     static const struct { unsigned vk; u16 btn; } map[] = {
         {0x7E, CELL_PAD_CTRL_UP}, {0x7D, CELL_PAD_CTRL_DOWN},
         {0x7B, CELL_PAD_CTRL_LEFT}, {0x7C, CELL_PAD_CTRL_RIGHT},
-        {0x31, CELL_PAD_CTRL_CROSS}, {0x0C, CELL_PAD_CTRL_CIRCLE},
-        {0x0E, CELL_PAD_CTRL_SQUARE}, {0x0F, CELL_PAD_CTRL_TRIANGLE},
-        {0x20, CELL_PAD_CTRL_L1}, {0x1F, CELL_PAD_CTRL_R1},
-        {0x10, CELL_PAD_CTRL_L2}, {0x23, CELL_PAD_CTRL_R2},
-        {0x05, CELL_PAD_CTRL_L3}, {0x04, CELL_PAD_CTRL_R3},
+        {0x12, CELL_PAD_CTRL_UP}, {0x13, CELL_PAD_CTRL_DOWN},
+        {0x14, CELL_PAD_CTRL_LEFT}, {0x15, CELL_PAD_CTRL_RIGHT},
+        {0x31, CELL_PAD_CTRL_CROSS}, {0x38, CELL_PAD_CTRL_CIRCLE},
+        {0x03, CELL_PAD_CTRL_SQUARE}, {0x0C, CELL_PAD_CTRL_TRIANGLE},
+        {0x06, CELL_PAD_CTRL_L1}, {0x0E, CELL_PAD_CTRL_R1},
+        {0x08, CELL_PAD_CTRL_L2}, {0x0F, CELL_PAD_CTRL_R2},
+        {0x09, CELL_PAD_CTRL_L3}, {0x07, CELL_PAD_CTRL_R3},
         {0x24, CELL_PAD_CTRL_START}, {0x4C, CELL_PAD_CTRL_START},
-        {0x30, CELL_PAD_CTRL_SELECT},
+        {0x2E, CELL_PAD_CTRL_SELECT}, {0x30, CELL_PAD_CTRL_SELECT},
     };
     int down[128] = {0};
     for (int i = 0; i < n; i++) down[vks[i]] = 1;
@@ -71,21 +73,23 @@ static void test_default_layout(void)
     for (unsigned vk = 0; vk < 128; vk++) expect_like_old(&vk, 1);
     const unsigned combos[][4] = {
         {0x00, 0x02, 0, 0}, {0x0D, 0x01, 0, 0}, {0x0D, 0x02, 0x31, 0x22},
-        {0x26, 0x25, 0x28, 0x24}, {0x10, 0x23, 0x20, 0x1F},
+        {0x26, 0x25, 0x28, 0x24}, {0x08, 0x0F, 0x06, 0x0E},
     };
     expect_like_old(combos[0], 2);
     expect_like_old(combos[1], 2);
     for (int i = 2; i < 5; i++) expect_like_old(combos[i], 4);
     press_only(NULL, 0);
-    /* mouse buttons: left R1, right R2, middle and the side buttons L1 */
+    /* mouse buttons: left R1, right L1 (aim), middle R3, 4 R2, 5 L2, others nothing */
     g_pad_mouse_buttons = 1; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_R1);
-    g_pad_mouse_buttons = 2; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_R2);
-    g_pad_mouse_buttons = 4; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_L1);
-    g_pad_mouse_buttons = 8;  pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_L1);   /* as before: */
-    g_pad_mouse_buttons = 64; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_L1);   /* any other button */
+    g_pad_mouse_buttons = 2; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_L1);
+    g_pad_mouse_buttons = 4; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_R3);
+    g_pad_mouse_buttons = 8;  pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_R2);
+    g_pad_mouse_buttons = 16; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_L2);
+    g_pad_mouse_buttons = 64; pad_poll_keys(0); assert(s_host_state[0].buttons == 0);
     g_pad_mouse_buttons = 0;
-    g_pad_mouse_wheel = 64; pad_poll_keys(0); assert(s_host_state[0].buttons == 0);   /* wheel unbound */
+    g_pad_mouse_wheel = 16; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_UP);   /* wheel up: D-pad up */
     for (int i = 0; i < 8; i++) { usleep(100 * 1000); pad_poll_keys(0); }   /* let the queued notches pass */
+    g_pad_mouse_wheel = -16; pad_poll_keys(0); assert(s_host_state[0].buttons == 0);              /* wheel down: nothing */
     assert(cellPad_host_mouse_capture_wanted() == 1);
 }
 
@@ -120,11 +124,11 @@ static void test_mapped_layout(void)
     k = 0x7E; press_only(&k, 1); pad_poll_keys(0);
     assert(s_host_state[0].buttons == 0 && s_host_state[0].analog_ly == 0);
     k = 0x11; press_only(&k, 1); pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_UP);
-    k = 0x0E; press_only(&k, 1); pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_SQUARE);
+    k = 0x0E; press_only(&k, 1); pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_R1);   /* E keeps R1 */
     press_only(NULL, 0);
     g_pad_mouse_buttons = 1; pad_poll_keys(0); assert(s_host_state[0].buttons == 0);
     g_pad_mouse_buttons = 8; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_R1);
-    g_pad_mouse_buttons = 2; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_R2);
+    g_pad_mouse_buttons = 2; pad_poll_keys(0); assert(s_host_state[0].buttons == CELL_PAD_CTRL_L1);
     g_pad_mouse_buttons = 0;
 
     /* two wheel notches up: two separate presses of UP */

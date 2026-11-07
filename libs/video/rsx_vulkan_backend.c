@@ -6163,6 +6163,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
     return 0;
 }
 
+static int s_vk_holding;   /* the shutdown hold loop is running: Esc ends it (pump_messages) */
 void rsx_vulkan_backend_shutdown(void)
 {
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
@@ -6172,10 +6173,12 @@ void rsx_vulkan_backend_shutdown(void)
         VK_LOG("holding the last frame on screen for %.1f s "
                "(Esc or closing the window ends it early)\n", s_vk.hold_seconds);
         const Uint32 end = SDL_GetTicks() + (Uint32)(s_vk.hold_seconds * 1000.0);
+        s_vk_holding = 1;
         while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
             if (rsx_vulkan_backend_pump_messages() != 0) break;
             vk_present_window();         /* FIFO: paced by the display */
         }
+        s_vk_holding = 0;
     }
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
@@ -6282,6 +6285,52 @@ static void vk_playlog_frame(void)
     s_pl.sec_start = now;
 }
 
+/* ---- window events and the mouse (cellPad.c owns the decisions) -----------
+ * Esc no longer quits: with a mouse-driven camera it is the key players hit
+ * to get their cursor back. It goes to cellPad (cellPad_host_window_event):
+ * the in-game menu's open/close counter, and releasing the captured mouse.
+ * Quit = closing the window or Alt+F4 (SDL turns both into SDL_QUIT).
+ * PS3_ESC=quit restores Esc = quit; while the last frame is held on screen
+ * after the game ended (PS3RECOMP_VK_HOLD) Esc still ends it.
+ * The mouse is captured (cursor hidden, kept in the window) only after a
+ * click in the window, and only while the window has the focus and no menu
+ * is open; the motion itself comes from raw input on cellPad's own thread. */
+int  cellPad_host_window_event(int ev);          /* 1 click, 2 Esc; 1 = swallowed */
+void cellPad_host_window_focus(int focused);
+int  cellPad_host_capture_wanted_now(void);      /* 0 none, 1 motion only, 2 hold the cursor */
+void cellPad_host_set_mouse_captured(int on);
+static int s_cap_state;                          /* what the window applied (0/1/2) */
+
+static int vk_esc_quits(void)
+{
+    static int q = -1;
+    if (q < 0) { const char* e = getenv("PS3_ESC"); q = (e && !strcmp(e, "quit")) ? 1 : 0; }
+    return q;
+}
+
+static void vk_mouse_capture_sync(void)
+{
+    if (!s_vk.window) return;
+    const int focused = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    cellPad_host_window_focus(focused);
+    const int want = cellPad_host_capture_wanted_now();
+    if (want == s_cap_state) return;
+    if (want == 2) {
+        SDL_SetWindowGrab(s_vk.window, SDL_TRUE);   /* SDL re-clips/unclips it on focus changes */
+        SDL_ShowCursor(SDL_DISABLE);
+    } else if (s_cap_state == 2) {
+        SDL_SetWindowGrab(s_vk.window, SDL_FALSE);
+        SDL_ShowCursor(SDL_ENABLE);
+        if (focused) {                               /* give the cursor back in the middle */
+            int w = 0, h = 0;
+            SDL_GetWindowSize(s_vk.window, &w, &h);
+            SDL_WarpMouseInWindow(s_vk.window, w / 2, h / 2);
+        }
+    }
+    s_cap_state = want;
+    cellPad_host_set_mouse_captured(want != 0);
+}
+
 int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
@@ -6289,9 +6338,14 @@ int rsx_vulkan_backend_pump_messages(void)
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) quit = 1;
-        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {
+            if (s_vk_holding || vk_esc_quits()) quit = 1;
+            else if (!e.key.repeat) cellPad_host_window_event(2);
+        }
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9 && !e.key.repeat) s_pl.mark = 1;
+        else if (e.type == SDL_MOUSEBUTTONDOWN) cellPad_host_window_event(1);
     }
+    vk_mouse_capture_sync();
     return quit ? -1 : 0;
 }
 

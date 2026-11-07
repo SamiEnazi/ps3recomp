@@ -35,9 +35,30 @@
  *   cross = "a"                # (Cross on a DualSense, A on an Xbox pad)
  *   r2    = "righttrigger"
  *
+ *   [controller.xbox]          # replaces [controller] lines for one family
+ *   select = "back"            # of pads only: .playstation .xbox .nintendo
+ *                              # .other (the controls it lists; the rest
+ *                              # follow [controller])
+ *
+ *   [controller_settings]      # sticks and triggers (docs/INPUT.md)
+ *   deadzone        = 0.08     # radial, both sticks (or deadzone_left/_right)
+ *   anti_deadzone   = 0.0      # (or anti_deadzone_left/_right)
+ *   outer           = 0.97     # deflection that counts as full (outer_left/_right)
+ *   squircle        = 0.5      # 0 round .. 1 square diagonals (squircle_left/_right)
+ *   trigger_threshold = 0.12   # digital L2/R2 press point
+ *   trigger_deadzone  = 0.02
+ *   left_stick      = "left"   # which physical stick drives the PS3 left stick
+ *   right_stick     = "right"  # ("left", "right", "none"): swap = southpaw
+ *   invert_right_y  = false    # invert_left_x/_left_y/_right_x/_right_y
+ *   nintendo_layout = "position"  # or "label": A (east) = Cross on Nintendo pads
+ *   tilt            = "sensor" # SIXAXIS tilt (Ionic Storm steering): the pad's
+ *                              # motion sensor, else the left stick; "left_stick"; "none"
+ *   tilt_invert     = false
+ *
  * The environment variables in the comments win over the file. An input the
  * file binds leaves the controls the file does not mention: `cross = "Q"`
- * takes Q off its default, circle (list it under both to keep both).
+ * takes Q off its default, circle (list it under both to keep both). A key
+ * or button bound to SEVERAL controls presses them together (a chord).
  *
  * PS3 controls: up down left right (D-pad), cross circle square triangle,
  * l1 r1 l2 r2 l3 r3, start select, ls_up ls_down ls_left ls_right (left
@@ -56,11 +77,20 @@
  *
  * Controller inputs (SDL names): a b x y back guide start leftstick
  * rightstick leftshoulder rightshoulder dpup dpdown dpleft dpright misc1
- * paddle1-paddle4 touchpad lefttrigger righttrigger; PlayStation and Xbox
+ * paddle1-paddle4 touchpad lefttrigger righttrigger, and the stick
+ * half-axes as buttons (pushed past half way): leftx- leftx+ lefty- lefty+
+ * rightx- rightx+ righty- righty+ (y- = up); PlayStation and Xbox
  * names are accepted as aliases (cross circle square triangle, l1 r1 l2 r2
- * l3 r3, share create options ps, view menu home). The physical sticks always
- * drive the PS3 sticks; a stick direction bound to a button pushes that
- * axis to the end while it is held.
+ * l3 r3, share create options ps, view menu home). The names are SDL's
+ * POSITIONS: a = the bottom face button on every pad (Cross, Xbox A,
+ * Nintendo B). The physical sticks drive the PS3 sticks ([controller_settings]
+ * left_stick/right_stick choose which); a stick direction bound to a button
+ * pushes that axis to the end while it is held.
+ *
+ * Keys on Windows are read by POSITION too, with the US names: "W" is the
+ * key left of E whatever the layout prints on it. Windows names are accepted
+ * as aliases (Ctrl, Alt, LeftShift, Delete = the Del key, Insert, PrintScreen,
+ * ScrollLock, Pause, CapsLock, Numpad0-9, ...).
  *
  * The in-game menu rebinds controls live and writes them back with
  * pim_save_file (all three binding sections in full, every other section
@@ -95,9 +125,18 @@ enum {
 #define PIM_MOUSE_WHEEL_DOWN  (1u << 25)
 
 /* Controller inputs: bit n = SDL_GameControllerButton n (stable values since
- * SDL 2.0; 15-20 need SDL 2.0.14+), plus the two triggers read as buttons. */
+ * SDL 2.0; 15-20 need SDL 2.0.14+), plus the two triggers read as buttons,
+ * plus the sticks' half-axes read as buttons: 23 leftx-, 24 leftx+,
+ * 25 lefty- (up), 26 lefty+ (down), 27-30 the same for the right stick. */
 #define PIM_PAD_TRIGGER_LEFT   21
 #define PIM_PAD_TRIGGER_RIGHT  22
+#define PIM_PAD_AXIS_FIRST     23
+#define PIM_PAD_N_INPUTS       31
+#define PIM_PAD_AXIS_MASK      (((1u << 8) - 1u) << PIM_PAD_AXIS_FIRST)
+#define PIM_PAD_TRIGGER_MASK   ((1u << PIM_PAD_TRIGGER_LEFT) | (1u << PIM_PAD_TRIGGER_RIGHT))
+
+/* Controller families, for [controller.<family>]: what SDL calls the pad. */
+enum { PIM_FAM_PLAYSTATION, PIM_FAM_XBOX, PIM_FAM_NINTENDO, PIM_FAM_OTHER, PIM_N_FAM };
 
 typedef struct {
     uint32_t key[PIM_N_CONTROLS][4];   /* 128 key codes, like g_pad_host_keys */
@@ -106,6 +145,19 @@ typedef struct {
     /* [mouse]; -1 (or 0 for sens) = not in the file */
     int   mouse_camera, mouse_invert_x, mouse_invert_y, mouse_deadzone, mouse_capture;
     float mouse_sens;
+    /* [controller.<family>]: control c of family f is pad_fam[f][c] instead
+     * of pad[c] when bit c of pad_fam_set[f] is set (pim_pad_resolve). */
+    uint32_t pad_fam[PIM_N_FAM][PIM_N_CONTROLS];
+    uint32_t pad_fam_set[PIM_N_FAM];
+    /* [controller_settings]; < 0 = not in the file. Index 0 = the PS3 left
+     * stick, 1 = the right one (pad_stick.h has the meanings). */
+    float stick_deadzone[2], stick_anti[2], stick_outer[2], stick_squircle[2];
+    float trigger_threshold, trigger_deadzone;
+    int   stick_source[2];      /* physical stick driving it: 0 left, 1 right, 2 none */
+    int   stick_invert[2][2];   /* [stick][0 = x, 1 = y] */
+    int   nintendo_labels;      /* 1: Nintendo pads by label (A = Cross), 0 by position */
+    int   tilt;                 /* SIXAXIS tilt: 0 none, 1 motion sensor (else left stick), 2 left stick */
+    int   tilt_invert;
     int   n_set;        /* controls/settings the file changed */
     int   n_warnings;   /* names it did not know */
 } PadInputMap;
@@ -153,11 +205,25 @@ static const PimName pim_keys[] = {
     {"pagedown", 0x79}, {"f1", 0x7A}, {"left", 0x7B}, {"right", 0x7C},
     {"down", 0x7D}, {"up", 0x7E},
     /* aliases */
-    {"enter", 0x24}, {"esc", 0x35}, {"delete", 0x33}, {"backquote", 0x32},
+    {"enter", 0x24}, {"esc", 0x35}, {"backquote", 0x32},
     {"leftshift", 0x38}, {"leftcontrol", 0x3B}, {"leftoption", 0x3A},
     {"ctrl", 0x3B}, {"alt", 0x3A}, {"rightctrl", 0x3E}, {"rightalt", 0x3D},
     {"insert", 0x72}, {"numlock", 0x47},
     {"arrowup", 0x7E}, {"arrowdown", 0x7D}, {"arrowleft", 0x7B}, {"arrowright", 0x7C},
+    /* Windows names (a PC keyboard's key at the same position). "Delete" is
+     * the Del key here (it was the Mac's Backspace, which is "Backspace"). */
+    {"delete", 0x75}, {"del", 0x75}, {"ins", 0x72},
+    {"lshift", 0x38}, {"rshift", 0x3C}, {"lctrl", 0x3B}, {"rctrl", 0x3E},
+    {"leftctrl", 0x3B}, {"lalt", 0x3A}, {"ralt", 0x3D}, {"leftalt", 0x3A}, {"altgr", 0x3D},
+    {"capslock", 0x39}, {"caps", 0x39},
+    {"printscreen", 0x69}, {"prtsc", 0x69}, {"scrolllock", 0x6B}, {"pause", 0x71}, {"break", 0x71},
+    {"pgup", 0x74}, {"pgdn", 0x79}, {"apps", 0x6E}, {"contextmenu", 0x6E},
+    {"tilde", 0x32}, {"backtick", 0x32}, {"lbracket", 0x21}, {"rbracket", 0x1E},
+    {"numpad0", 0x52}, {"numpad1", 0x53}, {"numpad2", 0x54}, {"numpad3", 0x55},
+    {"numpad4", 0x56}, {"numpad5", 0x57}, {"numpad6", 0x58}, {"numpad7", 0x59},
+    {"numpad8", 0x5B}, {"numpad9", 0x5C}, {"numpadenter", 0x4C}, {"numpadplus", 0x45},
+    {"numpadminus", 0x4E}, {"numpadmultiply", 0x43}, {"numpaddivide", 0x4B},
+    {"numpaddecimal", 0x41}, {"oem102", 0x0A},
 };
 
 static const PimName pim_mouse_buttons[] = {
@@ -181,7 +247,37 @@ static const PimName pim_pad_inputs[] = {
     {"up", 11}, {"down", 12}, {"left", 13}, {"right", 14},
     {"l2", PIM_PAD_TRIGGER_LEFT}, {"r2", PIM_PAD_TRIGGER_RIGHT},
     {"lt", PIM_PAD_TRIGGER_LEFT}, {"rt", PIM_PAD_TRIGGER_RIGHT},
+    /* the sticks' half-axes, read as buttons */
+    {"leftx-", 23}, {"leftx+", 24}, {"lefty-", 25}, {"lefty+", 26},
+    {"rightx-", 27}, {"rightx+", 28}, {"righty-", 29}, {"righty+", 30},
+    {"ls_left", 23}, {"ls_right", 24}, {"ls_up", 25}, {"ls_down", 26},
+    {"rs_left", 27}, {"rs_right", 28}, {"rs_up", 29}, {"rs_down", 30},
 };
+
+/* The family of a controller from SDL_GameControllerType (SDL 2.30 values:
+ * 1/2 Xbox 360/One, 3/4/7 PS3/PS4/PS5, 5 Switch Pro, 11-13 Joy-Cons). */
+static inline int pim_family_of_sdl_type(int sdl_type)
+{
+    switch (sdl_type) {
+    case 3: case 4: case 7: return PIM_FAM_PLAYSTATION;
+    case 1: case 2: return PIM_FAM_XBOX;
+    case 5: case 11: case 12: case 13: return PIM_FAM_NINTENDO;
+    default: return PIM_FAM_OTHER;
+    }
+}
+static const char* const pim_family_names[PIM_N_FAM] = { "playstation", "xbox", "nintendo", "other" };
+
+/* The bindings of family `fam` (-1: [controller] alone): each control its
+ * [controller.<fam>] line if the file has one, else its [controller] line
+ * minus the inputs the family section took for other controls. */
+static inline void pim_pad_resolve(const PadInputMap* m, int fam, uint32_t out[PIM_N_CONTROLS])
+{
+    const uint32_t set = (fam >= 0 && fam < PIM_N_FAM) ? m->pad_fam_set[fam] : 0;
+    uint32_t taken = 0;
+    for (int c = 0; c < PIM_N_CONTROLS; c++) if (set >> c & 1u) taken |= m->pad_fam[fam][c];
+    for (int c = 0; c < PIM_N_CONTROLS; c++)
+        out[c] = (set >> c & 1u) ? m->pad_fam[fam][c] : (m->pad[c] & ~taken);
+}
 
 #define PIM_COUNT(a) (int)(sizeof(a) / sizeof((a)[0]))
 
@@ -194,27 +290,66 @@ static int pim_lookup(const PimName* t, int n, const char* name)
 
 static void pim_key_set(uint32_t m[4], unsigned vk) { m[(vk >> 5) & 3] |= 1u << (vk & 31); }
 
-/* The built-in layout: what cellPad.c hard-coded before the file existed. */
+/* The built-in layout (docs/INPUT.md has it as a table).
+ *
+ * Keyboard and mouse follow inFAMOUS 2's own controls page (the game's
+ * u_controller_help_* strings): L1 is "Aim Mode" and turns the face buttons
+ * into powers (L1+R1 Bolt, L1+Square Grenade, L1+Triangle Rocket, L1+Cross
+ * Blast, L1+L2 Find Electric Sources, L1+R3 Switch Reticule Side), so aim is
+ * the right mouse button and the powers sit under the left hand:
+ *
+ *   move W A S D             camera  mouse (or I J K L)
+ *   Cross    Space   Jump              (aim: Blast)
+ *   Circle   Shift   Dive Roll / Drop / cover
+ *   Square   F       Melee             (aim: Grenade)
+ *   Triangle Q       Melee Finisher    (aim: Rocket; with R1: Pulse Heal)
+ *   R1       E, left mouse    Static Thrusters / Use Object (aim: Bolt)
+ *   L1       right mouse, Z   Aim Mode
+ *   R2       R, mouse 4       Kinetic Pulse (hold to lift, tap to throw)
+ *   L2       C, mouse 5       Electric Drain (hold) / Radar Pulse (tap)
+ *   L3       V                Ping
+ *   R3       middle mouse, X  (aim: Switch Reticule Side)
+ *   D-pad    1 2 3 4 = up down left right (Precision Mode, Ionic Vortex,
+ *            Purchase Powers, Switch Powers), also the arrow keys (menus);
+ *            wheel up = up (Precision Mode)
+ *   START    Enter            SELECT  M, Tab (World Map)
+ *   Esc is the window's (menu / release the mouse), not the game's.
+ *
+ * A controller is bound by POSITION (SDL's a/b/x/y = bottom/right/left/top on
+ * every pad; the runtime asks SDL for positions on Nintendo pads too), so its
+ * layout is the DualShock's on any pad; the touchpad click of a DualShock
+ * 4/DualSense is SELECT (World Map), as in PS4 remasters. */
 static void pim_defaults(PadInputMap* m)
 {
     memset(m, 0, sizeof *m);
     static const struct { int ctl; unsigned char vk; } keys[] = {
-        {PIM_UP, 0x7E}, {PIM_DOWN, 0x7D}, {PIM_LEFT, 0x7B}, {PIM_RIGHT, 0x7C},
-        {PIM_CROSS, 0x31}, {PIM_CIRCLE, 0x0C}, {PIM_SQUARE, 0x0E}, {PIM_TRIANGLE, 0x0F},
-        {PIM_L1, 0x20}, {PIM_R1, 0x1F}, {PIM_L2, 0x10}, {PIM_R2, 0x23},
-        {PIM_L3, 0x05}, {PIM_R3, 0x04},
-        {PIM_START, 0x24}, {PIM_START, 0x4C},          /* Return, keypad Enter */
-        {PIM_SELECT, 0x30},
         {PIM_LS_UP, 0x0D}, {PIM_LS_LEFT, 0x00}, {PIM_LS_DOWN, 0x01}, {PIM_LS_RIGHT, 0x02},   /* WASD */
         {PIM_RS_UP, 0x22}, {PIM_RS_LEFT, 0x26}, {PIM_RS_DOWN, 0x28}, {PIM_RS_RIGHT, 0x25},   /* IJKL */
+        {PIM_CROSS, 0x31},                              /* Space */
+        {PIM_CIRCLE, 0x38},                             /* Shift */
+        {PIM_SQUARE, 0x03},                             /* F */
+        {PIM_TRIANGLE, 0x0C},                           /* Q */
+        {PIM_R1, 0x0E},                                 /* E */
+        {PIM_L1, 0x06},                                 /* Z */
+        {PIM_R2, 0x0F},                                 /* R */
+        {PIM_L2, 0x08},                                 /* C */
+        {PIM_L3, 0x09},                                 /* V */
+        {PIM_R3, 0x07},                                 /* X */
+        {PIM_UP, 0x12}, {PIM_DOWN, 0x13}, {PIM_LEFT, 0x14}, {PIM_RIGHT, 0x15},   /* 1 2 3 4 */
+        {PIM_UP, 0x7E}, {PIM_DOWN, 0x7D}, {PIM_LEFT, 0x7B}, {PIM_RIGHT, 0x7C},   /* arrows */
+        {PIM_START, 0x24}, {PIM_START, 0x4C},          /* Return, keypad Enter */
+        {PIM_SELECT, 0x2E}, {PIM_SELECT, 0x30},         /* M, Tab */
     };
     for (int i = 0; i < PIM_COUNT(keys); i++) pim_key_set(m->key[keys[i].ctl], keys[i].vk);
-    m->mouse[PIM_R1] = 1;   /* left: bolt */
-    m->mouse[PIM_R2] = 2;   /* right: grenade */
-    m->mouse[PIM_L1] = 0xFC;   /* middle: aim (and buttons 4-8, which the window
-                                  * once reported as the middle one) */
+    m->mouse[PIM_R1] = 1;                   /* left: Bolt (with aim) / use */
+    m->mouse[PIM_L1] = 2;                   /* right: Aim Mode */
+    m->mouse[PIM_R3] = 4;                   /* middle: switch reticule side */
+    m->mouse[PIM_R2] = 8;                   /* button 4 (back): Kinetic Pulse */
+    m->mouse[PIM_L2] = 16;                  /* button 5 (forward): Drain */
+    m->mouse[PIM_UP] = PIM_MOUSE_WHEEL_UP;  /* wheel up: Precision Mode */
     static const struct { int ctl; int in; } pad[] = {
-        {PIM_SELECT, 4}, {PIM_L3, 7}, {PIM_R3, 8}, {PIM_START, 6},
+        {PIM_SELECT, 4}, {PIM_SELECT, 20},              /* back (Share/View/-), touchpad */
+        {PIM_L3, 7}, {PIM_R3, 8}, {PIM_START, 6},
         {PIM_UP, 11}, {PIM_RIGHT, 14}, {PIM_DOWN, 12}, {PIM_LEFT, 13},
         {PIM_L1, 9}, {PIM_R1, 10}, {PIM_TRIANGLE, 3}, {PIM_CIRCLE, 1},
         {PIM_CROSS, 0}, {PIM_SQUARE, 2},
@@ -223,12 +358,20 @@ static void pim_defaults(PadInputMap* m)
     for (int i = 0; i < PIM_COUNT(pad); i++) m->pad[pad[i].ctl] |= 1u << pad[i].in;
     m->mouse_camera = m->mouse_invert_x = m->mouse_invert_y = m->mouse_deadzone = m->mouse_capture = -1;
     m->mouse_sens = 0.0f;
+    for (int s = 0; s < 2; s++) {
+        m->stick_deadzone[s] = m->stick_anti[s] = m->stick_outer[s] = m->stick_squircle[s] = -1.0f;
+        m->stick_source[s] = -1;
+        m->stick_invert[s][0] = m->stick_invert[s][1] = -1;
+    }
+    m->trigger_threshold = m->trigger_deadzone = -1.0f;
+    m->nintendo_labels = -1;
+    m->tilt = m->tilt_invert = -1;
 }
 
 /* ---- parsing ---------------------------------------------------------- */
 
 enum { PIM_SEC_NONE, PIM_SEC_KEYBOARD, PIM_SEC_MOUSE_BUTTONS, PIM_SEC_MOUSE,
-       PIM_SEC_CONTROLLER, PIM_SEC_UNKNOWN };
+       PIM_SEC_CONTROLLER, PIM_SEC_UNKNOWN, PIM_SEC_CONTROLLER_FAMILY, PIM_SEC_CONTROLLER_SETTINGS };
 
 static void pim_lower(char* s) { for (; *s; s++) *s = (char)tolower((unsigned char)*s); }
 
@@ -285,8 +428,9 @@ static int pim_parse_key_name(const char* name)
     return -1;
 }
 
-/* One "control = inputs" line of a binding section. */
-static void pim_bind(PadInputMap* m, int sec, int ctl, char* list, FILE* err, const char* src, int line)
+/* One "control = inputs" line of a binding section (fam: the family of a
+ * [controller.<family>] section, else unused). */
+static void pim_bind(PadInputMap* m, int sec, int ctl, char* list, FILE* err, const char* src, int line, int fam)
 {
     uint32_t keys[4] = {0, 0, 0, 0}, bits = 0;
     /* no strtok: cellPad's PS3_PAD_FILE reader uses it from the poll thread */
@@ -311,8 +455,99 @@ static void pim_bind(PadInputMap* m, int sec, int ctl, char* list, FILE* err, co
     }
     if (sec == PIM_SEC_KEYBOARD) memcpy(m->key[ctl], keys, sizeof keys);
     else if (sec == PIM_SEC_MOUSE_BUTTONS) m->mouse[ctl] = bits;
+    else if (sec == PIM_SEC_CONTROLLER_FAMILY) { m->pad_fam[fam][ctl] = bits; m->pad_fam_set[fam] |= 1u << ctl; }
     else m->pad[ctl] = bits;
     m->n_set++;
+}
+
+/* A fraction setting: 0.08, or a percentage (8 or 8%). */
+static int pim_fraction(const char* v, float* out)
+{
+    char* end;
+    float f = strtof(v, &end);
+    if (end == v) return 0;
+    if (*end == '%') { end++; f /= 100.0f; }
+    else if (f > 1.0f) f /= 100.0f;
+    if (*end) return 0;
+    if (f < 0.0f) f = 0.0f;
+    *out = f;
+    return 1;
+}
+
+/* One line of [controller_settings]. */
+static void pim_controller_setting(PadInputMap* m, const char* key, const char* v, FILE* err, const char* src, int line)
+{
+    static const struct { const char* name; int field; int stick; } fl[] = {
+        {"deadzone", 0, 2}, {"deadzone_left", 0, 0}, {"deadzone_right", 0, 1},
+        {"left_deadzone", 0, 0}, {"right_deadzone", 0, 1},
+        {"anti_deadzone", 1, 2}, {"anti_deadzone_left", 1, 0}, {"anti_deadzone_right", 1, 1},
+        {"outer", 2, 2}, {"outer_left", 2, 0}, {"outer_right", 2, 1},
+        {"saturation", 2, 2}, {"saturation_left", 2, 0}, {"saturation_right", 2, 1},
+        {"squircle", 3, 2}, {"squircle_left", 3, 0}, {"squircle_right", 3, 1},
+        {"trigger_threshold", 4, 0}, {"trigger_deadzone", 5, 0},
+    };
+    for (int i = 0; i < PIM_COUNT(fl); i++) {
+        if (strcmp(key, fl[i].name)) continue;
+        float f;
+        if (!pim_fraction(v, &f)) { pim_warn(m, err, src, line, "value for controller setting", v); return; }
+        for (int s = 0; s < 2; s++) {
+            if (fl[i].stick != 2 && fl[i].stick != s) continue;
+            switch (fl[i].field) {
+            case 0: m->stick_deadzone[s] = f; break;
+            case 1: m->stick_anti[s] = f; break;
+            case 2: m->stick_outer[s] = f; break;
+            case 3: m->stick_squircle[s] = f; break;
+            case 4: m->trigger_threshold = f; break;
+            case 5: m->trigger_deadzone = f; break;
+            }
+        }
+        m->n_set++;
+        return;
+    }
+    int b;
+    if (!strcmp(key, "left_stick") || !strcmp(key, "right_stick")) {
+        const int s = key[0] == 'r';
+        int src_stick = -1;
+        if (!strcmp(v, "left")) src_stick = 0;
+        else if (!strcmp(v, "right")) src_stick = 1;
+        else if (!strcmp(v, "none") || !*v) src_stick = 2;
+        if (src_stick < 0) { pim_warn(m, err, src, line, "value for controller setting", v); return; }
+        m->stick_source[s] = src_stick;
+        m->n_set++;
+        return;
+    }
+    static const struct { const char* name; int s, a; } inv[] = {
+        {"invert_left_x", 0, 0}, {"invert_left_y", 0, 1}, {"invert_right_x", 1, 0}, {"invert_right_y", 1, 1},
+    };
+    for (int i = 0; i < PIM_COUNT(inv); i++) {
+        if (strcmp(key, inv[i].name)) continue;
+        if (!pim_bool(v, &b)) { pim_warn(m, err, src, line, "value for controller setting", v); return; }
+        m->stick_invert[inv[i].s][inv[i].a] = b;
+        m->n_set++;
+        return;
+    }
+    if (!strcmp(key, "nintendo_layout")) {
+        if (!strcmp(v, "position") || !strcmp(v, "positional") || !strcmp(v, "positions")) m->nintendo_labels = 0;
+        else if (!strcmp(v, "label") || !strcmp(v, "labels") || !strcmp(v, "labeled")) m->nintendo_labels = 1;
+        else { pim_warn(m, err, src, line, "value for controller setting", v); return; }
+        m->n_set++;
+        return;
+    }
+    if (!strcmp(key, "tilt")) {
+        if (!strcmp(v, "sensor") || !strcmp(v, "motion") || !strcmp(v, "gyro")) m->tilt = 1;
+        else if (!strcmp(v, "left_stick") || !strcmp(v, "stick")) m->tilt = 2;
+        else if (!strcmp(v, "none") || !strcmp(v, "off") || !*v) m->tilt = 0;
+        else { pim_warn(m, err, src, line, "value for controller setting", v); return; }
+        m->n_set++;
+        return;
+    }
+    if (!strcmp(key, "tilt_invert")) {
+        if (!pim_bool(v, &b)) { pim_warn(m, err, src, line, "value for controller setting", v); return; }
+        m->tilt_invert = b;
+        m->n_set++;
+        return;
+    }
+    pim_warn(m, err, src, line, "controller setting", key);
 }
 
 static void pim_mouse_setting(PadInputMap* m, const char* key, const char* v, FILE* err, const char* src, int line)
@@ -344,7 +579,7 @@ static void pim_mouse_setting(PadInputMap* m, const char* key, const char* v, FI
  * number of warnings. */
 static int pim_parse(PadInputMap* m, const char* text, FILE* err, const char* src)
 {
-    int sec = PIM_SEC_NONE, line_no = 0;
+    int sec = PIM_SEC_NONE, line_no = 0, fam = 0;
     const int start_warnings = m->n_warnings;
     uint32_t set_key = 0, set_mouse = 0, set_pad = 0;   /* controls this text binds */
     const char* p = text;
@@ -369,6 +604,17 @@ static int pim_parse(PadInputMap* m, const char* text, FILE* err, const char* sr
             else if (!strcmp(name, "mouse_buttons") || !strcmp(name, "mouse.buttons")) sec = PIM_SEC_MOUSE_BUTTONS;
             else if (!strcmp(name, "mouse")) sec = PIM_SEC_MOUSE;
             else if (!strcmp(name, "controller") || !strcmp(name, "gamepad") || !strcmp(name, "pad")) sec = PIM_SEC_CONTROLLER;
+            else if (!strcmp(name, "controller_settings") || !strcmp(name, "controller.settings") ||
+                     !strcmp(name, "sticks")) sec = PIM_SEC_CONTROLLER_SETTINGS;
+            else if (!strncmp(name, "controller.", 11)) {
+                const char* f = name + 11;
+                sec = PIM_SEC_CONTROLLER_FAMILY;
+                if (!strcmp(f, "playstation") || !strcmp(f, "ps") || !strcmp(f, "dualshock") || !strcmp(f, "dualsense")) fam = PIM_FAM_PLAYSTATION;
+                else if (!strcmp(f, "xbox")) fam = PIM_FAM_XBOX;
+                else if (!strcmp(f, "nintendo") || !strcmp(f, "switch")) fam = PIM_FAM_NINTENDO;
+                else if (!strcmp(f, "other") || !strcmp(f, "generic")) fam = PIM_FAM_OTHER;
+                else { sec = PIM_SEC_UNKNOWN; pim_warn(m, err, src, line_no, "section", name); }
+            }
             else { sec = PIM_SEC_UNKNOWN; pim_warn(m, err, src, line_no, "section", name); }
             continue;
         }
@@ -386,12 +632,14 @@ static int pim_parse(PadInputMap* m, const char* text, FILE* err, const char* sr
         if (sec == PIM_SEC_UNKNOWN) continue;              /* already reported */
         if (sec == PIM_SEC_NONE) { pim_warn(m, err, src, line_no, "setting outside a section", key); continue; }
         if (sec == PIM_SEC_MOUSE) { pim_mouse_setting(m, key, val, err, src, line_no); continue; }
+        if (sec == PIM_SEC_CONTROLLER_SETTINGS) { pim_controller_setting(m, key, val, err, src, line_no); continue; }
         const int ctl = pim_lookup(pim_controls, PIM_COUNT(pim_controls), key);
         if (ctl < 0) { pim_warn(m, err, src, line_no, "PS3 control", key); continue; }
-        pim_bind(m, sec, ctl, val, err, src, line_no);
+        pim_bind(m, sec, ctl, val, err, src, line_no, fam);
         if (sec == PIM_SEC_KEYBOARD) set_key |= 1u << ctl;
         else if (sec == PIM_SEC_MOUSE_BUTTONS) set_mouse |= 1u << ctl;
-        else set_pad |= 1u << ctl;
+        else if (sec == PIM_SEC_CONTROLLER) set_pad |= 1u << ctl;
+        /* a family section's inputs leave the other controls in pim_pad_resolve */
     }
     /* An input bound here leaves the controls not mentioned here. */
     uint32_t keys[4] = {0, 0, 0, 0}, mouse = 0, pad = 0;
