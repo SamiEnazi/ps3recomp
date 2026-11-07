@@ -396,8 +396,14 @@ static int audio_backend_init(void)
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
     wfx.cbSize          = 0;
 
-    /* Request event-driven mode with a ~20ms buffer */
-    REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
+    /* Event-driven, 60 ms by default (PS3_AUDIO_BUF_MS). The old 20 ms ran
+     * dry whenever the mixing thread lost the CPU for a moment -- with every
+     * core busy running SPU/PPU code that was often, and each time is an
+     * audible stutter (Bink cutscenes most of all). Upstream #514, measured on
+     * inFAMOUS 2 on Windows: 0 device underruns. */
+    REFERENCE_TIME buf_duration = 600000; /* 60 ms in 100 ns units */
+    { const char* e = getenv("PS3_AUDIO_BUF_MS"); const int ms = e ? atoi(e) : 0;
+      if (ms >= 10 && ms <= 500) buf_duration = (REFERENCE_TIME)ms * 10000; }
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     hr = s_wasapi_client->lpVtbl->Initialize(
@@ -683,6 +689,19 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
+
+    /* The device deadline is every few ms and the guest threads keep every
+     * core busy: run this one ahead of them (MMCSS "Pro Audio" when the
+     * service is there, the highest normal priority anyway). avrt.dll is
+     * loaded by hand so the runtime does not need avrt.lib to link.
+     * Upstream #514. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    { HMODULE avrt = LoadLibraryW(L"avrt.dll");
+      typedef HANDLE (WINAPI *set_mm_fn)(LPCWSTR, LPDWORD);
+      set_mm_fn set_mm = avrt ? (set_mm_fn)(void*)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW") : NULL;
+      DWORD task = 0;
+      if (set_mm && !set_mm(L"Pro Audio", &task))
+          fprintf(stderr, "[cellAudio] MMCSS Pro Audio unavailable (%lu)\n", (unsigned long)GetLastError()); }
 
     /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
      * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
