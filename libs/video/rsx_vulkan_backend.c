@@ -123,7 +123,8 @@
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
     X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) \
-    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR)
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) \
+    X(vkGetPhysicalDeviceSurfacePresentModesKHR)
 #define VK_WSI_DEVICE_FNS(X) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) \
     X(vkAcquireNextImageKHR) X(vkQueuePresentKHR)
@@ -3013,6 +3014,29 @@ static int vk_create_swapchain(void)
     for (size_t k = 0; k < 4; k++)
         if (caps.supportedCompositeAlpha & alphas[k]) { alpha = alphas[k]; break; }
 
+    /* Present mode. FIFO (vsync) queues finished frames behind the display: with
+     * three images and two frames in flight, up to 2-3 frames waited between the
+     * game reading the controller and the picture showing it (Sami: "input lag
+     * using the controller", 2026-11-07). MAILBOX shows the newest finished frame
+     * at the next refresh and drops a waiting one -- no tearing, no queue -- and
+     * the frame cap (vk_frame_limit) does the pacing. PS3RECOMP_VK_PRESENT=fifo |
+     * mailbox | immediate; default mailbox where the driver has it, else fifo. */
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;   /* the one mode every driver has */
+    {
+        const char* want = getenv("PS3RECOMP_VK_PRESENT");
+        VkPresentModeKHR pref = VK_PRESENT_MODE_MAILBOX_KHR;
+        if (want && !strcmp(want, "fifo")) pref = VK_PRESENT_MODE_FIFO_KHR;
+        else if (want && !strcmp(want, "immediate")) pref = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        VkPresentModeKHR modes[8];
+        u32 nm = 8;
+        if (pref != VK_PRESENT_MODE_FIFO_KHR && pvkGetPhysicalDeviceSurfacePresentModesKHR &&
+            pvkGetPhysicalDeviceSurfacePresentModesKHR(s_vk.phys, s_vk.surface, &nm, modes) >= 0)
+            for (u32 k = 0; k < nm; k++) if (modes[k] == pref) mode = pref;
+        static int said;
+        if (!said++) VK_LOG("present mode: %s\n", mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox (no vsync queue)"
+                                                 : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo (vsync)");
+    }
+
     VkSwapchainKHR old = s_vk.swapchain;
     VkSwapchainCreateInfoKHR sci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
@@ -3022,7 +3046,7 @@ static int vk_create_swapchain(void)
         .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform, .compositeAlpha = alpha,
-        .presentMode = VK_PRESENT_MODE_FIFO_KHR,   /* the one mode every driver has */
+        .presentMode = mode,
         .clipped = VK_TRUE, .oldSwapchain = old,
     };
     VkSwapchainKHR sc = VK_NULL_HANDLE;
@@ -6251,7 +6275,7 @@ static void vk_playlog_frame(void)
     const double span = now - s_pl.sec_start;
     fprintf(s_pl.f, "%.1f	%.1f	%.1f	%.1f	%.1f	%u	%u	%u	%u	%.0f\n",
             now - s_pl.t0, s_pl.n / span, s_pl.dt[s_pl.n / 2], s_pl.dt[(s_pl.n * 99) / 100],
-            s_pl.dt[s_pl.n - 1], c17, c25, c33, c50, (double)(draws - s_pl.draws0) / s_pl.n);
+            s_pl.dt[s_pl.n - 1], c17, c25, c33, c50, (double)(draws >= s_pl.draws0 ? draws - s_pl.draws0 : 0u) / s_pl.n);
     fflush(s_pl.f);
     s_pl.draws0 = draws;
     s_pl.n = 0;
