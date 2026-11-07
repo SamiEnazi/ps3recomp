@@ -36,6 +36,11 @@ int main(void)
 #define CI(op, v) check(#op, spu_##op(a, v), spu_##op##_ref(a, v), a, b, v)
         CI(shlqbyi, sh); CI(rotqbyi, sh); CI(rotqmbyi, sh); CI(cwd, sh);
         C2(shlqby); C2(rotqby); C2(shlqbybi); C2(rotqbybi); C2(rotqmby); C2(rotqmbybi);
+        check("cntb", spu_cntb(a), spu_cntb_ref(a), a, b, 0);
+        { u128 c = rnd128();                      /* shufb: random controls, and SPU-typical ones */
+          if (it & 1) for (int i = 0; i < 16; i++) c._u8[i] = (uint8_t)(rnd32() % 0x20);
+          if (it % 5 == 0) for (int i = 0; i < 16; i++) c._u8[i] = (uint8_t)(0x80 | (rnd32() & 0x7F));
+          check("shufb", spu_shufb(a, b, c), spu_shufb_ref(a, b, c), a, b, 0); }
     }
     if (s_bad) { printf("test_spu_perm_x86: %ld mismatches\n", s_bad); return 1; }
     printf("test_spu_perm_x86: ok (%ld random cases x 10 ops)\n", N);

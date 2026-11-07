@@ -397,21 +397,23 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b, 
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
 /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
- * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
- * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+ * as the byte loop; 20-30 per hot function of inFAMOUS 2's cutscene jobs).
+ * Worked in HOST byte order, with no swaps: SPU byte P lives at host byte
+ * P ^ 3 (SPU_W), so the control byte for host output byte h is C[h] itself,
+ * and the SPU source byte s it names is host byte s ^ 3 of a (s < 16) or of
+ * b (bit 4). pshufb reads the low four index bits (and bit 7, which only
+ * special selectors carry -- they are blended over); blendv reads bit 7, so
+ * bit 4 is shifted up to pick b. The old form swapped a, b and c into SPU
+ * order and the result back: six pshufb instead of three. */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
-    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
-    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
-    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
-    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
-    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
-    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
-    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
-    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
-    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+    const __m128i idx = _mm_xor_si128(C, _mm_set1_epi8(3));
+    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), _mm_slli_epi16(C, 3));
+    /* Special selectors, by the top nibble: 8..B (10x) -> 0x00, C..D (110) -> 0xFF, E..F (111) -> 0x80. */
+    const __m128i lut = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                      (char)0xFF, (char)0xFF, (char)0x80, (char)0x80);
+    const __m128i special = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 4), _mm_set1_epi8(0x0F)));
+    r = _mm_blendv_epi8(r, special, C);
     u128 out; memcpy(&out, &r, 16); return out;
 }
 #elif defined(__ARM_NEON)
@@ -2000,7 +2002,16 @@ static inline u128 spu_addx(u128 a, u128 b, u128 t) { return spu_addx_ref(a, b, 
 static inline u128 spu_sfx(u128 a, u128 b, u128 t) { return spu_sfx_ref(a, b, t); }
 static inline u128 spu_cgx(u128 a, u128 b, u128 t) { return spu_cgx_ref(a, b, t); }
 static inline u128 spu_bgx(u128 a, u128 b, u128 t) { return spu_bgx_ref(a, b, t); }
+#if SPU_X86_SIMD
+static inline u128 spu_cntb(u128 a) {      /* per-byte popcount: two nibble lookups */
+    const __m128i x = spu__xl(a), m = _mm_set1_epi8(0x0F);
+    const __m128i lut = _mm_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+    return spu__xs(_mm_add_epi8(_mm_shuffle_epi8(lut, _mm_and_si128(x, m)),
+                                _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(x, 4), m))));
+}
+#else
 static inline u128 spu_cntb(u128 a) { return spu_cntb_ref(a); }
+#endif
 static inline u128 spu_xsbh(u128 a) { return spu_xsbh_ref(a); }
 static inline u128 spu_xshw(u128 a) { return spu_xshw_ref(a); }
 static inline u128 spu_clz(u128 a) { return spu_clz_ref(a); }

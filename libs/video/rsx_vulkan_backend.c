@@ -169,6 +169,12 @@ typedef struct vk_image {
     VkImage        img;
     VkDeviceMemory mem;
     VkImageView    view;
+    /* how vk_create_image_levels made it: the recycle pool's key (w == 0: an
+     * image made elsewhere, never pooled) */
+    VkFormat           fmt;
+    u32                w, h, levels;
+    VkImageUsageFlags  usage;
+    VkImageAspectFlags aspect;
 } vk_image;
 
 #define VK_SAMPLER_CACHE 32
@@ -265,7 +271,7 @@ static VkImageAspectFlags s_vk_ds_aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
  * per-batch linear arenas, and each draw gets its own descriptor set from a
  * pool reset at every flush, so nothing a pending draw uses is overwritten.
  * PS3RECOMP_VK_BATCH=0 restores the synchronous path (A/B). */
-#define VK_BATCH_SETS 4096u
+#define VK_BATCH_SETS 16384u   /* per-draw sets a frame can hold before a mid-frame flush: the Empire City wide shots draw 5-8k (4096 cost a submit-and-wait each such frame) */
 #define VK_BATCH_DEAD_FB 256u
 static struct {
     int          on;                     /* -1 unread, 0 off, 1 on            */
@@ -537,10 +543,40 @@ static int vk_find_memory_type(u32 type_bits, VkMemoryPropertyFlags want, u32* o
     return -1;
 }
 
+/* Recycled images. Every frame inFAMOUS 2 hands the backend a depth snapshot
+ * (a new 1280x720 R32F texture per call) and new targets for its depth
+ * decodes, and releases last frame's: three image + memory + view creations
+ * and destructions a frame, each a kernel allocation (~12% of the RSX thread
+ * in the Empire City shots). A destroyed image whose users are complete waits
+ * here, and a request with the same format, size, levels, usage and aspect
+ * takes it back; contents are undefined, as a fresh image's are (every first
+ * use transitions from UNDEFINED, which any layout satisfies). Oldest out. */
+#define VK_IMG_POOL 24u
+static vk_image s_imgpool[VK_IMG_POOL];
+static u32 s_imgpool_n;
+static void vk_destroy_image_real(vk_image* im);
+
 static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
                                   VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
     if (!levels) levels = 1;
+    for (u32 k = 0; k < s_imgpool_n; k++) {
+        const vk_image* q = &s_imgpool[k];
+        if (q->fmt == fmt && q->w == w && q->h == h && q->levels == levels &&
+            q->usage == usage && q->aspect == aspect) {
+            *im = *q;
+            memmove(&s_imgpool[k], &s_imgpool[k + 1], (s_imgpool_n - k - 1) * sizeof s_imgpool[0]);
+            s_imgpool_n--;
+            return 0;
+        }
+    }
+    /* PS3RECOMP_VK_ALLOC_LOG=<frames>: after that many presents, log the next 300
+     * image creations (steady-state churn: each is a kernel allocation). */
+    { static long after = -2, left = 300;
+      if (after == -2) { const char* e = getenv("PS3RECOMP_VK_ALLOC_LOG"); after = e ? atol(e) : -1; }
+      if (after >= 0 && s_vk.presented >= (u32)after && left > 0) { left--;
+          fprintf(stderr, "[vk-alloc] frame %u image %ux%u fmt %d levels %u usage 0x%X caller %p\n",
+                  s_vk.presented, w, h, (int)fmt, levels, (unsigned)usage, __builtin_return_address(0)); } }
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
         .format = fmt, .extent = { w, h, 1 }, .mipLevels = levels, .arrayLayers = 1,
@@ -566,6 +602,7 @@ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 
         .subresourceRange = { aspect, 0, levels, 0, 1 },
     };
     VK_CHECK(pvkCreateImageView(s_vk.device, &vci, NULL, &im->view), "vkCreateImageView");
+    im->fmt = fmt; im->w = w; im->h = h; im->levels = levels; im->usage = usage; im->aspect = aspect;
     return 0;
 }
 
@@ -599,6 +636,20 @@ static void vk_destroy_image(vk_image* im)
 }
 /* the list's own destroy: everything that could use it is complete */
 static void vk_destroy_image_now(vk_image* im)
+{
+    if (im->w && im->img && im->view && im->mem) {          /* recycle (see s_imgpool) */
+        if (s_imgpool_n == VK_IMG_POOL) {
+            vk_destroy_image_real(&s_imgpool[0]);
+            memmove(&s_imgpool[0], &s_imgpool[1], (VK_IMG_POOL - 1) * sizeof s_imgpool[0]);
+            s_imgpool_n--;
+        }
+        s_imgpool[s_imgpool_n++] = *im;
+        memset(im, 0, sizeof *im);
+        return;
+    }
+    vk_destroy_image_real(im);
+}
+static void vk_destroy_image_real(vk_image* im)
 {
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
@@ -857,13 +908,14 @@ static void vk_batch_completed(void)
             pvkResetDescriptorPool(s_vk.device, s_batch.dpool, 0);
             s_batch.dsets = 0;
         }
-        static int stats = -1;
-        if (stats < 0) stats = getenv("PS3RECOMP_VK_BATCH_STATS") ? 1 : 0;
-        if (stats && (s_batch.flushes % 2000) == 0)
+        static int stats = -1;   /* PS3RECOMP_VK_BATCH_STATS=<every n flushes> (1 = 2000) */
+        if (stats < 0) { const char* e = getenv("PS3RECOMP_VK_BATCH_STATS");
+                         stats = e ? (atoi(e) > 1 ? atoi(e) : 2000) : 0; }
+        if (stats && (s_batch.flushes % (unsigned long long)stats) == 0)
             fprintf(stderr, "[RSX vulkan] batching: %llu flushes, %.1f draws/flush (max %llu), %llu draws continued a pass\n",
                     s_batch.flushes, (double)s_batch.flushed_draws / (double)s_batch.flushes,
                     s_batch.max_draws, s_batch.merged);
-        if (stats && (s_batch.flushes % 2000) == 0) {
+        if (stats && (s_batch.flushes % (unsigned long long)stats) == 0) {
             for (int k = 0; k < 32 && s_flush_why[k].line; k++)
                 if (s_flush_why[k].n)
                     fprintf(stderr, "[RSX vulkan]   flush from line %d: %llu (%.1f draws each)\n",
@@ -2930,6 +2982,65 @@ static void vk_swapchain_lost(void)
 }
 
 static void vk_fif_advance(void);
+
+/* PS3RECOMP_FPS_CAP=<fps> (0/unset = uncapped): present at most that many frames a
+ * second, on an even beat -- each present waits for its deadline (the last one plus
+ * the period; a frame that is late moves the beat instead of bunching the next ones
+ * up). The RSX thread waiting here stalls the FIFO, so the guest, which waits on its
+ * flips and labels, follows the beat: the game runs at the cap, not just shows it.
+ * The wait is a high-resolution waitable timer to ~1 ms before the deadline and a
+ * spin for the rest. */
+static void vk_frame_limit(void)
+{
+    static double period_s = -1.0;
+    if (period_s < 0.0) {
+        const char* e = getenv("PS3RECOMP_FPS_CAP");
+        const double f = e ? atof(e) : 0.0;
+        period_s = f > 0.0 ? 1.0 / f : 0.0;
+        if (f > 0.0) fprintf(stderr, "[RSX vulkan] frame cap %.1f fps (PS3RECOMP_FPS_CAP)\n", f);
+    }
+    if (period_s <= 0.0) return;
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    static LONGLONG next;
+    static HANDLE timer;
+    if (!freq.QuadPart) {
+        QueryPerformanceFrequency(&freq);
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                       TIMER_ALL_ACCESS);
+        if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+    }
+    const LONGLONG per = (LONGLONG)(period_s * (double)freq.QuadPart);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!next || now.QuadPart - next > per) next = now.QuadPart;   /* first frame, or late: new beat */
+    else next += per;
+    for (;;) {
+        QueryPerformanceCounter(&now);
+        const LONGLONG left = next - now.QuadPart;
+        if (left <= 0) break;
+        const LONGLONG left_100ns = left * 10000000 / freq.QuadPart;
+        if (left_100ns > 15000 && timer) {                 /* > 1.5 ms: sleep to ~1 ms short */
+            LARGE_INTEGER due; due.QuadPart = -(left_100ns - 10000);
+            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, INFINITE);
+            else Sleep(1);
+        } else {
+            YieldProcessor();
+        }
+    }
+#else
+    static struct timespec next;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const long long per = (long long)(period_s * 1e9);
+    long long n = (long long)now.tv_sec * 1000000000ll + now.tv_nsec;
+    long long t = (long long)next.tv_sec * 1000000000ll + next.tv_nsec;
+    if (!t || n - t > per) t = n; else t += per;
+    next.tv_sec = t / 1000000000ll; next.tv_nsec = t % 1000000000ll;
+    if (t > n) clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+#endif
+}
+
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
 {
@@ -3010,6 +3121,7 @@ static void vk_present_window(void)
         .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
+    vk_frame_limit();
     r = pvkQueuePresentKHR(s_vk.queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
@@ -4264,8 +4376,10 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     if (!s_g.on || !data) { s_e2.vs_bytes = 0; return; }
     const u32 cap = (u32)s_g.ps_off;
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
-    memcpy(s_g.ubo.ptr, data, bytes);
+    /* Batched, draws read the shadow (copied into the uniform arena per draw);
+     * the shared UBO is the unbatched path's only. */
     if (vk_batch_on() && vk_batch_shadow()) memcpy(s_batch.shadow, data, bytes);
+    else memcpy(s_g.ubo.ptr, data, bytes);
     s_e2.vs_bytes = bytes;
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
@@ -4274,8 +4388,8 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
     if (!s_g.on || !data) { s_e2.ps_bytes = 0; return; }
     const u32 cap = (u32)(s_g.ubo.size - s_g.ps_off);
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
-    memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, data, bytes);
     if (vk_batch_on() && vk_batch_shadow()) memcpy(s_batch.shadow + s_g.ps_off, data, bytes);
+    else memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, data, bytes);
     s_e2.ps_bytes = bytes;
 }
 static void vk_eng_bind_textures(void* user, const u32* textures,
