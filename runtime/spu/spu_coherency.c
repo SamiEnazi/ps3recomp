@@ -316,6 +316,13 @@ static __thread int t_ppu_slot = -1;
 
 static void ppu_resv_clear(uint32_t line, int except)
 {
+    /* The writer's half of the Dekker pair in spu_coh_ppu_reserve: the
+     * caller has just stored into the line (a PUTLLC/PUTLLUC commit, a DMA
+     * PUT, a coherent PPU store), and those stores must be globally visible
+     * before the reservation records are read -- otherwise a PPU that
+     * published its reservation and then read the line can miss both the
+     * store and the break. A release store (RESV_DROP) orders nothing here. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     const int hi = __atomic_load_n(&s_ppu_resv_hi, __ATOMIC_ACQUIRE);
     for (int i = 0; i < hi; i++) {
         if (i == except) continue;
@@ -349,7 +356,20 @@ void spu_coh_ppu_reserve(uint32_t ea)
             return;
         }
     }
-    __atomic_store_n(&s_ppu_resv[t_ppu_slot].lv, (uint64_t)(ea & ~127u) | (1ull << 32), __ATOMIC_RELEASE);
+    /* SEQ_CST, not RELEASE: this is one half of a Dekker pair. The PPU
+     * publishes "I hold the line" and then READS other words of it; a writer
+     * (an SPU PUTLLC) stores into the line and then READS this record to break
+     * it (ppu_resv_clear). On x86 a release store is a plain mov that can sit
+     * in the store buffer while the PPU's next loads run -- so the SPU finds no
+     * reservation to break, the PPU reads the line from before the SPU's
+     * commit, and the store-conditional succeeds on stale reads. inFAMOUS 2
+     * deadlocked there: libsre's _cellSpursSendSignal read `waiting` as 0 just
+     * as the fios decompression task set it, committed `signalled` without the
+     * workload signal, and the task slept forever with waiting=signalled=1
+     * (taskset 0x47E7E380, wid 3) -- the title never left its loading screen.
+     * The matching fence on the writer side is in ppu_resv_clear. */
+    __atomic_store_n(&s_ppu_resv[t_ppu_slot].lv, (uint64_t)(ea & ~127u) | (1ull << 32), __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
 /* The line this thread holds a PPU reservation on, or ~0u: a new lwarx elsewhere
