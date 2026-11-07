@@ -263,6 +263,8 @@ static struct {
     vk_image     dead_img[256];          /* likewise images (and their views) */
     u32          n_dead_img;
     int          zrgba_pending;          /* a depth-as-RGBA8 pass is recorded */
+    int          light_pending;          /* the GPU light pass is recorded     */
+    int          ssao_pending;           /* the GPU SSAO passes are recorded   */
     /* The engine render pass left open after a draw, so the next draw into the
      * same framebuffer continues it instead of paying a pass and barriers. */
     int          rp_open;
@@ -619,6 +621,7 @@ static void vk_batch_completed(void)
         s_batch.draws = 0;
         s_batch.vcur = s_batch.icur = s_batch.ucur = s_batch.scur = 0;
         s_batch.zrgba_pending = 0;
+        s_batch.light_pending = s_batch.ssao_pending = 0;
         for (u32 k = 0; k < s_batch.n_dead_fb; k++)
             pvkDestroyFramebuffer(s_vk.device, s_batch.dead_fb[k], NULL);
         s_batch.n_dead_fb = 0;
@@ -3515,6 +3518,51 @@ static int vk_eng_copy_depth(const vk_eng_obj* z, VkImage dst, VkImageLayout dst
     return rc;
 }
 
+/* Copy the top-left w x h of depth target `z`'s STENCIL aspect (one byte a
+ * texel) into the R8 image `dst` (in `dst_layout`). Batched: through the
+ * staging arena, in the batch; unbatched: a host buffer, waited on. */
+static int vk_eng_copy_stencil(const vk_eng_obj* z, VkImage dst, VkImageLayout dst_layout, u32 w, u32 h)
+{
+    if (!(VK_DS_ASPECT & VK_IMAGE_ASPECT_STENCIL_BIT)) return -1;
+    const VkDeviceSize bytes = ((VkDeviceSize)w * h + 3u) & ~(VkDeviceSize)3u;
+    vk_buffer st = {0};
+    VkBuffer buf; VkDeviceSize off = 0;
+    const int batched = vk_batch_on();
+    if (batched) {
+        const int64_t so = vk_batch_stage(bytes);
+        if (so < 0) return -1;
+        buf = s_batch.sarena.buf; off = (VkDeviceSize)so;
+    } else {
+        if (vk_create_host_buffer(&st, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+            vk_destroy_buffer(&st); return -1;
+        }
+        buf = st.buf;
+    }
+    if (vk_begin()) { vk_destroy_buffer(&st); return -1; }
+    if (batched) vk_barrier_all();
+    vk_barrier_image(z->im.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(dst, VK_IMAGE_ASPECT_COLOR_BIT, dst_layout);
+    VkBufferImageCopy out = { .bufferOffset = off,
+                              .imageSubresource = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1 },
+                              .imageExtent = { w, h, 1 } };
+    pvkCmdCopyImageToBuffer(s_vk.cmd, z->im.img, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &out);
+    VkBufferMemoryBarrier bb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buf, .offset = off, .size = bytes };
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          0, 0, NULL, 1, &bb, 0, NULL);
+    VkBufferImageCopy in = { .bufferOffset = off,
+                             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                             .imageExtent = { w, h, 1 } };
+    pvkCmdCopyBufferToImage(s_vk.cmd, buf, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+    int rc = 0;
+    if (!batched) rc = vk_submit_and_wait();
+    vk_destroy_buffer(&st);
+    return rc;
+}
+
 static int vk_eng_depth_copyable(void)
 {
     if (s_vk.depth_format == VK_FORMAT_D32_SFLOAT ||
@@ -4430,6 +4478,7 @@ static struct {
     u32                   ssao_out, ssao_dims[4];
     VkFramebuffer         ssao_fb[4];              /* hd, a, b, out */
     vk_image              zr32;                    /* the depth decode's R32F copy */
+    vk_image              zs8;                     /* ... and its stencil (R8), same size */
     u32                   zr32_w, zr32_h;
 } s_lp;
 
@@ -4754,13 +4803,20 @@ static u32 vk_eng_light_pass(void* user, u32 normals, u32 depth, u32 w, u32 h,
         if (!(s_lp.light_fb = vk_pass_framebuffer(rp, views, 2, w, h))) { vk_pass_drop_light(); return 0; }
         s_lp.light_w = w; s_lp.light_h = h;
     }
+    /* Batched, the pass rides in the frame's batch: its outputs are only
+     * sampled by later draws (the composite), never read back, so nothing
+     * waits for it. Its one UBO and descriptor set may not be rewritten while
+     * a recorded pass still reads them -- a second light pass in one batch
+     * flushes first (the depth-RGBA8 pass's rule). Unbatched: as before. */
+    if (s_batch.recording && s_batch.light_pending) vk_batch_flush();
     const size_t cap = (size_t)s_lp.light_ubo.size;
     memset(s_lp.light_ubo.ptr, 0, cap);
     memcpy(s_lp.light_ubo.ptr, params, param_bytes < cap ? param_bytes : cap);
     vk_pass_write_set(s_lp.set[VK_PASS_LIGHT], &s_lp.light_ubo, nv, zv, VK_NULL_HANDLE);
     if (vk_begin()) return 0;
     vk_pass_record(rp, s_lp.light_fb, pipe, s_lp.set[VK_PASS_LIGHT], w, h);
-    if (vk_submit_and_wait()) return 0;
+    if (s_batch.recording) s_batch.light_pending = 1;
+    else if (vk_submit_and_wait()) return 0;
     *spec_out = s_lp.light_out[1];
     return s_lp.light_out[0];
 }
@@ -4819,6 +4875,9 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
         }
         s_lp.ssao_dims[0] = fw; s_lp.ssao_dims[1] = fh; s_lp.ssao_dims[2] = hw; s_lp.ssao_dims[3] = hh;
     }
+    /* Batched: recorded into the frame's batch, as the light pass (one UBO,
+     * five sets: a second SSAO in one batch flushes first). */
+    if (s_batch.recording && s_batch.ssao_pending) vk_batch_flush();
     memset(s_lp.ssao_ubo.ptr, 0, VK_SSAO_UBO_BYTES);
     memcpy(s_lp.ssao_ubo.ptr, consts, const_bytes < VK_SSAO_UBO_BYTES ? const_bytes : VK_SSAO_UBO_BYTES);
     const VkImageView hd = s_lp.ssao_hd.view, a = s_lp.ssao_a.view, b = s_lp.ssao_b.view;
@@ -4834,6 +4893,7 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
     if (vk_begin()) return 0;
     for (u32 k = 0; k < 5; k++)
         vk_pass_record(steps[k].rp, steps[k].fb, steps[k].pipe, s_lp.set[steps[k].set], steps[k].w, steps[k].h);
+    if (s_batch.recording) { s_batch.ssao_pending = 1; return s_lp.ssao_out; }
     return vk_submit_and_wait() ? 0 : s_lp.ssao_out;
 }
 
@@ -4876,21 +4936,30 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
     if (!s_lp.zr32.img || s_lp.zr32_w < w || s_lp.zr32_h < h) {
         const u32 nw = w > s_lp.zr32_w ? w : s_lp.zr32_w, nh = h > s_lp.zr32_h ? h : s_lp.zr32_h;
         vk_destroy_image(&s_lp.zr32);
+        vk_destroy_image(&s_lp.zs8);
         s_lp.zr32_w = s_lp.zr32_h = 0;
         if (vk_create_image(&s_lp.zr32, VK_FORMAT_R32_SFLOAT, nw, nh,
                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                             VK_IMAGE_ASPECT_COLOR_BIT)) { vk_destroy_image(&s_lp.zr32); return 0; }
+        /* The stencil byte rides in the decode's blue channel, as Z24S8 read
+         * as A8R8G8B8 carries it: the deferred composite tests its bit 7. */
+        if ((VK_DS_ASPECT & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+            vk_create_image(&s_lp.zs8, VK_FORMAT_R8_UNORM, nw, nh,
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT)) vk_destroy_image(&s_lp.zs8);
         s_lp.zr32_w = nw; s_lp.zr32_h = nh;
         zl = VK_IMAGE_LAYOUT_UNDEFINED;
     }
     if (vk_eng_copy_depth(z, s_lp.zr32.img, zl, w, h)) return 0;
+    VkImageView sview = VK_NULL_HANDLE;
+    if (s_lp.zs8.img && !vk_eng_copy_stencil(z, s_lp.zs8.img, zl, w, h)) sview = s_lp.zs8.view;
 
     VkFramebuffer fb = vk_pass_framebuffer(rp, &s_eobj[dst].im.view, 1, w, h);
     if (!fb) return 0;
     /* Batched: the pass's one descriptor set may not be rewritten while a
      * recorded pass still uses it, so a second pass in one batch flushes. */
     if (s_batch.recording && s_batch.zrgba_pending) vk_batch_flush();
-    vk_pass_write_set(s_lp.set[VK_PASS_ZRGBA], &s_lp.ssao_ubo, s_lp.zr32.view, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    vk_pass_write_set(s_lp.set[VK_PASS_ZRGBA], &s_lp.ssao_ubo, s_lp.zr32.view, sview, VK_NULL_HANDLE);
     int rc = vk_begin();
     if (!rc) {
         if (s_batch.recording) vk_barrier_all();
@@ -4918,6 +4987,7 @@ static void vk_eng5_shutdown(void)
         vk_destroy_image(&s_lp.ssao_a);
         vk_destroy_image(&s_lp.ssao_b);
         vk_destroy_image(&s_lp.zr32);
+        vk_destroy_image(&s_lp.zs8);
         for (u32 k = 0; k < VK_PASS_COUNT; k++) {
             if (s_lp.pipe[k]) pvkDestroyPipeline(d, s_lp.pipe[k], NULL);
             if (s_lp.fs[k])   pvkDestroyShaderModule(d, s_lp.fs[k], NULL);

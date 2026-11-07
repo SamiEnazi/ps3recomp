@@ -260,11 +260,12 @@ static const char kVkSsaoUp4FS[] = VK_SSAO_GLSL_COMMON
 static const char kVkDepthRgba8FS[] =
 "#version 450\n"
 "layout(set = 0, binding = 1) uniform sampler2D zt;\n"
+"layout(set = 0, binding = 2) uniform sampler2D st;   /* the stencil byte (R8), or the black stand-in */\n"
 "layout(location = 0) out vec4 o;\n"
 "void main() {\n"
 "    ivec2 px = ivec2(gl_FragCoord.xy);\n"
 "    uint v = uint(clamp(texelFetch(zt, px, 0).r, 0.0, 1.0) * 16777215.0);\n"
-"    uint sv = 0u;\n"
+"    uint sv = uint(texelFetch(st, px, 0).r * 255.0 + 0.5);\n"
 "    o = vec4(float((v >> 8) & 255u), float(v & 255u), float(sv & 255u), float((v >> 16) & 255u)) / 255.0;\n"
 "}\n";
 

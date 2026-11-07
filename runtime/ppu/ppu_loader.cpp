@@ -576,7 +576,7 @@ static void samp_report(void)
     fprintf(stderr, "[samp] %llu samples, %llu in guest code (%.1f%%)\n",
             (unsigned long long)s_samp_total, (unsigned long long)s_samp_guest,
             s_samp_total ? 100.0 * (double)s_samp_guest / (double)s_samp_total : 0.0);
-    for (int rank = 0; rank < 12; rank++) {
+    for (int rank = 0; rank < 30; rank++) {
         uint64_t best = 0; int bi = -1;
         for (int k = 0; k < SAMP_SLOTS; k++)
             if (s_samp_ct[k] > best) { best = s_samp_ct[k]; bi = k; }
@@ -665,6 +665,11 @@ static DWORD WINAPI samp_thread(LPVOID p)
     unsigned ei = 0;
     unsigned long long next_report = t0 + early[0];
     samp_build_map();
+    /* PS3_SAMPLE_FROM=<sec>: start sampling that long after the sampler
+     * itself (the reports are cumulative: a gameplay profile otherwise drowns
+     * in the boot's). */
+    { const char* f = getenv("PS3_SAMPLE_FROM");
+      if (f && atoi(f) > 0) { Sleep((DWORD)atoi(f) * 1000u); next_report = GetTickCount64() + 10000; } }
     for (;;) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap != INVALID_HANDLE_VALUE) {
