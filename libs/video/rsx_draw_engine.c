@@ -1800,7 +1800,27 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
             const int full_always = __atomic_load_n(&s_texhash_full, __ATOMIC_RELAXED);
             /* Due by age, not by (frame + slot) & 7: a texture sampled only on
              * alternate frames could miss its turn for ever. */
-            const int full = full_always || span <= 16384u || g.frames - e->last_full_frame >= 8u;
+            int full = full_always || span <= 16384u;
+            /* The age-due full hashes are budgeted per frame: textures that
+             * come into view together (a camera cut) fall due together, every
+             * eighth frame -- 50-73 MB of hashing, 4-7 ms of the RSX thread,
+             * in one frame of the Empire City cutscene. Past the budget a
+             * texture stays due and goes next frame; the first one of a frame
+             * always goes, so no size starves. A sparse-hash change is never
+             * held back. PS3RECOMP_ENG_TEXHASH_BUDGET_MB (default 12, 0 = no
+             * budget). */
+            if (!full && g.frames - e->last_full_frame >= 8u) {
+                static long budget_mb = -1;
+                static u32 budget_frame = ~0u;
+                static u64 budget_left;
+                if (budget_mb < 0) { const char* be = getenv("PS3RECOMP_ENG_TEXHASH_BUDGET_MB"); budget_mb = be ? atol(be) : 12; }
+                const u64 budget = (u64)budget_mb << 20;
+                if (budget_frame != g.frames) { budget_frame = g.frames; budget_left = budget; }
+                if (!budget_mb || budget_left == budget || span <= budget_left) {
+                    full = 1;
+                    budget_left = span <= budget_left ? budget_left - span : 0;
+                }
+            }
             int readable = 0;
             const u64 th0 = eng_ds_enabled() ? eng_ds_now() : 0;
             const u64 sparse = eng_texture_sparse_hash(location, offset, span, &readable);
