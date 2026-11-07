@@ -113,6 +113,7 @@
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
     X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
+    X(vkCmdSetDepthBias) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) X(vkCmdCopyImage)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
@@ -228,6 +229,12 @@ typedef struct vk_state {
 
 static vk_state s_vk;
 static int s_vk_indep_blend;   /* device has independentBlend (per-attachment state) */
+static int s_vk_depth_clamp_ok; /* device has depthClamp (ZMIN_MAX_CONTROL clamp, not clip) */
+/* DEPTH, or DEPTH|STENCIL when the depth format carries the RSX's 8 stencil
+ * bits (D32_SFLOAT_S8_UINT): barriers, clears and attachment views of a depth
+ * image name every aspect it has; copies out of it name DEPTH alone. */
+static VkImageAspectFlags s_vk_ds_aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+#define VK_DS_ASPECT s_vk_ds_aspect
 
 /* ---- batched recording (PS3RECOMP_VK_BATCH, default on) --------------------
  * The backend was written with every operation submitted and waited on, so a
@@ -1563,6 +1570,18 @@ static int vk_pick_depth_format(void)
     };
     const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
                                       VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    /* The RSX's Z24S8 has a stencil the titles test (inFAMOUS 2 marks water,
+     * sky and lit receivers in it); without one every stencil-tested pass
+     * covers the whole target. D32_SFLOAT_S8_UINT keeps the float depth the
+     * snapshots copy out. PS3RECOMP_VK_STENCIL=0: depth only (A/B). */
+    { const char* e = getenv("PS3RECOMP_VK_STENCIL");
+      VkFormatProperties fp;
+      pvkGetPhysicalDeviceFormatProperties(s_vk.phys, VK_FORMAT_D32_SFLOAT_S8_UINT, &fp);
+      if (!(e && *e == '0') && (fp.optimalTilingFeatures & need) == need) {
+          s_vk.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+          s_vk_ds_aspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+          return 0;
+      } }
     for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
         VkFormatProperties fp;
         pvkGetPhysicalDeviceFormatProperties(s_vk.phys, candidates[i], &fp);
@@ -1593,8 +1612,8 @@ static int vk_create_render_pass(void)
           .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL },
         { .format = s_vk.depth_format, .samples = VK_SAMPLE_COUNT_1_BIT,
           .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
           .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL },
     };
     VkAttachmentReference cref = { 0, VK_IMAGE_LAYOUT_GENERAL };
@@ -2296,7 +2315,7 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
 
     if (vk_begin()) return 0;
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    vk_barrier_image(s_vk.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(s_vk.depth.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_GENERAL);
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = s_vk.render_pass, .framebuffer = s_vk.framebuffer,
                                   .renderArea = { { 0, 0 }, { s_vk.width, s_vk.height } } };
@@ -2341,7 +2360,7 @@ static void vk_draw(u32 prim, u32 first, u32 count)
 
     if (vk_begin()) return;
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    vk_barrier_image(s_vk.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(s_vk.depth.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_GENERAL);
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = s_vk.render_pass, .framebuffer = s_vk.framebuffer,
                                   .renderArea = { { 0, 0 }, { s_vk.width, s_vk.height } } };
@@ -2402,8 +2421,8 @@ static void vk_cb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     }
     if (do_depth) {
         VkClearDepthStencilValue d = { depth, 0 };
-        VkImageSubresourceRange r = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-        vk_barrier_image(s_vk.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        VkImageSubresourceRange r = { VK_DS_ASPECT, 0, 1, 0, 1 };
+        vk_barrier_image(s_vk.depth.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_GENERAL);
         pvkCmdClearDepthStencilImage(s_vk.cmd, s_vk.depth.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
     }
     vk_submit_and_wait();
@@ -2974,15 +2993,15 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
     if (vk_create_image(&o->im, s_vk.depth_format, w, h,
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                        VK_IMAGE_ASPECT_DEPTH_BIT)) {
+                        VK_DS_ASPECT)) {
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_DEPTH; o->fmt = s_vk.depth_format; o->w = w; o->h = h;
     /* Far plane, for the reason the display depth starts there. */
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
-    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    vk_barrier_image(o->im.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
-    VkImageSubresourceRange r = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    VkImageSubresourceRange r = { VK_DS_ASPECT, 0, 1, 0, 1 };
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
     if (!s_batch.recording && vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
     return hd;
@@ -3020,13 +3039,16 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
 static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
                                        float depth_value, u8 stencil)
 {
-    (void)user; (void)stencil;      /* E1: no stencil in the depth format yet */
+    (void)user;
     vk_eng_obj* o = vk_eng_get(depth, VK_ENG_DEPTH);
-    if (!o || !(flags & RSX_BE_CLEAR_DEPTH) || vk_begin()) return;
-    VkClearDepthStencilValue d = { depth_value, 0 };
-    VkImageSubresourceRange r = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    VkImageAspectFlags a = 0;
+    if (flags & RSX_BE_CLEAR_DEPTH) a |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (flags & RSX_BE_CLEAR_STENCIL) a |= (VK_DS_ASPECT & VK_IMAGE_ASPECT_STENCIL_BIT);
+    if (!o || !a || vk_begin()) return;
+    VkClearDepthStencilValue d = { depth_value, stencil };
+    VkImageSubresourceRange r = { a, 0, 1, 0, 1 };
     if (s_batch.recording) vk_barrier_all();
-    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(o->im.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_GENERAL);
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
     if (!s_batch.recording) vk_submit_and_wait();   /* batched: stays in the batch */
 }
@@ -3381,7 +3403,7 @@ static int vk_eng_copy_depth(const vk_eng_obj* z, VkImage dst, VkImageLayout dst
         const int64_t so = vk_batch_stage(bytes);
         if (so < 0 || vk_begin()) return -1;
         vk_barrier_all();
-        vk_barrier_image(z->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(z->im.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_GENERAL);
         vk_barrier_image(dst, VK_IMAGE_ASPECT_COLOR_BIT, dst_layout);
         VkBufferImageCopy out = { .bufferOffset = (VkDeviceSize)so,
                                   .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
@@ -3407,7 +3429,7 @@ static int vk_eng_copy_depth(const vk_eng_obj* z, VkImage dst, VkImageLayout dst
     }
     int rc = vk_begin();
     if (!rc) {
-        vk_barrier_image(z->im.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(z->im.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_GENERAL);
         vk_barrier_image(dst, VK_IMAGE_ASPECT_COLOR_BIT, dst_layout);
         VkBufferImageCopy out = { .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
                                   .imageExtent = { w, h, 1 } };
@@ -3430,7 +3452,8 @@ static int vk_eng_copy_depth(const vk_eng_obj* z, VkImage dst, VkImageLayout dst
 
 static int vk_eng_depth_copyable(void)
 {
-    if (s_vk.depth_format == VK_FORMAT_D32_SFLOAT) return 1;
+    if (s_vk.depth_format == VK_FORMAT_D32_SFLOAT ||
+        s_vk.depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT) return 1;
     static int warned_fmt;
     if (!warned_fmt) { VK_LOG("engine: depth snapshots need D32_SFLOAT, this device uses %d\n",
                               (int)s_vk.depth_format); warned_fmt = 1; }
@@ -3486,7 +3509,9 @@ typedef struct vk_eng_pipe {
     VkShaderModule      vs, fs;
     rsx_be_render_state rs;
     u32                 nslots, stride, rt_count;
-    VkPipeline          variant[VK_ENG_TOPOLOGIES];
+    /* By topology, then depth clamp (bit 0) and depth bias (bit 1): both
+     * are pipeline state in Vulkan, encoder state in the engine. */
+    VkPipeline          variant[VK_ENG_TOPOLOGIES][4];
     /* Units the fragment program declares TextureCube / Texture3D: a sampled
      * image's view type has to match the declaration, bound or not. */
     u32                 cube_mask, vol_mask;
@@ -3524,6 +3549,8 @@ static struct {
     u32          sc[4];
     int          have_vp, have_sc;
     u32          stencil_ref;
+    int          depth_clamp;                          /* set_depth_clamp */
+    float        bias_const, bias_slope;               /* set_depth_bias  */
     vk_buffer    indices;
     u32          warned;
 } s_e2;
@@ -3555,8 +3582,8 @@ static VkRenderPass vk_eng_render_pass(u32 n)
             .format = (i < n) ? VK_FORMAT_R8G8B8A8_UNORM : s_vk.depth_format,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .stencilLoadOp = (i < n) ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .stencilStoreOp = (i < n) ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
             .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL };
         if (i < n) cref[i] = (VkAttachmentReference){ i, VK_IMAGE_LAYOUT_GENERAL };
     }
@@ -3692,20 +3719,21 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
     vk_eng_pipe* P = &s_epipe[pipeline - 1];
     vk_batch_flush();                       /* a recorded draw may still bind it */
     for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
-        if (P->variant[t]) pvkDestroyPipeline(s_vk.device, P->variant[t], NULL);
+        for (u32 k = 0; k < 4; k++)
+            if (P->variant[t][k]) pvkDestroyPipeline(s_vk.device, P->variant[t][k], NULL);
     if (P->vs) pvkDestroyShaderModule(s_vk.device, P->vs, NULL);
     if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
     memset(P, 0, sizeof *P);
     if (s_e2.pipeline == pipeline) s_e2.pipeline = 0;
 }
 
-static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx)
 {
     static const VkPrimitiveTopology topo[VK_ENG_TOPOLOGIES] = {
         VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
         VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
-    if (P->variant[topo_idx]) return P->variant[topo_idx];
+    if (P->variant[topo_idx][vk_idx]) return P->variant[topo_idx][vk_idx];
     VkRenderPass rp = vk_eng_render_pass(P->rt_count);
     if (!rp || P->nslots > VK_GUEST_ATTRS) return VK_NULL_HANDLE;
     const rsx_be_render_state* rs = &P->rs;
@@ -3741,6 +3769,8 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
                                                                            : VK_CULL_MODE_BACK_BIT,
         .frontFace = (rs->front_face == 0x0901u) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                                  : VK_FRONT_FACE_CLOCKWISE,
+        .depthClampEnable = (vk_idx & 1u) ? VK_TRUE : VK_FALSE,
+        .depthBiasEnable = (vk_idx & 2u) ? VK_TRUE : VK_FALSE,
         .lineWidth = 1.0f };
     VkPipelineMultisampleStateCreateInfo ms = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
@@ -3801,22 +3831,22 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = P->rt_count, .pAttachments = cba };
-    VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                              VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    VkDynamicState dyn[4] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                              VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS };
     VkPipelineDynamicStateCreateInfo dy = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 3, .pDynamicStates = dyn };
+        .dynamicStateCount = (vk_idx & 2u) ? 4u : 3u, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo gci = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = s_g.pipe_layout, .renderPass = rp, .subpass = 0 };
-    if (vk_sc_create_pipeline(&gci, &P->variant[topo_idx], 0) != VK_SUCCESS) {
+    if (vk_sc_create_pipeline(&gci, &P->variant[topo_idx][vk_idx], 0) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
-        P->variant[topo_idx] = VK_NULL_HANDLE;
+        P->variant[topo_idx][vk_idx] = VK_NULL_HANDLE;
     }
-    return P->variant[topo_idx];
+    return P->variant[topo_idx][vk_idx];
 }
 
 static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pipeline = pipeline; }
@@ -3895,6 +3925,15 @@ static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
     s_e2.sc[0] = x; s_e2.sc[1] = y; s_e2.sc[2] = w; s_e2.sc[3] = h; s_e2.have_sc = 1;
 }
 static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
+/* POLYGON_OFFSET: `constant` in units of the guest depth's resolution
+ * (2^-24, D24). The depth image is D32_SFLOAT, whose constant unit is
+ * 2^(e-23) for the primitive's largest exponent e: the same 2^-24 for depths
+ * in [0.5, 1), half that per octave below. */
+static void vk_eng_set_depth_bias(void* user, float constant, float slope)
+{ (void)user; s_e2.bias_const = constant; s_e2.bias_slope = slope; }
+/* ZMIN_MAX_CONTROL: 1 = clamp depth to the viewport range instead of
+ * clipping at the near/far planes (needs the depthClamp feature). */
+static void vk_eng_set_depth_clamp(void* user, int clamp) { (void)user; s_e2.depth_clamp = clamp; }
 
 static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, VkImageView dview,
                                         u32 dkey, u32 w, u32 h)
@@ -3928,11 +3967,11 @@ static VkImageView vk_eng_scratch_depth(u32 w, u32 h)
     vk_destroy_image(&s_e2.scratch_depth);
     if (vk_create_image(&s_e2.scratch_depth, s_vk.depth_format, w, h,
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        VK_IMAGE_ASPECT_DEPTH_BIT) || vk_begin())
+                        VK_DS_ASPECT) || vk_begin())
         return VK_NULL_HANDLE;
-    vk_barrier_image(s_e2.scratch_depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    vk_barrier_image(s_e2.scratch_depth.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
-    VkImageSubresourceRange r = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    VkImageSubresourceRange r = { VK_DS_ASPECT, 0, 1, 0, 1 };
     pvkCmdClearDepthStencilImage(s_vk.cmd, s_e2.scratch_depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
     if (vk_submit_and_wait()) return VK_NULL_HANDLE;
     s_e2.scratch_w = w; s_e2.scratch_h = h;
@@ -4170,7 +4209,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     if (!dview) return;
     const u32 dkey = (zo && dview == zo->im.view) ? s_eng_bound.depth : 0xFFFFFFFFu;
 
-    VkPipeline pipe = vk_eng_variant(P, (u32)topology - 1u);
+    const int use_bias = s_e2.bias_const != 0.0f || s_e2.bias_slope != 0.0f;
+    const u32 vk_idx = ((s_e2.depth_clamp && s_vk_depth_clamp_ok) ? 1u : 0u) | (use_bias ? 2u : 0u);
+    VkPipeline pipe = vk_eng_variant(P, (u32)topology - 1u, vk_idx);
     VkRenderPass rp = vk_eng_render_pass(n);
     VkFramebuffer fb = vk_eng_framebuffer(rp, s_eng_bound.rt, n, dview, dkey, w, h);
     if (!pipe || !rp || !fb) return;
@@ -4258,6 +4299,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
     pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
     pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s_e2.stencil_ref & 0xFFu);
+    if (use_bias) pvkCmdSetDepthBias(s_vk.cmd, s_e2.bias_const, 0.0f, s_e2.bias_slope);
     pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout,
                              0, 1, &set, 0, NULL);
     pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
@@ -4858,6 +4900,8 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .set_viewport         = vk_eng_set_viewport,
     .set_scissor          = vk_eng_set_scissor,
     .set_stencil_ref      = vk_eng_set_stencil_ref,
+    .set_depth_bias       = vk_eng_set_depth_bias,
+    .set_depth_clamp      = vk_eng_set_depth_clamp,
     .draw                 = vk_eng_draw,
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
@@ -4939,6 +4983,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * without independentBlend every attachment must share one state. */
     want.independentBlend = have.independentBlend;
     s_vk_indep_blend = have.independentBlend ? 1 : 0;
+    /* NV4097_SET_ZMIN_MAX_CONTROL: a draw the RSX clamps at the near/far
+     * planes instead of clipping (eng_apply_depth_clip). */
+    want.depthClamp = have.depthClamp;
+    s_vk_depth_clamp_ok = have.depthClamp ? 1 : 0;
     s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
@@ -4970,7 +5018,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
     if (vk_create_image(&s_vk.depth, s_vk.depth_format, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT)) return -1;
+                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_DS_ASPECT)) return -1;
     if (vk_create_host_buffer(&s_vk.readback, (VkDeviceSize)s_vk.width * s_vk.height * 4u,
                               VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return -1;
     if (vk_create_render_pass()) return -1;
@@ -4987,11 +5035,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * null backend makes the same choice). */
     if (vk_begin()) return -1;
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    vk_barrier_image(s_vk.depth.img, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    vk_barrier_image(s_vk.depth.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
     VkImageSubresourceRange cr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    VkImageSubresourceRange dr = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+    VkImageSubresourceRange dr = { VK_DS_ASPECT, 0, 1, 0, 1 };
     pvkCmdClearColorImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &cr);
     pvkCmdClearDepthStencilImage(s_vk.cmd, s_vk.depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &dr);
     if (vk_submit_and_wait()) return -1;

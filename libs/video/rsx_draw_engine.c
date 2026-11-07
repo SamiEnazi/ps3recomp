@@ -4858,6 +4858,16 @@ static void sink_end(void* user, const rsx_dispatch* r)
               fprintf(stderr, "[hudlog]   blend sf=0x%08X df=0x%08X eq=0x%08X color=0x%08X tex_mask=0x%X\n",
                       rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR), rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR),
                       rsx_dsp_reg(&g.rsx, M_BLEND_EQUATION), rsx_dsp_reg(&g.rsx, 0x031C), tex_mask);
+              /* What can reject every fragment of a draw whose depth test is
+               * off: the stencil test, the scissor, depth bounds. */
+              fprintf(stderr, "[hudlog]   stencil en=%u func=0x%X ref=0x%02X fmask=0x%02X wmask=0x%02X ops=0x%X/0x%X/0x%X two=%u dbounds=%u scissor=0x%08X/0x%08X zslot=%d vpz=(%g %g) zminmax=0x%X\n",
+                      rsx_dsp_reg(&g.rsx, M_STENCIL_TEST_ENABLE) & 1u, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC),
+                      rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_MASK) & 0xFFu,
+                      rsx_dsp_reg(&g.rsx, M_STENCIL_MASK) & 0xFFu, rsx_dsp_reg(&g.rsx, M_STENCIL_OP_FAIL),
+                      rsx_dsp_reg(&g.rsx, M_STENCIL_OP_ZFAIL), rsx_dsp_reg(&g.rsx, M_STENCIL_OP_ZPASS),
+                      rsx_dsp_reg(&g.rsx, M_TWO_SIDED_STENCIL) & 1u, rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_ENABLE) & 1u,
+                      rsx_dsp_reg(&g.rsx, 0x08C0), rsx_dsp_reg(&g.rsx, 0x08C4), zslot == ENG_INVALID ? -1 : (int)zslot,
+                      vp.scale[2], vp.translate[2], rsx_dsp_reg(&g.rsx, 0x1D78));
               { const float* k = (const float*)g.fp_cb;   /* the fragment constants handed over */
                 const u32 nk = g.fp_constants->count;
                 for (u32 i = 0; i < nk && i < 32u; i++)
