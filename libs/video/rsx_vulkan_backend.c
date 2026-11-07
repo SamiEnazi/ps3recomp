@@ -227,6 +227,7 @@ typedef struct vk_state {
 } vk_state;
 
 static vk_state s_vk;
+static int s_vk_indep_blend;   /* device has independentBlend (per-attachment state) */
 
 /* ---- batched recording (PS3RECOMP_VK_BATCH, default on) --------------------
  * The backend was written with every operation submitted and waited on, so a
@@ -3764,17 +3765,39 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     if ((rs->color_mask >>  8) & 0xFFu) wm |= VK_COLOR_COMPONENT_G_BIT;
     if ((rs->color_mask >>  0) & 0xFFu) wm |= VK_COLOR_COMPONENT_B_BIT;
     if ((rs->color_mask >> 24) & 0xFFu) wm |= VK_COLOR_COMPONENT_A_BIT;
+    /* Targets B..D of an MRT set take their own write mask from COLOR_MASK_MRT
+     * (0x0370: a nibble per target at [4i..4i+3], bit 0 A, 1 R, 2 G, 3 B) and
+     * their own blend enable from BLEND_ENABLE_MRT (0x036C bit i) -- the
+     * hardware rule, as rsx_metal_backend.m applies it. Giving every target
+     * A's mask let inFAMOUS 2's G-buffer pass overwrite channels of planes B
+     * and C that it masks off (and leave stale the ones it writes), and the
+     * composite multiplies its lighting by those channels.
+     * PS3RECOMP_VK_MRT_MASK=0: target A's state everywhere (old behaviour). */
+    static int mrt_mode = -1;
+    if (mrt_mode < 0) { const char* e = getenv("PS3RECOMP_VK_MRT_MASK"); mrt_mode = e ? atoi(e) : 1; }
     VkPipelineColorBlendAttachmentState cba[RSX_BE_MAX_COLOR_TARGETS];
-    for (u32 r = 0; r < P->rt_count; r++)
+    for (u32 r = 0; r < P->rt_count; r++) {
+        VkColorComponentFlags twm = wm;
+        int tblend = rs->blend_enable != 0;
+        if (r > 0 && mrt_mode && s_vk_indep_blend) {
+            const u32 nib = (rs->color_mask_mrt >> (r * 4)) & 0xFu;
+            twm = 0;
+            if (nib & 1u) twm |= VK_COLOR_COMPONENT_A_BIT;
+            if (nib & 2u) twm |= VK_COLOR_COMPONENT_R_BIT;
+            if (nib & 4u) twm |= VK_COLOR_COMPONENT_G_BIT;
+            if (nib & 8u) twm |= VK_COLOR_COMPONENT_B_BIT;
+            tblend = (rs->blend_mrt >> r) & 1u;
+        }
         cba[r] = (VkPipelineColorBlendAttachmentState){
-            .blendEnable = rs->blend_enable ? VK_TRUE : VK_FALSE,
+            .blendEnable = tblend ? VK_TRUE : VK_FALSE,
             .srcColorBlendFactor = vk_gcm_blend_factor(rs->sf_rgb),
             .dstColorBlendFactor = vk_gcm_blend_factor(rs->df_rgb),
             .colorBlendOp = vk_gcm_blend_op(rs->eq_rgb),
             .srcAlphaBlendFactor = vk_gcm_blend_factor(rs->sf_a),
             .dstAlphaBlendFactor = vk_gcm_blend_factor(rs->df_a),
             .alphaBlendOp = vk_gcm_blend_op(rs->eq_a),
-            .colorWriteMask = wm };
+            .colorWriteMask = twm };
+    }
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = P->rt_count, .pAttachments = cba };
@@ -4912,6 +4935,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     want.textureCompressionBC = have.textureCompressionBC;
     /* User clip planes (rsx_vp_apply_user_clip) write ClipDistance. */
     want.shaderClipDistance = have.shaderClipDistance;
+    /* Per-attachment write masks and blend (COLOR_MASK_MRT/BLEND_ENABLE_MRT):
+     * without independentBlend every attachment must share one state. */
+    want.independentBlend = have.independentBlend;
+    s_vk_indep_blend = have.independentBlend ? 1 : 0;
     s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,

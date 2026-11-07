@@ -4834,7 +4834,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
           if (hframe != ~0u && g.frames - hframe <= 2u) eng_guest_programs(&vpm, &fpm);
           const int after = hafter_frame == g.frames;
           if (hafter && fpm && fpm->structural == hafter) hafter_frame = g.frames;
-          if (hframe != ~0u && g.frames - hframe <= 2u && (after || (n_targets == 1 && !rs.depth_test))) {
+          /* PS3RECOMP_ENG_HUDLOG_RT=<hex offset>: every draw into that colour
+           * target too, depth-tested or not (light volumes, MRT passes). */
+          static long hrt = -2;
+          if (hrt == -2) { const char* e = getenv("PS3RECOMP_ENG_HUDLOG_RT"); hrt = e ? (long)strtoul(e, 0, 16) : -1; }
+          const int rt_match = hrt >= 0 && n_targets && g.surfaces[target].offset == (u32)hrt;
+          if (hframe != ~0u && g.frames - hframe <= 2u && (after || rt_match || (n_targets == 1 && !rs.depth_test))) {
               float mn[4] = { 1e30f, 1e30f, 1e30f, 1e30f }, mx[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
               const s8 ps = layout.slot_by_attr[0];
               if (ps >= 0 && dc.verts && !(dc.vbuf_hit && indexed))
