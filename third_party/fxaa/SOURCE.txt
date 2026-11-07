@@ -1,0 +1,7 @@
+FXAA3_11.h: NVIDIA FXAA 3.11 by Timothy Lottes, the NVIDIA GameWorks
+Graphics Samples release (SDK v1.2, BSD-3-Clause, LICENSE.txt), unmodified.
+Taken from github.com/ThirteenAG/GTAIV.EFLC.FusionFix
+(source/resources/FXAA3_11.h at 09ec3d8534c669802b6441b72901363a06e7a9c2),
+lines 17-2081: that file is NVIDIA's header with a few integration lines of
+its own before and after, which are not included here.
+fxaa_glsl.h is generated from it by tools/gen_glsl_header.py.
