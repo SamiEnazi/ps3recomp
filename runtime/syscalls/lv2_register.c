@@ -1053,6 +1053,12 @@ static void* spu_exec_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+#ifdef _WIN32
+    /* Same shape as the PPU line ("[THREAD n] host thread started ... hosttid="),
+     * so a per-host-thread CPU sample can be named: SPU or PPU, which one. */
+    fprintf(stderr, "[SPU-THREAD 0x%X] host thread started, hosttid=%lu\n",
+            (unsigned)t->tid, (unsigned long)GetCurrentThreadId());
+#endif
     ps3_host_qos_self(1);   /* PS3_QOS (host_qos.h): the SPUs set the frame rate */
     /* PS3_HOT_QOS=1: on an SPU-bound title these threads are the frame-rate
      * ceiling, and at the default QoS macOS is free to run them on the
