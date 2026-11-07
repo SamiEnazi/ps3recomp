@@ -9,8 +9,9 @@
  *   F1           performance HUD on/off (default on, top left)
  *   F2           settings menu open/close (Esc also closes it)
  *   Alt+Enter, F11  fullscreen on/off
- * Controller: hold L3+R3 together for 1 s to open/close the menu; in it the
- * D-pad / left stick move, Cross picks, Circle closes, L1/R1 switch pages.
+ * Controller: hold L3+R3 together for 1 s (any controller) to open/close the
+ * menu; in it the D-pad / left stick move, Cross picks, Circle closes, L1/R1
+ * switch pages.
  * While the menu is open the game reads neutral input (cellPad's
  * g_pad_overlay_open) and gets no keyboard or mouse events.
  *
@@ -31,7 +32,8 @@
  *   PS3RECOMP_OVERLAY_MENU_OPEN=1        menu open from the start
  *   PS3RECOMP_OVERLAY_TAB=<page>         0..4 or display|graphics|audio|controls|hud
  *   PS3RECOMP_OVERLAY_MENU_AT="40:display,50:audio,60:close"  a timed script
- *                                        (seconds after the window opened)
+ *                                        (seconds after the window opened); also
+ *                                        hud0 / hud1 and set=VAR=value (as the menu sets it)
  *
  * Threads: everything runs on the thread that owns the window and presents
  * (the port's frame-clock / RSX thread): attach, draw, poll and the event
