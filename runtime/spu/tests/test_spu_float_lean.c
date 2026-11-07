@@ -68,7 +68,7 @@ static u128 w4(uint32_t x, uint32_t y, uint32_t z, uint32_t w) { u128 r; r._u32[
 
 int main(int argc, char** argv)
 {
-#if !defined(__ARM_NEON)
+#if !defined(__ARM_NEON) && !SPU_X86_SIMD
     puts("test_spu_float_lean: no NEON, the lean forms are the plain ones");
     return 0;
 #else
