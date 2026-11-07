@@ -34,11 +34,27 @@
  * an image is (re)made, which waits for the device first -- so a set is never
  * rewritten under a frame in flight. Per-frame values go in push constants.
  *
- * Internal resolution (PS3RECOMP_RENDER_SCALE) is NOT done here. Rendering the
- * game larger is the draw engine + backend's business (every engine target,
- * viewport, scissor, WPOS, readback and the light/SSAO/depth-decode passes
- * scaled -- what rsx_metal_backend.m's PS3_RES_SCALE does, ~40 sites); the
- * setting is accepted and reported as 1 until the Vulkan backend has it.
+ * Internal resolution (PS3RECOMP_RENDER_SCALE) is NOT done here: the setting
+ * is accepted and reported as 1. Rendering the game larger is the backend's
+ * business, as rsx_metal_backend.m's PS3_RES_SCALE does it; on Vulkan it needs,
+ * in rsx_vulkan_backend.c (2026-11-08 survey):
+ *   - vk_eng_obj: the guest's size AND the image's size (o->w/h is both today,
+ *     ~23 uses); colour/depth targets, surface views, depth snapshots, colour
+ *     snapshots, depth decodes made at res_px(w) x res_px(h); seeds
+ *     nearest-upscaled (vk_eng_color_target_create, vk_eng_texture_upload
+ *     into a target)
+ *   - framebuffers, render areas, vk_eng_set_viewport / vk_eng_set_scissor
+ *     scaled with Metal's edge rounding; the scratch depth at the scaled size
+ *   - vk_eng_light_pass: params width/height = the scaled size;
+ *     vk_eng_ssao_pass: the GLSL `rs` (a constant 1 in rsx_vk_passes_glsl.h)
+ *     = the scale, and Metal's ssao_up4s_fs (full-size upsample) ported
+ *   - vk_eng_readback: point-sample the scaled image down to the guest's pixels
+ *   - rsx_fp_set_wpos_scale_xy(s, s) at init (the shared decompiler already
+ *     emits the WPOS divide and the shadow-lookup fix)
+ *   - vk_eng_present: hand the scaled display surface straight to this module
+ *     (not the 1280x720 blit) and add a downsample pass here
+ * Gate: the shot suite unchanged at 1x; light, SSAO, shadows and SPU readbacks
+ * A/B-checked at 1.5x and 2x.
  */
 #if defined(PS3RECOMP_RSX_VULKAN)
 
