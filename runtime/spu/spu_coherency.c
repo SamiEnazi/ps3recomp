@@ -212,6 +212,10 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * Written once, under the lock; read unlocked, where a stale zero costs at most
  * one missed event on the very first reservation of the run. */
 static int s_coh_armed;
+/* The lifted code's inline store fast path (ppu_lifter.py's header) reads
+ * the same two objects spu_coh_is_reserved does. */
+int* const           g_spu_coh_armed  = &s_coh_armed;
+unsigned char* const g_spu_coh_bitmap = s_coh_bitmap;
 
 /* The SPU contexts that have reserved a line. Sized to match the MFC engine
  * registry in spu_channels.c, which is the ceiling on live SPU contexts. */

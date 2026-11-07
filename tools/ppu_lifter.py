@@ -218,6 +218,69 @@ static inline uint64_t vm_read64_inl(uint64_t a)
 #define vm_read64(a) vm_read64_inl(a)
 #endif
 
+/* Inline guest-store fast paths, the loads' counterpart. Every lifted store
+ * was an out-of-line call that ran the diagnostics gate, the bounds and null
+ * checks and the SPU coherence check: a third of inFAMOUS 2's main thread
+ * (host profile, 2026-11-07). The fast path keeps VM_WRITE_COH's protocol for
+ * a line no SPU has reserved -- store, compiler fence, re-check the
+ * reservation bitmap, notify (under the line lock) if it is now reserved; a
+ * line already reserved, the null page, the raw-SPU window and any armed
+ * memory diagnostic take the out-of-line path, which does the rest. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern int* const           g_spu_coh_armed;
+extern unsigned char* const g_spu_coh_bitmap;
+void ppu_store_coh_notify(uint32_t ea, uint32_t n);
+#ifdef __cplusplus
+}
+#endif
+static inline int vm_st_resv(uint32_t ea)
+{
+    if (!__atomic_load_n(g_spu_coh_armed, __ATOMIC_ACQUIRE)) return 0;
+    const uint32_t line = ea >> 7;
+    return (__atomic_load_n(&g_spu_coh_bitmap[line >> 3], __ATOMIC_RELAXED) >> (line & 7)) & 1u;
+}
+static inline int vm_st_ok(uint32_t ea, uint32_t n)
+{
+    return vm_inl_ok(ea, n) && !vm_st_resv(ea);
+}
+static inline void vm_st_after(uint32_t ea, uint32_t n)
+{
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    if (__builtin_expect(vm_st_resv(ea), 0)) ppu_store_coh_notify(ea, n);
+}
+static inline void vm_write8_inl(uint64_t a, uint8_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_st_ok(ea, 1)) { __atomic_store_n(vm_base + ea, v, __ATOMIC_RELAXED); vm_st_after(ea, 1); return; }
+    vm_write8(a, v);
+}
+static inline void vm_write16_inl(uint64_t a, uint16_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_st_ok(ea, 2)) { VM_RAW_ST(uint16_t, ea, __builtin_bswap16(v)); vm_st_after(ea, 2); return; }
+    vm_write16(a, v);
+}
+static inline void vm_write32_inl(uint64_t a, uint32_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_st_ok(ea, 4)) { VM_RAW_ST(uint32_t, ea, __builtin_bswap32(v)); vm_st_after(ea, 4); return; }
+    vm_write32(a, v);
+}
+static inline void vm_write64_inl(uint64_t a, uint64_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_st_ok(ea, 8)) { VM_RAW_ST(uint64_t, ea, __builtin_bswap64(v)); vm_st_after(ea, 8); return; }
+    vm_write64(a, v);
+}
+#if !defined(PPU_NO_INLINE_STORES) && !defined(PPU_NO_INLINE_LOADS)   /* a file defining the out-of-line accessors opts out of both */
+#define vm_write8(a, v)  vm_write8_inl(a, v)
+#define vm_write16(a, v) vm_write16_inl(a, v)
+#define vm_write32(a, v) vm_write32_inl(a, v)
+#define vm_write64(a, v) vm_write64_inl(a, v)
+#endif
+
 /* Syscall handler */
 #ifdef __cplusplus
 extern "C"

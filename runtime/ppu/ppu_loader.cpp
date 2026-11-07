@@ -2067,6 +2067,16 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
     }
 }
 
+/* The inline store fast path (ppu_recomp.h) stored to a line that is now
+ * reserved: VM_WRITE_COH's second half, under the line lock. */
+extern "C" void ppu_store_coh_notify(uint32_t ea, uint32_t n)
+{
+    const uint64_t m = spu_lockline_mask_range(ea, n);
+    spu_lockline_lock_mask(m);
+    spu_coh_notify_write_from_ppu(ea);
+    spu_lockline_unlock_mask(m);
+}
+
 /* See the note on the forward declaration above ppu_stwcx32. */
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
 {
