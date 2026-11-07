@@ -24,6 +24,7 @@
 #include "backends/imgui_impl_sdl2.h"
 
 #include "../../include/ps3emu/ps3_settings.h"
+#include "vk_postfx.h"
 #include "../../include/ps3emu/ps3_pad_icons.h"
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -107,7 +108,7 @@ static bool env_on(const char* v)
  * manage are applied the same way and kept when the file is rewritten. */
 enum {
     V_FPS_CAP, V_PRESENT, V_FULLSCREEN,
-    V_AA, V_SHARPEN, V_RENDER_SCALE, V_ANISO,
+    V_AA, V_SHARPEN, V_RENDER_SCALE, V_ANISO, V_UPSCALE,
     V_VOLUME,
     V_INPUT_MODE, V_BUTTON_ICONS, V_RUMBLE, V_RUMBLE_STRENGTH,
     V_HUD, V_HUD_CORNER, V_HUD_OPACITY, V_HUD_GRAPH, V_HUD_CPU,
@@ -115,7 +116,7 @@ enum {
 };
 static const char* const kVar[V_N] = {
     "PS3RECOMP_FPS_CAP", "PS3RECOMP_VK_PRESENT", "PS3RECOMP_VK_FULLSCREEN",
-    "PS3RECOMP_AA", "PS3RECOMP_SHARPEN", "PS3RECOMP_RENDER_SCALE", "PS3RECOMP_ANISO",
+    "PS3RECOMP_AA", "PS3RECOMP_SHARPEN", "PS3RECOMP_RENDER_SCALE", "PS3RECOMP_ANISO", "PS3RECOMP_UPSCALE",
     "PS3_AUDIO_VOLUME",
     "PS3_INPUT_MODE", "PS3_BUTTON_ICONS", "PS3_RUMBLE", "PS3_RUMBLE_STRENGTH",
     "PS3_OVERLAY_HUD", "PS3_OVERLAY_HUD_CORNER", "PS3_OVERLAY_HUD_OPACITY",
@@ -922,12 +923,14 @@ static const char* const kScale[] = { "1", "1.5", "2" };
 static const char* const kScaleName[] = { "1x  (1280x720, native)", "1.5x  (1920x1080)", "2x  (2560x1440)" };
 static const char* const kAniso[] = { "1", "2", "4", "8", "16" };
 static const char* const kAnisoName[] = { "Off (1x)", "2x", "4x", "8x", "16x" };
+static const char* const kUp[] = { "fsr", "cas", "bilinear" };   /* VK_POSTFX_UP_* order */
+static const char* const kUpName[] = { "AMD FSR 1 (sharpest)", "AMD CAS scaling", "Bilinear (soft)" };
 
 struct Ui {
     int cap, cap_custom;      /* index in kCap; -1 = cap_custom fps */
     int present;
     bool fullscreen;
-    int aa, scale, aniso; float sharpen;
+    int aa, scale, aniso, upscale; float sharpen;
     int volume;
     int input_mode, button_icons;
     bool rumble; int rumble_strength;
@@ -950,13 +953,15 @@ static void ui_load(void)
     s_ui.present = pick(getenv(kVar[V_PRESENT]), kPresent, 3, 1);
     { SDL_Window* w = (SDL_Window*)s_vk.sdl_window;
       s_ui.fullscreen = w && (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) != 0; }
-    s_ui.aa = pick(getenv(kVar[V_AA]), kAA, 3, 0);
-    { const char* e = getenv(kVar[V_SHARPEN]); s_ui.sharpen = e ? (float)atof(e) : 0.0f; }
+    /* image quality: the values in effect (vk_postfx.c owns the defaults) */
+    { const int a = vk_postfx_aa();
+      s_ui.aa = a == VK_POSTFX_AA_SMAA ? 2 : a == VK_POSTFX_AA_FXAA ? 1 : 0; }
+    s_ui.sharpen = vk_postfx_sharpen();
+    s_ui.upscale = vk_postfx_upscale();
     { const char* e = getenv(kVar[V_RENDER_SCALE]);
       const double v = e ? atof(e) : 1.0;
       s_ui.scale = v >= 1.75 ? 2 : v >= 1.25 ? 1 : 0; }
-    { const char* e = getenv(kVar[V_ANISO]);
-      const int v = e ? atoi(e) : 1;
+    { const int v = vk_postfx_aniso();
       s_ui.aniso = v >= 16 ? 4 : v >= 8 ? 3 : v >= 4 ? 2 : v >= 2 ? 1 : 0; }
     s_ui.volume = cellAudio_host_volume();
     s_ui.input_mode = cellPad_host_input_mode();
@@ -1067,11 +1072,17 @@ static void tab_graphics(void)
     }
     live_mark(V_SHARPEN);
     ImGui::SetNextItemWidth(combo_w());
+    ImGui::BeginDisabled();   /* not on Vulkan yet (vk_postfx.c's work list) */
     if (ImGui::Combo("Render scale", &s_ui.scale, kScaleName, 3)) apply_setting(V_RENDER_SCALE, kScale[s_ui.scale]);
-    live_mark(V_RENDER_SCALE);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextColored(kGrey, "coming");
     ImGui::SetNextItemWidth(combo_w());
     if (ImGui::Combo("Anisotropic filtering", &s_ui.aniso, kAnisoName, 5)) apply_setting(V_ANISO, kAniso[s_ui.aniso]);
     live_mark(V_ANISO);
+    ImGui::SetNextItemWidth(combo_w());
+    if (ImGui::Combo("Upscaling (window larger than 1280x720)", &s_ui.upscale, kUpName, 3)) apply_setting(V_UPSCALE, kUp[s_ui.upscale]);
+    live_mark(V_UPSCALE);
     hint("\"live\" settings change at once; \"on restart\" ones are saved now and used the next time the "
          "game starts. A higher render scale costs GPU time (see the HUD).");
 }

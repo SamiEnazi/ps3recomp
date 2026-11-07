@@ -63,6 +63,7 @@
 
 #include "vk_postfx.h"
 #include "rsx_shader_spirv.h"
+#include "../../include/ps3emu/ps3_settings.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -173,6 +174,12 @@ bad:
     if (from_env) PFX_LOG("%s=%s not understood; the default stays\n", name, value);
     return -1;
 }
+/* The in-game menu's live appliers (ps3_settings.h): 1 = took effect now. */
+static int pfx_apply_aa(const char* v)      { return pfx_set_one("PS3RECOMP_AA", v, 0) == 0; }
+static int pfx_apply_sharpen(const char* v) { return pfx_set_one("PS3RECOMP_SHARPEN", v, 0) == 0; }
+static int pfx_apply_aniso(const char* v)   { return pfx_set_one("PS3RECOMP_ANISO", v, 0) == 0; }
+static int pfx_apply_upscale(const char* v) { return pfx_set_one("PS3RECOMP_UPSCALE", v, 0) == 0; }
+
 static void pfx_env(void)
 {
     if (s_env_done) return;
@@ -183,6 +190,11 @@ static void pfx_env(void)
         const char* v = getenv(names[k]);
         if (v) pfx_set_one(names[k], v, 1);
     }
+    /* RENDER_SCALE is not registered: not live (see the work list above). */
+    ps3_setting_register("PS3RECOMP_AA", pfx_apply_aa);
+    ps3_setting_register("PS3RECOMP_SHARPEN", pfx_apply_sharpen);
+    ps3_setting_register("PS3RECOMP_ANISO", pfx_apply_aniso);
+    ps3_setting_register("PS3RECOMP_UPSCALE", pfx_apply_upscale);
 }
 
 void vk_postfx_set_aa(int mode)
