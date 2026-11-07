@@ -1,6 +1,11 @@
 Dear ImGui v1.92.9b (2026-07-31), MIT licence (LICENSE.txt), unmodified.
 Source: https://github.com/ocornut/imgui/archive/refs/tags/v1.92.9b.tar.gz
 sha256 of that archive: 21d8a0a565e85dce943e375db00812c2f3f0ab21f3f0f7964e364a63422d7f99
-Only the core and the Metal renderer backend are vendored; the in-game
-overlay (libs/video/ps3_overlay.mm) feeds input itself, so imgui_impl_osx is
-not used. Upgrade by replacing these files from a newer release.
+Vendored: the core, the Metal renderer backend (macOS in-game menu,
+libs/video/ps3_overlay.mm) and -- same tag, from
+https://raw.githubusercontent.com/ocornut/imgui/v1.92.9b/backends/ -- the
+Vulkan renderer and SDL2 platform backends (imgui_impl_vulkan.*,
+imgui_impl_sdl2.*) for the Vulkan overlay (libs/video/vk_overlay.cpp).
+imgui.h fetched from that tag is byte-identical to the one here.
+The Metal overlay feeds input itself, so imgui_impl_osx is not used.
+Upgrade by replacing these files from a newer release.

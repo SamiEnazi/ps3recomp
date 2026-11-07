@@ -60,6 +60,8 @@
 #include "vulkan/rsx_vk_passes_glsl.h"
 #include "vk_postfx.h"                           /* [postfx] AA, sharpening, anisotropy */
 #include "../../include/ps3emu/ps3_ftrace.h"    /* PS3_FTRACE: GPU_WAIT spans at each fence wait */
+#include "../../include/ps3emu/ps3_settings.h"  /* [overlay] PC settings the in-game menu changes live */
+#include "vk_overlay.h"                          /* [overlay] HUD + settings menu (vk_overlay.cpp) */
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
@@ -2893,6 +2895,7 @@ static void vk_window_drop(const char* why)
     if (why) VK_LOG("window disabled, continuing headless: %s\n", why);
     if (s_vk.device && pvkDeviceWaitIdle) {
         pvkDeviceWaitIdle(s_vk.device);
+        vk_overlay_shutdown();               /* [overlay] its views of the swapchain images first */
         for (u32 i = 0; i < 8; i++)
             if (s_vk.sc_done[i]) {
                 pvkDestroySemaphore(s_vk.device, s_vk.sc_done[i], NULL);
@@ -3033,9 +3036,10 @@ static int vk_create_swapchain(void)
         if (pref != VK_PRESENT_MODE_FIFO_KHR && pvkGetPhysicalDeviceSurfacePresentModesKHR &&
             pvkGetPhysicalDeviceSurfacePresentModesKHR(s_vk.phys, s_vk.surface, &nm, modes) >= 0)
             for (u32 k = 0; k < nm; k++) if (modes[k] == pref) mode = pref;
-        static int said;
-        if (!said++) VK_LOG("present mode: %s\n", mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox (no vsync queue)"
-                                                 : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo (vsync)");
+        static int said = -1;   /* [overlay] logged again when the menu changes it */
+        if (said != (int)mode) { said = (int)mode;
+            VK_LOG("present mode: %s\n", mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox (no vsync queue)"
+                                         : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo (vsync)"); }
     }
 
     VkSwapchainKHR old = s_vk.swapchain;
@@ -3044,7 +3048,8 @@ static int vk_create_swapchain(void)
         .surface = s_vk.surface, .minImageCount = count,
         .imageFormat = fmt.format, .imageColorSpace = fmt.colorSpace,
         .imageExtent = ext, .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |   /* [overlay] it draws into them: */
+                      (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT),
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform, .compositeAlpha = alpha,
         .presentMode = mode,
@@ -3052,6 +3057,8 @@ static int vk_create_swapchain(void)
     };
     VkSwapchainKHR sc = VK_NULL_HANDLE;
     VkResult r = pvkCreateSwapchainKHR(s_vk.device, &sci, NULL, &sc);
+    /* [overlay] its views of the old images go before the old swapchain does */
+    vk_overlay_swapchain_changed(fmt.format, (sci.imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0);
     if (old) pvkDestroySwapchainKHR(s_vk.device, old, NULL);
     s_vk.swapchain = VK_NULL_HANDLE;
     if (r != VK_SUCCESS) { VK_LOG("vkCreateSwapchainKHR failed (VkResult %d)\n", (int)r); return -1; }
@@ -3109,6 +3116,22 @@ static int vk_window_ready(void)
 
 static void vk_fif_advance(void);
 
+/* [overlay] Live PC settings (include/ps3emu/ps3_settings.h): the in-game menu
+ * (vk_overlay.cpp) sets the variable, then these run on this, the presenting,
+ * thread: the frame cap is re-read at the next present, a present mode or a
+ * fullscreen change rebuilds the swapchain before the next acquire. */
+static volatile int s_fps_cap_dirty, s_present_dirty;
+static int vk_set_fps_cap(const char* v) { (void)v; s_fps_cap_dirty = 1; return 1; }
+static int vk_set_present(const char* v) { (void)v; s_present_dirty = 1; return 1; }
+static int vk_set_fullscreen(const char* v)
+{
+    if (!s_vk.window) return 0;
+    const int on = v && v[0] && v[0] != '0';
+    if (SDL_SetWindowFullscreen(s_vk.window, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0) return 0;
+    s_present_dirty = 1;
+    return 1;
+}
+
 /* PS3RECOMP_FPS_CAP=<fps> (0/unset = uncapped): present at most that many frames a
  * second, on an even beat -- each present waits for its deadline (the last one plus
  * the period; a frame that is late moves the beat instead of bunching the next ones
@@ -3119,11 +3142,14 @@ static void vk_fif_advance(void);
 static void vk_frame_limit(void)
 {
     static double period_s = -1.0;
-    if (period_s < 0.0) {
+    if (period_s < 0.0 || s_fps_cap_dirty) {   /* [overlay] or changed in the menu */
+        const int live = s_fps_cap_dirty;
+        s_fps_cap_dirty = 0;
         const char* e = getenv("PS3RECOMP_FPS_CAP");
         const double f = e ? atof(e) : 0.0;
         period_s = f > 0.0 ? 1.0 / f : 0.0;
         if (f > 0.0) fprintf(stderr, "[RSX vulkan] frame cap %.1f fps (PS3RECOMP_FPS_CAP)\n", f);
+        else if (live) fprintf(stderr, "[RSX vulkan] frame cap off (PS3RECOMP_FPS_CAP)\n");
     }
     if (period_s <= 0.0) return;
 #ifdef _WIN32
@@ -3171,6 +3197,11 @@ static void vk_frame_limit(void)
 static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain || s_sc_minimized) return;
+    if (s_present_dirty) {                  /* [overlay] present mode / fullscreen changed live */
+        s_present_dirty = 0;
+        vk_swapchain_lost();
+        if (!s_vk.windowed || !s_vk.swapchain || s_sc_minimized) return;
+    }
 
     u32 idx = 0;
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
@@ -3220,8 +3251,13 @@ static void vk_present_window(void)
     b.dstAccessMask = 0;
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                          0, 0, NULL, 0, NULL, 1, &b);
+    /* [overlay] the HUD / menu on top (vk_overlay.cpp): when it draws, its render
+     * pass leaves the image in PRESENT_SRC itself */
+    if (!(g_vk_overlay_active &&
+          vk_overlay_draw(s_vk.cmd, idx, s_vk.sc_images[idx], s_vk.sc_extent, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)))
+        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              0, 0, NULL, 0, NULL, 1, &b);
     vk_gprof_stamp(GP_BLIT, s_vk.sc_extent.width, s_vk.sc_extent.height);
     if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
 
@@ -6148,6 +6184,15 @@ static int vk_init_all(u32 width, u32 height, const char* title)
             (s_vk.sem_acquire = s_fif_acq[s_fif_cur], vk_create_swapchain()))
             vk_window_drop("the swapchain could not be created");
     }
+    if (s_vk.windowed && s_vk.swapchain) {   /* [overlay] the live settings and the HUD / menu */
+        ps3_setting_register("PS3RECOMP_FPS_CAP", vk_set_fps_cap);
+        ps3_setting_register("PS3RECOMP_VK_PRESENT", vk_set_present);
+        ps3_setting_register("PS3RECOMP_VK_FULLSCREEN", vk_set_fullscreen);
+        const vk_overlay_attach_info oi = {
+            pvkGetInstanceProcAddr, s_vk.instance, s_vk.phys, s_vk.device, s_vk.queue_family, s_vk.queue,
+            s_vk.window, s_vk.width, s_vk.height };
+        vk_overlay_attach(&oi);
+    }
     return 0;
 }
 
@@ -6304,7 +6349,9 @@ int rsx_vulkan_backend_pump_messages(void)
     if (!s_vk.windowed) return 0;
     int quit = 0;
     SDL_Event e;
+    vk_overlay_poll();                       /* [overlay] the L3+R3 hold, a test's timed menu */
     while (SDL_PollEvent(&e)) {
+        if (vk_overlay_event(&e)) continue;  /* [overlay] F1/F2/Alt+Enter; all input while the menu is open */
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9 && !e.key.repeat) s_pl.mark = 1;
