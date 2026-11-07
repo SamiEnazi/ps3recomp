@@ -114,7 +114,9 @@
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
     X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCmdSetDepthBias) \
-    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) X(vkCmdCopyImage)
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) X(vkCmdCopyImage) \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) \
+    X(vkGetQueryPoolResults) X(vkGetFenceStatus)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
@@ -131,6 +133,20 @@ VK_INSTANCE_FNS(VK_DECLARE)
 VK_DEVICE_FNS(VK_DECLARE)
 VK_WSI_INSTANCE_FNS(VK_DECLARE)
 VK_WSI_DEVICE_FNS(VK_DECLARE)
+
+/* GPU timestamp profiler (PS3RECOMP_VK_GPU_PROF): what each interval recorded. The
+ * call-like macros count; the loader's assignments (no parentheses) are untouched,
+ * and a macro does not expand inside itself, so the real pointer is called. */
+static u32 s_gp_ops[8];
+#define pvkCmdCopyImage(...)              (s_gp_ops[0]++, pvkCmdCopyImage(__VA_ARGS__))
+#define pvkCmdCopyBufferToImage(...)      (s_gp_ops[1]++, pvkCmdCopyBufferToImage(__VA_ARGS__))
+#define pvkCmdCopyImageToBuffer(...)      (s_gp_ops[2]++, pvkCmdCopyImageToBuffer(__VA_ARGS__))
+#define pvkCmdClearColorImage(...)        (s_gp_ops[3]++, pvkCmdClearColorImage(__VA_ARGS__))
+#define pvkCmdClearDepthStencilImage(...) (s_gp_ops[4]++, pvkCmdClearDepthStencilImage(__VA_ARGS__))
+#define pvkCmdBlitImage(...)              (s_gp_ops[5]++, pvkCmdBlitImage(__VA_ARGS__))
+#define pvkCmdPipelineBarrier(...)        (s_gp_ops[6]++, pvkCmdPipelineBarrier(__VA_ARGS__))
+#define pvkCmdDrawIndexed(...)            (s_gp_ops[7]++, pvkCmdDrawIndexed(__VA_ARGS__))
+#define pvkCmdDraw(...)                   (s_gp_ops[7]++, pvkCmdDraw(__VA_ARGS__))
 
 /* ---------------------------------------------------------------------------
  * Backend state
@@ -257,7 +273,8 @@ static struct {
     u32          draws;                  /* engine draws in the open batch    */
     vk_buffer    varena, iarena, uarena; /* vertex / index / uniform arenas   */
     vk_buffer    sarena;                 /* transfer staging (uploads, depth copies) */
-    VkDeviceSize vcur, icur, ucur, ualign, scur;
+    vk_buffer    garena;                 /* GPU-local bounce for image -> buffer -> image copies */
+    VkDeviceSize vcur, icur, ucur, ualign, scur, gcur;
     VkFramebuffer dead_fb[VK_BATCH_DEAD_FB]; /* destroyed once the batch is done */
     u32          n_dead_fb;
     vk_image     dead_img[256];          /* likewise images (and their views) */
@@ -270,6 +287,7 @@ static struct {
     int          rp_open;
     VkFramebuffer rp_fb;
     VkRenderPass rp_rp;
+    u32          rp_w, rp_h;             /* its render area (GPU timestamp labels) */
     u32          rp_rt[RSX_BE_MAX_COLOR_TARGETS], rp_nrt, rp_depth;
     unsigned long long merged;           /* draws that continued an open pass */
     VkDescriptorPool dpool;              /* per-draw descriptor sets          */
@@ -278,6 +296,64 @@ static struct {
     size_t       shadow_size;
     unsigned long long flushes, flushed_draws, max_draws;
 } s_batch = { .on = -1 };
+
+/* ---- frames in flight (PS3RECOMP_VK_FIF, default 2; 1 = the old behaviour) ---------
+ * The windowed present used to submit the frame's batch and WAIT for it: the RSX
+ * thread sat idle while the GPU drew, and the GPU idle while the next frame was
+ * recorded -- a gameplay frame was ~8 ms of recording plus ~10 ms of waiting, in
+ * series (inFAMOUS 2, 2026-11-07: the main thread then waited on the RSX thread).
+ * With two slots the present submits slot A and returns; slot B (whose previous
+ * frame is waited for, normally long done) records the next frame while the GPU
+ * draws A. Everything the host writes for a batch, or that a recorded command
+ * refers to by handle and the batch may free, is per slot: the command buffer and
+ * fence, the swapchain acquire semaphore, the vertex/index/uniform/staging/bounce
+ * arenas, the per-draw descriptor pool, the dead-object lists, the passes' UBOs and
+ * descriptor sets (vk_lp_swap), the GPU-timestamp pool. The active slot's live in
+ * s_vk/s_batch/s_lp as before -- no other code changed -- and the other slot's are
+ * parked in s_fif_bs / s_lp_park. GPU-side order between frames is the queue's:
+ * every pass starts with a barrier whose first scope is everything submitted before.
+ * An object freed while the other slot may still use it joins the ACTIVE slot's
+ * dead list, freed only after that slot's next submission completes -- which, the
+ * queue being in order, is after the other slot's. */
+#define VK_FIF_MAX 2u
+static int             s_fif = -1;             /* -1 unread, else 1 or 2 */
+static u32             s_fif_cur;              /* the active slot */
+static VkCommandBuffer s_fif_cmd[VK_FIF_MAX];
+static VkFence         s_fif_fence[VK_FIF_MAX];
+static VkSemaphore     s_fif_acq[VK_FIF_MAX];
+static int             s_fif_pending[VK_FIF_MAX];  /* a submission on the fence nobody waited for */
+static struct {
+    vk_buffer        varena, iarena, uarena, sarena, garena;
+    VkDescriptorPool dpool;
+    u32              dsets;
+    VkFramebuffer    dead_fb[VK_BATCH_DEAD_FB];
+    u32              n_dead_fb;
+    vk_image         dead_img[256];
+    u32              n_dead_img;
+} s_fif_bs[VK_FIF_MAX];                         /* a parked slot's batch resources */
+static int vk_fif_on(void)
+{
+    if (s_fif < 0) {
+        const char* e = getenv("PS3RECOMP_VK_FIF");
+        s_fif = (e && e[0] == '1') ? 1 : 2;
+        fprintf(stderr, "[RSX vulkan] frames in flight: %d (PS3RECOMP_VK_FIF)\n", s_fif);
+    }
+    return s_fif > 1;
+}
+/* the other slot's frame may still be on the GPU */
+static int vk_fif_busy(void)
+{
+    if (s_fif <= 1) return 0;
+    const u32 o = s_fif_cur ^ 1u;
+    return s_fif_pending[o] && pvkGetFenceStatus(s_vk.device, s_fif_fence[o]) != VK_SUCCESS;
+}
+/* wait for the other slot's frame (its cleanup stays for its turn) */
+static void vk_fif_wait_other(void)
+{
+    if (s_fif <= 1) return;
+    const u32 o = s_fif_cur ^ 1u;
+    if (s_fif_pending[o]) pvkWaitForFences(s_vk.device, 1, &s_fif_fence[o], VK_TRUE, UINT64_MAX);
+}
 
 static int vk_batch_on(void)
 {
@@ -499,19 +575,31 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
     return vk_create_image_levels(im, fmt, w, h, 1, usage, aspect);
 }
 
+static int vk_fif_busy(void);
+static void vk_fif_wait_other(void);
+static void vk_destroy_image_now(vk_image* im);
 static void vk_destroy_image(vk_image* im)
 {
-    /* A batched draw may still sample or render into it: destroy it when the
-     * batch has completed (or finish the batch now if the list is full). */
-    if (s_batch.recording && (im->view || im->img)) {
-        if (s_batch.n_dead_img >= sizeof s_batch.dead_img / sizeof s_batch.dead_img[0])
-            vk_batch_flush();
-        if (s_batch.recording) {
+    /* A batched draw may still sample or render into it -- or, frames in
+     * flight, the other slot's frame: destroy it when the batch has completed
+     * (or finish the batch now if the list is full). */
+    if ((s_batch.recording || vk_fif_busy()) && (im->view || im->img)) {
+        if (s_batch.n_dead_img >= sizeof s_batch.dead_img / sizeof s_batch.dead_img[0]) {
+            if (s_batch.recording) vk_batch_flush();
+            else vk_fif_wait_other();
+        }
+        if ((s_batch.recording || vk_fif_busy()) &&
+            s_batch.n_dead_img < sizeof s_batch.dead_img / sizeof s_batch.dead_img[0]) {
             s_batch.dead_img[s_batch.n_dead_img++] = *im;
             memset(im, 0, sizeof *im);
             return;
         }
     }
+    vk_destroy_image_now(im);
+}
+/* the list's own destroy: everything that could use it is complete */
+static void vk_destroy_image_now(vk_image* im)
+{
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
     if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
@@ -541,9 +629,33 @@ static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageF
     return 0;
 }
 
+/* A buffer in device-local memory, not mapped: GPU-only traffic (the depth
+ * decode's image -> buffer -> image bounces) stays on the card instead of
+ * crossing PCIe twice through host memory. */
+static int vk_create_device_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageFlags usage)
+{
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                               .size = size, .usage = usage,
+                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VK_CHECK(pvkCreateBuffer(s_vk.device, &bci, NULL, &b->buf), "vkCreateBuffer");
+    VkMemoryRequirements req;
+    pvkGetBufferMemoryRequirements(s_vk.device, b->buf, &req);
+    u32 type;
+    if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type)) {
+        VK_LOG("no device-local memory for a buffer\n"); return -1;
+    }
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = req.size, .memoryTypeIndex = type };
+    VK_CHECK(pvkAllocateMemory(s_vk.device, &mai, NULL, &b->mem), "vkAllocateMemory(device buffer)");
+    VK_CHECK(pvkBindBufferMemory(s_vk.device, b->buf, b->mem, 0), "vkBindBufferMemory");
+    b->size = size;
+    return 0;
+}
+
 static void vk_destroy_buffer(vk_buffer* b)
 {
     if (s_batch.recording && b->buf) vk_batch_flush();
+    if (b->buf) vk_fif_wait_other();         /* the other slot's frame may read it */
     if (b->ptr) pvkUnmapMemory(s_vk.device, b->mem);
     if (b->buf) pvkDestroyBuffer(s_vk.device, b->buf, NULL);
     if (b->mem) pvkFreeMemory(s_vk.device, b->mem, NULL);
@@ -562,12 +674,122 @@ static void vk_invalidate(vk_buffer* b)
 }
 
 /* ---------------------------------------------------------------------------
+ * GPU timestamps (PS3RECOMP_VK_GPU_PROF=1)
+ *
+ * Where the GPU time of a batch goes. A timestamp (bottom of pipe) is written
+ * at each boundary the backend crosses -- before an engine render pass (after
+ * its barriers), at its end, around each backend pass (light, SSAO, depth
+ * decodes) and around the present blit -- and each interval is credited to
+ * the boundary that closes it: "gap" intervals are the copies, uploads and
+ * barrier drains between passes, "pass" intervals the draws. Labels carry the
+ * target size, so the deferred pipeline's passes can be told apart. Every 5 s
+ * of batches it prints the top intervals per presented frame.
+ * -------------------------------------------------------------------------*/
+#define VK_GPROF_N 2048u
+enum { GP_START = 0, GP_GAP = 1, GP_PASS = 2, GP_BGAP = 3, GP_BPASS = 4, GP_PGAP = 5, GP_BLIT = 6, GP_END = 7 };
+static struct {
+    int          on;                 /* -1 unread, 0 off, 1 on */
+    struct {
+        VkQueryPool pool;
+        u32         n;                   /* stamps written into the slot's command buffer */
+        u32         label[VK_GPROF_N];
+        u32         ops[VK_GPROF_N][8];  /* commands recorded in each interval */
+    } sl[VK_FIF_MAX];                    /* one per frame-in-flight slot */
+    double       ns_per_tick;
+    u32          klab[512]; double kms[512]; unsigned long long kcnt[512]; u32 nk;
+    double       total_ms; unsigned long long batches, frames, dropped;
+    uint64_t     t_print;
+} s_gp = { .on = -1 };
+static const char* const gp_kind[8] = { "start", "gap", "pass", "bgap", "bpass", "pgap", "blit", "end" };
+#define GPS (s_gp.sl[s_fif_cur])
+static void vk_gprof_init(void)
+{
+    if (s_gp.on >= 0) return;
+    s_gp.on = getenv("PS3RECOMP_VK_GPU_PROF") ? 1 : 0;
+    if (!s_gp.on) return;
+    VkPhysicalDeviceProperties p;
+    pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    s_gp.ns_per_tick = p.limits.timestampPeriod;
+    VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                 .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = VK_GPROF_N };
+    for (u32 k = 0; k < VK_FIF_MAX; k++)
+        if (pvkCreateQueryPool(s_vk.device, &qi, NULL, &s_gp.sl[k].pool) != VK_SUCCESS) { s_gp.on = 0; return; }
+    fprintf(stderr, "[RSX vulkan] GPU timestamps on (%.2f ns/tick)\n", s_gp.ns_per_tick);
+}
+static void vk_gprof_stamp(u32 kind, u32 w, u32 h)
+{
+    if (s_gp.on <= 0) return;
+    if (GPS.n >= VK_GPROF_N) { s_gp.dropped++; return; }
+    pvkCmdWriteTimestamp(s_vk.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, GPS.pool, GPS.n);
+    memcpy(GPS.ops[GPS.n], s_gp_ops, sizeof s_gp_ops); memset(s_gp_ops, 0, sizeof s_gp_ops);
+    GPS.label[GPS.n++] = (kind << 28) | ((w >> 2) & 0x3FFFu) << 14 | ((h >> 2) & 0x3FFFu);
+}
+/* a new command buffer: reset the pool and stamp its start */
+static void vk_gprof_begin(void)
+{
+    if (s_gp.on < 0) vk_gprof_init();
+    if (s_gp.on <= 0) return;
+    pvkCmdResetQueryPool(s_vk.cmd, GPS.pool, 0, VK_GPROF_N);
+    GPS.n = 0;
+    vk_gprof_stamp(GP_START, 0, 0);
+}
+static void vk_gprof_note_present(void) { if (s_gp.on > 0) s_gp.frames++; }
+/* the batch is complete: read its stamps and credit the intervals */
+static void vk_gprof_collect(void)
+{
+    if (s_gp.on <= 0 || GPS.n < 2) { GPS.n = 0; return; }
+    static uint64_t ts[VK_GPROF_N];
+    const u32 n = GPS.n;
+    GPS.n = 0;
+    if (pvkGetQueryPoolResults(s_vk.device, GPS.pool, 0, n, sizeof(uint64_t) * n, ts, sizeof(uint64_t),
+                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) return;
+    { static int dumped = 0; static unsigned long long seen = 0;
+      if (getenv("PS3RECOMP_VK_GPU_PROF_DUMP") && n > 20 && ++seen > 1500 && dumped < 1) { dumped++;
+          for (u32 i = 0; i < n; i++)
+              fprintf(stderr, "[gpu-prof] raw %3u %-5s %4ux%-4u %llu  cpI=%u upl=%u cpB=%u clr=%u clz=%u blit=%u bar=%u drw=%u\n",
+                      i, gp_kind[GPS.label[i] >> 28],
+                      ((GPS.label[i] >> 14) & 0x3FFFu) << 2, (GPS.label[i] & 0x3FFFu) << 2, (unsigned long long)ts[i],
+                      GPS.ops[i][0], GPS.ops[i][1], GPS.ops[i][2], GPS.ops[i][3], GPS.ops[i][4], GPS.ops[i][5],
+                      GPS.ops[i][6], GPS.ops[i][7]); } }
+    for (u32 i = 1; i < n; i++) {
+        const double ms = (double)(ts[i] - ts[i - 1]) * s_gp.ns_per_tick / 1e6;
+        const u32 lab = GPS.label[i];
+        u32 k = 0;
+        for (; k < s_gp.nk && s_gp.klab[k] != lab; k++) {}
+        if (k == s_gp.nk) { if (s_gp.nk == 512) continue; s_gp.klab[s_gp.nk++] = lab; }
+        s_gp.kms[k] += ms; s_gp.kcnt[k]++;
+    }
+    s_gp.total_ms += (double)(ts[n - 1] - ts[0]) * s_gp.ns_per_tick / 1e6;
+    s_gp.batches++;
+    const uint64_t now = ps3_ft_now();
+    if (!s_gp.t_print) s_gp.t_print = now;
+    if (now - s_gp.t_print < 5000000000ull || !s_gp.frames) return;   /* ps3_ft_now: ns */
+    const double F = (double)s_gp.frames;
+    fprintf(stderr, "[gpu-prof] %llu frames, %llu batches: GPU busy %.2f ms/frame (%llu stamps dropped)\n",
+            s_gp.frames, s_gp.batches, s_gp.total_ms / F, s_gp.dropped);
+    for (int r = 0; r < 24; r++) {
+        int best = -1;
+        for (u32 k = 0; k < s_gp.nk; k++) if (s_gp.kcnt[k] && (best < 0 || s_gp.kms[k] > s_gp.kms[best])) best = (int)k;
+        if (best < 0) break;
+        const u32 lab = s_gp.klab[best];
+        fprintf(stderr, "[gpu-prof]   %6.3f ms/frame  %5.1f x  %-5s %4ux%-4u\n", s_gp.kms[best] / F,
+                (double)s_gp.kcnt[best] / F, gp_kind[lab >> 28], ((lab >> 14) & 0x3FFFu) << 2, (lab & 0x3FFFu) << 2);
+        s_gp.kcnt[best] = 0;
+    }
+    s_gp.nk = 0; s_gp.total_ms = 0; s_gp.batches = 0; s_gp.frames = 0; s_gp.dropped = 0;
+    s_gp.t_print = now;
+}
+
+/* ---------------------------------------------------------------------------
  * One-shot command submission
  * -------------------------------------------------------------------------*/
 /* Open the command buffer -- or, batching, keep appending to the open one. */
 static void vk_batch_end_pass(void)
 {
-    if (s_batch.rp_open) { pvkCmdEndRenderPass(s_vk.cmd); s_batch.rp_open = 0; }
+    if (s_batch.rp_open) {
+        pvkCmdEndRenderPass(s_vk.cmd); s_batch.rp_open = 0;
+        vk_gprof_stamp(GP_PASS, s_batch.rp_w, s_batch.rp_h);
+    }
 }
 static int vk_begin(void)
 {
@@ -578,6 +800,7 @@ static int vk_begin(void)
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     VK_CHECK(pvkBeginCommandBuffer(s_vk.cmd, &bi), "vkBeginCommandBuffer");
     if (s_batch.on > 0) s_batch.recording = 1;
+    vk_gprof_begin();
     return 0;
 }
 
@@ -597,6 +820,7 @@ static int vk_submit_and_wait_at(int line)
     const int was_batch = s_batch.recording;
     if (was_batch) vk_flush_note(line, s_batch.draws);
     vk_batch_end_pass();
+    vk_gprof_stamp(GP_END, 0, 0);
     s_batch.recording = 0;                  /* even on failure: never append to a dead buffer */
     VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -614,19 +838,20 @@ static int vk_submit_and_wait_at(int line)
  * retired objects are free again. */
 static void vk_batch_completed(void)
 {
+    vk_gprof_collect();
     {
         s_batch.flushes++;
         s_batch.flushed_draws += s_batch.draws;
         if (s_batch.draws > s_batch.max_draws) s_batch.max_draws = s_batch.draws;
         s_batch.draws = 0;
-        s_batch.vcur = s_batch.icur = s_batch.ucur = s_batch.scur = 0;
+        s_batch.vcur = s_batch.icur = s_batch.ucur = s_batch.scur = s_batch.gcur = 0;
         s_batch.zrgba_pending = 0;
         s_batch.light_pending = s_batch.ssao_pending = 0;
         for (u32 k = 0; k < s_batch.n_dead_fb; k++)
             pvkDestroyFramebuffer(s_vk.device, s_batch.dead_fb[k], NULL);
         s_batch.n_dead_fb = 0;
         for (u32 k = 0; k < s_batch.n_dead_img; k++)
-            vk_destroy_image(&s_batch.dead_img[k]);   /* not recording now: destroyed at once */
+            vk_destroy_image_now(&s_batch.dead_img[k]);   /* its users are complete */
         s_batch.n_dead_img = 0;
         if (s_batch.dpool && s_batch.dsets) {
             pvkResetDescriptorPool(s_vk.device, s_batch.dpool, 0);
@@ -693,13 +918,42 @@ static int64_t vk_batch_stage(VkDeviceSize bytes)
     return -1;
 }
 
+/* `bytes` of the GPU-local bounce arena, live until the batch completes (as
+ * vk_batch_stage, for copies the host never touches). May flush. */
+static int64_t vk_batch_gstage(VkDeviceSize bytes)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        const VkDeviceSize o = (s_batch.gcur + 255u) & ~(VkDeviceSize)255u;
+        if (s_batch.garena.buf && o + bytes <= s_batch.garena.size) {
+            s_batch.gcur = o + bytes;
+            return (int64_t)o;
+        }
+        if (pass) break;
+        vk_batch_flush();
+        if (s_batch.garena.buf && s_batch.garena.size >= bytes) continue;
+        VkDeviceSize size = s_batch.garena.size ? s_batch.garena.size * 2 : (64u << 20);
+        while (size < bytes) size *= 2;
+        vk_destroy_buffer(&s_batch.garena);
+        if (vk_create_device_buffer(&s_batch.garena, size,
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+            vk_destroy_buffer(&s_batch.garena);
+            return -1;
+        }
+    }
+    return -1;
+}
+
 /* Destroy a framebuffer a recorded command may still use, once it cannot. */
 static void vk_batch_retire_fb(VkFramebuffer fb)
 {
     if (!fb) return;
-    if (!s_batch.recording) { pvkDestroyFramebuffer(s_vk.device, fb, NULL); return; }
-    if (s_batch.n_dead_fb >= VK_BATCH_DEAD_FB) vk_batch_flush();   /* frees the list */
-    if (s_batch.recording) s_batch.dead_fb[s_batch.n_dead_fb++] = fb;
+    if (!s_batch.recording && !vk_fif_busy()) { pvkDestroyFramebuffer(s_vk.device, fb, NULL); return; }
+    if (s_batch.n_dead_fb >= VK_BATCH_DEAD_FB) {
+        if (s_batch.recording) vk_batch_flush();   /* frees the list */
+        else vk_fif_wait_other();
+    }
+    if ((s_batch.recording || vk_fif_busy()) && s_batch.n_dead_fb < VK_BATCH_DEAD_FB)
+        s_batch.dead_fb[s_batch.n_dead_fb++] = fb;
     else pvkDestroyFramebuffer(s_vk.device, fb, NULL);
 }
 
@@ -2520,7 +2774,8 @@ static void vk_window_drop(const char* why)
                 pvkDestroySemaphore(s_vk.device, s_vk.sc_done[i], NULL);
                 s_vk.sc_done[i] = VK_NULL_HANDLE;
             }
-        if (s_vk.sem_acquire) pvkDestroySemaphore(s_vk.device, s_vk.sem_acquire, NULL);
+        for (u32 k = 0; k < VK_FIF_MAX; k++)
+            if (s_fif_acq[k]) { pvkDestroySemaphore(s_vk.device, s_fif_acq[k], NULL); s_fif_acq[k] = VK_NULL_HANDLE; }
         if (s_vk.swapchain && pvkDestroySwapchainKHR)
             pvkDestroySwapchainKHR(s_vk.device, s_vk.swapchain, NULL);
     }
@@ -2674,6 +2929,7 @@ static void vk_swapchain_lost(void)
     if (vk_create_swapchain()) vk_window_drop("the swapchain could not be recreated");
 }
 
+static void vk_fif_advance(void);
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
 {
@@ -2694,6 +2950,8 @@ static void vk_present_window(void)
     if (was_batch) vk_flush_note(__LINE__, s_batch.draws);
     if (vk_begin()) return;                 /* batched: ends the open pass */
     s_batch.recording = 0;
+    vk_gprof_stamp(GP_PGAP, s_vk.width, s_vk.height);
+    vk_gprof_note_present();
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2720,6 +2978,7 @@ static void vk_present_window(void)
     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                           0, 0, NULL, 0, NULL, 1, &b);
+    vk_gprof_stamp(GP_BLIT, s_vk.sc_extent.width, s_vk.sc_extent.height);
     if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -2736,10 +2995,15 @@ static void vk_present_window(void)
         if (was_batch) vk_batch_completed();   /* nothing in flight: free it anyway */
         return;
     }
-    { const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-      pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
-      if (ft0) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 1u, s_batch.draws, ft0, ps3_ft_now()); }
-    if (was_batch) vk_batch_completed();
+    const int fif = vk_fif_on();
+    if (fif) {
+        s_fif_pending[s_fif_cur] = 1;          /* waited for when the slot comes round */
+    } else {
+        const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
+        if (ft0) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 1u, s_batch.draws, ft0, ps3_ft_now());
+        if (was_batch) vk_batch_completed();
+    }
 
     VkPresentInfoKHR pi = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -2749,6 +3013,7 @@ static void vk_present_window(void)
     r = pvkQueuePresentKHR(s_vk.queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
+    if (fif) vk_fif_advance();
 }
 
 static void vk_dump_ppm(const unsigned char* rgba)
@@ -3466,9 +3731,11 @@ static int vk_eng_copy_depth(const vk_eng_obj* z, VkImage dst, VkImageLayout dst
 {
     if (vk_batch_on()) {
         /* Batched: the depth -> buffer -> colour bounce goes through the
-         * staging arena and stays in the batch (GPU-only, nothing to wait for). */
+         * GPU-local bounce arena and stays in the batch (GPU-only, nothing to
+         * wait for). It went through the host-visible staging arena: two PCIe
+         * crossings, ~1.2 ms of every depth decode on an RTX 2070 Super. */
         const VkDeviceSize bytes = (VkDeviceSize)w * h * 4u;
-        const int64_t so = vk_batch_stage(bytes);
+        const int64_t so = vk_batch_gstage(bytes);
         if (so < 0 || vk_begin()) return -1;
         vk_barrier_all();
         vk_barrier_image(z->im.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_GENERAL);
@@ -3476,18 +3743,18 @@ static int vk_eng_copy_depth(const vk_eng_obj* z, VkImage dst, VkImageLayout dst
         VkBufferImageCopy out = { .bufferOffset = (VkDeviceSize)so,
                                   .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
                                   .imageExtent = { w, h, 1 } };
-        pvkCmdCopyImageToBuffer(s_vk.cmd, z->im.img, VK_IMAGE_LAYOUT_GENERAL, s_batch.sarena.buf, 1, &out);
+        pvkCmdCopyImageToBuffer(s_vk.cmd, z->im.img, VK_IMAGE_LAYOUT_GENERAL, s_batch.garena.buf, 1, &out);
         VkBufferMemoryBarrier bb = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = s_batch.sarena.buf, .offset = (VkDeviceSize)so, .size = bytes };
+            .buffer = s_batch.garena.buf, .offset = (VkDeviceSize)so, .size = bytes };
         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                               0, 0, NULL, 1, &bb, 0, NULL);
         VkBufferImageCopy in = { .bufferOffset = (VkDeviceSize)so,
                                  .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                                  .imageExtent = { w, h, 1 } };
-        pvkCmdCopyBufferToImage(s_vk.cmd, s_batch.sarena.buf, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+        pvkCmdCopyBufferToImage(s_vk.cmd, s_batch.garena.buf, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
         return 0;
     }
     vk_buffer st = {0};
@@ -3529,9 +3796,9 @@ static int vk_eng_copy_stencil(const vk_eng_obj* z, VkImage dst, VkImageLayout d
     VkBuffer buf; VkDeviceSize off = 0;
     const int batched = vk_batch_on();
     if (batched) {
-        const int64_t so = vk_batch_stage(bytes);
+        const int64_t so = vk_batch_gstage(bytes);   /* GPU-local: see vk_eng_copy_depth */
         if (so < 0) return -1;
-        buf = s_batch.sarena.buf; off = (VkDeviceSize)so;
+        buf = s_batch.garena.buf; off = (VkDeviceSize)so;
     } else {
         if (vk_create_host_buffer(&st, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
             vk_destroy_buffer(&st); return -1;
@@ -3831,6 +4098,7 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
     if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
     vk_eng_pipe* P = &s_epipe[pipeline - 1];
     vk_batch_flush();                       /* a recorded draw may still bind it */
+    vk_fif_wait_other();                    /* ... or the other slot's frame */
     for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
         for (u32 k = 0; k < 4; k++)
             if (P->variant[t][k]) pvkDestroyPipeline(s_vk.device, P->variant[t][k], NULL);
@@ -4386,14 +4654,20 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
          * is waited on); batched, a global barrier orders this pass after
          * everything recorded before it (it may sample what that rendered).
          * Either way the image barriers order the surfaces it draws into. */
-        if (batched) vk_barrier_all();
+        /* PS3RECOMP_VK_BARRIER_MODE (measurement only, not correct rendering): 1 = no global
+         * barrier at an engine pass start, 2 = and no per-target barriers either. */
+        static int bm = -1;
+        if (bm < 0) { const char* e = getenv("PS3RECOMP_VK_BARRIER_MODE"); bm = e ? atoi(e) : 0; }
+        if (batched && bm < 1) vk_barrier_all();
+        if (bm < 2)
         for (u32 i = 0; i < n; i++)
             vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                       .renderPass = rp, .framebuffer = fb,
                                       .renderArea = { { 0, 0 }, { w, h } } };
+        vk_gprof_stamp(GP_GAP, w, h);
         pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
-        if (batched) { s_batch.rp_open = 1; s_batch.rp_fb = fb; s_batch.rp_rp = rp; }
+        if (batched) { s_batch.rp_open = 1; s_batch.rp_fb = fb; s_batch.rp_rp = rp; s_batch.rp_w = w; s_batch.rp_h = h; }
     }
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
@@ -4483,6 +4757,20 @@ static struct {
     vk_image              zs8;                     /* ... and its stencil (R8), same size */
     u32                   zr32_w, zr32_h;
 } s_lp;
+/* the parked slot's pass UBOs and descriptor sets (see frames in flight) */
+static struct {
+    VkDescriptorSet set[VK_PASS_COUNT], zset[VK_ZRGBA_SETS];
+    vk_buffer       light_ubo, ssao_ubo;
+} s_lp_park[VK_FIF_MAX];
+static void vk_lp_swap(u32 out, u32 in)
+{
+    memcpy(s_lp_park[out].set, s_lp.set, sizeof s_lp.set);
+    memcpy(s_lp_park[out].zset, s_lp.zset, sizeof s_lp.zset);
+    s_lp_park[out].light_ubo = s_lp.light_ubo; s_lp_park[out].ssao_ubo = s_lp.ssao_ubo;
+    memcpy(s_lp.set, s_lp_park[in].set, sizeof s_lp.set);
+    memcpy(s_lp.zset, s_lp_park[in].zset, sizeof s_lp.zset);
+    s_lp.light_ubo = s_lp_park[in].light_ubo; s_lp.ssao_ubo = s_lp_park[in].ssao_ubo;
+}
 
 static struct { u32 src, dst; } s_csnap[VK_CSNAP_MAX];
 static u32 s_csnap_count;
@@ -4533,11 +4821,12 @@ static int vk_pass_init(void)
     VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                         .setLayoutCount = 1, .pSetLayouts = &s_lp.set_layout };
     if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_lp.pipe_layout) != VK_SUCCESS) return -1;
-    VkDescriptorPoolSize ps[2] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_PASS_COUNT + VK_ZRGBA_SETS },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (VK_PASS_COUNT + VK_ZRGBA_SETS) * VK_PASS_TEXTURES } };
+    VkDescriptorPoolSize ps[2] = {   /* a set group per frame-in-flight slot */
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (VK_PASS_COUNT + VK_ZRGBA_SETS) * VK_FIF_MAX },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (VK_PASS_COUNT + VK_ZRGBA_SETS) * VK_PASS_TEXTURES * VK_FIF_MAX } };
     VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                       .maxSets = VK_PASS_COUNT + VK_ZRGBA_SETS, .poolSizeCount = 2, .pPoolSizes = ps };
+                                       .maxSets = (VK_PASS_COUNT + VK_ZRGBA_SETS) * VK_FIF_MAX,
+                                       .poolSizeCount = 2, .pPoolSizes = ps };
     if (pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_lp.pool) != VK_SUCCESS) return -1;
     VkDescriptorSetLayout layouts[VK_PASS_COUNT];
     for (u32 k = 0; k < VK_PASS_COUNT; k++) layouts[k] = s_lp.set_layout;
@@ -4557,6 +4846,21 @@ static int vk_pass_init(void)
         vk_create_host_buffer(&s_lp.ssao_ubo, VK_SSAO_UBO_BYTES,
                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp.ssao_ubo.coherent)
         return -1;
+    /* the parked slot's own group (frames in flight) */
+    { const u32 o = s_fif_cur ^ 1u;
+      VkDescriptorSetAllocateInfo d2 = dai; d2.pSetLayouts = layouts;
+      if (pvkAllocateDescriptorSets(s_vk.device, &d2, s_lp_park[o].set) != VK_SUCCESS) return -1;
+      VkDescriptorSetLayout zl[VK_ZRGBA_SETS];
+      for (u32 k = 0; k < VK_ZRGBA_SETS; k++) zl[k] = s_lp.set_layout;
+      VkDescriptorSetAllocateInfo z2 = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                         .descriptorPool = s_lp.pool, .descriptorSetCount = VK_ZRGBA_SETS,
+                                         .pSetLayouts = zl };
+      if (pvkAllocateDescriptorSets(s_vk.device, &z2, s_lp_park[o].zset) != VK_SUCCESS) return -1;
+      if (vk_create_host_buffer(&s_lp_park[o].light_ubo, sizeof(rsx_gpu_light_params),
+                                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp_park[o].light_ubo.coherent ||
+          vk_create_host_buffer(&s_lp_park[o].ssao_ubo, VK_SSAO_UBO_BYTES,
+                                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp_park[o].ssao_ubo.coherent)
+          return -1; }
     s_lp.ok = 1;
     return 0;
 }
@@ -4686,6 +4990,7 @@ static void vk_pass_record(VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe, V
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = rp, .framebuffer = fb,
                                   .renderArea = { { 0, 0 }, { w, h } } };
+    vk_gprof_stamp(GP_BGAP, w, h);
     pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
@@ -4696,6 +5001,40 @@ static void vk_pass_record(VkRenderPass rp, VkFramebuffer fb, VkPipeline pipe, V
                              0, 1, &set, 0, NULL);
     pvkCmdDraw(s_vk.cmd, 3, 1, 0, 0);
     pvkCmdEndRenderPass(s_vk.cmd);
+    vk_gprof_stamp(GP_BPASS, w, h);
+}
+
+/* Frames in flight: park the active slot (its frame is on the GPU), make the
+ * other one active, and wait for ITS previous frame -- normally finished while
+ * this one was recorded -- then free what that frame held. */
+static void vk_fif_advance(void)
+{
+    const u32 out = s_fif_cur, in = out ^ 1u;
+#define FIF_SW(f) s_fif_bs[out].f = s_batch.f; s_batch.f = s_fif_bs[in].f;
+    FIF_SW(varena) FIF_SW(iarena) FIF_SW(uarena) FIF_SW(sarena) FIF_SW(garena)
+    FIF_SW(dpool) FIF_SW(dsets) FIF_SW(n_dead_fb) FIF_SW(n_dead_img)
+#undef FIF_SW
+    memcpy(s_fif_bs[out].dead_fb, s_batch.dead_fb, sizeof s_batch.dead_fb);
+    memcpy(s_batch.dead_fb, s_fif_bs[in].dead_fb, sizeof s_batch.dead_fb);
+    memcpy(s_fif_bs[out].dead_img, s_batch.dead_img, sizeof s_batch.dead_img);
+    memcpy(s_batch.dead_img, s_fif_bs[in].dead_img, sizeof s_batch.dead_img);
+    vk_lp_swap(out, in);
+    s_fif_cur = in;
+    s_vk.cmd = s_fif_cmd[in];
+    s_vk.fence = s_fif_fence[in];
+    if (s_fif_acq[in]) s_vk.sem_acquire = s_fif_acq[in];
+    if (s_fif_pending[in]) {
+        const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
+        if (ft0) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 1u, 0, ft0, ps3_ft_now());
+        s_fif_pending[in] = 0;
+        vk_batch_completed();                  /* its arenas, sets, dead objects */
+    }
+    /* the cursors and per-batch counters are the open batch's: none is open,
+     * and this slot's arenas are idle (never used, or just completed) */
+    s_batch.vcur = s_batch.icur = s_batch.ucur = s_batch.scur = s_batch.gcur = 0;
+    s_batch.zrgba_pending = 0;
+    s_batch.light_pending = s_batch.ssao_pending = 0;
 }
 
 /* A backend-owned RGBA8 COLOR object (cleared to transparent black). */
@@ -4771,7 +5110,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
 
 static void vk_pass_drop_light(void)
 {
-    if (s_lp.light_fb) pvkDestroyFramebuffer(s_vk.device, s_lp.light_fb, NULL);
+    if (s_lp.light_fb) { vk_batch_flush(); vk_fif_wait_other(); pvkDestroyFramebuffer(s_vk.device, s_lp.light_fb, NULL); }
     s_lp.light_fb = VK_NULL_HANDLE;
     for (u32 k = 0; k < 2; k++) {
         if (vk_eng_get(s_lp.light_out[k], VK_ENG_COLOR) && s_eobj[s_lp.light_out[k]].tag == VK_TAG_PASS)
@@ -4832,7 +5171,7 @@ static u32 vk_eng_light_pass(void* user, u32 normals, u32 depth, u32 w, u32 h,
 static void vk_pass_drop_ssao(void)
 {
     for (u32 k = 0; k < 4; k++) {
-        if (s_lp.ssao_fb[k]) pvkDestroyFramebuffer(s_vk.device, s_lp.ssao_fb[k], NULL);
+        if (s_lp.ssao_fb[k]) { vk_batch_flush(); vk_fif_wait_other(); pvkDestroyFramebuffer(s_vk.device, s_lp.ssao_fb[k], NULL); }
         s_lp.ssao_fb[k] = VK_NULL_HANDLE;
     }
     vk_destroy_image(&s_lp.ssao_hd);
@@ -5154,9 +5493,14 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                                         .commandPool = s_vk.pool,
                                         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                         .commandBufferCount = 1 };
-    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.cmd), "vkAllocateCommandBuffers");
+    cai.commandBufferCount = VK_FIF_MAX;
+    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, s_fif_cmd), "vkAllocateCommandBuffers");
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.fence), "vkCreateFence");
+    for (u32 k = 0; k < VK_FIF_MAX; k++)
+        VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_fif_fence[k]), "vkCreateFence");
+    s_fif_cur = 0;
+    s_vk.cmd = s_fif_cmd[0];
+    s_vk.fence = s_fif_fence[0];
 
     if (vk_pick_depth_format()) return -1;
     if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
@@ -5192,8 +5536,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 
     if (s_vk.windowed) {
         VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-        if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
-            vk_create_swapchain())
+        if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_fif_acq[0]) != VK_SUCCESS ||
+            pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_fif_acq[1]) != VK_SUCCESS ||
+            (s_vk.sem_acquire = s_fif_acq[s_fif_cur], vk_create_swapchain()))
             vk_window_drop("the swapchain could not be created");
     }
     return 0;
