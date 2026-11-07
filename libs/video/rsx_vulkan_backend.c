@@ -986,7 +986,7 @@ static void vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
  * 1 guest, 2 fallback, 3 full-screen pass; who 5 a pipeline-cache save,
  * a = KB written (0: unchanged or failed), b = 0 periodic, 1 idle, 2 shutdown.
  * -------------------------------------------------------------------------*/
-#define VK_SC_VERSION      "ps3recomp-vk-spirv-1"   /* bump: the translation changed */
+#define VK_SC_VERSION      "ps3recomp-vk-spirv-2"   /* bump: the translation changed (2: one binding per unit) */
 #define VK_SC_PATH         1024u
 #define VK_SC_SAVE_EVERY   64u
 #define VK_SC_SAVE_GAP_NS  2000000000ull     /* periodic saves at most this often   */
@@ -1369,8 +1369,60 @@ static void vk_sc_fingerprint(u32* words, u32 max_words)
 
 /* rsx_hlsl_to_spirv through the disk cache: the same arguments and result,
  * and *from_disk = 1 when the SPIR-V came from a file and glslang never ran. */
+/* The fragment decompiler declares its units either as one array
+ * ("Texture2D    rsx_tex[16] : register(t0);", "SamplerState rsx_samp[16] :
+ * register(s0);", used as rsx_tex[N] / rsx_samp[N] with literal N) or, when a
+ * unit is a cube or a volume, one by one ("rsx_texN : register(tN)"). The
+ * guest set layout has one binding per unit, which only the second form
+ * matches: rewrite the first into it. Returns a malloc'd copy, or NULL when
+ * there is nothing to rewrite. */
+static char* vk_hlsl_unarray(const char* hlsl)
+{
+    static const char tdecl[] = "Texture2D    rsx_tex[16] : register(t0);\n";
+    static const char sdecl[] = "SamplerState rsx_samp[16] : register(s0);\n";
+    if (!hlsl || (!strstr(hlsl, tdecl) && !strstr(hlsl, sdecl))) return NULL;
+    const size_t len = strlen(hlsl);
+    char* out = (char*)malloc(len + 4096);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (const char* q = hlsl; *q; ) {
+        if (!strncmp(q, tdecl, sizeof tdecl - 1)) {
+            for (u32 u = 0; u < 16; u++) o += (size_t)sprintf(out + o, "Texture2D   rsx_tex%u : register(t%u);\n", u, u);
+            q += sizeof tdecl - 1; continue;
+        }
+        if (!strncmp(q, sdecl, sizeof sdecl - 1)) {
+            for (u32 u = 0; u < 16; u++) o += (size_t)sprintf(out + o, "SamplerState rsx_samp%u : register(s%u);\n", u, u);
+            q += sizeof sdecl - 1; continue;
+        }
+        const size_t nl = !strncmp(q, "rsx_tex[", 8) ? 8 : !strncmp(q, "rsx_samp[", 9) ? 9 : 0;
+        if (nl && q[nl] >= '0' && q[nl] <= '9') {
+            const char* d = q + nl; u32 v = 0;
+            while (*d >= '0' && *d <= '9') v = v * 10u + (u32)(*d++ - '0');
+            if (*d == ']' && v < 16u) {
+                o += (size_t)sprintf(out + o, "%s%u", nl == 8 ? "rsx_tex" : "rsx_samp", v);
+                q = d + 1; continue;
+            }
+        }
+        if (o + 64 >= len + 4096) { free(out); return NULL; }
+        out[o++] = *q++;
+    }
+    out[o] = 0;
+    return out;
+}
+
+static int vk_sc_hlsl_to_spirv_raw(const char* hlsl, int stage, u32* words, u32 max_words,
+                                   u32* out_words, char* log, u32 log_size, int* from_disk);
 static int vk_sc_hlsl_to_spirv(const char* hlsl, int stage, u32* words, u32 max_words,
                                u32* out_words, char* log, u32 log_size, int* from_disk)
+{
+    char* un = vk_hlsl_unarray(hlsl);
+    const int rc = vk_sc_hlsl_to_spirv_raw(un ? un : hlsl, stage, words, max_words, out_words,
+                                           log, log_size, from_disk);
+    free(un);
+    return rc;
+}
+static int vk_sc_hlsl_to_spirv_raw(const char* hlsl, int stage, u32* words, u32 max_words,
+                                   u32* out_words, char* log, u32 log_size, int* from_disk)
 {
     *from_disk = 0;
     char path[VK_SC_PATH];
@@ -2154,17 +2206,30 @@ static int vk_guest_init(void)
     }
 
     const VkShaderStageFlags both = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutBinding b[4] = {
+    /* One binding per texture unit and per sampler (register(tN) -> 16+N,
+     * register(sN) -> 48+N), never one 16-element array: a program that
+     * declares a TextureCube or Texture3D gets every unit declared on its own,
+     * and with an array layout its units 1..15 named bindings the layout did
+     * not have -- the driver read them as zero (the deferred composite saw no
+     * normals, light, AO or sun mask; the cutscene's final pass, no scene).
+     * vk_hlsl_unarray gives the array-declared programs the same form. The
+     * descriptor writes fill all 16 in one go: consecutive bindings of one
+     * type and stage set take the overflow. */
+    VkDescriptorSetLayoutBinding b[2 + 2 * RSX_MAX_TEXTURES] = {
         { RSX_SPIRV_VPCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
         { RSX_SPIRV_PSCONST_BINDING, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, both, NULL },
-        { RSX_SPIRV_TEXTURE_BINDING, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RSX_MAX_TEXTURES,
-          VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
-        { RSX_SPIRV_SAMPLER_BINDING, VK_DESCRIPTOR_TYPE_SAMPLER, RSX_MAX_TEXTURES,
-          VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
     };
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        b[2 + u] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_TEXTURE_BINDING + u,
+                                                   VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                                                   VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+        b[2 + RSX_MAX_TEXTURES + u] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_SAMPLER_BINDING + u,
+                                                   VK_DESCRIPTOR_TYPE_SAMPLER, 1,
+                                                   VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+    }
     VkDescriptorSetLayoutCreateInfo lci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 4, .pBindings = b };
+        .bindingCount = 2 + 2 * RSX_MAX_TEXTURES, .pBindings = b };
     VK_CHECK(pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_g.set_layout),
              "vkCreateDescriptorSetLayout(guest)");
     VkDescriptorPoolSize ps[3] = {

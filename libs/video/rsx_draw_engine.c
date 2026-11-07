@@ -4342,14 +4342,14 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* PS3RECOMP_ENG_SKIP_FP=<hex>[,<hex>...]: drop draws whose fragment
      * program has that structural hash (TEXSTATE's fp=). Pipeline numbers
      * drift between runs with asset streaming; the hash does not. */
-    { static u64 skipfp[8]; static int nskip = -1;
+    { static u64 skipfp[32]; static int nskip = -1;
       /* Re-read when PS3_TOGGLE_FILE changes the list (eng_skip_fp_set). */
       if (__builtin_expect(nskip < 0 || __atomic_load_n(&s_skip_fp_dirty, __ATOMIC_RELAXED), 0)) {
           if (nskip < 0) ps3_toggle_watch(PS3T_ENG_SKIP_FP, eng_skip_fp_set);
           __atomic_store_n(&s_skip_fp_dirty, 0, __ATOMIC_RELAXED);
           char buf[PS3_TOGGLE_STR]; const char* e = ps3_toggle_str(PS3T_ENG_SKIP_FP, buf, sizeof buf);
           nskip = 0;
-          while (e && *e && nskip < 8) { skipfp[nskip++] = strtoull(e, (char**)&e, 16); if (*e == ',') e++; else break; } }
+          while (e && *e && nskip < 32) { skipfp[nskip++] = strtoull(e, (char**)&e, 16); if (*e == ',') e++; else break; } }
       if (nskip) { const eng_fp_memo* fpm = NULL;
           const u64 fk = eng_guest_programs(NULL, &fpm) && fpm ? fpm->structural : 0;
           for (int k = 0; k < nskip; k++) if (fk && skipfp[k] == fk) return; } }
@@ -4823,8 +4823,15 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * title's 2D overlay from its full-screen passes. */
     { static long hsec = -2; static u32 hframe = ~0u, hdone, hafter_frame = ~0u; static unsigned long long ht0;
       static u64 hafter;   /* PS3RECOMP_ENG_HUDLOG_AFTER=<fp hex>: also every draw after it in its frame */
-      if (hsec == -2) { const char* e = getenv("PS3RECOMP_ENG_HUDLOG"); hsec = e ? strtol(e, 0, 10) : -1;
+      /* PS3RECOMP_ENG_HUDLOG=<sec>[,<sec>...]: one three-frame window per time
+       * (A/B inside one run: a working scene, then a broken one). */
+      static long hlist[8]; static u32 hn, hi;
+      if (hsec == -2) { const char* e = getenv("PS3RECOMP_ENG_HUDLOG");
+                        while (e && *e && hn < 8) { char* q; const long v = strtol(e, &q, 10);
+                                                    if (q == e) break; hlist[hn++] = v; e = *q == ',' ? q + 1 : q; }
+                        hsec = hn ? hlist[0] : -1;
                         const char* f = getenv("PS3RECOMP_ENG_HUDLOG_AFTER"); hafter = f ? strtoull(f, 0, 16) : 0; }
+      if (hdone && hi + 1u < hn) { hsec = hlist[++hi]; hdone = 0; hframe = ~0u; }
       if (hsec >= 0 && !hdone) {
           extern unsigned long long ps3_ms_now(void);
           if (!ht0) ht0 = ps3_ms_now();
@@ -4876,10 +4883,25 @@ static void sink_end(void* user, const rsx_dispatch* r)
                 char tb[256]; int tp = 0;
                 for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && tp < (int)sizeof tb - 16; u++)
                     if (tex_mask & (1u << u)) tp += snprintf(tb + tp, sizeof tb - (size_t)tp, " u%u=h%u", u, textures[u]);
-                fprintf(stderr, "[hudlog]   textures:%s\n", tb); }
+                fprintf(stderr, "[hudlog]   textures:%s\n", tb);
+                /* Each sampled unit's raw state: what a read returning black
+                 * was given (format, remap, filter, wrap, LOD control). */
+                for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+                    if (!(tex_mask & (1u << u))) continue;
+                    rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+                    fprintf(stderr, "[hudlog]     u%u en %u loc %u off 0x%08X fmt 0x%02X %ux%u mips %u pitch %u cube %u dim %u remap 0x%08X filter 0x%08X ctl0 0x%08X wrap 0x%08X\n",
+                            u, t.enabled, t.location, t.offset, t.format, t.width, t.height, t.mipmaps, t.pitch,
+                            t.cubemap, t.dimension, t.remap, t.filter, t.control0, t.wrap);
+                } }
               for (u32 c = g.vpc_lo; c < g.vpc_lo + g.vpc_n && c < g.vpc_lo + 6u && c < RSX_DSP_NUM_CONSTANTS; c++) {
                   float v4[4]; memcpy(v4, g.rsx.constants[c], sizeof v4);
                   fprintf(stderr, "[hudlog]   c[%u] = (%g %g %g %g)\n", c, v4[0], v4[1], v4[2], v4[3]); }
+              /* The rows full-screen passes take clip z/w and texcoord
+               * transforms from (463..467), whatever the program's range. */
+              if (g.vpc_lo + g.vpc_n > 463u && g.vpc_lo < 458u)
+                  for (u32 c = 463; c < 468; c++) {
+                      float v4[4]; memcpy(v4, g.rsx.constants[c], sizeof v4);
+                      fprintf(stderr, "[hudlog]   c[%u] = (%g %g %g %g)\n", c, v4[0], v4[1], v4[2], v4[3]); }
           } } }
     /* PS3_ASPECT_HUD_AFTER=<fp hex>[,<fp hex>..]: the title's 2D overlay for
      * a backend rendering wide (PS3_ASPECT, set_hud). The listed fragment

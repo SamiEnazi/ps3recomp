@@ -174,7 +174,7 @@ static inline const ps3_toggle_def* ps3_toggle_def_of(int id)
 
 typedef void (*ps3_toggle_fn)(int id, int value);
 
-enum { PS3_TOGGLE_STR = 160, PS3_TOGGLE_WATCHERS = 4, PS3_TOGGLE_EXTRA = 16 };
+enum { PS3_TOGGLE_STR = 640, PS3_TOGGLE_WATCHERS = 4, PS3_TOGGLE_EXTRA = 16 };
 
 typedef struct {
     int seeded;                                   /* 0 no, 1 seeding, 2 done */
