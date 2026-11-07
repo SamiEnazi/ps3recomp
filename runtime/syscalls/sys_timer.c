@@ -308,16 +308,68 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * and busy-spins at full speed (so the wait is effectively a no-op).
          * Busy-wait to a precise QPC deadline, yielding inside the spin
          * (SwitchToThread) so a sibling host thread the guest may be waiting on
-         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
+         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail.
+         *
+         * PS3_USLEEP_WAIT (timing only, A/B) picks how the wait is spent:
+         *   spin          the yield-spin above (default)
+         *   pause         spin on the deadline with PAUSE, a SwitchToThread only
+         *                 every ~64 us: no syscall per turn (in a profile of the
+         *                 docks walk the main thread's job waits were ~13% kernel
+         *                 entry/exit for the yields)
+         *   sleep[:<us>]  a thread that has polled from one guest call site
+         *                 (same lr, calls < 30 us apart) for <us> (default 200)
+         *                 sleeps each further usleep on a high-resolution
+         *                 waitable timer (~0.5 ms granularity here) instead:
+         *                 a real wait, at the cost of seeing the condition up
+         *                 to ~0.5 ms late. */
         ensure_qpc_init();
+        static int s_wmode = -1; static int64_t s_sleep_after;
+        if (s_wmode < 0) {
+            const char* e = getenv("PS3_USLEEP_WAIT");
+            int m = 0; long us = 200;
+            if (e && !strncmp(e, "pause", 5)) m = 1;
+            else if (e && !strncmp(e, "sleep", 5)) { m = 2; if (e[5] == ':' && atol(e + 6) >= 0) us = atol(e + 6); }
+            s_sleep_after = (int64_t)us * s_qpc_freq.QuadPart / 1000000;
+            s_wmode = m;
+        }
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
-        do {
-            SwitchToThread();
-            QueryPerformanceCounter(&qpc_now);
-        } while (qpc_now.QuadPart < qpc_deadline);
+        if (s_wmode == 2) {
+            static __declspec(thread) uint32_t t_lr;
+            static __declspec(thread) int64_t t_run0, t_last;
+            static __declspec(thread) HANDLE t_timer;
+            const uint32_t lr = (uint32_t)ctx->lr;
+            if (lr != t_lr || qpc_start.QuadPart - t_last > s_qpc_freq.QuadPart / 33333) {
+                t_lr = lr; t_run0 = qpc_start.QuadPart;   /* a new poll run */
+            }
+            if (qpc_start.QuadPart - t_run0 >= s_sleep_after) {
+                if (!t_timer) t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                               TIMER_ALL_ACCESS);
+                LARGE_INTEGER due; due.QuadPart = -((LONGLONG)usec * 10);
+                if (t_timer && SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE)) {
+                    WaitForSingleObject(t_timer, INFINITE);
+                    QueryPerformanceCounter(&qpc_now); t_last = qpc_now.QuadPart;
+                    return CELL_OK;
+                }
+            }
+            do { SwitchToThread(); QueryPerformanceCounter(&qpc_now); } while (qpc_now.QuadPart < qpc_deadline);
+            t_last = qpc_now.QuadPart;
+        } else if (s_wmode == 1) {
+            int64_t next_yield = qpc_start.QuadPart + s_qpc_freq.QuadPart / 15625;   /* 64 us */
+            for (;;) {
+                for (int i = 0; i < 16; i++) YieldProcessor();   /* PAUSE */
+                QueryPerformanceCounter(&qpc_now);
+                if (qpc_now.QuadPart >= qpc_deadline) break;
+                if (qpc_now.QuadPart >= next_yield) { SwitchToThread(); next_yield = qpc_now.QuadPart + s_qpc_freq.QuadPart / 15625; }
+            }
+        } else {
+            do {
+                SwitchToThread();
+                QueryPerformanceCounter(&qpc_now);
+            } while (qpc_now.QuadPart < qpc_deadline);
+        }
     }
 #else
     /* PS3_USLEEP_SPIN_US=<n>: a sleep of n microseconds or less spins to a
