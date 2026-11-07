@@ -1399,12 +1399,14 @@ def main() -> None:
                         "which append a zlib inflate string table + float tables "
                         "after the code at 0xAE68 / 0xAE48).")
     p.add_argument("--merge-chunks", action="store_true",
+                   default=os.environ.get("SPU_LIFT_MERGE_CHUNKS", "0") == "1",
                    help="Emit each run of contiguous chunks from one call target "
                         "to the next as ONE C function (branches between them "
                         "become gotos) instead of one function per chunk linked "
                         "by trampolines. Every chunk is still emitted and "
                         "registered on its own for indirect entry, so this only "
-                        "changes speed, not which code can be reached.")
+                        "changes speed, not which code can be reached. "
+                        "SPU_LIFT_MERGE_CHUNKS=1 makes it the default (every lift_* tool).")
     p.add_argument("--max-group-insns", type=int, default=4000,
                    help="Cap on instructions per merged group (keeps clang fast).")
     p.add_argument("--force-indirect", default="",
