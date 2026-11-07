@@ -3166,6 +3166,76 @@ static void vk_frame_limit(void)
 #endif
 }
 
+#ifdef _WIN32
+/* PS3RECOMP_VK_RDOC_AT=<sec>[,<sec>...] (diagnostic): when RenderDoc is loaded --
+ * ENABLE_VULKAN_RENDERDOC_CAPTURE=1 switches on its implicit Vulkan layer (the
+ * installer registers it), or renderdoccmd capture -- ask it for a frame
+ * capture at each of these times, in seconds since the process started (the
+ * scripted runs' PAD_SCRIPT and screenshot clock); PS3RECOMP_VK_RDOC_TRIGGER
+ * and PS3RECOMP_VK_RDOC_FILE below. RenderDoc's in-application API
+ * (renderdoc_app.h, MIT): RENDERDOC_GetAPI from the loaded renderdoc.dll, API
+ * 1.0.0, whose 16th entry is TriggerCapture (the next frame, present to
+ * present). tools/combat_beast.ps1 -RdocAt / -RdocTrigger set all of it up,
+ * tools/rdoc_inspect.py reads the captures headless. Without RenderDoc loaded,
+ * or without the variables, nothing happens. */
+static void vk_rdoc_poll(void)
+{
+    static int state = -1, n = 0, next = 0;
+    static double at[16];
+    static void (*trigger)(void);
+    static ULONGLONG t_start;
+    static const char* tfile;   /* PS3RECOMP_VK_RDOC_TRIGGER */
+    static unsigned tick;
+    if (state < 0) {
+        state = 0;
+        const char* e = getenv("PS3RECOMP_VK_RDOC_AT");
+        tfile = getenv("PS3RECOMP_VK_RDOC_TRIGGER");
+        if (tfile && !*tfile) tfile = NULL;
+        HMODULE m = GetModuleHandleA("renderdoc.dll");
+        if ((!e || !*e) && !tfile) return;
+        if (!e) e = "";
+        if (!m) { VK_LOG("PS3RECOMP_VK_RDOC_AT: renderdoc.dll is not loaded (run under renderdoccmd capture)\n"); return; }
+        typedef int (*rdoc_get_api_fn)(int version, void** out);
+        rdoc_get_api_fn get_api = (rdoc_get_api_fn)(void*)GetProcAddress(m, "RENDERDOC_GetAPI");
+        void** api = NULL;
+        if (!get_api || !get_api(10000 /* eRENDERDOC_API_Version_1_0_0 */, (void**)&api) || !api) {
+            VK_LOG("PS3RECOMP_VK_RDOC_AT: RENDERDOC_GetAPI failed\n"); return;
+        }
+        trigger = (void (*)(void))api[15];
+        /* PS3RECOMP_VK_RDOC_FILE=<path template>: where the captures go (entry 12,
+         * SetCaptureFilePathTemplate); RenderDoc appends _frameN.rdc. */
+        const char* tmpl = getenv("PS3RECOMP_VK_RDOC_FILE");
+        if (tmpl && *tmpl) ((void (*)(const char*))api[11])(tmpl);
+        for (const char* p = e; *p && n < 16; ) {
+            char* q; const double t = strtod(p, &q);
+            if (q == p) break;
+            at[n++] = t; p = q; while (*p == ',' || *p == ' ') p++;
+        }
+        FILETIME c, x, k, u;
+        GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u);
+        t_start = ((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime;
+        state = trigger && (n > 0 || tfile);
+        VK_LOG("PS3RECOMP_VK_RDOC_AT: %d capture time(s) armed%s\n", n, tfile ? ", trigger file watched" : "");
+    }
+    if (!state) return;
+    /* PS3RECOMP_VK_RDOC_TRIGGER=<file>: a capture whenever that file appears (it is
+     * deleted again), for a driver that decides by looking at the screen. */
+    if (tfile && (++tick & 15u) == 0 && GetFileAttributesA(tfile) != INVALID_FILE_ATTRIBUTES) {
+        DeleteFileA(tfile);
+        trigger();
+        VK_LOG("RenderDoc capture triggered by %s\n", tfile);
+    }
+    if (next >= n) return;
+    FILETIME f; GetSystemTimeAsFileTime(&f);
+    const double now = (double)((((ULONGLONG)f.dwHighDateTime << 32) | f.dwLowDateTime) - t_start) / 1e7;
+    if (now >= at[next]) {
+        trigger();
+        VK_LOG("RenderDoc capture triggered at %.1f s (asked for %.1f s)\n", now, at[next]);
+        while (next < n && now >= at[next]) next++;
+    }
+}
+#endif
+
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
 {
@@ -3247,6 +3317,9 @@ static void vk_present_window(void)
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
     vk_frame_limit();
+#ifdef _WIN32
+    vk_rdoc_poll();
+#endif
     r = pvkQueuePresentKHR(s_vk.queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
