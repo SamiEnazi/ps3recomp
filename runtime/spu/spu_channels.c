@@ -354,6 +354,45 @@ void spu_stop(spu_context* ctx)
     if (s_halt) spu_halt(ctx);
 }
 
+/* SPU_FLOAT_RZ (x86, spu_helpers.h): every SPU run executes with MXCSR at round toward zero +
+ * FTZ + DAZ, and the lean single-precision ops are the host's native ones. Set on entry to
+ * spu_run_with_halt and put back on the way out: a run can happen synchronously on a PPU
+ * thread, whose lifted floating point needs round to nearest with denormals. A nested run
+ * (a job run from inside another SPU's execution) finds the mode already on and leaves it
+ * to the outer run. A halt's longjmp lands inside the run (the jmp_buf is taken after the
+ * mode is set), and the exit path restores either way. SPU_FLOAT_RZ=0 keeps the default
+ * MXCSR and the exact double-precision forms (A/B). Default on. */
+static unsigned spu_float_mode_enter(void)
+{
+#if SPU_X64_MXCSR
+    static int s_on = -1;
+    int on = __atomic_load_n(&s_on, __ATOMIC_ACQUIRE);
+    if (on < 0) {
+        const char* e = getenv("SPU_FLOAT_RZ");
+        on = !(e && e[0] == '0');
+        if (on) __atomic_store_n(&g_spu_float_rz, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_on, on, __ATOMIC_RELEASE);
+        fprintf(stderr, "[spu] single precision: %s (SPU_FLOAT_RZ)\n",
+                on ? "native, MXCSR round-toward-zero + FTZ + DAZ" : "exact emulation, default MXCSR");
+    }
+    if (!on) return ~0u;
+    const unsigned v = _mm_getcsr();
+    if ((v & SPU_MXCSR_RZFZ) == SPU_MXCSR_RZFZ) return ~0u;   /* nested run: the outer one restores */
+    _mm_setcsr(v | SPU_MXCSR_RZFZ);
+    return v;
+#else
+    return ~0u;
+#endif
+}
+static void spu_float_mode_leave(unsigned outer)
+{
+#if SPU_X64_MXCSR
+    if (outer != ~0u) _mm_setcsr(outer);
+#else
+    (void)outer;
+#endif
+}
+
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
@@ -398,6 +437,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * executes at a time. No-op when unarmed. The thread-local halt env above
      * makes a token pause/resume mid-run safe. */
     yz_lockstep_register(ctx);
+    const unsigned float_outer = spu_float_mode_enter();
     switch (SPU_SETJMP(s_spu_halt_env)) {
     case 1:
         halted = 1;
@@ -433,6 +473,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
               fflush(stderr); } }
         SPU_DRAIN(ctx);
     }
+    spu_float_mode_leave(float_outer);
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
