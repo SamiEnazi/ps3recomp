@@ -138,10 +138,40 @@ static BOOL CALLBACK place_init(PINIT_ONCE once, PVOID p, PVOID* ctx)
     return TRUE;
 }
 
+/* Per-thread knobs for the frame-critical roles, independent of PS3_CPU_PLACE:
+ * PS3_HIGHQOS=1 also turns the thread's own power throttling off
+ * (ThreadPowerThrottling, EcoQoS), PS3_PLACE_PRIO=1 raises main and RSX to
+ * THREAD_PRIORITY_ABOVE_NORMAL (=2: HIGHEST) so a poller or a driver thread
+ * cannot preempt them on their core. */
+static void place_thread_knobs(int role)
+{
+    static int qos = -1, prio = -1;
+    if (qos < 0) { const char* e = getenv("PS3_HIGHQOS"); qos = e ? atoi(e) : 0; }
+    if (prio < 0) { const char* e = getenv("PS3_PLACE_PRIO"); prio = e ? atoi(e) : 0; }
+    const int hot = role == PS3_PLACE_MAIN || role == PS3_PLACE_RSX || role == PS3_PLACE_SPU;
+    if (qos > 0 && hot) {
+        THREAD_POWER_THROTTLING_STATE st;
+        memset(&st, 0, sizeof st);
+        st.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+        st.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        st.StateMask = 0;
+        if (!SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &st, sizeof st))
+            fprintf(stderr, "[place] ThreadPowerThrottling(%s) failed (%lu)\n", role_name(role), GetLastError());
+    }
+    if (prio > 0 && (role == PS3_PLACE_MAIN || role == PS3_PLACE_RSX)) {
+        const int p = prio >= 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL;
+        if (!SetThreadPriority(GetCurrentThread(), p))
+            fprintf(stderr, "[place] SetThreadPriority(%s) failed (%lu)\n", role_name(role), GetLastError());
+        else
+            fprintf(stderr, "[place] thread %lu (%s) priority %d\n", GetCurrentThreadId(), role_name(role), p);
+    }
+}
+
 void ps3_host_place_self(int role)
 {
     InitOnceExecuteOnce(&s_once, place_init, NULL, NULL);
     t_placed = 1;
+    if (role >= 0 && role <= 4) place_thread_knobs(role);
     if (s_mode == PL_OFF || role < 0 || role > 4) return;
     if (!s_n[role]) {
         /* a role with no set of its own: drop any earlier selection so the

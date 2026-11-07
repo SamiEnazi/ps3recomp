@@ -23,7 +23,11 @@
  *
  * PS3_HIGHQOS=1: process power throttling off (Windows EcoQoS), so the
  * scheduler treats every thread as high QoS whether or not the window has
- * focus. Independent of PS3_CPU_PLACE.
+ * focus, and the same per thread for main, RSX and SPU threads
+ * (ThreadPowerThrottling). Independent of PS3_CPU_PLACE.
+ *
+ * PS3_PLACE_PRIO=1: main and RSX threads at THREAD_PRIORITY_ABOVE_NORMAL
+ * (=2: HIGHEST). Independent of PS3_CPU_PLACE.
  *
  * Call ps3_host_place_self(role) at a thread's entry, on that thread. A thread
  * placed once keeps its first role (ps3_host_place_self_once for call sites a
