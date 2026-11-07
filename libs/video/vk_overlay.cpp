@@ -73,7 +73,7 @@ int   ps3_button_icons_mode_setting(void);
 int   ps3_button_icons_effective(void);
 void  ps3_host_quit(const char* why);           /* libs/system/cellSysutil.c */
 extern volatile int      g_pad_overlay_open;   /* libs/input/cellPad.c */
-extern volatile uint32_t g_pad_overlay_nav, g_pad_overlay_nav2;
+extern volatile uint32_t g_pad_overlay_nav, g_pad_overlay_nav2, g_pad_overlay_raw;
 }
 
 volatile int g_vk_overlay_active;
@@ -526,13 +526,16 @@ extern "C" void vk_overlay_poll(void)
     if (!s_enabled) return;
     const double now = now_s();
     if (s_n_script) script_poll(now);
-    /* Hold L3+R3 for a second (port 0, as cellPad saw it before the menu's
-     * neutral copy): cellPad already keeps both from the game while they are
-     * held together. */
+    /* Hold L3+R3 for a second: port 0 as cellPad saw it before the menu's
+     * neutral copy, or the two stick clicks on any controller (SDL buttons 7
+     * and 8 in g_pad_overlay_raw, whatever they are bound to). cellPad keeps
+     * L3 and R3 from the game while they are held together. */
     if (s_pad_chord) {
         static double t0;
         static bool fired;
-        const bool both = (g_pad_overlay_nav & (PAD_L3 | PAD_R3)) == (PAD_L3 | PAD_R3);
+        const uint32_t sticks = (1u << 7) | (1u << 8);
+        const bool both = (g_pad_overlay_nav & (PAD_L3 | PAD_R3)) == (PAD_L3 | PAD_R3) ||
+                          (g_pad_overlay_raw & sticks) == sticks;
         if (!both) { t0 = 0; fired = false; }
         else if (!t0) t0 = now;
         else if (!fired && now - t0 >= 1.0) { fired = true; set_open(!s_open); }
@@ -1431,7 +1434,14 @@ static void feed_pad(ImGuiIO& io)
 {
     static uint16_t prev;
     const uint32_t nav = g_pad_overlay_nav, nav2 = g_pad_overlay_nav2;
-    const uint16_t b = (uint16_t)nav;
+    /* plus the buttons of every other controller, by position (raw SDL buttons) */
+    static const struct { uint8_t sdl; uint16_t pad; } kRaw[] = {
+        { 0, PAD_CROSS }, { 1, PAD_CIRCLE }, { 2, PAD_SQUARE }, { 3, PAD_TRIANGLE },
+        { 9, PAD_L1 }, { 10, PAD_R1 }, { 11, PAD_UP }, { 12, PAD_DOWN }, { 13, PAD_LEFT }, { 14, PAD_RIGHT },
+    };
+    uint16_t b = (uint16_t)nav;
+    const uint32_t raw = g_pad_overlay_raw;
+    for (const auto& r : kRaw) if (raw >> r.sdl & 1u) b |= r.pad;
     const int lx = (nav >> 16) & 255, ly = (nav >> 24) & 255, ry = (nav2 >> 8) & 255;
     io.AddKeyEvent(ImGuiKey_GamepadDpadUp,    (b & PAD_UP) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadDown,  (b & PAD_DOWN) != 0);
