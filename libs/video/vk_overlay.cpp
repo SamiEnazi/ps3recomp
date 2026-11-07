@@ -318,6 +318,7 @@ static int   s_tab, s_tab_want = -1;     /* the menu's page; one to switch to */
 static volatile int  s_quit_ask;         /* 1 open the confirmation, 2 showing */
 static volatile bool s_quit_cancel;
 static double s_t_attach;
+static bool  s_ui_stale;                 /* a setting changed outside the menu: re-read its view */
 static bool  s_pad_chord = true;
 static bool  s_rel_mouse_saved;
 static char  s_gpu_name[256];
@@ -420,6 +421,7 @@ static void toggle_fullscreen(void)
     const bool fs = w && (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) != 0;
     if (!apply_setting(V_FULLSCREEN, fs ? "0" : "1"))
         vk_overlay_notice("Fullscreen: applies when the game restarts");
+    s_ui_stale = true;
 }
 
 static int tab_from_name(const char* e)
@@ -465,6 +467,7 @@ static void script_poll(double now)
             const int v = eq ? (*eq = 0, var_index(k)) : -1;
             if (v == V_VOLUME) { cellAudio_host_set_volume(atoi(eq + 1)); set_value(v, "%d", atoi(eq + 1)); }
             else if (v >= 0) fprintf(stderr, "[overlay] %s=%s: %s\n", k, eq + 1, apply_setting(v, eq + 1) ? "live" : "at the next start");
+            s_ui_stale = true;
         }
         else { const int t = tab_from_name(w); if (t >= 0) s_tab_want = t; set_open(1); }
     }
@@ -1562,7 +1565,7 @@ extern "C" int vk_overlay_draw(VkCommandBuffer cmd, uint32_t index, VkImage imag
     if (!fb_for(index, image, ext)) return 0;
 
     static int was_open;
-    if (s_open && !was_open) ui_load();
+    if (s_open && (!was_open || s_ui_stale)) { ui_load(); s_ui_stale = false; }
     was_open = s_open;
 
     ImGuiIO& io = ImGui::GetIO();
