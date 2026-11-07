@@ -705,7 +705,7 @@ static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayo
         .oldLayout = old_layout, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = img, .subresourceRange = { aspect, 0, VK_REMAINING_MIP_LEVELS, 0, 1 },
+        .image = img, .subresourceRange = { aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS },
     };
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
@@ -2112,6 +2112,7 @@ typedef struct vk_eng_obj {
     u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u32      tag;                    /* E5: which cache made it, 0 = none   */
+    u32      faces;                  /* TEXTURE: 6 = a cube (layers = faces) */
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -2232,13 +2233,15 @@ static VkComponentMapping vk_remap(u32 remap, u32 rsx_fmt)
                              vk_remap_sel(sel[3]), vk_remap_sel(sel[0]) };
     return m;
 }
-static int vk_eng_make_view(VkImage img, VkFormat fmt, u32 levels, VkComponentMapping map,
+/* faces 6: a cube view over the six layers; otherwise a 2D view. */
+static int vk_eng_make_view(VkImage img, VkFormat fmt, u32 levels, u32 faces, VkComponentMapping map,
                             VkImageView* out)
 {
     VkImageViewCreateInfo vci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt, .components = map,
-        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels ? levels : 1, 0, 1 },
+        .viewType = faces == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D,
+        .format = fmt, .components = map,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels ? levels : 1, 0, faces == 6 ? 6u : 1u },
     };
     return pvkCreateImageView(s_vk.device, &vci, NULL, out) == VK_SUCCESS ? 0 : -1;
 }
@@ -2387,11 +2390,142 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     if (!s_batch.recording) vk_submit_and_wait();   /* batched: stays in the batch */
 }
 
+/* ---- PS3RECOMP_VK_RT_DUMP=<dir> [PS3RECOMP_VK_RT_DUMP_AT=<sec>] -------------
+ * DIAGNOSTIC: every colour target one frame draws into, written as PPM in
+ * first-draw order (rt_<order>_h<handle>_<w>x<h>.ppm, alpha as *_a.ppm) with a
+ * list of draw counts (rt_list.txt) -- what a black picture is made of. The
+ * frame is the first to start at least <sec> seconds (default 30) after the
+ * first present; the presented surface is dumped too. */
+static struct {
+    int on; double at; unsigned long long t0; int phase;
+    u32 rt[64], draws[64], first[64], n, seq; char dir[400];
+} s_rtd = { .on = -1 };
+
+/* Screen-sized sampled textures of the dumped frame (light buffers, AO,
+ * depth-as-colour): what a composite reads, beside what the frame renders. */
+static u32 s_rtd_tex[32], s_rtd_ntex;
+static void vk_rtd_note_tex(const u32* tex, u32 mask)
+{
+    if (s_rtd.phase != 1) return;
+    for (u32 u = 0; u < 16; u++) {
+        if (!((mask >> u) & 1u) || !tex[u] || tex[u] >= 2048u) continue;
+        const vk_eng_obj* o = &s_eobj[tex[u]];
+        /* Views of surfaces and render targets, and plain 4-byte screen-sized
+         * textures (light/AO buffers uploaded from guest memory); never the
+         * compressed materials. */
+        if (!(o->kind == VK_ENG_VIEW || o->kind == VK_ENG_COLOR ||
+              (o->kind == VK_ENG_TEXTURE && o->bpp == 4 && o->w >= 640 && o->h >= 360))) continue;
+        u32 k = 0;
+        while (k < s_rtd_ntex && s_rtd_tex[k] != tex[u]) k++;
+        if (k == s_rtd_ntex && s_rtd_ntex < 32) s_rtd_tex[s_rtd_ntex++] = tex[u];
+    }
+}
+
+static void vk_rtd_note(const u32* rts, u32 n)
+{
+    if (s_rtd.phase != 1) return;
+    for (u32 i = 0; i < n; i++) {
+        u32 k = 0;
+        while (k < s_rtd.n && s_rtd.rt[k] != rts[i]) k++;
+        if (k == s_rtd.n) {
+            if (s_rtd.n >= 64) continue;
+            s_rtd.rt[k] = rts[i]; s_rtd.draws[k] = 0; s_rtd.first[k] = s_rtd.seq; s_rtd.n++;
+        }
+        s_rtd.draws[k]++;
+    }
+    s_rtd.seq++;
+}
+
+static void vk_rtd_write(u32 order, u32 h)
+{
+    if (!h || h >= VK_ENG_MAX_OBJ) return;
+    const vk_eng_obj* o = &s_eobj[h];
+    if (o->kind == VK_ENG_VIEW && o->surface && o->surface < VK_ENG_MAX_OBJ) o = &s_eobj[o->surface];
+    if ((o->kind != VK_ENG_COLOR && o->kind != VK_ENG_TEXTURE) || !o->im.img || o->bpp != 4 ||
+        !o->w || !o->h) return;
+    vk_buffer b = {0};
+    if (vk_create_host_buffer(&b, (VkDeviceSize)o->w * o->h * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+        vk_destroy_buffer(&b); return;
+    }
+    if (vk_begin()) { vk_destroy_buffer(&b); return; }
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    VkBufferImageCopy region = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                 .imageExtent = { o->w, o->h, 1 } };
+    pvkCmdCopyImageToBuffer(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, b.buf, 1, &region);
+    VkBufferMemoryBarrier host = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = b.buf, .offset = 0, .size = VK_WHOLE_SIZE };
+    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                          0, 0, NULL, 1, &host, 0, NULL);
+    if (vk_submit_and_wait()) { vk_destroy_buffer(&b); return; }
+    vk_invalidate(&b);
+    const u8* px = (const u8*)b.ptr;
+    char path[512];
+    for (int pass = 0; pass < 2; pass++) {
+        snprintf(path, sizeof path, "%s/rt_%02u_h%u_%ux%u%s.ppm", s_rtd.dir, order, h, o->w, o->h,
+                 pass ? "_a" : "");
+        FILE* f = fopen(path, "wb");
+        if (!f) continue;
+        fprintf(f, "P6\n%u %u\n255\n", o->w, o->h);
+        for (size_t i = 0; i < (size_t)o->w * o->h; i++) {
+            const u8* q = px + i * 4;
+            u8 rgb[3] = { q[0], q[1], q[2] };
+            if (pass) rgb[0] = rgb[1] = rgb[2] = q[3];
+            fwrite(rgb, 1, 3, f);
+        }
+        fclose(f);
+    }
+    vk_destroy_buffer(&b);
+}
+
+/* Called at every present, before it: arms one frame, then dumps it. */
+static void vk_rtd_frame(u32 presented)
+{
+    if (s_rtd.on < 0) {
+        const char* d = getenv("PS3RECOMP_VK_RT_DUMP");
+        const char* a = getenv("PS3RECOMP_VK_RT_DUMP_AT");
+        s_rtd.on = (d && *d) ? 1 : 0;
+        if (s_rtd.on) snprintf(s_rtd.dir, sizeof s_rtd.dir, "%s", d);
+        s_rtd.at = a ? atof(a) : 30.0;
+        s_rtd.t0 = SDL_GetTicks64();
+    }
+    if (!s_rtd.on || s_rtd.phase == 2) return;
+    if (s_rtd.phase == 0) {
+        if ((double)(SDL_GetTicks64() - s_rtd.t0) >= s_rtd.at * 1000.0) { s_rtd.phase = 1; s_rtd.n = s_rtd.seq = 0; }
+        return;
+    }
+    s_rtd.phase = 2;
+    vk_batch_flush();
+    char path[512];
+    snprintf(path, sizeof path, "%s/rt_list.txt", s_rtd.dir);
+    FILE* f = fopen(path, "w");
+    for (u32 k = 0; k < s_rtd.n; k++) {
+        const vk_eng_obj* o = vk_eng_get(s_rtd.rt[k], VK_ENG_COLOR);
+        if (f) fprintf(f, "%02u handle %u %ux%u draws %u first-draw %u\n", k, s_rtd.rt[k],
+                       o ? o->w : 0, o ? o->h : 0, s_rtd.draws[k], s_rtd.first[k]);
+        vk_rtd_write(k, s_rtd.rt[k]);
+    }
+    for (u32 k = 0; k < s_rtd_ntex; k++) {
+        const u32 t = s_rtd_tex[k];
+        const vk_eng_obj* o = &s_eobj[t];
+        if (f) fprintf(f, "tex %02u handle %u kind %d %ux%u bpp %u", 40 + k, t, (int)o->kind, o->w, o->h, o->bpp);
+        if (f && o->kind == VK_ENG_VIEW) fprintf(f, " (view of surface %u)", o->surface);
+        if (f) fprintf(f, "\n");
+        if (o->w >= 320) vk_rtd_write(40 + k, t);   /* screen-sized only: light/AO/depth buffers */
+    }
+    if (f) { fprintf(f, "presented handle %u, %u draws in the frame\n", presented, s_rtd.seq); fclose(f); }
+    vk_rtd_write(99, presented);
+    VK_LOG("RT dump: %u colour targets of one frame -> %s\n", s_rtd.n, s_rtd.dir);
+}
+
 /* The named surface becomes the frame: blit it onto the display image, then
  * the existing present does the readback, the PPM dump and the window. */
 static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
+    vk_rtd_frame(surface);
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (o && !vk_begin()) {
         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -2461,9 +2595,14 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     const int bc = (fmt == RSX_BE_FMT_BC1 || fmt == RSX_BE_FMT_BC2 || fmt == RSX_BE_FMT_BC3);
     if (vf == VK_FORMAT_UNDEFINED || !w || !h || w > 4096u || h > 4096u || (bc && !s_vk.bc_ok))
         return 0;
-    if (faces == 6) {
-        static int warned_cube;
-        if (!warned_cube) { VK_LOG("engine: cube textures not supported yet\n"); warned_cube = 1; }
+    /* A cube: six square layers, one per face (+X -X +Y -Y +Z -Z, the RSX's
+     * order and Vulkan's), sampled through a CUBE view. Without them, units a
+     * program declares TextureCube had nothing to read -- inFAMOUS 2's
+     * deferred composite looks its ambient and reflection up in cubes, and a
+     * missing one turned the whole lit world black (NaN -> 0). */
+    if (faces != 1 && (faces != 6 || w != h)) {
+        static int warned_faces;
+        if (!warned_faces) { VK_LOG("engine: %u-face %ux%u texture not supported\n", faces, w, h); warned_faces = 1; }
         return 0;
     }
     if (!mips) mips = 1;
@@ -2472,7 +2611,8 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     vk_eng_obj* o = &s_eobj[hd];
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-        .format = vf, .extent = { w, h, 1 }, .mipLevels = mips, .arrayLayers = 1,
+        .flags = faces == 6 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
+        .format = vf, .extent = { w, h, 1 }, .mipLevels = mips, .arrayLayers = faces,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
@@ -2486,9 +2626,9 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                                  .allocationSize = req.size, .memoryTypeIndex = type };
     if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS ||
         pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS ||
-        vk_eng_make_view(o->im.img, vf, mips, vk_remap(remap, rsx_fmt), &o->im.view))
+        vk_eng_make_view(o->im.img, vf, mips, faces, vk_remap(remap, rsx_fmt), &o->im.view))
         goto fail;
-    o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h;
+    o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->faces = faces;
     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
     /* UNDEFINED -> GENERAL for every level before the uploads arrive
      * (batched: the transition joins the batch, ahead of those uploads). */
@@ -2507,10 +2647,10 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
 {
     (void)user;
     vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
-    if (!o || !src || !row_bytes || !rows || face) return;
+    if (!o || !src || !row_bytes || !rows || face >= (o->faces ? o->faces : 1u)) return;
     /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
     const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
-    vk_eng_upload_rows(o->im.img, 0, mip, w, h, tight, rows, src, row_bytes);
+    vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);   /* face = layer */
 }
 
 /* A colour target sampled with a unit's crossbar: an extra view of the same
@@ -2527,7 +2667,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
-    if (vk_eng_make_view(t->im.img, t->fmt, 1, vk_remap(remap, rsx_format), &o->im.view)) {
+    if (vk_eng_make_view(t->im.img, t->fmt, 1, 1, vk_remap(remap, rsx_format), &o->im.view)) {
         memset(o, 0, sizeof *o); return 0;
     }
     o->kind = VK_ENG_VIEW; o->fmt = t->fmt; o->w = t->w; o->h = t->h;
@@ -2653,7 +2793,11 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
  * samplers s0..s3 would alias the pixel samplers' binding), FP16 and other
  * non-RGBA8 colour targets, depth-only passes, and stencil (the depth format
  * has no stencil aspect yet, so the test is inert). */
-#define VK_ENG_MAX_PIPE   512
+/* As many as the engine keeps (ENG_MAX_PIPELINES): it never releases a
+ * pipeline in play, and inFAMOUS 2 has used 512 by the time its first level
+ * loads -- at 512 every later pipeline failed silently and the level's
+ * draws were dropped ("pipeline"), leaving a black world. */
+#define VK_ENG_MAX_PIPE   8192
 #define VK_ENG_TOPOLOGIES 5
 #define VK_ENG_FB_CACHE   64
 
@@ -2663,7 +2807,25 @@ typedef struct vk_eng_pipe {
     rsx_be_render_state rs;
     u32                 nslots, stride, rt_count;
     VkPipeline          variant[VK_ENG_TOPOLOGIES];
+    /* Units the fragment program declares TextureCube / Texture3D: a sampled
+     * image's view type has to match the declaration, bound or not. */
+    u32                 cube_mask, vol_mask;
 } vk_eng_pipe;
+
+/* Bit u set for each "<kind> rsx_tex<u>" declaration in the program text. */
+static u32 vk_eng_decl_mask(const char* hlsl, const char* kind)
+{
+    u32 m = 0;
+    const size_t kl = strlen(kind);
+    for (const char* p = hlsl; p && (p = strstr(p, kind)); p += kl) {
+        const char* q = p + kl;
+        while (*q == ' ') q++;
+        if (strncmp(q, "rsx_tex", 7)) continue;
+        const unsigned u = (unsigned)strtoul(q + 7, NULL, 10);
+        if (u < 32) m |= 1u << u;
+    }
+    return m;
+}
 
 static vk_eng_pipe s_epipe[VK_ENG_MAX_PIPE];
 
@@ -2815,7 +2977,12 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
     u32 slot = VK_ENG_MAX_PIPE;
     for (u32 i = 0; i < VK_ENG_MAX_PIPE; i++) if (!s_epipe[i].used) { slot = i; break; }
-    if (slot == VK_ENG_MAX_PIPE) return 0;
+    if (slot == VK_ENG_MAX_PIPE) {
+        static int said;
+        if (!said++) VK_LOG("engine: all %u pipeline slots in use -- new pipelines fail, their draws are dropped\n",
+                            (unsigned)VK_ENG_MAX_PIPE);
+        return 0;
+    }
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
     if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
@@ -2826,6 +2993,8 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     P->nslots = layout->count;
     P->stride = vertex_stride;
     P->rt_count = rt_count;
+    P->cube_mask = vk_eng_decl_mask(ps_hlsl, "TextureCube");
+    P->vol_mask  = vk_eng_decl_mask(ps_hlsl, "Texture3D");
     P->used = 1;
     return slot + 1u;
 }
@@ -3120,15 +3289,70 @@ static void vk_eng_write_descriptors(void)
 }
 /* The guest set layout's four bindings, with the constant file at `ubase` of
  * `ubuf` (the shared UBO at 0, or a draw's copy in the batch's arena). */
+/* 1x1 black stand-ins of the other view types: a unit declared TextureCube or
+ * Texture3D must be given a view of that type even when nothing usable is
+ * bound -- a 2D view there is undefined, and on this driver it read as NaN. */
+static vk_image s_dummy_cube, s_dummy_vol;
+static VkImageView vk_eng_dummy_view(int vol)
+{
+    vk_image* im = vol ? &s_dummy_vol : &s_dummy_cube;
+    if (im->view) return im->view;
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .flags = vol ? 0 : VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
+        .imageType = vol ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { 1, 1, 1 }, .mipLevels = 1,
+        .arrayLayers = vol ? 1u : 6u, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    VkMemoryRequirements req; u32 type;
+    if (pvkCreateImage(s_vk.device, &ici, NULL, &im->img) != VK_SUCCESS) goto fail;
+    pvkGetImageMemoryRequirements(s_vk.device, im->img, &req);
+    if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
+        vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = req.size, .memoryTypeIndex = type };
+    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &im->mem) != VK_SUCCESS ||
+        pvkBindImageMemory(s_vk.device, im->img, im->mem, 0) != VK_SUCCESS) goto fail;
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img,
+        .viewType = vol ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_CUBE,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, vol ? 1u : 6u } };
+    if (pvkCreateImageView(s_vk.device, &vci, NULL, &im->view) != VK_SUCCESS) goto fail;
+    if (vk_begin()) goto fail;
+    vk_barrier_image(im->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 0.0f } };
+    VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS };
+    pvkCmdClearColorImage(s_vk.cmd, im->img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &r);
+    if (!s_batch.recording && vk_submit_and_wait()) goto fail;
+    return im->view;
+fail:
+    VK_LOG("engine: could not make the 1x1 %s stand-in\n", vol ? "volume" : "cube");
+    vk_destroy_image(im);
+    return s_vk.dummy.view;
+}
+
 static void vk_eng_write_descriptors_to(VkDescriptorSet set, VkBuffer ubuf, VkDeviceSize ubase)
 {
     VkDescriptorBufferInfo bi[2] = {
         { ubuf, ubase, s_e2.vs_bytes ? s_e2.vs_bytes : 16u },
         { ubuf, ubase + s_g.ps_off, s_e2.ps_bytes ? s_e2.ps_bytes : 16u },
     };
+    /* What the bound program declares per unit (vk_eng_decl_mask): the view
+     * handed over must be of that type -- a cube for TextureCube (the bound
+     * cube, else the stand-in), the volume stand-in for Texture3D (no 3D
+     * textures yet), and never a cube where a 2D texture is read. */
+    const vk_eng_pipe* EP = (s_e2.pipeline && s_e2.pipeline <= VK_ENG_MAX_PIPE) ? &s_epipe[s_e2.pipeline - 1] : NULL;
+    const u32 cube_mask = EP ? EP->cube_mask : 0u, vol_mask = EP ? EP->vol_mask : 0u;
     VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
-        VkImageView v = ((s_e2.tex_mask >> u) & 1u) ? vk_eng_sample_view(s_e2.tex[u]) : VK_NULL_HANDLE;
+        const u32 h = ((s_e2.tex_mask >> u) & 1u) ? s_e2.tex[u] : 0u;
+        VkImageView v = h ? vk_eng_sample_view(h) : VK_NULL_HANDLE;
+        const int is_cube = h && h < VK_ENG_MAX_OBJ && s_eobj[h].kind == VK_ENG_TEXTURE && s_eobj[h].faces == 6;
+        if ((cube_mask >> u) & 1u) { if (!v || !is_cube) v = vk_eng_dummy_view(0); }
+        else if ((vol_mask >> u) & 1u) v = vk_eng_dummy_view(1);
+        else if (is_cube) v = VK_NULL_HANDLE;           /* a cube where 2D is read: the 2D stand-in */
         VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
         ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, v ? v : s_vk.dummy.view, VK_IMAGE_LAYOUT_GENERAL };
         si[u] = (VkDescriptorImageInfo){ smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
@@ -3231,6 +3455,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     if (!rt0) return;
     for (u32 i = 1; i < n; i++)
         if (!vk_eng_get(s_eng_bound.rt[i], VK_ENG_COLOR)) return;
+    vk_rtd_note(s_eng_bound.rt, n);
+    vk_rtd_note_tex(s_e2.tex, s_e2.tex_mask);
     const u32 w = rt0->w, h = rt0->h;
     vk_eng_obj* zo = vk_eng_get(s_eng_bound.depth, VK_ENG_DEPTH);
     VkImageView dview = (zo && zo->w >= w && zo->h >= h) ? zo->im.view : vk_eng_scratch_depth(w, h);
