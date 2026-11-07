@@ -55,6 +55,7 @@ static uint32_t loader_vscr_default(void)
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "../platform/host_place.h"        /* PS3_CPU_PLACE: the main PPU thread's cores */
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <sched.h>   /* the guest-pointer trap reserves the low 4 GB */
@@ -4040,6 +4041,10 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * the buffer for minutes and were LOST when the run was killed -- which
      * made "the log line is absent" unusable as evidence. */
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* PS3_CPU_PLACE / PS3_HIGHQOS (host_place.h): this thread runs the guest's
+     * main PPU thread, the frame's game logic. */
+    ps3_host_place_self(PS3_PLACE_MAIN);
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
 

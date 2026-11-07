@@ -21,6 +21,7 @@
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
 #include "../../include/ps3emu/ps3_toggles.h" /* GCM_STALL_GAP_MS, live */
 #include "gcm_fifo_decode.h"                   /* JUMP forms */
+#include "../../runtime/platform/host_place.h" /* PS3_CPU_PLACE: the draining thread's cores */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -1923,6 +1924,10 @@ void cellGcm_ref_on_poll(void)
 
 void cellGcm_rsx_process_fifo(void)
 {
+    /* The host's frame clock thread drains the FIFO and encodes the draws:
+     * the RSX role, once per thread (a guest thread that drains is already
+     * placed and keeps its own role). */
+    ps3_host_place_self_once(PS3_PLACE_RSX);
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     s_drain_in_ms = ps3_ms_now();
 #if !defined(_WIN32)
