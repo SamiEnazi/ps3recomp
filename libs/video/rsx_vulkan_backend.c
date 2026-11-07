@@ -58,6 +58,7 @@
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 #include "vulkan/rsx_vk_passes_glsl.h"
+#include "vk_postfx.h"                           /* [postfx] AA, sharpening, anisotropy */
 #include "../../include/ps3emu/ps3_ftrace.h"    /* PS3_FTRACE: GPU_WAIT spans at each fence wait */
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
@@ -3189,6 +3190,13 @@ static void vk_present_window(void)
     vk_gprof_stamp(GP_PGAP, s_vk.width, s_vk.height);
     vk_gprof_note_present();
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    /* [postfx] AA + CAS (vk_postfx.c) on the frame; the window gets its output */
+    VkImage pf_img = s_vk.color.img;
+    uint32_t pf_w = s_vk.width, pf_h = s_vk.height;
+    if (!vk_postfx_apply(s_vk.cmd, s_vk.color.img, s_vk.color.view, s_vk.width, s_vk.height,
+                         s_vk.sc_extent.width, s_vk.sc_extent.height, &pf_img, &pf_w, &pf_h)) {
+        pf_img = s_vk.color.img; pf_w = s_vk.width; pf_h = s_vk.height;
+    }
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -3200,12 +3208,12 @@ static void vk_present_window(void)
                           0, 0, NULL, 0, NULL, 1, &b);
     VkImageBlit blit = {
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .srcOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+        .srcOffsets = { { 0, 0, 0 }, { (int32_t)pf_w, (int32_t)pf_h, 1 } },
         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .dstOffsets = { { 0, 0, 0 },
                         { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
     };
-    pvkCmdBlitImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
+    pvkCmdBlitImage(s_vk.cmd, pf_img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     1, &blit, VK_FILTER_LINEAR);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -4181,7 +4189,7 @@ static struct {
     u32          warned;
 } s_e2;
 
-#define VK_ENG_SAMP_CACHE 64
+#define VK_ENG_SAMP_CACHE 256   /* [postfx] room for samplers of a live anisotropy change */
 static struct { u64 key; VkSampler s; } s_esamp[VK_ENG_SAMP_CACHE];
 static u32 s_esamp_count;
 
@@ -4658,10 +4666,13 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
 {
     u32 lo, hi;
     memcpy(&lo, &d->min_lod, 4); memcpy(&hi, &d->max_lod, 4);
+    /* [postfx] PS3RECOMP_ANISO: only a linear minification through mipmaps */
+    const u32 aniso = (u32)vk_postfx_sampler_aniso(d->min_linear, d->mip_present) & 0x1Fu;
     const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1) | ((u64)d->mip_linear << 2)
                   | ((u64)d->mip_present << 3) | ((u64)(d->wrap_s & 0xF) << 4)
                   | ((u64)(d->wrap_t & 0xF) << 8) | ((u64)(d->wrap_r & 0xF) << 12)
-                  | ((u64)(lo >> 16) << 16) | ((u64)(hi >> 16) << 32);
+                  | ((u64)(lo >> 16) << 16) | ((u64)(hi >> 16) << 32)
+                  | ((u64)aniso << 48);    /* [postfx] a new level keys new samplers */
     for (u32 i = 0; i < s_esamp_count; i++) if (s_esamp[i].key == key) return s_esamp[i].s;
     if (s_esamp_count >= VK_ENG_SAMP_CACHE) return s_vk.sampler;
     float min_lod = d->min_lod, max_lod = d->mip_present ? d->max_lod : d->min_lod;
@@ -4674,6 +4685,7 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
         .addressModeU = vk_gcm_wrap(d->wrap_s), .addressModeV = vk_gcm_wrap(d->wrap_t),
         .addressModeW = vk_gcm_wrap(d->wrap_r),
         .minLod = min_lod, .maxLod = max_lod,
+        .anisotropyEnable = aniso > 1 ? VK_TRUE : VK_FALSE, .maxAnisotropy = aniso > 1 ? (float)aniso : 1.0f,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK };
     VkSampler smp;
     if (pvkCreateSampler(s_vk.device, &sci, NULL, &smp) != VK_SUCCESS) return s_vk.sampler;
@@ -6062,6 +6074,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     /* NV4097_SET_ZMIN_MAX_CONTROL: a draw the RSX clamps at the near/far
      * planes instead of clipping (eng_apply_depth_clip). */
     want.depthClamp = have.depthClamp;
+    vk_postfx_device_features(&have, &want);   /* [postfx] samplerAnisotropy */
     s_vk_depth_clamp_ok = have.depthClamp ? 1 : 0;
     s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -6075,6 +6088,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
     vk_sc_open(title);               /* the shader + pipeline disk caches */
+    vk_postfx_init(s_vk.instance, s_vk.phys, s_vk.device, pvkGetInstanceProcAddr,   /* [postfx] */
+                   pvkGetDeviceProcAddr, s_sc.pc);
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -6096,7 +6111,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (vk_pick_depth_format()) return -1;
     if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        VK_IMAGE_USAGE_SAMPLED_BIT /* [postfx] reads it */, VK_IMAGE_ASPECT_COLOR_BIT)) return -1;
     if (vk_create_image(&s_vk.depth, s_vk.depth_format, s_vk.width, s_vk.height,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_DS_ASPECT)) return -1;
@@ -6180,6 +6196,7 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         if (pvkDeviceWaitIdle) pvkDeviceWaitIdle(s_vk.device);
+        vk_postfx_shutdown();            /* [postfx] */
         vk_guest_shutdown();
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);
