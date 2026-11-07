@@ -49,6 +49,8 @@ powers, so aim sits on the right mouse button and the powers under the left hand
   (`PS3_ESC=quit` brings back Esc = quit; binding `Escape` to a control in `[keyboard]`
   gives it to the game instead.)
 - **F9** marks the play log ("this felt bad", `PS3RECOMP_PLAYLOG`).
+- While Alt (unless bound) or a Windows key is held, keys are a system chord and do not
+  reach the game (Alt+Tab does not open the World Map on the way out).
 - Controllers are bound by **position**: SDL is told `SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0`,
   so a Nintendo-layout pad's bottom button is Cross like on a DualShock, whatever it is
   labelled. `nintendo_layout = "label"` (below) switches to labels (A = Cross).
@@ -81,7 +83,8 @@ sensor, `tilt = "none"` keeps the pad level, `tilt_invert = true` flips the dire
 ## The controls file
 
 `PS3_INPUT_MAP=<path>` names it; without the variable, `input.toml` next to the exe is
-used if it exists (`PS3_INPUT_MAP=` set but empty = no file). Format: a TOML subset,
+used if it exists (`PS3_INPUT_MAP=` set but empty = no file). `docs/input.example.toml`
+lists every default binding and setting: copy it and edit. Format: a TOML subset,
 sections and `name = value` lines; every section and line is optional, anything left
 out keeps its default. Names are case-insensitive; unknown ones are reported on stderr
 (`[cellPad] ...: unknown ...`) and ignored. The full reference is the comment at the top
@@ -186,6 +189,14 @@ sets its inputs at the given seconds after `cellPadInit` (`a=1`, `leftx=16384`,
 `righttrigger=32767`, ...). Mapping, bindings, dead zones and triggers then run exactly as
 for a real pad; SDL's hardware drivers are off in this mode, so a real controller is
 neither read nor touched. (`PAD_SCRIPT` instead injects into the packet after all of it.)
+The virtual pad's triggers take 0..32767 like a real one; SDL's automatic mapping for a
+virtual pad has no touchpad, so cellPad gives it a full mapping of its own.
+
+Keyboard and mouse without the focus (tests): `PS3_KBM_TEST=1` (with `PS3_KBM=1`) reads
+the bound keys without the focus check and counts raw mouse motion without a capture
+(the cursor is never grabbed). An injector can then `SendInput` keys nobody types
+(bind e.g. `cross = "F17"`) and small mouse moves into a game window that is not in
+front, without taking the focus from the desktop.
 
 Start-up lines on stderr name the controls file, the stick settings, the controller
 database size and each controller as it connects (name, SDL type, USB id, GUID, whether

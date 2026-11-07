@@ -764,7 +764,7 @@ static void pad_sdl_describe(SDL_GameController* gc, int port, int back, int id,
          * layout SDL applied (a = bottom face button). */
         const char* p = strchr(map, ',');
         p = p ? strchr(p + 1, ',') : NULL;
-        fprintf(stderr, "[cellPad]   mapping: %.200s\n", p ? p + 1 : map);
+        fprintf(stderr, "[cellPad]   mapping: %.480s\n", p ? p + 1 : map);
         SDL_free(map);
     }
 }
@@ -1098,7 +1098,7 @@ static void pad_virtual_attach(void)
       snprintf(map, sizeof map, "%s,%s,a:b0,b:b1,x:b2,y:b3,back:b4,guide:b5,start:b6,leftstick:b7,rightstick:b8,"
                "leftshoulder:b9,rightshoulder:b10,dpup:b11,dpdown:b12,dpleft:b13,dpright:b14,misc1:b15,paddle1:b16,"
                "paddle2:b17,paddle3:b18,paddle4:b19,touchpad:b20,leftx:a0,lefty:a1,rightx:a2,righty:a3,"
-               "lefttrigger:a4,righttrigger:a5", gs, d.name);
+               "lefttrigger:a4,righttrigger:a5,", gs, d.name);   /* the trailing comma: SDL appends crc:... */
       SDL_GameControllerAddMapping(map); }
     s_virt_js = SDL_JoystickOpen(idx);
     s_virt_t0 = pad_now_us();
@@ -1509,6 +1509,16 @@ static int pad_kbm_on(void)
     }
     return on;
 }
+/* PS3_KBM_TEST=1 (tests only): keys count without the focus check and raw
+ * mouse motion without a capture (the cursor is never grabbed), so an
+ * injector can drive keyboard and mouse into a game window that does not
+ * have the focus -- with keys nobody types (F13-F24) and small moves. */
+static int pad_kbm_test(void)
+{
+    static int t = -1;
+    if (t < 0) { const char* e = getenv("PS3_KBM_TEST"); t = e && *e && *e != '0'; }
+    return t;
+}
 /* Is macOS key code vk bound to any PS3 control? */
 static int pad_key_bound(unsigned vk)
 {
@@ -1568,7 +1578,7 @@ static const unsigned char kWinVkMac[][2] = {
  * open; only the keys some control uses are asked for. */
 static void pad_win_keys(uint32_t keys[4], const PadInputMap* map)
 {
-    if (!pad_kbm_on() || cellPad_host_overlay_open() || !pad_win_focused()) return;
+    if (!pad_kbm_on() || cellPad_host_overlay_open() || !(pad_win_focused() || pad_kbm_test())) return;
     uint32_t want[4] = { 0, 0, 0, 0 };
     for (int c = 0; c < PIM_N_CONTROLS; c++)
         for (int w = 0; w < 4; w++) want[w] |= map->key[c][w];
@@ -1584,6 +1594,12 @@ static void pad_win_keys(uint32_t keys[4], const PadInputMap* map)
     }
 #define PAD_WANT(mac) (want[(mac) >> 5] >> ((mac) & 31) & 1u)
 #define PAD_SET(mac)  (keys[(mac) >> 5] |= 1u << ((mac) & 31))
+    /* Alt (unless a control uses it) or a Windows key held: a system chord
+     * (Alt+Tab, Alt+F4, Win+...), not the game's -- Tab is SELECT. */
+    if (((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) ||
+        ((GetAsyncKeyState(VK_LMENU) & 0x8000) && !PAD_WANT(0x3Au)) ||
+        ((GetAsyncKeyState(VK_RMENU) & 0x8000) && !PAD_WANT(0x3Du)))
+        return;
     for (int i = 0; i < PAD_N_SCAN_KEYS; i++) {
         const unsigned mac = kWinScanMac[i][1];
         if (PAD_WANT(mac) && s_scan_vk[i] && (GetAsyncKeyState(s_scan_vk[i]) & 0x8000)) PAD_SET(mac);
@@ -1619,7 +1635,7 @@ static int    s_abs_have, s_abs_x, s_abs_y;
 
 static void pad_host_raw_mouse(const RAWMOUSE* m)
 {
-    if (!__atomic_load_n(&g_pad_mouse_captured, __ATOMIC_ACQUIRE)) { s_abs_have = 0; return; }
+    if (!__atomic_load_n(&g_pad_mouse_captured, __ATOMIC_ACQUIRE) && !pad_kbm_test()) { s_abs_have = 0; return; }
     if (m->usFlags & MOUSE_MOVE_ABSOLUTE) {
         /* tablets, remote desktop: absolute 0..65535 -> pixel deltas */
         const int vd = (m->usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
