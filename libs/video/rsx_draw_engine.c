@@ -4847,6 +4847,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
                       g.vpc_lo, g.vpc_n, dc.n_verts, rs.blend_enable, rsx_dsp_reg(&g.rsx, 0x0324),
                       vp.scale[0], vp.scale[1], vp.translate[0], vp.translate[1],
                       mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], mn[3], mx[3]);
+              /* The blend itself (SFACTOR/DFACTOR/EQUATION, A<<16|RGB) and the
+               * blend colour 0x0310+.. -- what a fade or composite does with
+               * the frame under it. */
+              fprintf(stderr, "[hudlog]   blend sf=0x%08X df=0x%08X eq=0x%08X color=0x%08X tex_mask=0x%X\n",
+                      rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR), rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR),
+                      rsx_dsp_reg(&g.rsx, M_BLEND_EQUATION), rsx_dsp_reg(&g.rsx, 0x031C), tex_mask);
+              { const float* k = (const float*)g.fp_cb;   /* the fragment constants handed over */
+                const u32 nk = g.fp_constants->count;
+                for (u32 i = 0; i < nk && i < 4u; i++)
+                    fprintf(stderr, "[hudlog]   fpc[%u] = (%g %g %g %g)\n", i, k[i*4], k[i*4+1], k[i*4+2], k[i*4+3]);
+                if (!nk) fprintf(stderr, "[hudlog]   fpc: none\n"); }
               for (u32 c = g.vpc_lo; c < g.vpc_lo + g.vpc_n && c < g.vpc_lo + 6u && c < RSX_DSP_NUM_CONSTANTS; c++) {
                   float v4[4]; memcpy(v4, g.rsx.constants[c], sizeof v4);
                   fprintf(stderr, "[hudlog]   c[%u] = (%g %g %g %g)\n", c, v4[0], v4[1], v4[2], v4[3]); }
