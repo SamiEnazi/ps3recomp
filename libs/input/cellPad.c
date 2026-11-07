@@ -1155,7 +1155,9 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
-#ifdef _WIN32
+#if defined(_WIN32) && PAD_BACKEND_XINPUT
+    /* The XInput build's own keyboard fallback; the SDL build reads keys
+     * through the input map below like every other host. */
     if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
     pad_overlay_gate();   /* the controllers alone: before the keys join in */

@@ -223,6 +223,14 @@ if(PS3RECOMP_RSX_VULKAN)
         find_package(SDL2 CONFIG REQUIRED)
         target_link_libraries(ps3recomp_runtime PUBLIC SDL2::SDL2)
         target_compile_definitions(ps3recomp_runtime PUBLIC SDL_MAIN_HANDLED)
+        # SDL2 is linked anyway, so cellPad can read controllers through SDL's
+        # GameController: DualShock 4/5, Switch Pro and Xbox pads directly,
+        # where XInput sees Xbox-style devices only (a DS4 needed DS4Windows
+        # or Steam Input). OFF keeps the XInput backend.
+        option(PS3RECOMP_PAD_SDL2 "Windows: cellPad through SDL2 GameController" ON)
+        if(PS3RECOMP_PAD_SDL2)
+            target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_USE_SDL2)
+        endif()
         if(PS3RECOMP_SDL2_INCLUDE_PARENT)
             target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_SDL2_INCLUDE_PARENT}")
         endif()
