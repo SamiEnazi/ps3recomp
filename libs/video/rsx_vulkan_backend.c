@@ -262,7 +262,7 @@ static struct {
     u32          n_dead_fb;
     vk_image     dead_img[256];          /* likewise images (and their views) */
     u32          n_dead_img;
-    int          zrgba_pending;          /* a depth-as-RGBA8 pass is recorded */
+    int          zrgba_pending;          /* depth-as-RGBA8 passes recorded (their set ring's next slot) */
     int          light_pending;          /* the GPU light pass is recorded     */
     int          ssao_pending;           /* the GPU SSAO passes are recorded   */
     /* The engine render pass left open after a draw, so the next draw into the
@@ -4457,6 +4457,7 @@ enum { VK_PASS_LIGHT, VK_PASS_SSAO_HD, VK_PASS_SSAO_AO, VK_PASS_SSAO_BLUR_H, VK_
 #define VK_PASS_SPV_WORDS 16384u
 #define VK_CSNAP_MAX      64u
 #define VK_ZRGBA_MAX      32u
+#define VK_ZRGBA_SETS     16u              /* depth decodes one batch can hold */
 #define VK_TAG_CSNAP      0xC5000000u       /* a colour copy                      */
 #define VK_TAG_PASS       0xA0000000u       /* a light or SSAO output             */
 #define VK_TAG_ZRGBA      0x5A000000u       /* | depth handle: a depth decode     */
@@ -4470,6 +4471,7 @@ static struct {
     VkPipelineLayout      pipe_layout;
     VkDescriptorPool      pool;
     VkDescriptorSet       set[VK_PASS_COUNT];      /* one per pass */
+    VkDescriptorSet       zset[VK_ZRGBA_SETS];     /* the depth decode's, one per decode in a batch */
     VkRenderPass          rp_light, rp_rgba8, rp_r8, rp_r32f;
     vk_buffer             light_ubo, ssao_ubo;
     u32                   light_out[2], light_w, light_h;
@@ -4532,10 +4534,10 @@ static int vk_pass_init(void)
                                         .setLayoutCount = 1, .pSetLayouts = &s_lp.set_layout };
     if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_lp.pipe_layout) != VK_SUCCESS) return -1;
     VkDescriptorPoolSize ps[2] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_PASS_COUNT },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_PASS_COUNT * VK_PASS_TEXTURES } };
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_PASS_COUNT + VK_ZRGBA_SETS },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (VK_PASS_COUNT + VK_ZRGBA_SETS) * VK_PASS_TEXTURES } };
     VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                       .maxSets = VK_PASS_COUNT, .poolSizeCount = 2, .pPoolSizes = ps };
+                                       .maxSets = VK_PASS_COUNT + VK_ZRGBA_SETS, .poolSizeCount = 2, .pPoolSizes = ps };
     if (pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_lp.pool) != VK_SUCCESS) return -1;
     VkDescriptorSetLayout layouts[VK_PASS_COUNT];
     for (u32 k = 0; k < VK_PASS_COUNT; k++) layouts[k] = s_lp.set_layout;
@@ -4543,6 +4545,12 @@ static int vk_pass_init(void)
                                         .descriptorPool = s_lp.pool, .descriptorSetCount = VK_PASS_COUNT,
                                         .pSetLayouts = layouts };
     if (pvkAllocateDescriptorSets(s_vk.device, &dai, s_lp.set) != VK_SUCCESS) return -1;
+    { VkDescriptorSetLayout zl[VK_ZRGBA_SETS];
+      for (u32 k = 0; k < VK_ZRGBA_SETS; k++) zl[k] = s_lp.set_layout;
+      VkDescriptorSetAllocateInfo zai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                          .descriptorPool = s_lp.pool, .descriptorSetCount = VK_ZRGBA_SETS,
+                                          .pSetLayouts = zl };
+      if (pvkAllocateDescriptorSets(s_vk.device, &zai, s_lp.zset) != VK_SUCCESS) return -1; }
     /* Coherent, as every host-written buffer here (vk_invalidate's note). */
     if (vk_create_host_buffer(&s_lp.light_ubo, sizeof(rsx_gpu_light_params),
                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp.light_ubo.coherent ||
@@ -4956,16 +4964,19 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
 
     VkFramebuffer fb = vk_pass_framebuffer(rp, &s_eobj[dst].im.view, 1, w, h);
     if (!fb) return 0;
-    /* Batched: the pass's one descriptor set may not be rewritten while a
-     * recorded pass still uses it, so a second pass in one batch flushes. */
-    if (s_batch.recording && s_batch.zrgba_pending) vk_batch_flush();
-    vk_pass_write_set(s_lp.set[VK_PASS_ZRGBA], &s_lp.ssao_ubo, s_lp.zr32.view, sview, VK_NULL_HANDLE);
+    /* Batched: a descriptor set may not be rewritten while a recorded pass
+     * still uses it, so each decode in a batch takes the next set of a ring
+     * (the scratch copies are reused safely: every pass is ordered after the
+     * one before by barriers); a full ring flushes. Unbatched: slot 0. */
+    if (s_batch.recording && s_batch.zrgba_pending >= (int)VK_ZRGBA_SETS) vk_batch_flush();
+    const VkDescriptorSet zset = s_lp.zset[s_batch.recording ? (u32)s_batch.zrgba_pending : 0u];
+    vk_pass_write_set(zset, &s_lp.ssao_ubo, s_lp.zr32.view, sview, VK_NULL_HANDLE);
     int rc = vk_begin();
     if (!rc) {
         if (s_batch.recording) vk_barrier_all();
-        vk_pass_record(rp, fb, pipe, s_lp.set[VK_PASS_ZRGBA], w, h);
+        vk_pass_record(rp, fb, pipe, zset, w, h);
         if (s_batch.recording) {             /* stays in the batch; fb dies with it */
-            s_batch.zrgba_pending = 1;
+            s_batch.zrgba_pending++;
             vk_batch_retire_fb(fb);
             return dst;
         }
