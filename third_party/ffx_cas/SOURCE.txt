@@ -1,0 +1,5 @@
+ffx_a.h, ffx_cas.h, LICENSE.txt: AMD FidelityFX CAS (MIT), unmodified, from
+github.com/GPUOpen-Effects/FidelityFX-CAS at
+9fabcc9a2c45f958aff55ddfda337e74ef894b7f (ffx-cas/).
+ffx_a_glsl.h and ffx_cas_glsl.h are generated from them by
+tools/gen_glsl_header.py.
