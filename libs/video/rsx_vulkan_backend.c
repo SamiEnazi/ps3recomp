@@ -11,6 +11,8 @@
  *                          attribute 8, fetched and expanded through the
  *                          shared rsx_fetch_attrib(); unit 0 decoded through
  *                          rsx_texture_decode(); depth test, no blend/stencil
+ *   disk caches            translated SPIR-V and the VkPipelineCache, kept
+ *                          between runs (PS3RECOMP_VK_SHADER_CACHE)
  *   vtable guest programs  the same path running the decompilers' HLSL, with
  *                          whole mip chains and per-unit samplers
  *   optional window        SDL2 + swapchain; a present blits the frame into it
@@ -69,6 +71,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* The disk caches: on Windows CreateDirectoryA, GetFileAttributesA and
+ * MoveFileExA, from the <windows.h> ps3_ftrace.h already includes. */
+#ifndef _WIN32
+#include <sys/stat.h>       /* mkdir, stat */
+#include <unistd.h>         /* getpid */
+#endif
 
 /* ---------------------------------------------------------------------------
  * Run-time loaded entry points (Vulkan 1.0 core only)
@@ -97,6 +105,7 @@
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkResetDescriptorPool) \
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) \
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
     X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) \
@@ -917,6 +926,633 @@ static void vk_cb_bind_texture(void* ud, u32 unit, const rsx_texture_state* t)
 }
 
 /* ---------------------------------------------------------------------------
+ * Disk caches: translated SPIR-V and the driver's pipeline cache
+ *
+ * Every run used to translate each guest shader HLSL -> SPIR-V through
+ * glslang and have the driver build every pipeline from nothing: the long
+ * black screen at a level load, and the hitch the first time an effect
+ * appears. Both now persist, in one directory:
+ *
+ *   <key>.spv      one shader, exactly as glslang wrote it. The key is 128
+ *                  bits -- FNV-1a under two seeds -- of VK_SC_VERSION, the
+ *                  translator fingerprint (below), the fragcoord knob the
+ *                  translator reads, the stage and the whole HLSL text. A hit
+ *                  skips glslang. A file is used only if it is whole words,
+ *                  starts with the SPIR-V magic and its instruction stream
+ *                  ends exactly on an OpFunctionEnd, as every module glslang
+ *                  writes does; anything else is a miss and is rewritten.
+ *   pipelines.bin  the VkPipelineCache every vkCreateGraphicsPipelines goes
+ *                  through, behind a 32-byte header of our own (magic, size,
+ *                  hash). The driver's header in it -- vendor, device, cache
+ *                  UUID -- is checked here before the driver sees the data,
+ *                  as not every driver checks it: another GPU or a driver
+ *                  update starts an empty cache. Saved at shutdown, after
+ *                  every VK_SC_SAVE_EVERY new pipelines (at most every 2 s),
+ *                  and at the first present 2 s after the last new one --
+ *                  the game is usually killed rather than closed. A save
+ *                  whose bytes match the file is not written.
+ *
+ * Every file is written under a temporary name and renamed over the old one,
+ * so a killed process never leaves a torn file. Nothing is evicted: delete
+ * the directory to start again.
+ *
+ * VK_SC_VERSION is in every key: bump it when the HLSL -> SPIR-V translation
+ * changes in a way the fingerprint cannot see. The fingerprint is the SPIR-V
+ * of two small canary shaders, translated once per run before the first
+ * lookup: a glslang update, or a change to the translator's options (Y flip,
+ * binding shifts, the fragcoord preamble), changes it and with it every key.
+ *
+ *   PS3RECOMP_VK_SHADER_CACHE=<dir>  the directory, created as needed. Default
+ *       %LOCALAPPDATA%\ps3recomp\shader_cache\<title> on Windows, else
+ *       ${XDG_CACHE_HOME:-$HOME/.cache}/ps3recomp/shader_cache/<title>, where
+ *       <title> is the window title with anything but [A-Za-z0-9_-] as '_'.
+ *   PS3RECOMP_VK_SHADER_CACHE=0      off: every shader and pipeline is built
+ *       from scratch, exactly as before.
+ *   PS3RECOMP_VK_SHADER_CACHE_STATS=1  the stats line at every pipeline-cache
+ *       save; by default at most once per VK_SC_STATS_EVERY shaders and
+ *       pipelines, and at shutdown.
+ *
+ * PS3_FTRACE spans, kind PS3_FT_COMPILE: who 1/2 a vertex/fragment shader
+ * (SPIR-V, then vkCreateShaderModule), a = 1 built, b = 1 from the disk
+ * cache; who 3 one vkCreateGraphicsPipelines, a = 1 built, b = 0 engine,
+ * 1 guest, 2 fallback, 3 full-screen pass; who 5 a pipeline-cache save,
+ * a = KB written (0: unchanged or failed), b = 0 periodic, 1 idle, 2 shutdown.
+ * -------------------------------------------------------------------------*/
+#define VK_SC_VERSION      "ps3recomp-vk-spirv-1"   /* bump: the translation changed */
+#define VK_SC_PATH         1024u
+#define VK_SC_SAVE_EVERY   64u
+#define VK_SC_SAVE_GAP_NS  2000000000ull     /* periodic saves at most this often   */
+#define VK_SC_IDLE_NS      2000000000ull     /* idle save: no new pipeline this long */
+#define VK_SC_STATS_EVERY  64ull
+#define VK_SC_SEED_A       14695981039346656037ull   /* the FNV-1a offset basis */
+#define VK_SC_SEED_B       0x9E3779B97F4A7C15ull
+#define VK_SC_PC_MAGIC     "PS3RVKPC"
+#define VK_SC_PC_HEADER    32u
+#ifdef _WIN32
+#define VK_SC_SEP '\\'
+#else
+#define VK_SC_SEP '/'
+#endif
+
+static u64 vk_fnv1a64(const void* d, size_t n, u64 h);   /* guest programs */
+
+/* -- shader cache: pure helpers (no Vulkan, no backend state) -- */
+typedef struct { u64 a, b; } vk_sc_key;
+
+static void vk_sc_key_add(vk_sc_key* k, const void* d, size_t n)
+{
+    k->a = vk_fnv1a64(d, n, k->a);
+    k->b = vk_fnv1a64(d, n, k->b);
+}
+
+static vk_sc_key vk_sc_spv_key(const char* version, u64 fingerprint, u32 frag_rcp,
+                               int stage, const char* text)
+{
+    vk_sc_key k = { VK_SC_SEED_A, VK_SC_SEED_B };
+    const u32 st = (u32)stage;
+    const size_t n = strlen(text);
+    const u64 len = (u64)n;
+    vk_sc_key_add(&k, version, strlen(version) + 1u);
+    vk_sc_key_add(&k, &fingerprint, sizeof fingerprint);
+    vk_sc_key_add(&k, &frag_rcp, sizeof frag_rcp);
+    vk_sc_key_add(&k, &st, sizeof st);
+    vk_sc_key_add(&k, &len, sizeof len);
+    vk_sc_key_add(&k, text, n);
+    return k;
+}
+
+/* <dir><sep><name>; -1 if it does not fit. */
+static int vk_sc_join(char* out, size_t cap, const char* dir, const char* name)
+{
+    const int r = snprintf(out, cap, "%s%c%s", dir, VK_SC_SEP, name);
+    return (r < 0 || (size_t)r >= cap) ? -1 : 0;
+}
+
+static int vk_sc_spv_path(char* out, size_t cap, const char* dir, vk_sc_key k)
+{
+    char name[48];
+    snprintf(name, sizeof name, "%016llx%016llx.spv", (unsigned long long)k.a,
+             (unsigned long long)k.b);
+    return vk_sc_join(out, cap, dir, name);
+}
+
+/* `title` as one path component: [A-Za-z0-9_-] kept, anything else '_', at
+ * most 48 characters, "default" when there is nothing. */
+static void vk_sc_component(const char* title, char* out, size_t cap)
+{
+    size_t n = 0;
+    for (const char* p = title; p && *p && n + 1u < cap && n < 48u; p++) {
+        const char c = *p;
+        const int keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                         (c >= '0' && c <= '9') || c == '_' || c == '-';
+        out[n++] = keep ? c : '_';
+    }
+    out[n] = 0;
+    if (!n) snprintf(out, cap, "default");
+}
+
+/* The cache directory: `env` (PS3RECOMP_VK_SHADER_CACHE) when set, without
+ * trailing separators, else the per-user default for `title`. -1 when there
+ * is neither (no LOCALAPPDATA / HOME) or it does not fit. */
+static int vk_sc_choose_dir(const char* env, const char* title, char* out, size_t cap)
+{
+    out[0] = 0;
+    int r;
+    if (env && *env) {
+        r = snprintf(out, cap, "%s", env);
+        if (r < 0 || (size_t)r >= cap) return -1;
+        size_t n = (size_t)r;
+        while (n > 1u && (out[n - 1u] == '/' || out[n - 1u] == '\\') && out[n - 2u] != ':')
+            out[--n] = 0;
+        return 0;
+    }
+    char comp[64];
+    vk_sc_component(title, comp, sizeof comp);
+#ifdef _WIN32
+    const char* base = getenv("LOCALAPPDATA");
+    if (!base || !*base) return -1;
+    r = snprintf(out, cap, "%s\\ps3recomp\\shader_cache\\%s", base, comp);
+#else
+    const char* xdg = getenv("XDG_CACHE_HOME");
+    const char* home = getenv("HOME");
+    if (xdg && *xdg)        r = snprintf(out, cap, "%s/ps3recomp/shader_cache/%s", xdg, comp);
+    else if (home && *home) r = snprintf(out, cap, "%s/.cache/ps3recomp/shader_cache/%s", home, comp);
+    else                    return -1;
+#endif
+    if (r < 0 || (size_t)r >= cap) { out[0] = 0; return -1; }
+    return 0;
+}
+
+static int vk_sc_is_dir(const char* p)
+{
+#ifdef _WIN32
+    const DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static void vk_sc_mkdir(const char* p)
+{
+#ifdef _WIN32
+    CreateDirectoryA(p, NULL);              /* exists or fails: is_dir decides */
+#else
+    mkdir(p, 0755);
+#endif
+}
+
+/* mkdir -p: every prefix ending before a separator, then the whole path. */
+static int vk_sc_make_dirs(char* path)
+{
+    for (char* q = path + 1; *q; q++) {
+        if ((*q != '/' && *q != '\\') || q[-1] == ':' || q[-1] == '/' || q[-1] == '\\')
+            continue;
+        const char c = *q;
+        *q = 0;
+        vk_sc_mkdir(path);
+        *q = c;
+    }
+    vk_sc_mkdir(path);
+    return vk_sc_is_dir(path) ? 0 : -1;
+}
+
+static unsigned long vk_sc_pid(void)
+{
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    const pid_t p = getpid();
+    return (unsigned long)p;
+#endif
+}
+
+/* `head` then `body` into `path`, through <path>.<pid>.tmp and a rename over
+ * it: a reader sees the old file or the whole new one, never a torn one. */
+static int vk_sc_write_file(const char* path, const void* head, size_t nhead,
+                            const void* body, size_t nbody)
+{
+    char tmp[VK_SC_PATH];
+    const int r = snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, vk_sc_pid());
+    if (r < 0 || (size_t)r >= sizeof tmp) return -1;
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return -1;
+    int ok = (!nhead || fwrite(head, 1, nhead, f) == nhead) &&
+             (!nbody || fwrite(body, 1, nbody, f) == nbody);
+    if (fclose(f) != 0) ok = 0;
+#ifdef _WIN32
+    if (ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) return 0;
+#else
+    if (ok && rename(tmp, path) == 0) return 0;
+#endif
+    remove(tmp);
+    return -1;
+}
+
+/* The whole of `path` into buf[0, cap): 0 and its size, or -1 when it is
+ * missing, unreadable or larger than cap. */
+static int vk_sc_read_into(const char* path, void* buf, size_t cap, size_t* got)
+{
+    *got = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    const size_t n = fread(buf, 1, cap, f);
+    const int bad = ferror(f) || (n == cap && fgetc(f) != EOF);
+    fclose(f);
+    if (bad) return -1;
+    *got = n;
+    return 0;
+}
+
+/* The whole of `path` in a malloc'd buffer (NULL when missing, empty or
+ * unreadable). */
+static u8* vk_sc_read_all(const char* path, size_t* size)
+{
+    *size = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    long end = -1;
+    if (fseek(f, 0, SEEK_END) == 0) end = ftell(f);
+    u8* buf = (end > 0 && fseek(f, 0, SEEK_SET) == 0) ? (u8*)malloc((size_t)end) : NULL;
+    if (buf && fread(buf, 1, (size_t)end, f) != (size_t)end) { free(buf); buf = NULL; }
+    fclose(f);
+    if (buf) *size = (size_t)end;
+    return buf;
+}
+
+/* Worth handing to vkCreateShaderModule: whole words, the SPIR-V magic, a
+ * header with an id bound, instructions that tile the rest exactly and end
+ * on OpFunctionEnd, and every function an OpEntryPoint or OpFunctionCall
+ * names defined -- glslang's HLSL output is a `main` wrapper plus `@main`,
+ * so a file cut just after the first of them is refused too. */
+static int vk_sc_spirv_ok(const u32* w, size_t bytes)
+{
+    if (bytes % 4u || bytes < 24u) return 0;
+    const size_t n = bytes / 4u;
+    if (w[0] != 0x07230203u || w[3] == 0u || w[4] != 0u) return 0;
+    u32 fn[64], nfn = 0, last = 0;
+    int all_fn = 1;
+    for (size_t i = 5; i < n;) {
+        const u32 wc = w[i] >> 16;
+        if (wc == 0u || wc > n - i) return 0;
+        last = w[i] & 0xFFFFu;
+        if (last == 54u && wc >= 3u) {       /* OpFunction: result id in word 2 */
+            if (nfn < 64u) fn[nfn++] = w[i + 2];
+            else           all_fn = 0;       /* too many to check: structure only */
+        }
+        i += wc;
+    }
+    if (last != 56u) return 0;               /* OpFunctionEnd */
+    for (size_t i = 5; all_fn && i < n; i += w[i] >> 16) {
+        const u32 op = w[i] & 0xFFFFu, wc = w[i] >> 16;
+        u32 target;
+        if (op == 15u && wc >= 3u)      target = w[i + 2];   /* OpEntryPoint    */
+        else if (op == 57u && wc >= 4u) target = w[i + 3];   /* OpFunctionCall  */
+        else continue;
+        u32 k = 0;
+        while (k < nfn && fn[k] != target) k++;
+        if (k == nfn) return 0;
+    }
+    return 1;
+}
+
+/* pipelines.bin: our header -- VK_SC_PC_MAGIC, format u32 1, u32 0, data
+ * bytes u64, vk_sc_blob_hash u64, all little-endian -- then the bytes
+ * vkGetPipelineCacheData returned. The hash takes eight bytes a step: the
+ * blob can be tens of MB and is hashed at every save. */
+static u64 vk_sc_blob_hash(const u8* p, size_t n)
+{
+    u64 h = VK_SC_SEED_A ^ (u64)n;
+    size_t i = 0;
+    for (; i + 8u <= n; i += 8u) {
+        u64 v;
+        memcpy(&v, p + i, sizeof v);
+        h = (h ^ v) * 1099511628211ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
+    h ^= h >> 32;
+    h *= 0xD6E8FEB86659FD93ull;
+    h ^= h >> 32;
+    return h;
+}
+
+static u32 vk_sc_le32(const u8* p)
+{
+    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static u64 vk_sc_le64(const u8* p)
+{
+    return (u64)vk_sc_le32(p) | ((u64)vk_sc_le32(p + 4) << 32);
+}
+
+static void vk_sc_put_le64(u8* p, u64 v)
+{
+    for (u32 i = 0; i < 8u; i++) p[i] = (u8)(v >> (8u * i));
+}
+
+static void vk_sc_pc_header(u8* out, size_t n, u64 hash)
+{
+    memset(out, 0, VK_SC_PC_HEADER);
+    memcpy(out, VK_SC_PC_MAGIC, 8);
+    out[8] = 1;                                         /* format 1 */
+    vk_sc_put_le64(out + 16, (u64)n);
+    vk_sc_put_le64(out + 24, hash);
+}
+
+/* The driver data inside a pipelines.bin image, or NULL and *why. The second
+ * half reads the VkPipelineCacheHeaderVersionOne the driver wrote first:
+ * header size, version 1, vendor, device, pipelineCacheUUID. */
+static const u8* vk_sc_pc_unwrap(const u8* file, size_t size, u32 vendor, u32 device,
+                                 const u8* uuid, size_t* n, const char** why)
+{
+    *n = 0;
+    if (size < VK_SC_PC_HEADER || memcmp(file, VK_SC_PC_MAGIC, 8) != 0 ||
+        vk_sc_le32(file + 8) != 1u) {
+        *why = "ignored, not a pipeline cache file"; return NULL;
+    }
+    const u64 len = vk_sc_le64(file + 16);
+    if (len != (u64)(size - VK_SC_PC_HEADER)) { *why = "ignored, cut short"; return NULL; }
+    const u8* data = file + VK_SC_PC_HEADER;
+    if (vk_sc_blob_hash(data, (size_t)len) != vk_sc_le64(file + 24)) {
+        *why = "ignored, damaged (hash mismatch)"; return NULL;
+    }
+    if (len < 32u || vk_sc_le32(data) < 32u || vk_sc_le32(data) > len ||
+        vk_sc_le32(data + 4) != 1u) {
+        *why = "ignored, no driver header"; return NULL;
+    }
+    if (vk_sc_le32(data + 8) != vendor || vk_sc_le32(data + 12) != device ||
+        memcmp(data + 16, uuid, 16) != 0) {
+        *why = "ignored, made by another GPU or driver"; return NULL;
+    }
+    *n = (size_t)len;
+    return data;
+}
+/* -- end of the pure helpers -- */
+
+/* Two shaders shaped like the decompilers' output, translated once per run:
+ * their SPIR-V is the translator fingerprint. The vertex one exercises the Y
+ * flip, the fragment one the texture/sampler binding shifts and the
+ * fragcoord preamble. */
+static const char kVkScCanaryVS[] =
+    "cbuffer VPConst : register(b0) { float4 vc[4]; };\n"
+    "struct VSInput { float4 a0:ATTR0; float4 a8:ATTR8; };\n"
+    "struct VSOutput { float4 pos:SV_Position; float4 tc0:TEXCOORD0; };\n"
+    "VSOutput main(VSInput i) {\n"
+    "    VSOutput o;\n"
+    "    o.pos = float4(dot(i.a0, vc[0]), dot(i.a0, vc[1]), dot(i.a0, vc[2]), dot(i.a0, vc[3]));\n"
+    "    o.tc0 = i.a8;\n"
+    "    return o;\n"
+    "}\n";
+static const char kVkScCanaryFS[] =
+    "Texture2D    rsx_tex[16] : register(t0);\n"
+    "SamplerState rsx_samp[16] : register(s0);\n"
+    "cbuffer PSConstants : register(b1) { float4 pc[2]; };\n"
+    "struct PSInput { float4 wpos:SV_Position; float4 tc0:TEXCOORD0; };\n"
+    "float4 main(PSInput i) : SV_Target0 {\n"
+    "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
+    "    float w = 1.0 / i.wpos.w;\n"
+    "#else\n"
+    "    float w = i.wpos.w;\n"
+    "#endif\n"
+    "    return rsx_tex[2].Sample(rsx_samp[2], i.tc0.xy) * pc[0] * w;\n"
+    "}\n";
+
+static struct {
+    int             on;                  /* the directory is usable                 */
+    int             fp_done;             /* fingerprint taken (or given up)         */
+    int             stats_all;           /* PS3RECOMP_VK_SHADER_CACHE_STATS         */
+    u32             frag_rcp;            /* PS3RECOMP_FRAGCOORD_W, as the translator reads it */
+    u32             pc_new;              /* pipelines created since the last save   */
+    u32             warned;              /* 1 a write failed, 2 unstorable SPIR-V   */
+    u64             fp;                  /* translator fingerprint, 0 if none       */
+    VkPipelineCache pc;
+    u64             pc_hash, pc_size;    /* what pipelines.bin holds                */
+    u64             pc_last_new, pc_last_save;   /* ps3_ft_now()                    */
+    unsigned long long hits, misses, rejected, stored, spv_ns, fp_ns;
+    unsigned long long pipes, pipe_ns, saves, save_ns, stats_at;
+    char            dir[VK_SC_PATH];
+} s_sc;
+
+static void vk_sc_fingerprint(u32* words, u32 max_words)
+{
+    s_sc.fp_done = 1;
+    const u64 t0 = ps3_ft_now();
+    u64 h = VK_SC_SEED_A;
+    for (int s = 0; s < 2; s++) {
+        char log[512];
+        u32 n = 0;
+        if (rsx_hlsl_to_spirv(s ? kVkScCanaryFS : kVkScCanaryVS,
+                              s ? RSX_SHADER_STAGE_FRAGMENT : RSX_SHADER_STAGE_VERTEX,
+                              words, max_words, &n, log, sizeof log) || !n) {
+            VK_LOG("shader cache: the %s canary does not translate (%s) -- keyed on "
+                   VK_SC_VERSION " alone\n", s ? "fragment" : "vertex", log);
+            return;
+        }
+        h = vk_fnv1a64(words, (size_t)n * 4u, h);
+    }
+    s_sc.fp = h;
+    s_sc.fp_ns = ps3_ft_now() - t0;
+    VK_LOG("shader cache: translator fingerprint %016llx (%.1f ms)\n",
+           (unsigned long long)h, (double)s_sc.fp_ns / 1e6);
+}
+
+/* rsx_hlsl_to_spirv through the disk cache: the same arguments and result,
+ * and *from_disk = 1 when the SPIR-V came from a file and glslang never ran. */
+static int vk_sc_hlsl_to_spirv(const char* hlsl, int stage, u32* words, u32 max_words,
+                               u32* out_words, char* log, u32 log_size, int* from_disk)
+{
+    *from_disk = 0;
+    char path[VK_SC_PATH];
+    int cached = 0;
+    if (s_sc.on && hlsl && words && out_words) {
+        if (!s_sc.fp_done) vk_sc_fingerprint(words, max_words);
+        const vk_sc_key k = vk_sc_spv_key(VK_SC_VERSION, s_sc.fp, s_sc.frag_rcp, stage, hlsl);
+        cached = vk_sc_spv_path(path, sizeof path, s_sc.dir, k) == 0;
+    }
+    if (cached) {
+        size_t got = 0;
+        const int rd = vk_sc_read_into(path, words, (size_t)max_words * 4u, &got);
+        if (rd == 0 && vk_sc_spirv_ok(words, got)) {
+            *out_words = (u32)(got / 4u);
+            *from_disk = 1;
+            s_sc.hits++;
+            return 0;
+        }
+        s_sc.misses++;
+        if (rd == 0 && ++s_sc.rejected <= 4u)
+            VK_LOG("shader cache: %s is not valid SPIR-V -- translating again\n", path);
+    }
+    const u64 t0 = ps3_ft_now();
+    const int rc = rsx_hlsl_to_spirv(hlsl, stage, words, max_words, out_words, log, log_size);
+    s_sc.spv_ns += ps3_ft_now() - t0;
+    if (cached && rc == 0) {
+        const size_t bytes = (size_t)*out_words * 4u;
+        if (!vk_sc_spirv_ok(words, bytes)) {
+            if (!(s_sc.warned & 2u)) VK_LOG("shader cache: glslang wrote SPIR-V the cache's check refuses -- not stored\n");
+            s_sc.warned |= 2u;
+        } else if (vk_sc_write_file(path, NULL, 0, words, bytes) == 0) {
+            s_sc.stored++;
+        } else {
+            if (!(s_sc.warned & 1u)) VK_LOG("shader cache: cannot write %s\n", path);
+            s_sc.warned |= 1u;
+        }
+    }
+    return rc;
+}
+
+static void vk_sc_stats(const char* when)
+{
+    VK_LOG("shader cache: %llu hits, %llu misses; pipelines: %llu created "
+           "(%s; glslang %.0f ms, vkCreateGraphicsPipelines %.0f ms, "
+           "%llu stored, %llu rejected; pipelines.bin %llu KB, %llu saves %.0f ms)\n",
+           s_sc.hits, s_sc.misses, s_sc.pipes, when,
+           (double)s_sc.spv_ns / 1e6, (double)s_sc.pipe_ns / 1e6, s_sc.stored, s_sc.rejected,
+           (unsigned long long)(s_sc.pc_size / 1024u), s_sc.saves, (double)s_sc.save_ns / 1e6);
+    s_sc.stats_at = s_sc.hits + s_sc.misses + s_sc.pipes;
+}
+
+/* why: 0 periodic, 1 idle, 2 shutdown (the trace's b). */
+static void vk_sc_save_pipelines(u32 why)
+{
+    if (!s_sc.pc) return;
+    const u64 t0 = ps3_ft_now();
+    s_sc.pc_new = 0;
+    s_sc.pc_last_save = t0;
+    u32 kb = 0;
+    size_t n = 0;
+    u8* data = NULL;
+    if (pvkGetPipelineCacheData(s_vk.device, s_sc.pc, &n, NULL) == VK_SUCCESS && n)
+        data = (u8*)malloc(n);
+    if (data && pvkGetPipelineCacheData(s_vk.device, s_sc.pc, &n, data) == VK_SUCCESS) {
+        const u64 h = vk_sc_blob_hash(data, n);
+        if (h != s_sc.pc_hash || (u64)n != s_sc.pc_size) {
+            u8 head[VK_SC_PC_HEADER];
+            char path[VK_SC_PATH];
+            vk_sc_pc_header(head, n, h);
+            if (vk_sc_join(path, sizeof path, s_sc.dir, "pipelines.bin") == 0 &&
+                vk_sc_write_file(path, head, sizeof head, data, n) == 0) {
+                s_sc.pc_hash = h;
+                s_sc.pc_size = (u64)n;
+                kb = (u32)(n / 1024u) + 1u;
+                s_sc.saves++;
+            } else {
+                if (!(s_sc.warned & 1u))
+                    VK_LOG("shader cache: cannot write %s%cpipelines.bin\n", s_sc.dir, VK_SC_SEP);
+                s_sc.warned |= 1u;
+            }
+        }
+    }
+    free(data);
+    const u64 t1 = ps3_ft_now();
+    s_sc.save_ns += t1 - t0;
+    if (PS3_FT_ON()) ps3_ft_span(PS3_FT_COMPILE, 5, kb, why, t0, t1);
+}
+
+static void vk_sc_maybe_stats(const char* when)
+{
+    if (s_sc.stats_all || s_sc.hits + s_sc.misses + s_sc.pipes - s_sc.stats_at >= VK_SC_STATS_EVERY)
+        vk_sc_stats(when);
+}
+
+/* Every vkCreateGraphicsPipelines: one pipeline, through the cache, timed;
+ * `site` is the trace's b (0 engine, 1 guest, 2 fallback, 3 pass). */
+static VkResult vk_sc_create_pipeline(const VkGraphicsPipelineCreateInfo* gci,
+                                      VkPipeline* out, u32 site)
+{
+    const u64 t0 = ps3_ft_now();
+    const VkResult r = pvkCreateGraphicsPipelines(s_vk.device, s_sc.pc, 1, gci, NULL, out);
+    const u64 t1 = ps3_ft_now();
+    if (PS3_FT_ON()) ps3_ft_span(PS3_FT_COMPILE, 3, r == VK_SUCCESS ? 1u : 0u, site, t0, t1);
+    s_sc.pipes++;
+    s_sc.pipe_ns += t1 - t0;
+    if (r == VK_SUCCESS && s_sc.pc) {
+        s_sc.pc_new++;
+        s_sc.pc_last_new = t1;
+        if (s_sc.pc_new >= VK_SC_SAVE_EVERY && t1 - s_sc.pc_last_save >= VK_SC_SAVE_GAP_NS) {
+            vk_sc_save_pipelines(0);
+            vk_sc_maybe_stats("periodic");
+        }
+    }
+    return r;
+}
+
+/* At each present: the tail of a burst of new pipelines, once it has ended. */
+static void vk_sc_tick(void)
+{
+    if (!s_sc.pc_new || ps3_ft_now() - s_sc.pc_last_new < VK_SC_IDLE_NS) return;
+    vk_sc_save_pipelines(1);
+    vk_sc_maybe_stats("idle");
+}
+
+/* After device creation: choose and create the directory, and create the
+ * pipeline cache from pipelines.bin when it belongs to this device. */
+static void vk_sc_open(const char* title)
+{
+    memset(&s_sc, 0, sizeof s_sc);
+    const char* fw = getenv("PS3RECOMP_FRAGCOORD_W");    /* read as rsx_shader_spirv.cpp does */
+    s_sc.frag_rcp = (fw && *fw == 'w') ? 0u : 1u;
+    const char* st = getenv("PS3RECOMP_VK_SHADER_CACHE_STATS");
+    s_sc.stats_all = (st && *st && *st != '0') ? 1 : 0;
+    const char* env = getenv("PS3RECOMP_VK_SHADER_CACHE");
+    if (env && strcmp(env, "0") == 0) {
+        VK_LOG("shader cache: off (PS3RECOMP_VK_SHADER_CACHE=0)\n");
+        return;
+    }
+    if (vk_sc_choose_dir(env, title, s_sc.dir, sizeof s_sc.dir) || vk_sc_make_dirs(s_sc.dir)) {
+        VK_LOG("shader cache: off -- no usable directory (%s); set PS3RECOMP_VK_SHADER_CACHE=<dir>\n",
+               s_sc.dir[0] ? s_sc.dir : "no LOCALAPPDATA/HOME");
+        s_sc.dir[0] = 0;
+        return;
+    }
+    s_sc.on = 1;
+
+    VkPhysicalDeviceProperties p;
+    pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    char path[VK_SC_PATH];
+    size_t size = 0, n = 0;
+    u8* file = vk_sc_join(path, sizeof path, s_sc.dir, "pipelines.bin") == 0
+             ? vk_sc_read_all(path, &size) : NULL;
+    const char* why = "none yet";
+    const u8* data = file ? vk_sc_pc_unwrap(file, size, p.vendorID, p.deviceID,
+                                            p.pipelineCacheUUID, &n, &why) : NULL;
+    VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                     .initialDataSize = data ? n : 0, .pInitialData = data };
+    VkResult r = pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_sc.pc);
+    if (r != VK_SUCCESS && data) {
+        why = "ignored, refused by the driver";
+        data = NULL;
+        ci.initialDataSize = 0;
+        ci.pInitialData = NULL;
+        r = pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_sc.pc);
+    }
+    if (r != VK_SUCCESS) {
+        s_sc.pc = VK_NULL_HANDLE;
+        why = "vkCreatePipelineCache failed: pipelines not cached";
+    }
+    if (data) {                    /* a save of the same bytes is skipped */
+        s_sc.pc_hash = vk_sc_blob_hash(data, n);
+        s_sc.pc_size = (u64)n;
+    }
+    free(file);
+    s_sc.pc_last_save = ps3_ft_now();
+    if (data) VK_LOG("shader cache: %s (pipelines.bin: %llu KB loaded)\n", s_sc.dir,
+                     (unsigned long long)(n / 1024u));
+    else      VK_LOG("shader cache: %s (pipelines.bin: %s)\n", s_sc.dir, why);
+}
+
+/* Before the device goes: the last save, the stats, the cache object. */
+static void vk_sc_close(void)
+{
+    if (s_sc.pc && s_sc.pc_new) vk_sc_save_pipelines(2);
+    if (s_sc.hits + s_sc.misses + s_sc.pipes) vk_sc_stats(s_sc.on ? "shutdown" : "shutdown, cache off");
+    if (s_sc.pc) pvkDestroyPipelineCache(s_vk.device, s_sc.pc, NULL);
+    memset(&s_sc, 0, sizeof s_sc);
+}
+
+/* ---------------------------------------------------------------------------
  * Render pass, framebuffer, pipelines
  * -------------------------------------------------------------------------*/
 static int vk_pick_depth_format(void)
@@ -1101,7 +1737,7 @@ static VkPipeline vk_get_pipeline(int ztest, int zwrite, u32 cmp)
         .pDynamicState = &dy, .layout = s_vk.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    VkResult r = vk_sc_create_pipeline(&gci, &p, 2);
     if (r != VK_SUCCESS) { VK_LOG("vkCreateGraphicsPipelines failed (%d)\n", (int)r); return VK_NULL_HANDLE; }
     s_vk.pipelines[slot] = p;
     return p;
@@ -1292,19 +1928,23 @@ static u32 vk_vtex_mask(const rsx_state* st)
 
 static VkShaderModule vk_guest_module(const char* what, int stage)
 {
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     u32 n = 0;
-    if (rsx_hlsl_to_spirv(s_g.hlsl, stage, s_g.spv, VK_SPV_WORDS, &n,
-                          s_g.log, sizeof s_g.log) != 0) {
-        VK_LOG("%s: %s\n", what, s_g.log);
-        return VK_NULL_HANDLE;
-    }
-    VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                    .codeSize = (size_t)n * 4u, .pCode = s_g.spv };
+    int disk = 0;
     VkShaderModule m = VK_NULL_HANDLE;
-    if (pvkCreateShaderModule(s_vk.device, &ci, NULL, &m) != VK_SUCCESS) {
-        VK_LOG("%s: vkCreateShaderModule failed\n", what);
-        return VK_NULL_HANDLE;
+    if (vk_sc_hlsl_to_spirv(s_g.hlsl, stage, s_g.spv, VK_SPV_WORDS, &n,
+                            s_g.log, sizeof s_g.log, &disk) != 0) {
+        VK_LOG("%s: %s\n", what, s_g.log);
+    } else {
+        VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                        .codeSize = (size_t)n * 4u, .pCode = s_g.spv };
+        if (pvkCreateShaderModule(s_vk.device, &ci, NULL, &m) != VK_SUCCESS) {
+            VK_LOG("%s: vkCreateShaderModule failed\n", what);
+            m = VK_NULL_HANDLE;
+        }
     }
+    if (ft0) ps3_ft_span(PS3_FT_COMPILE, stage == RSX_SHADER_STAGE_VERTEX ? 1u : 2u,
+                         m ? 1u : 0u, disk ? 1u : 0u, ft0, ps3_ft_now());
     return m;
 }
 
@@ -1442,7 +2082,7 @@ static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 c
         .pDynamicState = &dy, .layout = s_g.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    VkResult r = vk_sc_create_pipeline(&gci, &p, 1);
     if (r != VK_SUCCESS) {
         VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
         return VK_NULL_HANDLE;
@@ -2990,15 +3630,21 @@ static VkStencilOpState vk_gcm_stencil_face(u32 func, u32 fail, u32 zfail, u32 z
 
 static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out)
 {
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     u32 words = 0;
-    if (rsx_hlsl_to_spirv(hlsl, stage, s_g.spv, VK_SPV_WORDS, &words, s_g.log, sizeof s_g.log) || !words) {
+    int disk = 0, rc = -1;
+    if (vk_sc_hlsl_to_spirv(hlsl, stage, s_g.spv, VK_SPV_WORDS, &words, s_g.log, sizeof s_g.log,
+                            &disk) || !words) {
         VK_LOG("engine: %s translation failed: %s\n",
                stage == RSX_SHADER_STAGE_VERTEX ? "vertex" : "fragment", s_g.log);
-        return -1;
+    } else {
+        VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                        .codeSize = (size_t)words * 4u, .pCode = s_g.spv };
+        rc = pvkCreateShaderModule(s_vk.device, &ci, NULL, out) == VK_SUCCESS ? 0 : -1;
     }
-    VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                    .codeSize = (size_t)words * 4u, .pCode = s_g.spv };
-    return pvkCreateShaderModule(s_vk.device, &ci, NULL, out) == VK_SUCCESS ? 0 : -1;
+    if (ft0) ps3_ft_span(PS3_FT_COMPILE, stage == RSX_SHADER_STAGE_VERTEX ? 1u : 2u,
+                         rc == 0 ? 1u : 0u, disk ? 1u : 0u, ft0, ps3_ft_now());
+    return rc;
 }
 
 static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
@@ -3143,8 +3789,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = s_g.pipe_layout, .renderPass = rp, .subpass = 0 };
-    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
-                                   &P->variant[topo_idx]) != VK_SUCCESS) {
+    if (vk_sc_create_pipeline(&gci, &P->variant[topo_idx], 0) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
         P->variant[topo_idx] = VK_NULL_HANDLE;
     }
@@ -3799,8 +4444,7 @@ static VkPipeline vk_pass_pipeline(u32 which, const char* glsl, const char* what
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = s_lp.pipe_layout, .renderPass = rp, .subpass = 0 };
-    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
-                                   &s_lp.pipe[which]) != VK_SUCCESS) {
+    if (vk_sc_create_pipeline(&gci, &s_lp.pipe[which], 3) != VK_SUCCESS) {
         VK_LOG("engine: %s pipeline failed\n", what);
         s_lp.pipe[which] = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;
@@ -4279,6 +4923,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed && vk_load_wsi_device_functions())
         vk_window_drop("the driver has no swapchain functions");
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
+    vk_sc_open(title);               /* the shader + pipeline disk caches */
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -4399,6 +5044,7 @@ void rsx_vulkan_backend_shutdown(void)
         vk_destroy_buffer(&s_vk.readback);
         if (s_vk.fence) pvkDestroyFence(s_vk.device, s_vk.fence, NULL);
         if (s_vk.pool)  pvkDestroyCommandPool(s_vk.device, s_vk.pool, NULL);
+        vk_sc_close();
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
@@ -4423,6 +5069,7 @@ void rsx_vulkan_backend_present(void)
 {
     if (s_vk.eng_active) rsx_draw_engine_present();
     else                 vk_cb_present(&s_vk, 0);
+    vk_sc_tick();                    /* save the pipeline cache once a burst ends */
 }
 
 u32 rsx_vulkan_backend_debug_color(void) { return s_vk.clear_argb; }
