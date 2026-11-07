@@ -3276,6 +3276,27 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr };
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
+    /* PS3_SC_BT_LR=<hex>[,<hex>...]: dump the guest stack (and the thread's
+     * recent indirect calls) the first 4 times a syscall is made from one of
+     * these call sites (guest lr at entry). For call sites reached only
+     * through vtables, where the static caller walk ends at "called through a
+     * pointer": the live chain names the object and the path that got there. */
+    { static std::atomic<int> s_bt_n = -1; static uint32_t s_bt_lr[8]; static std::atomic<int> s_bt_hits[8];
+      if (s_bt_n < 0) { int n = 0; const char* e = getenv("PS3_SC_BT_LR");
+                        for (const char* p = e; p && *p && n < 8;) {
+                            char* q; uint32_t v = (uint32_t)strtoul(p, &q, 16);
+                            if (q == p) break;
+                            s_bt_lr[n++] = v; p = *q == ',' ? q + 1 : q; }
+                        s_bt_n = n; }
+      for (int i = 0; i < s_bt_n; i++)
+          if ((uint32_t)ctx->lr == s_bt_lr[i] && s_bt_hits[i].fetch_add(1) < 4) {
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              extern void ppu_dump_bctrl_ring(uint32_t, const char*);
+              char tag[64];
+              snprintf(tag, sizeof tag, "sc%u@%08X tid=%u", (unsigned)num, s_bt_lr[i], (unsigned)ctx->thread_id);
+              ppu_dump_guest_stack(ctx, tag);
+              ppu_dump_bctrl_ring((uint32_t)ctx->thread_id, tag);
+          } }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */

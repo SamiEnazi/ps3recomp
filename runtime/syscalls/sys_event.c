@@ -168,8 +168,10 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     q->tail     = 0;
     q->count    = 0;
     q->type     = SYS_PPU_QUEUE;
-    fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
-            slot + 1, (unsigned long long)key, size);
+    /* id_out names the owner: libsre's cellSpursEventFlagAttachLv2EventQueue
+     * passes &eventFlag->eventQueueId, so this line locates the flag struct. */
+    fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d id_out=0x%08X lr=0x%08X\n",
+            slot + 1, (unsigned long long)key, size, id_out_addr, (uint32_t)ctx->lr);
 
     if (attr_addr != 0) {
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
