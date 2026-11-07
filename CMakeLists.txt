@@ -236,6 +236,41 @@ if(PS3RECOMP_RSX_VULKAN)
         endif()
         find_package(glslang CONFIG QUIET)
     endif()
+    # The Vulkan backend's in-game overlay -- performance HUD and settings menu
+    # (libs/video/vk_overlay.cpp) -- on Dear ImGui (third_party/imgui, v1.92.9b,
+    # MIT): the core, its Vulkan renderer (entry points loaded at run time like
+    # the backend's: IMGUI_IMPL_VULKAN_NO_PROTOTYPES) and its SDL2 platform side.
+    set(PS3_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui")
+    set(PS3_VK_OVERLAY_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_overlay.cpp"
+        "${PS3_IMGUI_DIR}/imgui.cpp"
+        "${PS3_IMGUI_DIR}/imgui_draw.cpp"
+        "${PS3_IMGUI_DIR}/imgui_tables.cpp"
+        "${PS3_IMGUI_DIR}/imgui_widgets.cpp"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_sdl2.cpp")
+    target_sources(ps3recomp_runtime PRIVATE ${PS3_VK_OVERLAY_SOURCES})
+    # The include path only for these files (the folder holds a VERSION.txt
+    # and other names that must not shadow system headers elsewhere).
+    set_source_files_properties(${PS3_VK_OVERLAY_SOURCES}
+        PROPERTIES INCLUDE_DIRECTORIES "${PS3_IMGUI_DIR}")
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_overlay.cpp"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp"
+        PROPERTIES COMPILE_DEFINITIONS "IMGUI_IMPL_VULKAN_NO_PROTOTYPES")
+    if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # SDL_endian.h defines _m_prefetch itself unless this guard is set,
+        # and clang-cl in C++ rejects a definition of the builtin.
+        set_property(SOURCE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_overlay.cpp"
+            "${PS3_IMGUI_DIR}/backends/imgui_impl_sdl2.cpp"
+            APPEND PROPERTY COMPILE_DEFINITIONS "__PRFCHWINTRIN_H")
+    endif()
+    set_source_files_properties(
+        "${PS3_IMGUI_DIR}/imgui.cpp" "${PS3_IMGUI_DIR}/imgui_draw.cpp"
+        "${PS3_IMGUI_DIR}/imgui_tables.cpp" "${PS3_IMGUI_DIR}/imgui_widgets.cpp"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp" "${PS3_IMGUI_DIR}/backends/imgui_impl_sdl2.cpp"
+        PROPERTIES COMPILE_OPTIONS "-w")   # upstream code
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
 endif()
 
