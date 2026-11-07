@@ -557,6 +557,25 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #define SPU_BSWAP32(x) __builtin_bswap32(x)
 #define SPU_LS_FAST 1
 #endif
+/* SPU_LS_VEC (upstream sp00nznet/ps3recomp #637): the quadword as one 16-byte
+ * load or store and one pshufb that byte-swaps each word. The four 32-bit
+ * stores of the scalar form, read back by the next 16-byte load of the
+ * register (the AVX2 helpers load u128 whole), cannot be store-forwarded: a
+ * stall on every lqd/lqx/stqd of lifted code. Same per-lane _u32 values
+ * (tests/test_spu_ls_vec.c). Define SPU_LS_VEC=0 to keep the scalar form. */
+#if !defined(SPU_LS_VEC) && !defined(__ARM_NEON) && defined(__SSSE3__) && \
+    (defined(__x86_64__) || defined(_M_X64))
+#define SPU_LS_VEC 1
+#endif
+#if defined(SPU_LS_VEC) && SPU_LS_VEC
+#include <tmmintrin.h>
+static inline __m128i spu_ls_bswap_words(__m128i x) {
+    return _mm_shuffle_epi8(x, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+}
+#else
+#undef SPU_LS_VEC
+#define SPU_LS_VEC 0
+#endif
 
 /* Debug probes of spu_ls_read128, out of line: inlined they kept every LS
  * load a real call (~10% of GH3's FMOD mixer task). g_spu_ls_probe is -1
@@ -627,7 +646,9 @@ static inline __attribute__((always_inline)) u128 spu_ls_read128(const spu_conte
     }
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
-#if SPU_LS_FAST
+#if SPU_LS_VEC
+    _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)p)));
+#elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
     memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
@@ -709,7 +730,9 @@ static inline __attribute__((always_inline)) void spu_ls_write128(spu_context* c
      * command (commandNum==5) names the code buffer set. */
     if (__builtin_expect(g_spu_ls_dbg != 0, 0) && lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
         spu_ls_write_probe_pre(ctx, lsa, val);
-#if SPU_LS_FAST
+#if SPU_LS_VEC
+    _mm_storeu_si128((__m128i*)p, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8)));
+#elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
     memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
