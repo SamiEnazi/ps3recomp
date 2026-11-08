@@ -364,6 +364,10 @@ static int vk_fif_busy(void)
 {
     if (s_fif <= 1) return 0;
     const u32 o = s_fif_cur ^ 1u;
+#ifndef VK_TQ_NO_ASYNC_PRESENT
+    /* PS3RECOMP_VK_PRESENT_ASYNC: its submit may still be in the ring */
+    if (s_fif_pending[o] && __atomic_load_n(&s_tq_pres_done, __ATOMIC_ACQUIRE) < s_tq_pres_sent) return 1;
+#endif
     return s_fif_pending[o] && pvkGetFenceStatus(s_vk.device, s_fif_fence[o]) != VK_SUCCESS;
 }
 /* wait for the other slot's frame (its cleanup stays for its turn) */
@@ -371,6 +375,9 @@ static void vk_fif_wait_other(void)
 {
     if (s_fif <= 1) return;
     const u32 o = s_fif_cur ^ 1u;
+#ifndef VK_TQ_NO_ASYNC_PRESENT
+    if (s_fif_pending[o]) vk_tq_present_wait(s_tq_pres_sent);   /* submitted before it is waited for */
+#endif
     if (s_fif_pending[o]) pvkWaitForFences(s_vk.device, 1, &s_fif_fence[o], VK_TRUE, UINT64_MAX);
 }
 
@@ -3310,6 +3317,7 @@ static int vk_window_ready(void)
     static unsigned long long tries;
     if (++tries % 15u) return 0;            /* look a few times a second, not every frame */
     if (s_vk.window && (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED)) return 0;
+    vk_tq_sync();                           /* PS3RECOMP_VK_PRESENT_ASYNC: no present still queued */
     pvkDeviceWaitIdle(s_vk.device);
     const int r = vk_create_swapchain();
     if (r == VK_SC_NO_AREA) return 0;
@@ -3470,11 +3478,159 @@ static void vk_rdoc_poll(void)
 
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window_body(void);
+#ifndef VK_TQ_NO_ASYNC_PRESENT
+/* PS3RECOMP_VK_PRESENT_ASYNC (rsx3, default on; =0 = the present below, on this
+ * thread): the RSX thread ends the frame's pass, waits for the frame cap's beat
+ * and queues one TQ_PRESENT record; the recording worker, in ring order, records
+ * postfx + the blit + the HUD into the frame's command buffer, submits it and
+ * presents. The RSX thread goes straight on with the next frame (the other
+ * slot): it no longer waits for the worker to drain the frame, nor records the
+ * postfx/overlay passes, nor pays vkQueueSubmit/vkQueuePresentKHR (and the
+ * capture/overlay hooks other programs put into the present).
+ *  - Order: the record is behind every command of its frame; a later submit
+ *    (readback, label) drains the ring, so the queue sees the same order.
+ *  - The other slot's fence is waited for only after its present was submitted
+ *    (vk_tq_present_wait; vk_fif_busy / vk_fif_wait_other too).
+ *  - The swapchain belongs to the worker while presents are queued; anything
+ *    else that touches it drains first (vk_window_ready).
+ *  - The PC menu (settings appliers may touch the window) and the GPU profiler
+ *    and RenderDoc take the synchronous path. */
+static int vk_present_async_ok(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3RECOMP_VK_PRESENT_ASYNC");
+        on = !(e && e[0] == '0') && !getenv("PS3RECOMP_VK_RDOC_AT") && !getenv("PS3RECOMP_VK_RDOC_TRIGGER");
+        fprintf(stderr, "[RSX vulkan] present on the recording thread: %s (PS3RECOMP_VK_PRESENT_ASYNC)\n",
+                on ? "on" : "off");
+    }
+    return on && s_tq.running && !s_tq.direct && vk_fif_on() && s_gp.on <= 0 && !vk_overlay_menu_open();
+}
+/* The worker's half (also run on the RSX thread, direct, when no record fits). */
+static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore acq,
+                              VkImage cimg, VkImageView cview, u32 cw, u32 ch)
+{
+    int sc = s_vk.windowed && s_vk.swapchain && !s_sc_minimized;
+    if (sc && s_present_dirty) {                /* [overlay] present mode / fullscreen changed live */
+        s_present_dirty = 0;
+        vk_swapchain_lost();
+        sc = s_vk.windowed && s_vk.swapchain && !s_sc_minimized;
+    }
+    u32 idx = 0;
+    if (sc) {
+        const VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX, acq, VK_NULL_HANDLE, &idx);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); sc = 0; }
+        else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); sc = 0; }
+    }
+    if (sc) {
+        VkImage pf_img = cimg;
+        uint32_t pf_w = cw, pf_h = ch;
+        if (!vk_postfx_apply(cmd, cimg, cview, cw, ch, s_vk.sc_extent.width, s_vk.sc_extent.height,
+                             &pf_img, &pf_w, &pf_h)) {
+            pf_img = cimg; pf_w = cw; pf_h = ch;
+        }
+        VkImageMemoryBarrier b = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = s_vk.sc_images[idx], .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        pvkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, 0, NULL, 0, NULL, 1, &b);
+        VkImageBlit blit = {
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .srcOffsets = { { 0, 0, 0 }, { (int32_t)pf_w, (int32_t)pf_h, 1 } },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
+        };
+        pvkCmdBlitImage(cmd, pf_img, VK_IMAGE_LAYOUT_GENERAL, s_vk.sc_images[idx],
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = 0;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        g_vk_overlay_on_worker = t_tq_worker;
+        const int ov = g_vk_overlay_active &&
+            vk_overlay_draw(cmd, idx, s_vk.sc_images[idx], s_vk.sc_extent, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        g_vk_overlay_on_worker = 0;
+        if (!ov)
+            pvkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                  0, 0, NULL, 0, NULL, 1, &b);
+    }
+    /* Not shown (no swapchain, minimized, acquire failed): the frame is still
+     * submitted -- its targets are read by later frames. */
+    if (pvkEndCommandBuffer(cmd) != VK_SUCCESS) VK_LOG("vkEndCommandBuffer failed\n");
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd };
+    if (sc) {
+        si.waitSemaphoreCount = 1; si.pWaitSemaphores = &acq; si.pWaitDstStageMask = &wait_stage;
+        si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s_vk.sc_done[idx];
+    }
+    pvkResetFences(s_vk.device, 1, &fence);
+    if (pvkQueueSubmit(s_vk.queue, 1, &si, fence) != VK_SUCCESS) {
+        VK_LOG("vkQueueSubmit (window, async) failed\n");
+        /* nothing in flight: let the slot's wait find the fence signalled */
+        VkSubmitInfo none = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        pvkQueueSubmit(s_vk.queue, 1, &none, fence);
+        return;
+    }
+    if (!sc) return;
+    VkPresentInfoKHR pi = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
+        .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
+    };
+    const VkResult r = pvkQueuePresentKHR(s_vk.queue, &pi);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
+    else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
+}
+static void vk_present_exec(const tq_present_rec* r)
+{
+    vk_present_finish(r->h.cb, r->fence, r->acq, r->img, r->view, r->w, r->ht);
+}
+static void vk_present_async(void)
+{
+    if (!s_vk.windowed || !s_vk.swapchain || s_sc_minimized) return;   /* as the body: the frame stays open */
+    const int was_batch = s_batch.recording;
+    if (was_batch) vk_flush_note(__LINE__, s_batch.draws);
+    if (vk_begin()) return;                 /* batched: ends the open pass */
+    s_batch.recording = 0;
+    vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_frame_limit();                       /* the cap's beat, before the frame goes to the worker */
+    tq_present_rec* p = (tq_present_rec*)(void*)tq_alloc(TQ_PRESENT, sizeof(tq_present_rec), s_vk.cmd);
+    if (p) {
+        p->fence = s_vk.fence; p->acq = s_vk.sem_acquire;
+        p->img = s_vk.color.img; p->view = s_vk.color.view; p->w = s_vk.width; p->ht = s_vk.height;
+        p->seq = ++s_tq_pres_sent;
+        tq_commit((const u8*)p);
+    } else {
+        vk_tq_sync();
+        const int was = s_tq.direct;
+        s_tq.direct = 1;
+        vk_present_finish(s_vk.cmd, s_vk.fence, s_vk.sem_acquire, s_vk.color.img, s_vk.color.view,
+                          s_vk.width, s_vk.height);
+        s_tq.direct = was;
+    }
+    s_fif_pending[s_fif_cur] = 1;           /* waited for when the slot comes round */
+    /* The slot about to be reused: its present (the one before) must have been
+     * submitted before its fence means anything. Its frees need no drain: the
+     * queued records name only this frame's objects. */
+    vk_tq_present_wait(s_tq_pres_sent - (p ? 1u : 0u));
+    s_tq_nodrain = 1;
+    vk_fif_advance();
+    s_tq_nodrain = 0;
+}
+#endif
 /* The present records through postfx's and the overlay's own entry points (and
  * RenderDoc brackets it): with threaded recording, drain the worker and record
  * directly until it is done. */
 static void vk_present_window(void)
 {
+#ifndef VK_TQ_NO_ASYNC_PRESENT
+    if (vk_present_async_ok()) { vk_present_async(); return; }
+#endif
     vk_tq_sync();
     const int was = s_tq.direct;
     s_tq.direct = 1;
@@ -4335,12 +4491,22 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
     (void)user;
     vk_eng_obj* t = vk_eng_get(surface, VK_ENG_COLOR);
     if (!t) return 0;
+    /* (rsx3) a direct-mapped memo in front of the scan over every object (~1% of
+     * the RSX thread in the city): checked against the object, so a released or
+     * reused slot just falls through to the scan */
+    static u32 memo[256];
+    const u32 ms = (surface * 0x9E3779B1u ^ remap * 0x85EBCA77u ^ rsx_format) >> 24;
+    { const u32 i = memo[ms];
+      if (i && i < VK_ENG_MAX_OBJ && s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
+          s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format)
+          return i; }
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
         if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == surface &&
             s_eobj[i].remap == remap && s_eobj[i].rsx_fmt == rsx_format)
-            return i;
+            { memo[ms] = i; return i; }
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
+    memo[ms] = hd;
     vk_eng_obj* o = &s_eobj[hd];
     if (vk_eng_make_view(t->im.img, t->fmt, 1, 1, vk_remap(remap, rsx_format), &o->im.view)) {
         memset(o, 0, sizeof *o); return 0;
@@ -5155,8 +5321,11 @@ static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, V
     u32 key[RSX_BE_MAX_COLOR_TARGETS + 1] = { 0 };
     for (u32 i = 0; i < n; i++) key[i] = rt[i];
     key[RSX_BE_MAX_COLOR_TARGETS] = dkey;
+    /* (rsx3) consecutive draws nearly always share their targets: the last hit first */
+    static u32 last;
+    if (last < s_e2.fb_count && !memcmp(s_e2.fb[last].key, key, sizeof key)) return s_e2.fb[last].fb;
     for (u32 i = 0; i < s_e2.fb_count; i++)
-        if (!memcmp(s_e2.fb[i].key, key, sizeof key)) return s_e2.fb[i].fb;
+        if (!memcmp(s_e2.fb[i].key, key, sizeof key)) { last = i; return s_e2.fb[i].fb; }
     if (s_e2.fb_count >= VK_ENG_FB_CACHE) vk_eng_drop_framebuffers();
     VkImageView views[RSX_BE_MAX_COLOR_TARGETS + 1];
     for (u32 i = 0; i < n; i++) views[i] = s_eobj[rt[i]].im.view;

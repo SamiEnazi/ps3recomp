@@ -2199,12 +2199,70 @@ static void gcm_rsx_process_fifo_unlocked(void)
           fflush(stderr);
       } }
 
+    /* GCM_FIFO_FAST (rsx3, default 1; 0 = every header the general way below):
+     * a run of plain method headers -- what nearly all of a frame is -- in one
+     * tight loop over the current 1 MB IO page: one translation per page, the
+     * word read inline, and only the tests that can fire for such a header (the
+     * burst test's switches are read once per drain). Anything else (a jump,
+     * call, return, flip word, semaphore, a method the walker acts on, a header
+     * crossing the page, a park being left) ends the run and goes through the
+     * general walk exactly as before. Same calls, same order, same counters. */
+    static int fast_sw = -1, fast_tc = -1, fast_live = -1, fast_eng = -1, fast_burst = -1;
+    if (fast_sw < 0) {
+        const char* e = getenv("GCM_FIFO_FAST"); fast_sw = !(e && *e == '0');
+        const char* t = getenv("TCONST_FIFO"); fast_tc = t ? atoi(t) : 0;
+        const char* b = getenv("GCM_FIFO_BURST"); fast_burst = !(b && *b == '0');
+        fprintf(stderr, "[cellGcmSys] FIFO fast loop: %s (GCM_FIFO_FAST)\n", fast_sw ? "on" : "off");
+    }
+    if (fast_live < 0) fast_live = rsx_live_draw_enabled();
+    if (fast_eng < 0) fast_eng = rsx_draw_engine_enabled();
+    const int fast = fast_sw && !fast_tc && fast_burst && !gcm_fifo_dbg() && vm_inline_ok &&
+                     !fast_live && fast_eng && gcm_lean_state();
+    const int fast_s1 = !gcm_subch1_2d();
     int budget = 0x100000;                    /* words per tick cap */
     /* GCM_DRAINDBG also reports WHY each pass stopped. A drain that ends far
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
     while (s_fifo_getoff != put && budget-- > 0) {
+        if (fast && !s_park_off) {
+            u32 g = s_fifo_getoff;
+            const u32 pg = g >> 20;
+            const u32 eag = gcm_io2ea(g);
+            int done = 0;
+            if (eag) {
+                extern u8* vm_base;
+                const u8* hb = vm_base + (eag - (g & 0xFFFFFu));   /* the IO page's first byte */
+                for (;;) {
+                    const u32 w = __builtin_bswap32(__atomic_load_n((const u32*)(hb + (g & 0xFFFFFu)), __ATOMIC_RELAXED));
+                    const u32 type = w >> 29;
+                    if ((type != 0 && type != 2) || (w & 3u) || w == 0x00020000u ||
+                        (w & 0xFFFF0000u) == 0xFEAD0000u) break;
+                    const u32 count = (w >> 18) & 0x7FFu, method = w & 0x1FFCu, subch = (w >> 13) & 7u;
+                    if (count) {   /* (a count-0 header is a plain skip in the general walk too) */
+                        if (!(subch == 0 || (subch == 1 && fast_s1))) break;
+                        if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) break;
+                        const u32 hi = type == 0 ? method + (count - 1u) * 4u : method;
+                        if (hi > 0x1FFCu || (method <= 0x0050u && hi >= 0x0050u) ||
+                            (method <= 0x1800u && hi >= 0x1800u) || (method <= 0x1D74u && hi >= 0x1D6Cu)) break;
+                        if (((g + 4u) >> 20) != pg || ((g + count * 4u) >> 20) != pg) break;
+                    }
+                    if (g < put) s_last_ring_off = g + 4;
+                    s_tr_off[s_tr_i % GCM_TRACE_N] = g;
+                    s_tr_w[s_tr_i % GCM_TRACE_N] = w;
+                    s_tr_i++;
+                    if (count)
+                        rsx_draw_engine_burst((subch << 13) | method, type == 0,
+                                              (const u32*)(hb + ((g + 4u) & 0xFFFFFu)), count);
+                    s_frame_bytes += 4 + count * 4; s_walk_bytes += 4 + count * 4;
+                    g += 4 + count * 4;
+                    s_fifo_getoff = g;
+                    done = 1;
+                    if (g == put || (g >> 20) != pg || budget-- <= 0) break;
+                }
+            }
+            if (done) continue;
+        }
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             /* get is sitting on an IO offset with no mapping -- the title

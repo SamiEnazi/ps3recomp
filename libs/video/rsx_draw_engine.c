@@ -3129,6 +3129,33 @@ typedef struct {
 #define ENG_VC_BUDGET (512ull << 20)
 static eng_vc_entry s_vc[ENG_VC_SIZE];
 static u32 s_vc_cursor;
+/* PS3RECOMP_ENG_PREFETCH (rsx3, default 1; 0 = off): a frame draws the same
+ * objects in the same order as the frame before, so the cache entry the next
+ * draw will probe is, nearly always, the one that followed this one last time.
+ * Each table keeps that successor per entry (a parallel array: the entries
+ * stay 64 bytes) and prefetches it while this draw is still being processed --
+ * the probes of the 4 MB vertex and 1 MB index tables were cache misses, ~4.5%
+ * of the RSX thread in the city. Only a hint: a wrong or stale successor (the
+ * tables are rebuilt on a prune) costs one useless prefetch. */
+static u32 s_vc_next[ENG_VC_SIZE], s_vc_prev;
+static int s_prefetch_on = -1;
+static inline void eng_cache_predict(const void* table, size_t esz, u32* next, u32* prev, u32 idx)
+{
+    if (__builtin_expect(s_prefetch_on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_PREFETCH");
+        s_prefetch_on = !(e && e[0] == '0');
+    }
+    if (!s_prefetch_on) return;
+    const u32 me = idx + 1u;
+    if (*prev && *prev != me) next[*prev - 1u] = me;
+    *prev = me;
+    const u32 nx = next[idx];
+    if (nx) {
+        const char* p = (const char*)table + (size_t)(nx - 1u) * esz;
+        __builtin_prefetch(p, 0, 3);
+        __builtin_prefetch(p + esz - 1u, 0, 3);   /* an entry that straddles two lines */
+    }
+}
 
 /* PS3_TOGGLE_FILE can switch it live: the watcher only records the wish, and
  * the RSX thread (the cache's only user) acts on it at its next draw. Off
@@ -3283,6 +3310,7 @@ static eng_vc_entry* eng_vc_probe(const rsx_vertex_layout_plan* layout, u64* con
         }
     }
     if (!e) return NULL;
+    eng_cache_predict(s_vc, sizeof *e, s_vc_next, &s_vc_prev, (u32)(e - s_vc));
     if (e->skip_until > g.frames) { ds_vc_skip++; return NULL; }
     /* Hash the union of the attribute spans: interleaved attributes share one. */
     for (u32 i = 1; i < nr; i++)            /* insertion sort by start */
@@ -3373,6 +3401,7 @@ typedef struct {
 #define ENG_IC_SIZE   16384u
 #define ENG_IC_BUDGET (128ull << 20)
 static eng_ic_entry s_ic[ENG_IC_SIZE];
+static u32 s_ic_next[ENG_IC_SIZE], s_ic_prev;   /* PS3RECOMP_ENG_PREFETCH (eng_cache_predict) */
 static int s_ic_want = -1, s_ic_applied = -2;
 /* The current draw: the entry its key found (and the content it hashed to),
  * and whether the index work was skipped for it. */
@@ -3458,6 +3487,7 @@ static eng_ic_entry* eng_ic_probe(const rsx_dsp_index_array* ia, u32 ia_loc, int
         }
     }
     if (!e) return NULL;
+    eng_cache_predict(s_ic, sizeof *e, s_ic_next, &s_ic_prev, (u32)(e - s_ic));
     /* The raw indices' hash -- or, rsx_wtrack, the one they had when their
      * pages were armed, while those stay unwritten. */
     const int wt = rsx_wt_mode();

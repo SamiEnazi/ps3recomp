@@ -41,7 +41,7 @@ enum {
     TQ_WRAP = 0, TQ_BARRIER, TQ_CLEARC, TQ_CLEARDS, TQ_CI2B, TQ_CB2I, TQ_BEGINRP, TQ_ENDRP,
     TQ_BINDPIPE, TQ_BINDVB, TQ_BINDDS, TQ_PUSHC, TQ_VIEWPORT, TQ_SCISSOR, TQ_DRAW, TQ_SREF,
     TQ_BINDIB, TQ_DRAWIDX, TQ_DBIAS, TQ_BLIT, TQ_COPYIMG, TQ_RESETQ, TQ_TIMESTAMP,
-    TQ_BEGINCB, TQ_ENDCB, TQ_RESETCB, TQ_UPDDS, TQ_NOPS
+    TQ_BEGINCB, TQ_ENDCB, TQ_RESETCB, TQ_UPDDS, TQ_PRESENT, TQ_NOPS
 };
 
 typedef struct { u32 op, size; VkCommandBuffer cb; } tq_hdr;   /* size: whole record, 8-aligned */
@@ -60,6 +60,17 @@ static __declspec(align(64)) volatile u64  s_tq_w;     /* published write positi
 static __declspec(align(64)) volatile u64  s_tq_r;     /* consumed position (worker) */
 static __declspec(align(64)) volatile LONG s_tq_sleep; /* worker is (about to be) asleep */
 static volatile LONG s_tq_quit;
+/* PS3RECOMP_VK_PRESENT_ASYNC (rsx3): the frame's present -- postfx, the overlay,
+ * the submit and vkQueuePresentKHR -- is one more record in the ring, run by the
+ * worker. The worker's own calls through the thunks go straight to the driver
+ * (t_tq_worker), and a drain asked for on the worker is a no-op. */
+static __declspec(thread) int t_tq_worker;
+static int s_tq_nodrain;                                  /* producer: the next drains are not needed */
+static u64 s_tq_pres_sent;                                /* producer: presents queued */
+static __declspec(align(64)) volatile u64 s_tq_pres_done; /* worker: presents submitted */
+typedef struct { tq_hdr h; VkFence fence; VkSemaphore acq;
+                 VkImage img; VkImageView view; u32 w, ht; u64 seq; } tq_present_rec;
+static void vk_present_exec(const tq_present_rec* r);    /* rsx_vulkan_backend.c */
 
 /* The real entry points (the worker's). */
 #define TQ_FNS(X) \
@@ -80,6 +91,7 @@ static void tq_exec(const u8* p);
 static DWORD WINAPI tq_worker(LPVOID arg)
 {
     (void)arg;
+    t_tq_worker = 1;
     u64 r = s_tq_r;
     for (;;) {
         u64 w = __atomic_load_n(&s_tq_w, __ATOMIC_ACQUIRE);
@@ -120,7 +132,7 @@ static void tq_wake(void)
 /* Make every recorded call reach the driver before returning. */
 static void vk_tq_sync(void)
 {
-    if (!s_tq.running) return;
+    if (!s_tq.running || t_tq_worker || s_tq_nodrain) return;
     const u64 w = __atomic_load_n(&s_tq_w, __ATOMIC_ACQUIRE);
     if (__atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) == w) return;
     s_tq.n_syncs++;
@@ -138,10 +150,23 @@ static void vk_tq_sync(void)
     }
 }
 
+/* Producer: until the worker has submitted present number `seq` (and every
+ * record before it). */
+static void vk_tq_present_wait(u64 seq)
+{
+    if (!s_tq.running || __atomic_load_n(&s_tq_pres_done, __ATOMIC_ACQUIRE) >= seq) return;
+    WakeByAddressSingle((PVOID)&s_tq_w);
+    u32 spins = 0;
+    while (__atomic_load_n(&s_tq_pres_done, __ATOMIC_ACQUIRE) < seq) {
+        _mm_pause();
+        if (++spins > 20000u) { SwitchToThread(); spins = 0; WakeByAddressSingle((PVOID)&s_tq_w); }
+    }
+}
+
 /* Room for one record of `bytes` (header included); NULL: record it directly. */
 static u8* tq_alloc(u32 op, u32 bytes, VkCommandBuffer cb)
 {
-    if (!s_tq.running || s_tq.direct) return NULL;
+    if (!s_tq.running || s_tq.direct || t_tq_worker) return NULL;
     bytes = (bytes + 7u) & ~7u;
     if (bytes > TQ_RING_BYTES / 8u) { vk_tq_sync(); return NULL; }
     u64 pos = s_tq.wlocal;
@@ -274,6 +299,11 @@ static void tq_exec(const u8* p)
             else { w[k].pBufferInfo = (const VkDescriptorBufferInfo*)q; q += TQ_ARR(VkDescriptorBufferInfo, w[k].descriptorCount); }
         }
         rvkUpdateDescriptorSets(r->dev, r->nw, w, 0, NULL);
+        break; }
+    case TQ_PRESENT: {
+        const tq_present_rec* r = (const tq_present_rec*)p;
+        vk_present_exec(r);
+        __atomic_store_n(&s_tq_pres_done, r->seq, __ATOMIC_RELEASE);
         break; }
     default: break;
     }
@@ -615,6 +645,7 @@ static void vk_tq_install(void) {}
 static void vk_tq_stop(void) {}
 static void vk_tq_sync(void) {}
 static struct { int on, running, direct; } s_tq;
+#define VK_TQ_NO_ASYNC_PRESENT 1
 #endif
 
 #endif /* PS3RECOMP_VK_THREADED_REC_H */

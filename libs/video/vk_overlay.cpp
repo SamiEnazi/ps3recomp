@@ -79,6 +79,10 @@ extern volatile uint32_t g_pad_overlay_nav, g_pad_overlay_nav2, g_pad_overlay_ra
 }
 
 volatile int g_vk_overlay_active;
+volatile int g_vk_overlay_on_worker;   /* PS3RECOMP_VK_PRESENT_ASYNC: the recording thread is drawing */
+/* ImGui's context: the HUD may be built on the recording thread while the
+ * RSX thread's event pump opens or closes the menu (set_open touches io). */
+static std::recursive_mutex s_imgui_lock;
 
 /* CELL_PAD_CTRL_* (libs/input/cellPad.h) */
 enum {
@@ -384,9 +388,11 @@ static void set_open(int o);
 extern "C" int vk_overlay_open_menu(void) { if (!s_enabled) return 0; set_open(1); return 1; }
 
 /* ---- the menu opening and closing ------------------------------------------ */
+extern "C" int vk_overlay_menu_open(void) { return s_enabled && s_open; }
 static void set_open(int o)
 {
     if (!s_enabled || (o != 0) == (s_open != 0)) return;
+    std::lock_guard<std::recursive_mutex> il(s_imgui_lock);
     s_open = o;
     g_pad_overlay_open = o;          /* cellPad: every port reads neutral while open */
     if (o) {
@@ -1584,6 +1590,8 @@ extern "C" int vk_overlay_draw(VkCommandBuffer cmd, uint32_t index, VkImage imag
                                VkImageLayout layout, VkPipelineStageFlags stage, VkAccessFlags access)
 {
     if (!s_enabled || !s_color_ok || s_failed || !cmd || !ext.width || !ext.height) return 0;
+    if (s_open && g_vk_overlay_on_worker) return 0;   /* the menu: on the RSX thread only (next frame) */
+    std::lock_guard<std::recursive_mutex> il(s_imgui_lock);
     const double now = now_s();
     if (s_last_present > 0) {
         s_ft[s_ft_i] = (float)((now - s_last_present) * 1000.0);
