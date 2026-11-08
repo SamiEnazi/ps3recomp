@@ -4046,6 +4046,11 @@ extern "C" uint32_t lv2_prx_boot_liblv2(void);   /* runtime/syscalls/lv2_prx.c *
 
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
+    /* Decide the memory-diagnostics gate (vm_inline_ok) before any guest code
+     * runs: a PPU_MM lift copies it into each function's ppu_mm at entry, and a
+     * function entered before the first out-of-line access (which used to
+     * decide it) would keep the slow path for as long as it runs. */
+    (void)vm_diag();
     /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
      * (stderr); with a redirected block-buffered stdout, printf lines sat in
      * the buffer for minutes and were LOST when the run was killed -- which
