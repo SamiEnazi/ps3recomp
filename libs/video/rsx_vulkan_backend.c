@@ -154,6 +154,9 @@ static u32 s_gp_ops[8];
 #define pvkCmdDrawIndexed(...)            (s_gp_ops[7]++, pvkCmdDrawIndexed(__VA_ARGS__))
 #define pvkCmdDraw(...)                   (s_gp_ops[7]++, pvkCmdDraw(__VA_ARGS__))
 
+/* PS3RECOMP_VK_THREADED: vkCmd* recording on a second thread (vk_threaded_rec.h) */
+#include "vk_threaded_rec.h"
+
 /* ---------------------------------------------------------------------------
  * Backend state
  * -------------------------------------------------------------------------*/
@@ -438,6 +441,7 @@ static int vk_load_device_functions(void)
     if (!(p##name = (PFN_##name)pvkGetDeviceProcAddr(s_vk.device, #name))) \
         { VK_LOG("missing device function " #name "\n"); return -1; }
     VK_DEVICE_FNS(LOAD_D)
+    vk_tq_install();                         /* PS3RECOMP_VK_THREADED=1 */
     return 0;
 }
 
@@ -3268,7 +3272,19 @@ static void vk_rdoc_poll(void)
 #endif
 
 /* Blit the offscreen target into the next swapchain image and present it. */
+static void vk_present_window_body(void);
+/* The present records through postfx's and the overlay's own entry points (and
+ * RenderDoc brackets it): with threaded recording, drain the worker and record
+ * directly until it is done. */
 static void vk_present_window(void)
+{
+    vk_tq_sync();
+    const int was = s_tq.direct;
+    s_tq.direct = 1;
+    vk_present_window_body();
+    s_tq.direct = was;
+}
+static void vk_present_window_body(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain || s_sc_minimized) return;
     if (s_present_dirty) {                  /* [overlay] present mode / fullscreen changed live */
@@ -6583,6 +6599,7 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 static int s_vk_holding;   /* the shutdown hold loop is running: Esc ends it (pump_messages) */
 void rsx_vulkan_backend_shutdown(void)
 {
+    vk_tq_stop();                        /* PS3RECOMP_VK_THREADED: drain, real entry points back */
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }
     rsx_draw_engine_set_backend(NULL);
