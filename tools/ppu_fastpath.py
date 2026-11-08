@@ -1,0 +1,270 @@
+"""Lift-time fast paths for the PPU codegen (ppu2 agent, 2026-11-08).
+
+Each rewrite here has its own switch, read in every lifting worker (the
+workers inherit the environment); all of them off = the lift as before, byte
+for byte. Every replacement computes exactly what the text it replaces
+computes -- only the order and number of tests change.
+
+  PPU_FP_ONE_NAN=1  scalar FP helpers test the RESULT for NaN once, and only
+                    on that (rare) path look at the operands: every IEEE
+                    add/sub/mul/div/fma with a NaN operand gives a NaN, so a
+                    non-NaN result proves no operand was one. Same values,
+                    bit for bit, including which NaN is propagated. stfs of a
+                    value a float holds exactly stores the float's bits.
+                    (tools/test_fp_fast.py: old vs new on 4M operand sets.)
+  PPU_VMX_SSE=1     the hot AltiVec ops on SSE/AVX2 (runtime/ppu/ppu_vmx_sse.h):
+                    float arithmetic, compares, vperm, vsldoi, vspltw, the logic
+                    ops and lvx/stvx as single 16-byte accesses; each computes
+                    what the scalar form computes (tools/test_vmx_sse.c).
+  PPU_VM_RUNS_LOADS=1  ppu_nv_dirty's access runs for loads (see _RUNS_C);
+                    PPU_VM_RUNS_VERIFY=1 = the check build of it.
+"""
+import os
+import re
+
+
+def _on(name: str) -> bool:
+    return os.environ.get(name, "0") not in ("0", "")
+
+
+_FP_BIN_OLD = """\
+static inline double ppu_fp_bin(double a, double b, double r)
+{
+    if (a != a) return ppu_fp_quiet(a);
+    if (b != b) return ppu_fp_quiet(b);
+    if (r != r) return ppu_fp_default_qnan();
+    return r;
+}
+"""
+_FP_BIN_NEW = """\
+static inline double ppu_fp_nan2(double a, double b)
+{
+    if (a != a) return ppu_fp_quiet(a);
+    if (b != b) return ppu_fp_quiet(b);
+    return ppu_fp_default_qnan();
+}
+/* PPU_FP_ONE_NAN: a NaN operand always makes r a NaN, so one test of r
+ * decides; the operands are only looked at on that path (same result). */
+static inline double ppu_fp_bin(double a, double b, double r)
+{
+    if (__builtin_expect(r != r, 0)) return ppu_fp_nan2(a, b);
+    return r;
+}
+"""
+_FMA_OLD = """\
+static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
+{
+    if (a != a) return ppu_fp_quiet(a);
+    if (b != b) return ppu_fp_quiet(b);
+    if (c != c) return ppu_fp_quiet(c);
+    double r = fma(a, c, neg_b ? -b : b);
+    if (r != r) return ppu_fp_default_qnan();
+    return neg_res ? -r : r;
+}
+"""
+_FMA_NEW = """\
+static inline double ppu_fma_nan3(double a, double c, double b)
+{
+    if (a != a) return ppu_fp_quiet(a);
+    if (b != b) return ppu_fp_quiet(b);
+    if (c != c) return ppu_fp_quiet(c);
+    return ppu_fp_default_qnan();
+}
+static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
+{
+    double r = fma(a, c, neg_b ? -b : b);
+    if (__builtin_expect(r != r, 0)) return ppu_fma_nan3(a, c, b);
+    return neg_res ? -r : r;
+}
+"""
+
+
+_VMX_INC = '#include "ppu_vmx.h"   /* exact VMX semantics (runtime/ppu/ppu_vmx.h) */\n'
+
+# PPU_VM_RUNS_LOADS=1 (needs PPU_MM and PPU_NV_LOCALS): ppu_nv_dirty's access runs
+# (soyjxck/ps3recomp, MIT) for LOADS only -- four or more loads at constant offsets
+# from one unchanged register, with no label, call or return between, take one range
+# test (PPU_RUN) instead of one each. The test passes only if every load of the run
+# would have passed its own (inside the snapshot's span, the gcm ref-poll word
+# outside the run), and then each load reads the very address its own fast path
+# would; otherwise each load takes its own path, test and all. Stores keep their
+# per-store coherence protocol (not grouped). PPU_VM_RUNS_VERIFY=1 adds, at every
+# grouped load, a check of exactly that claim (ppu_run_bad reports a violation).
+_RUNS_C = r"""
+/* PPU_VM_RUNS_LOADS (ppu2): one range test per run of loads off one register */
+static inline uint16_t ppu_run_ld16(const uint8_t* p) { uint16_t v;
+    if (!((uintptr_t)p & 1u)) v = __atomic_load_n((const uint16_t*)p, __ATOMIC_RELAXED); else memcpy(&v, p, 2);
+    return __builtin_bswap16(v); }
+static inline uint32_t ppu_run_ld32(const uint8_t* p) { uint32_t v;
+    if (!((uintptr_t)p & 3u)) v = __atomic_load_n((const uint32_t*)p, __ATOMIC_RELAXED); else memcpy(&v, p, 4);
+    return __builtin_bswap32(v); }
+static inline uint64_t ppu_run_ld64(const uint8_t* p) { uint64_t v;
+    if (!((uintptr_t)p & 7u)) v = __atomic_load_n((const uint64_t*)p, __ATOMIC_RELAXED); else memcpy(&v, p, 8);
+    return __builtin_bswap64(v); }
+#define PPU_RUN_VARS(r) const uint8_t* _rp##r = 0; int _rk##r = 0; (void)_rp##r; (void)_rk##r;
+#define PPU_RUN(r, base, lo, len, bits) do { const uint32_t _re = (uint32_t)((uint64_t)(base) + (int64_t)(lo)); \
+    _rk##r = vm_mm_in(&_mm, _re, (uint32_t)(len)) && (uint32_t)(_mm.poll - _re) >= (uint32_t)(len); \
+    _rp##r = _mm.vb + _re; } while (0)
+#ifdef PPU_VM_RUNS_VERIFY
+#ifdef __cplusplus
+extern "C"
+#endif
+void ppu_run_bad(uint32_t ea, uint32_t n);
+static inline const uint8_t* ppu_run_chk(const ppu_mm* m, const uint8_t* p, uint64_t a, uint32_t n) {
+    const uint32_t ea = (uint32_t)a;
+    if (p != m->vb + ea || !vm_mm_in(m, ea, n) || (n == 4 && ea == m->poll)) ppu_run_bad(ea, n);
+    return p; }
+#define PPU_RUN_P(r, o, a, n) ppu_run_chk(&_mm, _rp##r + (o), (a), (n))
+#else
+#define PPU_RUN_P(r, o, a, n) (_rp##r + (o))
+#endif
+#define PPU_RR8(r, o, a)  (_rk##r ? __atomic_load_n(PPU_RUN_P(r, o, a, 1), __ATOMIC_RELAXED) : vm_read8(a))
+#define PPU_RR16(r, o, a) (_rk##r ? ppu_run_ld16(PPU_RUN_P(r, o, a, 2)) : vm_read16(a))
+#define PPU_RR32(r, o, a) (_rk##r ? ppu_run_ld32(PPU_RUN_P(r, o, a, 4)) : vm_read32(a))
+#define PPU_RR64(r, o, a) (_rk##r ? ppu_run_ld64(PPU_RUN_P(r, o, a, 8)) : vm_read64(a))
+"""
+_RE_LOAD_ONLY = r"vm_(read)(8|16|32|64)\((?=ctx->gpr\[(\d+)\](?: \+ (-?0x[0-9A-Fa-f]+|-?\d+))?[,)])"
+
+
+def tune_nv(mod):
+    """ppu_nv_dirty after import: with PPU_VM_RUNS_LOADS, its access runs on, loads only."""
+    if _on("PPU_VM_RUNS_LOADS"):
+        if not (_on("PPU_MM") and _on("PPU_NV_LOCALS")):
+            raise RuntimeError("PPU_VM_RUNS_LOADS needs PPU_MM=1 and PPU_NV_LOCALS=1")
+        if mod.RE_RUN_ACC.pattern.replace("(read|write)", "(read)") != _RE_LOAD_ONLY:
+            raise RuntimeError("PPU_VM_RUNS_LOADS: ppu_nv_dirty's access pattern changed; update ppu_fastpath.py")
+        mod.RE_RUN_ACC = re.compile(_RE_LOAD_ONLY)
+        mod.RUNS_ON = True
+    return mod
+
+
+# stfs: a double that a float holds exactly (the usual case: a single-precision result)
+# stores the float's own bits, which is what the bit selection gives for it; anything
+# else (rounding needed, out of range, NaN: the compare is false) takes the full path.
+_STFS_OLD = "static inline uint32_t ppu_stfs_bits(double v)\n{"
+_STFS_NEW = "static inline uint32_t ppu_stfs_bits_full(double v)\n{"
+_STFS_AT = "/* lfs/lfsx/lfsu/lfsux:"
+_STFS_FAST = """\
+static inline uint32_t ppu_stfs_bits(double v)
+{
+#ifndef PPU_FP_AUDIT
+    const float f = (float)v;
+    if (__builtin_expect((double)f == v, 1)) { uint32_t w; memcpy(&w, &f, 4); return w; }
+#endif
+    return ppu_stfs_bits_full(v);
+}
+"""
+
+
+def source_preamble(text: str) -> str:
+    """The per-chunk source preamble with the switched-on helper rewrites."""
+    if _on("PPU_FP_ONE_NAN"):
+        for old, new in ((_FP_BIN_OLD, _FP_BIN_NEW), (_FMA_OLD, _FMA_NEW), (_STFS_OLD, _STFS_NEW),
+                         (_STFS_AT, _STFS_FAST + _STFS_AT)):
+            if old not in text:
+                raise RuntimeError("PPU_FP_ONE_NAN: the lifter's FP helper text changed; update ppu_fastpath.py")
+            text = text.replace(old, new)
+    if _on("PPU_VMX_SSE"):
+        if _VMX_INC not in text:
+            raise RuntimeError("PPU_VMX_SSE: the lifter's ppu_vmx.h include changed; update ppu_fastpath.py")
+        text = text.replace(_VMX_INC, _VMX_INC + '#include "ppu_vmx_sse.h"   /* PPU_VMX_SSE: same results, 4 lanes at once */\n')
+    if _on("PPU_VM_RUNS_LOADS"):
+        text += ("\n#define PPU_VM_RUNS_VERIFY 1\n" if _on("PPU_VM_RUNS_VERIFY") else "") + _RUNS_C
+    return text
+
+
+# PPU_VMX_SSE: the lifter's inline vperm (a 16-step byte loop) -> ppu_vperm_sse (two pshufb + a blend).
+_OPND = r"(&(?:v\d+|ctx->vr\[\d+\]))"
+_RE_VPERM = re.compile(r"\{ uint8_t\* a = \(uint8_t\*\)" + _OPND + r"; uint8_t\* b = \(uint8_t\*\)" + _OPND +
+                       r"; uint8_t\* c = \(uint8_t\*\)" + _OPND + r"; uint8_t\* d = \(uint8_t\*\)" + _OPND +
+                       r"; uint8_t tmp\[16\]; for \(int i = 0; i < 16; i\+\+\) \{ uint8_t sel = c\[i\] & 0x1F; "
+                       r"tmp\[i\] = \(sel < 16\) \? a\[sel\] : b\[sel - 16\]; \} memcpy\(d, tmp, 16\); \}")
+# vsldoi: a 32-byte stack temp -> palignr; vspltw: four word stores -> pshufd (both would
+# otherwise make the next 16-byte read of the register a failed store-to-load forward).
+_RE_VSLDOI = re.compile(r"\{ uint8_t tmp\[32\]; memcpy\(tmp, " + _OPND + r", 16\); memcpy\(tmp\+16, " + _OPND +
+                        r", 16\); memcpy\(" + _OPND + r", tmp \+ (\d+), 16\); \}")
+_RE_VSPLTW = re.compile(r"\{ uint32_t\* d = \(uint32_t\*\)" + _OPND + r"; uint32_t val = \(\(uint32_t\*\)" + _OPND +
+                        r"\)\[([0-3])\]; d\[0\] = d\[1\] = d\[2\] = d\[3\] = val; \}")
+# vxor / vor / vand / vandc / vsel as two 64-bit halves -> one 16-byte op (same bits).
+_U = r"uint64_t\* ?{0} ?= ?\(uint64_t\*\)" + _OPND + "; "
+_LOGIC = [
+    (re.compile(r"\{ " + _U.format("d") + _U.format("a") + _U.format("b") +
+                r"d\[0\] = a\[0\] \^ b\[0\]; d\[1\] = a\[1\] \^ b\[1\]; \}"), r"PPU_VLOGIC_SSE(\1, _mm_xor_si128, \2, \3);", "vxor"),
+    (re.compile(r"\{ " + _U.format("d") + _U.format("a") + _U.format("b") +
+                r"d\[0\] = a\[0\] \| b\[0\]; d\[1\] = a\[1\] \| b\[1\]; \}"), r"PPU_VLOGIC_SSE(\1, _mm_or_si128, \2, \3);", "vor"),
+    (re.compile(r"\{ " + _U.format("d") + _U.format("a") + _U.format("b") +
+                r"for\(int i=0;i<2;i\+\+\) d\[i\]=a\[i\]&b\[i\]; \}"), r"PPU_VLOGIC_SSE(\1, _mm_and_si128, \2, \3);", "vand"),
+    (re.compile(r"\{ " + _U.format("d") + _U.format("a") + _U.format("b") +
+                r"d\[0\]=a\[0\]&~b\[0\]; d\[1\]=a\[1\]&~b\[1\]; \}"), r"PPU_VLOGIC_SSE(\1, ppu_vandc_sse, \2, \3);", "vandc"),
+    (re.compile(r"\{ " + _U.format("d") + _U.format("a") + _U.format("b") + _U.format("c") +
+                r"d\[0\]=\(a\[0\]&~c\[0\]\)\|\(b\[0\]&c\[0\]\); d\[1\]=\(a\[1\]&~c\[1\]\)\|\(b\[1\]&c\[1\]\); \}"),
+     r"PPU_VSEL_SSE(\1, \2, \3, \4);", "vsel"),
+]
+# vmrgh/vmrgl (words, halfwords): t = {a[s], b[s], a[s+1], b[s+1], ...} -> unpacklo/hi
+_RE_VMRG = re.compile(r"\{ uint(32|16)_t\* d=\(uint\1_t\*\)" + _OPND + r"; uint\1_t\* a=\(uint\1_t\*\)" + _OPND +
+                      r"; uint\1_t\* b=\(uint\1_t\*\)" + _OPND + r"; uint\1_t t\[(\d+)\]; ((?:t\[\d+\]=[ab]\[\d+\]; )+)"
+                      r"memcpy\(d, t, 16\); \}")
+
+
+def _vmrg(m):
+    bits, d, a, b, k, body = m.group(1), m.group(2), m.group(3), m.group(4), int(m.group(5)), m.group(6)
+    got = re.findall(r"t\[(\d+)\]=([ab])\[(\d+)\]; ", body)
+    for s, op in ((0, "unpacklo"), (k // 2, "unpackhi")):
+        want = [(str(i), "ab"[i & 1], str(s + i // 2)) for i in range(k)]
+        if k == 128 // int(bits) and got == want:
+            STATS["vmrg"] = STATS.get("vmrg", 0) + 1
+            return "PPU_VMRG_SSE(%s, %s, %s, _mm_%s_epi%s);" % (d, a, b, op, bits)
+    return m.group(0)
+
+
+# lvsl / lvsr: { uint8_t b = (uint8_t)(X); for (...) ((uint8_t*)D)[i] = b + i; }
+_RE_LVSL = re.compile(r"\{ uint8_t b = (\(uint8_t\)\((?:[^;{}]*)\)); for \(int i = 0; i < 16; i\+\+\) "
+                      r"\(\(uint8_t\*\)" + _OPND + r"\)\[i\] = b \+ i; \}")
+# lvewx: zero the register, the aligned word at ea into its lane
+_RE_LVEWX = re.compile(r"\{ uint64_t ea = ([^;{}]+); ea &= ~3ULL; memset\(" + _OPND + r", 0, 16\); "
+                       r"\{ uint32_t _e = VM_RAW_LD\(uint32_t, ea\); memcpy\(\(uint8_t\*\)\2 \+ \(ea & 15\), &_e, 4\); \} \}")
+# lvlx / lvrx: the bytes of ea's aligned block from / up to ea, zeros elsewhere
+_LVX_HEAD = (r"\{ uint64_t ea = ([^;{}]+); uint32_t sh = \(uint32_t\)\(ea & 0xF\); "
+             r"uint8_t\* m = vm_base \+ \(uint32_t\)\(ea & ~0xFULL\); uint8_t\* d = \(uint8_t\*\)" + _OPND + "; ")
+_RE_LVLX = re.compile(_LVX_HEAD + r"for \(int i = 0; i < 16; i\+\+\) d\[i\] = \(sh \+ \(uint32_t\)i < 16\) \? m\[sh \+ i\] : 0; \}")
+_RE_LVRX = re.compile(_LVX_HEAD + r"for \(int i = 0; i < 16; i\+\+\) d\[i\] = \(\(uint32_t\)i >= 16u - sh\) "
+                      r"\? m\[i - \(int\)\(16u - sh\)\] : 0; \}")
+STATS: dict = {}
+
+
+def _sub(ln, rx, rep, key):
+    ln, k = rx.subn(rep, ln)
+    if k:
+        STATS[key] = STATS.get(key, 0) + k
+    return ln
+
+
+def rewrite_body(lines: list) -> list:
+    """A chunk's function lines with the switched-on statement rewrites."""
+    if not _on("PPU_VMX_SSE"):
+        return lines
+    out = []
+    for ln in lines:
+        if "sel < 16" in ln:
+            ln = _sub(ln, _RE_VPERM, r"ppu_vperm_sse(\4, \1, \2, \3);", "vperm")
+        if "tmp[32]" in ln:
+            ln = _sub(ln, _RE_VSLDOI, r"PPU_VSLDOI_SSE(\3, \1, \2, \4);", "vsldoi")
+        if "d[0] = d[1] = d[2] = d[3] = val" in ln:
+            ln = _sub(ln, _RE_VSPLTW, r"PPU_VSPLTW_SSE(\1, \2, \3);", "vspltw")
+        if "(uint64_t*)&" in ln:
+            for rx, rep, key in _LOGIC:
+                ln = _sub(ln, rx, rep, key)
+        if "memcpy(d, t, 16)" in ln:
+            ln = _RE_VMRG.sub(_vmrg, ln)
+        if "] = b + i; }" in ln:
+            ln = _sub(ln, _RE_LVSL, r"{ uint8_t b = \1; PPU_LVSL_SSE(\2, b); }", "lvsl")
+        if "ea &= ~3ULL; memset(" in ln:
+            ln = _sub(ln, _RE_LVEWX, r"{ uint64_t ea = \1; ea &= ~3ULL; ppu_lvewx_sse(\2, ea); }", "lvewx")
+        if "uint8_t* m = vm_base" in ln:
+            ln = _sub(ln, _RE_LVLX, r"ppu_lvlx_sse(\2, \1);", "lvlx")
+            ln = _sub(ln, _RE_LVRX, r"ppu_lvrx_sse(\2, \1);", "lvrx")
+        if "vm_raw_" in ln:
+            ln = _sub(ln, re.compile(r"\bvm_raw_ld16\("), "ppu_vld16_sse(", "lvx")
+            ln = _sub(ln, re.compile(r"\bvm_raw_st16\("), "ppu_vst16_sse(", "stvx")
+        out.append(ln)
+    return out

@@ -2604,8 +2604,62 @@ extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
     ps3_indirect_call(ctx);
 }
 
+/* The indirect-call fast path (PS3_ICALL_FAST, ppu2 agent 2026-11-08; =0 = the old
+ * dispatch only). With none of the dispatch diagnostics asked for, a call to a
+ * registered, non-null target takes exactly the steps ps3_indirect_call_impl takes
+ * for one (active context, the target from CTR or ps3_indirect_call_to, the depth
+ * cap, the vcall stack, the call, the trampoline drain) without the dozen flag
+ * tests in front of them. Anything else -- target 0, no registered function, the
+ * depth cap reached -- goes the old way, which does the same as before. */
+static thread_local int g_icall_depth = 0;
+
+/* A PPU_VM_RUNS_VERIFY lift (ppu2) calls this when a grouped load would not have
+ * taken its own fast path at that address: the run test was wrong. */
+extern "C" void ppu_run_bad(uint32_t ea, uint32_t n)
+{
+    static std::atomic<long> cnt{0};
+    const long c = cnt.fetch_add(1, std::memory_order_relaxed);
+    if (c < 16 || (c & (c - 1)) == 0)
+        fprintf(stderr, "[runs-verify] MISMATCH #%ld ea=0x%08X n=%u\n", c + 1, ea, n);
+}
+static int icall_fast_ok(void)
+{
+    const char* f = getenv("PS3_ICALL_FAST");
+    if (f && f[0] == '0') return 0;
+    static const char* const diag[] = {
+        "PPU_CSCHECK", "PS3_ICALL_GATE", "BCTRL_RING", "PS3_BREADCRUMB", "PPU_TOCWATCH",
+        "PS3_CALLTRACE", "PS3_CALLTRACE_LR", "PS3_CALLTRACE_TO", "PS3_CALLTRACE_FROM",
+        "PS3_CALLTRACE_R5", "FLOW_FORCE_RTCFG", "SPURS_TRACE", "PS3_PRX_CALLTRACE",
+        "PPU_TOCFIX", "PPU_RETWATCH" };
+    for (const char* e : diag)
+        if (getenv(e)) return 0;
+    return 1;
+}
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
+    static std::atomic<int> fast{-1};
+    int fs = fast.load(std::memory_order_relaxed);
+    if (__builtin_expect(fs < 0, 0)) { fs = icall_fast_ok(); fast.store(fs, std::memory_order_relaxed); }
+    if (fs) {
+        const uint32_t addr = g_icall_target_set ? g_icall_target : (uint32_t)ctx->ctr;
+        ppu_fn fn;
+        if (addr != 0 && g_icall_depth <= 4000 && (fn = ppu_lookup(addr)) != nullptr) {
+            g_active_ctx = ctx;
+            g_icall_target_set = 0;
+            g_icall_depth++;
+            if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
+            g_vcall_sp++;
+            fn(ctx);
+            while (g_trampoline_fn) {
+                void (*tf)(void*) = g_trampoline_fn;
+                g_trampoline_fn = 0;
+                tf(ctx);
+            }
+            if (g_vcall_sp > 0) g_vcall_sp--;
+            g_icall_depth--;
+            return;
+        }
+    }
     static std::atomic<int> on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
     { static std::atomic<int> hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
@@ -2906,7 +2960,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
          * chain that never converges) can dispatch recursively without bound
          * and blow the host stack. Cap the depth, log once, then unwind. */
-        static thread_local int s_depth = 0;
+        int& s_depth = g_icall_depth;   /* shared with ps3_indirect_call's fast path */
         if (s_depth > 4000) {
             static int warned = 0;
             if (PS3_LOG_FIRST(warned, 8))
