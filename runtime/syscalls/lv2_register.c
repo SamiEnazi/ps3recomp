@@ -51,6 +51,7 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 #include "../platform/host_qos.h"       /* PS3_QOS: SPU threads at USER_INTERACTIVE */
+#include "../platform/host_place.h"     /* PS3_CPU_PLACE: SPU threads on chosen cores */
 
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)
@@ -1060,6 +1061,7 @@ static void* spu_exec_thread_proc(void* arg)
             (unsigned)t->tid, (unsigned long)GetCurrentThreadId());
 #endif
     ps3_host_qos_self(1);   /* PS3_QOS (host_qos.h): the SPUs set the frame rate */
+    ps3_host_place_self(PS3_PLACE_SPU);   /* PS3_CPU_PLACE (host_place.h) */
     /* PS3_HOT_QOS=1: on an SPU-bound title these threads are the frame-rate
      * ceiling, and at the default QoS macOS is free to run them on the
      * efficiency cores. Above-normal maps to QOS_CLASS_USER_INTERACTIVE on

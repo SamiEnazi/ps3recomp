@@ -416,6 +416,31 @@ int main(void)
         check("expand_16bit", hlsl, "_rsx_expand_input(rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy), 19u, false)");
     }
 
+    /* DDX r1.x, r1.w ; DDY r2.x, r1.w -- the slope allowance of inFAMOUS 2's
+     * Beast distortion (FP d8160c63900ef8ce), which used to come out as an
+     * "unhandled FP opcode" comment that left both registers at 0. Unbuffered
+     * DDY is plain ddy; buffered it follows the window origin (fp_alpha.y). */
+    {
+        u8 prog[32];
+        const u32 mask_x = 1u << 9;
+        const u32 SWZ_WWWW = (3u<<9)|(3u<<11)|(3u<<13)|(3u<<15);
+        put_word(prog + 0, OPC(0x15) | mask_x | OUTREG(1));
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_WWWW | EXEC_ALWAYS);
+        put_word(prog + 8, 0); put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x16) | mask_x | OUTREG(2) | END);
+        put_word(prog + 20, T_TEMP | REG(1) | SWZ_WWWW | EXEC_ALWAYS);
+        put_word(prog + 24, 0); put_word(prog + 28, 0);
+        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+        check("ddx_expr", hlsl, "ddx((r[1]).wwww)");
+        check("ddx_dest", hlsl, "r[1].x =");
+        check("ddy_expr", hlsl, "ddy((r[1]).wwww) * 1");
+        check("ddy_dest", hlsl, "r[2].x =");
+        check_absent("ddxy_handled", hlsl, "unhandled FP opcode");
+        u32 nk = 0;
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check("ddy_window_origin", hlsl, "ddy((r[1]).wwww) * fp_alpha.y * 1");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -22,6 +22,7 @@
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "pad_input_map.h"                  /* PS3_INPUT_MAP: keyboard/mouse/controller bindings */
+#include "pad_stick.h"                      /* dead zones, anti-dead zone, saturation, squircle */
 #include "../../include/ps3emu/ps3_pad_icons.h"   /* the last device used, for the prompt glyphs */
 
 /* ---------------------------------------------------------------------------
@@ -50,6 +51,17 @@
 
 #if PAD_BACKEND_SDL2
   #include <SDL2/SDL.h>
+  #if defined(_WIN32)
+    /* The Windows host side: keys by position (GetAsyncKeyState), the mouse
+     * through raw input, and SDL's joystick windows pumped on a thread of
+     * their own (pad_host_thread). */
+    #ifndef WIN32_LEAN_AND_MEAN
+      #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+    #pragma comment(lib, "user32.lib")
+    #include "gamecontrollerdb_win.h"       /* SDL_GameControllerDB, Windows lines (zlib) */
+  #endif
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -78,6 +90,11 @@ typedef struct {
     u8   press_square;
     u8   press_l1;
     u8   press_r1;
+    /* SIXAXIS (DualShock 3 units, 0-1023, 512 = level; ~113 per g): from a
+     * controller's accelerometer when it has one (has_sensor), else made up
+     * in cellPadGetData (pad_tilt_fallback). */
+    int  has_sensor;
+    u16  sensor_x, sensor_y, sensor_z, sensor_g;
 } PadHostState;
 
 static int           s_pad_initialized = 0;
@@ -100,12 +117,45 @@ static void pad_icons_register(void);
 int cellPad_host_input_mode(void);
 static int s_map_state;   /* 0 not loaded, 1 loaded */
 static unsigned long long pad_now_ms(void);
+static unsigned long long pad_now_us(void);
+static void pad_ctl_settings_load(const PadInputMap* m);
+#if defined(_WIN32) && PAD_BACKEND_SDL2
+static void pad_host_thread_start(void);
+#endif
+
+/* "<the exe's folder>/<name>" (Windows), else "" -- where input.toml and an
+ * updated gamecontrollerdb.txt are looked for when no variable names them. */
+static void pad_exe_dir_file(const char* name, char* out, size_t n)
+{
+    out[0] = 0;
+#ifdef _WIN32
+    char exe[1024];
+    DWORD k = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
+    if (!k || k >= sizeof exe) return;
+    char* slash = strrchr(exe, '\\');
+    if (!slash) slash = strrchr(exe, '/');
+    if (!slash) return;
+    snprintf(out, n, "%.*s\\%s", (int)(slash - exe), exe, name);
+#else
+    (void)name; (void)n;
+#endif
+}
+static int pad_file_exists(const char* p)
+{
+    FILE* f = p && *p ? fopen(p, "rb") : NULL;
+    if (f) fclose(f);
+    return f != NULL;
+}
 
 static void pad_map_load(void)
 {
     if (s_map_state) return;
     PadInputMap* m = &s_maps[0];
     const char* path = getenv("PS3_INPUT_MAP");
+    char exe_map[1100];
+    /* No variable: input.toml next to the exe, if there is one. (Set to ""
+     * = no file at all.) */
+    if (!path) { pad_exe_dir_file("input.toml", exe_map, sizeof exe_map); if (pad_file_exists(exe_map)) path = exe_map; }
     if (path && *path) {
         if (pim_load_file(m, path, stderr))
             fprintf(stderr, "[cellPad] input map %s: %d change(s) from the defaults, %d name(s) ignored\n",
@@ -114,9 +164,11 @@ static void pad_map_load(void)
             fprintf(stderr, "[cellPad] input map %s: cannot open, using the default layout\n", path);
     } else {
         pim_defaults(m);
+        fprintf(stderr, "[cellPad] input map: built-in layout (docs/INPUT.md; PS3_INPUT_MAP=<file> or input.toml next to the exe changes it)\n");
     }
     s_map_cur = 0;
     s_map_state = 1;
+    pad_ctl_settings_load(m);
     pad_icons_register();
 }
 
@@ -149,6 +201,10 @@ static void pad_map_save_path(char* out, size_t n)
     const char* e = getenv("PS3_INPUT_MAP");
     if (e) { snprintf(out, n, "%s", e); return; }
     const char* ini = getenv("PS3_OVERLAY_INI");
+#ifdef _WIN32
+    /* Windows: next to the exe, where pad_map_load looks for it. */
+    if (!ini || !*ini) { pad_exe_dir_file("input.toml", out, n); return; }
+#endif
     if (!ini || !*ini) return;
     const char* slash = strrchr(ini, '/');
     if (!slash) { snprintf(out, n, "input.toml"); return; }
@@ -176,6 +232,119 @@ static int pad_dir_axis(uint32_t ctl, int neg, int pos, int base)
     return 128 + (p ? 127 : 0) - (n ? 128 : 0);
 }
 
+/* ---- sticks and triggers ([controller_settings], pad_stick.h) -------------
+ * Each setting: the variable, else the file, else the default.
+ *   PS3_PAD_DEADZONE=<f>        radial dead zone of both sticks (0.08), or
+ *   PS3_PAD_DEADZONE_L / _R     one stick; 0.08 and 8 (percent) are the same
+ *   PS3_PAD_ANTI_DEADZONE[_L|_R]   output start past the dead zone (0)
+ *   PS3_PAD_OUTER[_L|_R]        deflection that is already full (0.97)
+ *   PS3_PAD_SQUIRCLE[_L|_R]     0 round .. 1 square diagonals (0.5)
+ *   PS3_PAD_TRIGGER_THRESHOLD   digital L2/R2 press point (0.12)
+ *   PS3_PAD_TRIGGER_DEADZONE    analog L2/R2 dead zone (0.02)
+ *   PS3_PAD_SWAP_STICKS=1       left stick = camera, right stick = move
+ *   PS3_PAD_INVERT=<list>       any of lx,ly,rx,ry: invert that PS3 axis */
+typedef struct {
+    PadStickShape shape[2];        /* 0 = PS3 left stick, 1 = right */
+    float trig_threshold, trig_deadzone;
+    int   source[2];               /* physical stick: 0 left, 1 right, 2 none */
+    int   invert[2][2];
+    int   tilt, tilt_invert;       /* SIXAXIS: 0 none, 1 motion sensor else left stick, 2 left stick */
+} PadCtlSettings;
+static PadCtlSettings s_ctl;
+
+static float pad_env_frac(const char* var, const char* var2, float file, float def)
+{
+    const char* e = getenv(var);
+    if (!(e && *e) && var2) e = getenv(var2);
+    if (e && *e) {
+        float f = (float)atof(e);
+        if (f > 1.0f) f /= 100.0f;
+        return f < 0.0f ? 0.0f : f;
+    }
+    return file >= 0.0f ? file : def;
+}
+static void pad_ctl_settings_load(const PadInputMap* m)
+{
+    static const char* const dz[2]   = { "PS3_PAD_DEADZONE_L", "PS3_PAD_DEADZONE_R" };
+    static const char* const anti[2] = { "PS3_PAD_ANTI_DEADZONE_L", "PS3_PAD_ANTI_DEADZONE_R" };
+    static const char* const out[2]  = { "PS3_PAD_OUTER_L", "PS3_PAD_OUTER_R" };
+    static const char* const sq[2]   = { "PS3_PAD_SQUIRCLE_L", "PS3_PAD_SQUIRCLE_R" };
+    PadCtlSettings c;
+    memset(&c, 0, sizeof c);
+    for (int s = 0; s < 2; s++) {
+        PadStickShape sh;
+        sh.deadzone      = pad_env_frac(dz[s], "PS3_PAD_DEADZONE", m->stick_deadzone[s], PAD_STICK_DEFAULT_DEADZONE);
+        sh.anti_deadzone = pad_env_frac(anti[s], "PS3_PAD_ANTI_DEADZONE", m->stick_anti[s], PAD_STICK_DEFAULT_ANTI);
+        sh.outer         = pad_env_frac(out[s], "PS3_PAD_OUTER", m->stick_outer[s], PAD_STICK_DEFAULT_OUTER);
+        sh.squircle      = pad_env_frac(sq[s], "PS3_PAD_SQUIRCLE", m->stick_squircle[s], PAD_STICK_DEFAULT_SQUIRCLE);
+        c.shape[s] = pad_stick_shape_fix(sh);
+        c.source[s] = m->stick_source[s] >= 0 ? m->stick_source[s] : s;
+        c.invert[s][0] = m->stick_invert[s][0] > 0;
+        c.invert[s][1] = m->stick_invert[s][1] > 0;
+    }
+    { const char* e = getenv("PS3_PAD_SWAP_STICKS");
+      if (e && *e && e[0] != '0') { c.source[0] = 1; c.source[1] = 0; } }
+    { const char* e = getenv("PS3_PAD_INVERT");
+      if (e) {
+          static const char* const nm[4] = { "lx", "ly", "rx", "ry" };
+          for (int k = 0; k < 4; k++) c.invert[k >> 1][k & 1] = strstr(e, nm[k]) != NULL;
+      } }
+    c.trig_threshold = pad_clampf(pad_env_frac("PS3_PAD_TRIGGER_THRESHOLD", NULL, m->trigger_threshold,
+                                               PAD_TRIGGER_DEFAULT_THRESHOLD), 0.01f, 0.95f);
+    c.trig_deadzone  = pad_clampf(pad_env_frac("PS3_PAD_TRIGGER_DEADZONE", NULL, m->trigger_deadzone,
+                                               PAD_TRIGGER_DEFAULT_DEADZONE), 0.0f, 0.9f);
+    c.tilt = m->tilt >= 0 ? m->tilt : 1;
+    { const char* e = getenv("PS3_PAD_TILT");
+      if (e && *e) c.tilt = !strcmp(e, "none") || !strcmp(e, "0") ? 0 : !strcmp(e, "left_stick") || !strcmp(e, "stick") ? 2 : 1; }
+    c.tilt_invert = m->tilt_invert > 0;
+    { const char* e = getenv("PS3_PAD_TILT_INVERT"); if (e && *e) c.tilt_invert = e[0] != '0'; }
+    s_ctl = c;
+    static const char* const src_name[3] = { "left", "right", "none" };
+    fprintf(stderr, "[cellPad] sticks: left = physical %s (dead zone %.2f, anti %.2f, outer %.2f, squircle %.2f%s%s), "
+                    "right = physical %s (dead zone %.2f, anti %.2f, outer %.2f, squircle %.2f%s%s); "
+                    "L2/R2 press at %.2f, dead zone %.2f; tilt: %s%s\n",
+            src_name[c.source[0]], c.shape[0].deadzone, c.shape[0].anti_deadzone, c.shape[0].outer, c.shape[0].squircle,
+            c.invert[0][0] ? ", x inverted" : "", c.invert[0][1] ? ", y inverted" : "",
+            src_name[c.source[1]], c.shape[1].deadzone, c.shape[1].anti_deadzone, c.shape[1].outer, c.shape[1].squircle,
+            c.invert[1][0] ? ", x inverted" : "", c.invert[1][1] ? ", y inverted" : "",
+            c.trig_threshold, c.trig_deadzone,
+            c.tilt == 0 ? "none" : c.tilt == 2 ? "left stick" : "motion sensor, else left stick",
+            c.tilt_invert ? " (inverted)" : "");
+}
+
+/* SIXAXIS in DualShock 3 units: 10 bits, 512 = level, ~113 counts per g
+ * (a DS3 at rest reads X 512, Y 399, Z 512, gyro 512 -- the values RPCS3
+ * uses too). */
+#define PAD_SIXAXIS_ONE_G 113.0f
+static u16 pad_sixaxis(float g)
+{
+    int v = 512 + (int)lrintf(g * PAD_SIXAXIS_ONE_G);
+    return (u16)(v < 0 ? 0 : v > 1023 ? 1023 : v);
+}
+/* No motion sensor: tilt left/right from the PS3 left stick's X (Ionic
+ * Storm steering: "hold ... then tilt the controller left and right"), a
+ * full deflection = a 90-degree tilt; Y/Z/gyro level. */
+static void pad_tilt_fallback(const PadHostState* hs, u16* x, u16* y, u16* z, u16* g)
+{
+    float t = 0.0f;
+    if (s_ctl.tilt) t = ((float)hs->analog_lx - 128.0f) / 127.0f;
+    if (s_ctl.tilt_invert) t = -t;
+    *x = pad_sixaxis(pad_clampf(t, -1.0f, 1.0f));
+    *y = pad_sixaxis(-1.0f);
+    *z = 512; *g = 512;
+}
+
+/* One PS3 stick from the six SDL axes (lx ly rx ry lt rt). */
+static void pad_stick_from_axes(int s, const int ax[6], int* out_x, int* out_y)
+{
+    const int src = s_ctl.source[s];
+    if (src < 0 || src > 1) { *out_x = *out_y = 128; return; }
+    int x = ax[src * 2], y = ax[src * 2 + 1];
+    if (s_ctl.invert[s][0]) x = x <= -32767 ? 32767 : -x;
+    if (s_ctl.invert[s][1]) y = y <= -32767 ? 32767 : -y;
+    pad_stick_shape_apply(x, y, &s_ctl.shape[s], out_x, out_y);
+}
+
 #if PAD_BACKEND_SDL2
 /* PS3 port i's controller, by SDL instance id (-1 = none); the port keeps the
  * GUID of the last one it had so that pad gets the same port back. */
@@ -186,6 +355,10 @@ static int                 s_sdl_had[PAD_MAX_HOST_PORTS];
 static int                 s_sdl_type[PAD_MAX_HOST_PORTS];   /* 1 + SDL_GameControllerType */
 static unsigned long long  s_sdl_scan_ms;   /* last device-list scan (pad_now_ms) */
 static int s_sdl_inited = 0;
+static void pad_virtual_parse(void);
+static void pad_virtual_attach(void);
+static void pad_virtual_drive(void);
+static int  s_virt_on;
 #endif
 /* Raw controller inputs of every pad (bit n = SDL button n, 21/22 the
  * triggers, as in pad_input_map.h), before the map: what the in-game menu
@@ -427,10 +600,15 @@ static void pad_poll_xinput(void)
          * 128 (256 - x), NOT 255 - x: the latter turns a centered stick into 127,
          * whose bits (0x7F) alias SELECT+START and can make the guest self-exit.
          * (via sagemono, PR #42) */
-        s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
-        s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
+        /* Through the same shaping as the SDL path ([controller_settings]):
+         * XInput's +y is up, the PS3's (and SDL's) down. */
+        (void)pad_xinput_stick_to_u8;
+        { int ax[6], x, y;
+          ax[0] = gp->sThumbLX; ax[1] = gp->sThumbLY <= -32767 ? 32767 : -gp->sThumbLY;
+          ax[2] = gp->sThumbRX; ax[3] = gp->sThumbRY <= -32767 ? 32767 : -gp->sThumbRY;
+          ax[4] = ax[5] = 0;
+          pad_stick_from_axes(0, ax, &x, &y); s_host_state[i].analog_lx = (u8)x; s_host_state[i].analog_ly = (u8)y;
+          pad_stick_from_axes(1, ax, &x, &y); s_host_state[i].analog_rx = (u8)x; s_host_state[i].analog_ry = (u8)y; }
 
         /* Triggers */
         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
@@ -468,24 +646,6 @@ static void pad_shutdown_backend(void)
 
 #if PAD_BACKEND_SDL2
 
-static u8 pad_sdl_axis_to_u8(int raw)
-{
-    /* SDL axis: -32768..32767 -> 0..255 with center at 128 */
-    int val = ((raw + 32768) * 255) / 65535;
-    if (val < 0) val = 0;
-    if (val > 255) val = 255;
-    return (u8)val;
-}
-
-static u8 pad_sdl_trigger_to_u8(int raw)
-{
-    /* SDL trigger: 0..32767 -> 0..255 */
-    int val = (raw * 255) / 32767;
-    if (val < 0) val = 0;
-    if (val > 255) val = 255;
-    return (u8)val;
-}
-
 /* PS3_PAD_SDL=0: ignore physical controllers. SDL reads a pad whatever window
  * has focus, so a headless capture running beside a windowed game took the
  * player's START too and sat in the pause menu (tools/boot.sh sets it). */
@@ -496,14 +656,23 @@ static int pad_sdl_off(void)
     return off;
 }
 
-/* The analog value of a PS3 trigger from the SDL inputs bound to it. */
+/* The analog value of a PS3 trigger from the SDL inputs bound to it: a
+ * trigger's own travel, full for a bound button or stick direction. */
 static u8 pad_sdl_analog(uint32_t bound, uint32_t in, u8 lt, u8 rt)
 {
     u8 v = 0;
     if (bound & (1u << PIM_PAD_TRIGGER_LEFT)) v = lt;
     if ((bound & (1u << PIM_PAD_TRIGGER_RIGHT)) && rt > v) v = rt;
-    if (bound & in & ((1u << PIM_PAD_TRIGGER_LEFT) - 1u)) v = 255;
+    if (bound & in & ~PIM_PAD_TRIGGER_MASK) v = 255;
     return v;
+}
+
+static const char* pad_sdl_type_name(int t)
+{
+    static const char* const n[] = { "unknown", "Xbox 360", "Xbox One/Series", "PS3", "PS4", "Switch Pro",
+                                     "virtual", "PS5", "Amazon Luna", "Google Stadia", "NVIDIA Shield",
+                                     "Joy-Con (L)", "Joy-Con (R)", "Joy-Con pair" };
+    return t >= 0 && t < (int)(sizeof n / sizeof n[0]) ? n[t] : "?";
 }
 
 /* Send port i's rumble state to its controller (with a fresh duration). */
@@ -570,6 +739,36 @@ static void pad_sdl_close(int p, int gone)
     s_sdl_type[p] = 0;
 }
 
+/* One line per controller as it is opened: what it is and how SDL reads it
+ * (the mapping SDL chose: built-in, SDL_GameControllerDB, or its HIDAPI
+ * driver's own -- a GUID ending in 68xx is a HIDAPI device). */
+static void pad_sdl_describe(SDL_GameController* gc, int port, int back, int id, SDL_JoystickGUID guid)
+{
+    const char* name = SDL_GameControllerName(gc);
+    const int type = (int)SDL_GameControllerGetType(gc);
+    char gs[40];
+    SDL_JoystickGetGUIDString(guid, gs, (int)sizeof gs);
+    const int hidapi = guid.data[14] == 'h';
+    fprintf(stderr, "[cellPad] SDL controller %s on port %d: %s -- type %s (%s layout), USB id %04x:%04x, "
+                    "guid %s%s, rumble %s, motion sensor %s (instance %d)\n",
+            back ? "reconnected" : "connected", port, name ? name : "?", pad_sdl_type_name(type),
+            pim_family_names[pim_family_of_sdl_type(type)],
+            (unsigned)SDL_GameControllerGetVendor(gc), (unsigned)SDL_GameControllerGetProduct(gc),
+            gs, hidapi ? " (SDL HIDAPI driver)" : "",
+            SDL_GameControllerHasRumble(gc) ? "yes" : "no",
+            SDL_GameControllerIsSensorEnabled(gc, SDL_SENSOR_ACCEL) ? "yes (tilt)" :
+            SDL_GameControllerHasSensor(gc, SDL_SENSOR_ACCEL) ? "yes (unused)" : "no", id);
+    char* map = SDL_GameControllerMapping(gc);
+    if (map) {
+        /* "<guid>,<name>,a:b0,b:b1,..." -- the bindings part tells which pad
+         * layout SDL applied (a = bottom face button). */
+        const char* p = strchr(map, ',');
+        p = p ? strchr(p + 1, ',') : NULL;
+        fprintf(stderr, "[cellPad]   mapping: %.480s\n", p ? p + 1 : map);
+        SDL_free(map);
+    }
+}
+
 /* Open every game controller SDL lists that no port has yet. */
 static void pad_sdl_scan(void)
 {
@@ -579,6 +778,7 @@ static void pad_sdl_scan(void)
         const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(idx);
         if (id < 0 || pad_sdl_port_of(id) >= 0) continue;
         const SDL_JoystickGUID guid = SDL_JoystickGetDeviceGUID(idx);
+        if (s_virt_on && guid.data[14] != 'v') continue;   /* PS3_PAD_VIRTUAL: the virtual pad only */
         int port = -1, back = 0;
         for (int p = 0; p < PAD_MAX_HOST_PORTS && port < 0; p++)
             if (!s_sdl_controllers[p] && s_sdl_had[p] && !memcmp(&s_sdl_last_guid[p], &guid, sizeof guid)) { port = p; back = 1; }
@@ -598,10 +798,11 @@ static void pad_sdl_scan(void)
         SDL_GameControllerRumble(gc, 0, 0, 0);
         s_sdl_type[port] = 1 + (int)SDL_GameControllerGetType(gc);
         if (!g_ps3_pad_icons.connected) g_ps3_pad_icons.connected = s_sdl_type[port];
-        const char* name = SDL_GameControllerName(gc);
-        fprintf(stderr, "[cellPad] SDL controller %s on port %d: %s (instance %d)%s\n",
-                back ? "reconnected" : "connected", port, name ? name : "?", (int)id,
-                SDL_GameControllerHasRumble(gc) ? "" : " (no rumble)");
+        /* SIXAXIS tilt from the pad's own accelerometer (DualShock 4,
+         * DualSense, Switch Pro and most 8BitDo pads in Switch mode). */
+        if (s_ctl.tilt == 1 && SDL_GameControllerHasSensor(gc, SDL_SENSOR_ACCEL))
+            SDL_GameControllerSetSensorEnabled(gc, SDL_SENSOR_ACCEL, SDL_TRUE);
+        pad_sdl_describe(gc, port, back, (int)id, guid);
     }
 }
 
@@ -638,7 +839,8 @@ static void pad_poll_sdl2(void)
         for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) s_host_state[i].connected = 0;
         return;
     }
-    SDL_GameControllerUpdate();
+    pad_virtual_drive();          /* PS3_PAD_VIRTUAL: this poll's scripted inputs */
+    SDL_GameControllerUpdate();   /* the pads' newest reports, read now */
     pad_sdl_hotplug(0);
 
     uint32_t raw_all = 0;
@@ -657,47 +859,72 @@ static void pad_poll_sdl2(void)
             pad_sdl_rumble_send(i);
 
         /* Every SDL input, then the PS3 controls bound to them ([controller]
-         * in PS3_INPUT_MAP; by default each button is its PS3 namesake and
-         * the triggers are L2/R2, pressed past 3000). */
+         * in PS3_INPUT_MAP, with [controller.<family>] on top for this pad's
+         * family; by default each button is its PS3 namesake by position and
+         * the triggers are L2/R2, pressed past the trigger threshold). */
         const PadInputMap* map = pad_map();
-        int lt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
-        int rt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+        uint32_t bind[PIM_N_CONTROLS];
+        pim_pad_resolve(map, pim_family_of_sdl_type(s_sdl_type[i] - 1), bind);
+        int ax[SDL_CONTROLLER_AXIS_MAX];
+        for (int a = 0; a < SDL_CONTROLLER_AXIS_MAX; a++)
+            ax[a] = SDL_GameControllerGetAxis(gc, (SDL_GameControllerAxis)a);
+        const int lt = ax[SDL_CONTROLLER_AXIS_TRIGGERLEFT], rt = ax[SDL_CONTROLLER_AXIS_TRIGGERRIGHT];
         uint32_t in = 0;
         for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && b < PIM_PAD_TRIGGER_LEFT; b++)
             if (SDL_GameControllerGetButton(gc, (SDL_GameControllerButton)b)) in |= 1u << b;
-        if (lt > 3000) in |= 1u << PIM_PAD_TRIGGER_LEFT;
-        if (rt > 3000) in |= 1u << PIM_PAD_TRIGGER_RIGHT;
+        const int trig_on = (int)(s_ctl.trig_threshold * 32767.0f);
+        if (lt > trig_on) in |= 1u << PIM_PAD_TRIGGER_LEFT;
+        if (rt > trig_on) in |= 1u << PIM_PAD_TRIGGER_RIGHT;
+        /* stick half-axes as buttons: past half way */
+        for (int a = 0; a < 4; a++) {
+            if (ax[a] < -16384) in |= 1u << (PIM_PAD_AXIS_FIRST + a * 2);
+            if (ax[a] >  16384) in |= 1u << (PIM_PAD_AXIS_FIRST + a * 2 + 1);
+        }
         raw_all |= in;
         /* The prompt glyphs follow the device last used: a button, a trigger
-         * or a stick pushed well past its dead zone. */
-        if (in || abs(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX)) > 16000 ||
-            abs(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY)) > 16000 ||
-            abs(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX)) > 16000 ||
-            abs(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY)) > 16000)
+         * or a stick pushed well past its dead zone (the half-axis bits). */
+        if (in)
             if (g_ps3_pad_icons.source != s_sdl_type[i] && cellPad_host_input_mode() != 2 /* keyboard only */)
                 g_ps3_pad_icons.source = s_sdl_type[i];
         uint32_t ctl = 0;
         for (int c = 0; c < PIM_N_CONTROLS; c++)
-            if (map->pad[c] & in) ctl |= 1u << c;
+            if (bind[c] & in) ctl |= 1u << c;
         u16 btns = (u16)(ctl & 0xFFFFu);
 
         s_host_state[i].buttons = btns;
 
-        /* Analog sticks; a stick direction bound to a button pushes its axis
-         * to the end while held. */
-        s_host_state[i].analog_lx = (u8)pad_dir_axis(ctl, PIM_LS_LEFT, PIM_LS_RIGHT,
-                                        pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX)));
-        s_host_state[i].analog_ly = (u8)pad_dir_axis(ctl, PIM_LS_UP, PIM_LS_DOWN,
-                                        pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY)));
-        s_host_state[i].analog_rx = (u8)pad_dir_axis(ctl, PIM_RS_LEFT, PIM_RS_RIGHT,
-                                        pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX)));
-        s_host_state[i].analog_ry = (u8)pad_dir_axis(ctl, PIM_RS_UP, PIM_RS_DOWN,
-                                        pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY)));
+        /* Analog sticks through the dead zone / saturation / squircle shaping
+         * ([controller_settings]); a stick direction bound to a button pushes
+         * its axis to the end while held. */
+        { int x, y;
+          pad_stick_from_axes(0, ax, &x, &y);
+          s_host_state[i].analog_lx = (u8)pad_dir_axis(ctl, PIM_LS_LEFT, PIM_LS_RIGHT, x);
+          s_host_state[i].analog_ly = (u8)pad_dir_axis(ctl, PIM_LS_UP, PIM_LS_DOWN, y);
+          pad_stick_from_axes(1, ax, &x, &y);
+          s_host_state[i].analog_rx = (u8)pad_dir_axis(ctl, PIM_RS_LEFT, PIM_RS_RIGHT, x);
+          s_host_state[i].analog_ry = (u8)pad_dir_axis(ctl, PIM_RS_UP, PIM_RS_DOWN, y); }
 
         /* Analog L2/R2: the trigger bound to it (the strongest, if both),
          * full for a bound button that is down. */
-        s_host_state[i].trigger_l2 = pad_sdl_analog(map->pad[PIM_L2], in, pad_sdl_trigger_to_u8(lt), pad_sdl_trigger_to_u8(rt));
-        s_host_state[i].trigger_r2 = pad_sdl_analog(map->pad[PIM_R2], in, pad_sdl_trigger_to_u8(lt), pad_sdl_trigger_to_u8(rt));
+        { const u8 l8 = (u8)pad_trigger_shape(lt, s_ctl.trig_deadzone), r8 = (u8)pad_trigger_shape(rt, s_ctl.trig_deadzone);
+          s_host_state[i].trigger_l2 = pad_sdl_analog(bind[PIM_L2], in, l8, r8);
+          s_host_state[i].trigger_r2 = pad_sdl_analog(bind[PIM_R2], in, l8, r8); }
+
+        /* SIXAXIS from the accelerometer (SDL: m/s^2, +x right, +y up, +z
+         * toward the player; at rest +1 g on y). DS3: 512 level, Y 399 at
+         * rest, X rising as the pad rolls right. */
+        s_host_state[i].has_sensor = 0;
+        if (s_ctl.tilt == 1 && SDL_GameControllerIsSensorEnabled(gc, SDL_SENSOR_ACCEL)) {
+            float a[3];
+            if (SDL_GameControllerGetSensorData(gc, SDL_SENSOR_ACCEL, a, 3) == 0) {
+                const float gx = a[0] / SDL_STANDARD_GRAVITY, gy = a[1] / SDL_STANDARD_GRAVITY, gz = a[2] / SDL_STANDARD_GRAVITY;
+                s_host_state[i].sensor_x = pad_sixaxis(s_ctl.tilt_invert ? gx : -gx);
+                s_host_state[i].sensor_y = pad_sixaxis(-gy);
+                s_host_state[i].sensor_z = pad_sixaxis(-gz);
+                s_host_state[i].sensor_g = 512;
+                s_host_state[i].has_sensor = 1;
+            }
+        }
 
         /* Pressure: SDL has digital buttons, so 0 or 255 */
         s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
@@ -714,15 +941,199 @@ static void pad_poll_sdl2(void)
     g_pad_overlay_raw = raw_all;
 }
 
+/* SDL hints the pad depends on, set in code before SDL's joystick subsystem
+ * starts, so no launcher has to remember them. SDL_SetHint does not override
+ * an environment variable of the same name: a player's own setting wins.
+ *   SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1   SDL otherwise freezes controller
+ *       state while none of ITS windows has keyboard focus (a game started
+ *       from a console, the window behind another one)
+ *   SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0  Nintendo-layout pads by position:
+ *       the bottom button is Cross, as on a DualShock ([controller_settings]
+ *       nintendo_layout = "label" turns it back on: A = Cross)
+ *   SDL_JOYSTICK_HIDAPI_PS4_RUMBLE / _PS5_RUMBLE=1   rumble on a DualShock 4 /
+ *       DualSense over Bluetooth (SDL's enhanced reports; the pad stays in
+ *       that mode until it is switched off)
+ *   SDL_JOYSTICK_THREAD=1   (Windows) SDL's device notifications and raw
+ *       input for joysticks on a thread of SDL's own */
+static void pad_sdl_hints(void)
+{
+    const PadInputMap* m = pad_map();
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, m->nintendo_labels == 1 ? "1" : "0");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+#ifdef _WIN32
+    SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+#endif
+}
+
+/* Controller mappings beyond SDL's built-in list, after it (the later
+ * mapping for a GUID wins over SDL's own; a mapping the player set with
+ * SDL_GAMECONTROLLERCONFIG(_FILE) wins over all of these):
+ *   1. SDL_GameControllerDB's Windows lines, compiled in
+ *      (third_party/SDL_GameControllerDB, zlib license)
+ *   2. gamecontrollerdb.txt next to the exe, if present (a newer download)
+ *   3. PS3_PAD_DB=<file>[;<file>...]: the player's own mapping files */
+static void pad_sdl_load_db(void)
+{
+    const int before = SDL_GameControllerNumMappings();
+    int embedded = 0, files = 0;
+#if defined(_WIN32)
+    for (int i = 0; i < PAD_DB_WINDOWS_COUNT; i++)
+        if (SDL_GameControllerAddMapping(kPadDbWindows[i]) >= 0) embedded++;
+#endif
+    char path[1100];
+    pad_exe_dir_file("gamecontrollerdb.txt", path, sizeof path);
+    if (pad_file_exists(path)) {
+        const int n = SDL_GameControllerAddMappingsFromFile(path);
+        fprintf(stderr, "[cellPad] controller mappings from %s: %d\n", path, n);
+        if (n > 0) files += n;
+    }
+    const char* e = getenv("PS3_PAD_DB");
+    if (e && *e) {
+        char list[2048];
+        snprintf(list, sizeof list, "%s", e);
+        for (char *p = list, *next; p && *p; p = next) {
+            next = strchr(p, ';');
+            if (next) *next++ = 0;
+            const int n = SDL_GameControllerAddMappingsFromFile(p);
+            fprintf(stderr, "[cellPad] controller mappings from %s: %s%d\n", p, n < 0 ? "cannot read it, " : "", n < 0 ? 0 : n);
+            if (n > 0) files += n;
+        }
+    }
+    fprintf(stderr, "[cellPad] controller database: %d SDL built-in, %d SDL_GameControllerDB (compiled in), %d from files; %d known\n",
+            before, embedded, files, SDL_GameControllerNumMappings());
+}
+
+/* SDL's game controller subsystem with the hints and the database. On
+ * Windows this runs on the host input thread (pad_host_thread), so the
+ * hidden windows SDL makes for device arrival/removal belong to a thread
+ * that pumps messages: HIDAPI pads (DualShock, Switch Pro, 8BitDo in
+ * Switch mode) hot-plug through them. */
+static int pad_sdl_init_subsystem(void)
+{
+    if (s_sdl_inited) return 1;
+    pad_sdl_hints();
+    pad_virtual_parse();          /* PS3_PAD_VIRTUAL: before init (it turns the hardware drivers off) */
+    if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0 && SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+        fprintf(stderr, "[cellPad] SDL game controller init failed: %s\n", SDL_GetError());
+        return 0;
+    }
+    pad_sdl_load_db();
+    pad_virtual_attach();
+    /* No joystick/controller EVENTS: the state is read directly at read
+     * time (SDL_GameControllerUpdate in cellPadGetData), so the window's
+     * event pump on the RSX thread neither updates the pads nor fills its
+     * queue with their events; device changes are found by the rescan. */
+    SDL_GameControllerEventState(SDL_IGNORE);
+    SDL_JoystickEventState(SDL_IGNORE);
+    s_sdl_inited = 1;
+    return 1;
+}
+
+/* ---- PS3_PAD_VIRTUAL: a scripted controller through the REAL SDL path ------
+ *   PS3_PAD_VIRTUAL="<sec>:<input>=<value>,<sec>:<input>=<value>,..."
+ * attaches an SDL virtual game controller (an "Xbox One" pad: family xbox)
+ * and sets its inputs at the given seconds after cellPadInit; everything
+ * after that -- SDL's mapping, [controller] bindings, dead zones, triggers,
+ * the trace -- is the code a real pad goes through. Inputs: SDL button names
+ * (a b x y back guide start leftstick rightstick leftshoulder rightshoulder
+ * dpup dpdown dpleft dpright misc1 paddle1-4 touchpad; 0/1) and axes (leftx
+ * lefty rightx righty lefttrigger righttrigger; -32768..32767, triggers
+ * 0..32767). SDL's hardware drivers are switched off in this mode, so a real
+ * pad is neither used nor touched (a test run beside someone playing). */
+static struct { double t; int axis; int id; int value; } s_virt_ev[64];
+static int s_virt_n, s_virt_next;
+static SDL_Joystick* s_virt_js;
+static unsigned long long s_virt_t0;
+static void pad_virtual_parse(void)
+{
+    const char* e = getenv("PS3_PAD_VIRTUAL");
+    if (!e || !*e) return;
+    static const char* const axes[] = { "leftx", "lefty", "rightx", "righty", "lefttrigger", "righttrigger" };
+    for (const char* p = e; *p && s_virt_n < 64; ) {
+        char* end;
+        const double t = strtod(p, &end);
+        if (end == p || *end != ':') break;
+        p = end + 1;
+        char name[32]; int k = 0;
+        while (*p && *p != '=' && k < 31) name[k++] = (char)tolower((unsigned char)*p++);
+        name[k] = 0;
+        if (*p != '=') break;
+        const long v = strtol(p + 1, &end, 0);
+        p = end;
+        int axis = 0, id = -1;
+        for (int a = 0; a < 6; a++) if (!strcmp(name, axes[a])) { axis = 1; id = a; }
+        if (id < 0) { const int b = pim_lookup(pim_pad_inputs, PIM_COUNT(pim_pad_inputs), name); if (b >= 0 && b <= 20) id = b; }
+        if (id < 0) fprintf(stderr, "[cellPad] PS3_PAD_VIRTUAL: unknown input '%s' (ignored)\n", name);
+        else { s_virt_ev[s_virt_n].t = t; s_virt_ev[s_virt_n].axis = axis; s_virt_ev[s_virt_n].id = id;
+               s_virt_ev[s_virt_n].value = (int)v; s_virt_n++; }
+        while (*p == ',' || *p == ' ') p++;
+    }
+    s_virt_on = 1;
+    /* no hardware: only the virtual pad exists for SDL */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
+    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
+    SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "0");
+    SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "0");
+    SDL_SetHint(SDL_HINT_DIRECTINPUT_ENABLED, "0");
+}
+static void pad_virtual_attach(void)
+{
+    if (!s_virt_on) return;
+    SDL_VirtualJoystickDesc d;
+    memset(&d, 0, sizeof d);
+    d.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
+    d.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
+    d.naxes = SDL_CONTROLLER_AXIS_MAX;
+    d.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
+    d.vendor_id = 0x045E; d.product_id = 0x02EA;      /* Xbox One controller */
+    d.name = "ps3recomp virtual pad (PS3_PAD_VIRTUAL)";
+    const int idx = SDL_JoystickAttachVirtualEx(&d);
+    if (idx < 0) { fprintf(stderr, "[cellPad] PS3_PAD_VIRTUAL: attach failed: %s\n", SDL_GetError()); s_virt_on = 0; return; }
+    /* SDL's own mapping for a virtual pad stops at paddle4: give it every
+     * button, the touchpad included, in SDL_GameControllerButton order. */
+    { char gs[40], map[640];
+      SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(idx), gs, (int)sizeof gs);
+      snprintf(map, sizeof map, "%s,%s,a:b0,b:b1,x:b2,y:b3,back:b4,guide:b5,start:b6,leftstick:b7,rightstick:b8,"
+               "leftshoulder:b9,rightshoulder:b10,dpup:b11,dpdown:b12,dpleft:b13,dpright:b14,misc1:b15,paddle1:b16,"
+               "paddle2:b17,paddle3:b18,paddle4:b19,touchpad:b20,leftx:a0,lefty:a1,rightx:a2,righty:a3,"
+               "lefttrigger:a4,righttrigger:a5,", gs, d.name);   /* the trailing comma: SDL appends crc:... */
+      SDL_GameControllerAddMapping(map); }
+    s_virt_js = SDL_JoystickOpen(idx);
+    s_virt_t0 = pad_now_us();
+    fprintf(stderr, "[cellPad] PS3_PAD_VIRTUAL: virtual pad attached (device %d), %d event(s); real controllers off\n", idx, s_virt_n);
+}
+static void pad_virtual_drive(void)
+{
+    if (!s_virt_js) return;
+    const double now = (double)(pad_now_us() - s_virt_t0) / 1e6;
+    while (s_virt_next < s_virt_n && s_virt_ev[s_virt_next].t <= now) {
+        const int i = s_virt_next++;
+        int v = s_virt_ev[i].value;
+        /* a virtual trigger axis is full range (-32768 = released): the
+         * script's 0..32767 is spread over it */
+        if (s_virt_ev[i].axis && s_virt_ev[i].id >= SDL_CONTROLLER_AXIS_TRIGGERLEFT) v = v * 2 - 32768;
+        if (v < -32768) v = -32768;
+        if (v > 32767) v = 32767;
+        if (s_virt_ev[i].axis) SDL_JoystickSetVirtualAxis(s_virt_js, s_virt_ev[i].id, (Sint16)v);
+        else SDL_JoystickSetVirtualButton(s_virt_js, s_virt_ev[i].id, (Uint8)(s_virt_ev[i].value != 0));
+        printf("[cellPad] PS3_PAD_VIRTUAL t=%.2fs: %s %d = %d\n", now, s_virt_ev[i].axis ? "axis" : "button",
+               s_virt_ev[i].id, s_virt_ev[i].value);
+        fflush(stdout);
+    }
+}
+
 static void pad_init_backend(void)
 {
+#if defined(_WIN32)
+    pad_host_thread_start();      /* SDL's init and the raw mouse, on their own thread */
+#endif
     if (pad_sdl_off()) return;
-    if (!s_sdl_inited) {
-        if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
-            SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
-        }
-        s_sdl_inited = 1;
-    }
+#if !defined(_WIN32)
+    pad_sdl_init_subsystem();
+#endif
+    if (!s_sdl_inited) return;
     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) s_sdl_ids[p] = -1;
 
@@ -759,20 +1170,41 @@ static void pad_shutdown_backend(void)
  *
  * 4 ms is 250 Hz, well above the 60 Hz a title can actually observe (and above
  * a real DualShock 3's own report rate), so no game can tell the difference,
- * including one sampling for button-press edges. */
-#define PAD_POLL_INTERVAL_MS 4
+ * including one sampling for button-press edges.
+ *
+ * Now 1 ms by default, on the performance counter: the old 4 ms gate ran on
+ * GetTickCount64, which on Windows moves in 15.6 ms steps -- every read in
+ * the same tick got the cached state, up to a frame old at 60 fps and more
+ * above it. inFAMOUS 2 reads once a frame, so the host is sampled at that
+ * read (SDL_GameControllerUpdate there), never from a stale cache.
+ *   PS3_PAD_POLL_US=<us>   the minimum gap between two host polls (1000;
+ *                          0 = poll on every read) */
+#define PAD_POLL_INTERVAL_MS 1
+static unsigned long long pad_poll_interval_us(void)
+{
+    static long long us = -1;
+    if (us < 0) { const char* e = getenv("PS3_PAD_POLL_US"); us = e && *e ? atoll(e) : 1000; if (us < 0) us = 0; }
+    return (unsigned long long)us;
+}
 
-static unsigned long long pad_now_ms(void)
+/* Microseconds, monotonic, on the performance counter (Windows) -- not
+ * GetTickCount64 (15.6 ms steps). */
+static unsigned long long pad_now_us(void)
 {
 #ifdef _WIN32
-    return (unsigned long long)GetTickCount64();
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    const unsigned long long q = (unsigned long long)c.QuadPart, fr = (unsigned long long)f.QuadPart;
+    return q / fr * 1000000ull + q % fr * 1000000ull / fr;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (unsigned long long)ts.tv_sec * 1000ull +
-           (unsigned long long)ts.tv_nsec / 1000000ull;
+    return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
 #endif
 }
+static unsigned long long pad_now_ms(void) { return pad_now_us() / 1000ull; }
 
 /* Port-0 state from a button mask and stick positions (0-255, centre 128). */
 static void pad_apply(PadHostState* hs, u16 btns, int lx, int ly, int rx, int ry)
@@ -842,17 +1274,16 @@ static void pad_poll_file(u16* out_btns, int* out_lx, int* out_ly, int* out_rx, 
     *out_btns = btns; *out_lx = lx; *out_ly = ly; *out_rx = rx; *out_ry = ry;
 }
 
-/* Keyboard pad (macOS window): the Metal window records key state by
- * virtual keycode in g_pad_host_keys and swallows the events (Shift, Control
- * and Option too, from their flag changes). The default layout -- one key,
- * one control, no overlaps, only keys every Mac keyboard has -- is
- *   left stick W/A/S/D      right stick I/J/K/L     d-pad: arrow keys
- *   CROSS Space  CIRCLE Q   SQUARE E   TRIANGLE R
- *   L1 U  R1 O  L2 Y  R2 P  L3 G  R3 H              START Return/Enter  SELECT Tab
- * and [keyboard] in PS3_INPUT_MAP rebinds any of it (pad_input_map.h). */
+/* Keyboard pad. Keys are macOS virtual key codes (US positions) everywhere:
+ * the Metal window records key state in g_pad_host_keys; on Windows the
+ * keys are read at the poll itself, by position (pad_win_keys), while a
+ * window of this process has the focus. The default layout is
+ * pim_defaults' (docs/INPUT.md) and [keyboard] in PS3_INPUT_MAP rebinds any
+ * of it (pad_input_map.h). */
 volatile uint32_t g_pad_host_keys[4];
 
-/* Mouse camera (macOS window). The window adds motion in 1/16 px to
+/* Mouse camera. The window (macOS) or the raw-input thread (Windows,
+ * pad_host_thread) adds motion in 1/16 px to
  * g_pad_mouse_dx/dy, wheel turns in 1/16 lines to g_pad_mouse_wheel (+ = up,
  * away from the player, whatever the scroll direction setting) and keeps
  * button bits in g_pad_mouse_buttons (1 left, 2 right, 4 middle, 8 button 4,
@@ -870,9 +1301,11 @@ volatile uint32_t g_pad_host_keys[4];
  *   PS3_MOUSE_CAPTURE=0      capture = false: no cursor capture, motion
  *                            counts whenever the window is key (by default a click in the game
  *                            captures the mouse and Esc/Cmd releases it,
- *                            see rsx_metal_backend.h)
- * Buttons by default: left = R1 (bolt), right = R2 (grenade), middle = L1
- * (aim); [mouse_buttons] rebinds them, the extra buttons and the wheel. */
+ *                            see rsx_metal_backend.h; on Windows the
+ *                            mouse counts only while captured)
+ * Buttons by default: left = R1 (bolt while aiming), right = L1 (aim),
+ * middle = R3, button 4 = R2 (Kinetic Pulse), button 5 = L2 (Drain), wheel
+ * up = D-pad up (Precision Mode); [mouse_buttons] rebinds them. */
 volatile int32_t  g_pad_mouse_dx, g_pad_mouse_dy, g_pad_mouse_wheel;
 volatile uint32_t g_pad_mouse_buttons;
 static int pad_mouse_axis(float v, int dz)
@@ -923,7 +1356,18 @@ void cellPad_host_mouse_settings(int* on, float* sens, int* invert_x, int* inver
     *on = s_mouse_on; *sens = s_mouse_sens; *invert_x = s_mouse_invert_x; *invert_y = s_mouse_invert_y;
 }
 /* The prompt glyphs (ps3_pad_icons.h): the bindings and the mouse camera. */
-static void pad_icons_map(void* out) { cellPad_host_input_map((PadInputMap*)out); }
+static void pad_icons_map(void* out)
+{
+    PadInputMap* m = (PadInputMap*)out;
+    cellPad_host_input_map(m);
+    /* the controller glyphs: the bindings of the family of the pad in use */
+    const int src = g_ps3_pad_icons.source > 0 ? g_ps3_pad_icons.source : g_ps3_pad_icons.connected;
+    if (src > 0) {
+        uint32_t r[PIM_N_CONTROLS];
+        pim_pad_resolve(m, pim_family_of_sdl_type(src - 1), r);
+        memcpy(m->pad, r, sizeof r);
+    }
+}
 static int  pad_icons_mouse_camera(void) { pad_mouse_settings_load(); return s_mouse_on; }
 static void pad_icons_register(void)
 {
@@ -989,7 +1433,7 @@ static void pad_poll_mouse(uint32_t* ctl, int* mrx, int* mry)
     const int on = s_mouse_on, invert_x = s_mouse_invert_x, invert_y = s_mouse_invert_y, dz = s_mouse_dz;
     const float sens = s_mouse_sens;
     if (!on) return;
-    const unsigned long long now = pad_now_ms();
+    const unsigned long long now_us = pad_now_us(), now = now_us / 1000ull;
     uint32_t b = g_pad_mouse_buttons;
     { const int32_t w = __atomic_exchange_n(&g_pad_mouse_wheel, 0, __ATOMIC_RELAXED);
       if ((w > 0 && wheel_acc < 0) || (w < 0 && wheel_acc > 0)) wheel_acc = 0;   /* turned back */
@@ -1003,14 +1447,17 @@ static void pad_poll_mouse(uint32_t* ctl, int* mrx, int* mry)
             if (map->mouse[c] & b) *ctl |= 1u << c;
     const int32_t dx = __atomic_exchange_n(&g_pad_mouse_dx, 0, __ATOMIC_RELAXED);
     const int32_t dy = __atomic_exchange_n(&g_pad_mouse_dy, 0, __ATOMIC_RELAXED);
-    unsigned long long dt = last ? now - last : 16;
-    last = now;
-    if (dt < 1) dt = 1;
-    if (dt > 100) dt = 100;                 /* a long gap is not one slow move */
+    /* The time since the last read, in ms from the performance counter (it
+     * was GetTickCount64: 15.6 ms steps on Windows, so a 16.7 ms frame read
+     * as 15 or 31 ms and the camera speed jumped by 2x from frame to frame). */
+    float dt = last ? (float)(now_us - last) / 1000.0f : 16.0f;
+    last = now_us;
+    if (dt < 1.0f) dt = 1.0f;
+    if (dt > 100.0f) dt = 100.0f;           /* a long gap is not one slow move */
     /* px per ms; 1.5 px/ms (a brisk flick) reaches full deflection at SENS 1. */
     const float k = 127.0f / 1.5f * sens;
-    const float vx = (float)dx / 16.0f / (float)dt * k * (invert_x ? -1.0f : 1.0f);
-    const float vy = (float)dy / 16.0f / (float)dt * k * (invert_y ? -1.0f : 1.0f);
+    const float vx = (float)dx / 16.0f / dt * k * (invert_x ? -1.0f : 1.0f);
+    const float vy = (float)dy / 16.0f / dt * k * (invert_y ? -1.0f : 1.0f);
     sx = sx * 0.35f + vx * 0.65f;
     sy = sy * 0.35f + vy * 0.65f;
     if (sx > -0.5f && sx < 0.5f) sx = 0.0f;
@@ -1021,8 +1468,8 @@ static void pad_poll_mouse(uint32_t* ctl, int* mrx, int* mry)
       static uint32_t lb;
       if (getenv("PS3_MOUSE_LOG") && logged < 400 && (*mrx != lrx || *mry != lry || b != lb)) {
           logged++; lrx = *mrx; lry = *mry; lb = b;
-          printf("[cellPad] mouse: d=(%d,%d)/16 px in %llu ms -> rx=%d ry=%d buttons=0x%X\n",
-                 dx, dy, dt, *mrx, *mry, b); fflush(stdout); } }
+          printf("[cellPad] mouse: d=(%d,%d)/16 px in %.1f ms -> rx=%d ry=%d buttons=0x%X\n",
+                 dx, dy, (double)dt, *mrx, *mry, b); fflush(stdout); } }
 }
 /* For the window (rsx_metal_backend.m): the mouse camera is on and wants
  * the cursor captured -- PS3_MOUSE / PS3_MOUSE_CAPTURE, else [mouse] camera
@@ -1039,11 +1486,254 @@ int cellPad_host_mouse_capture_setting(void)
 {
     return pad_env_int("PS3_MOUSE_CAPTURE", pad_map()->mouse_capture, 1) != 0;
 }
+
+/* ---- the real keyboard and mouse on Windows -------------------------------
+ * PS3_KBM=0 keeps them out of the game. A test run (PS3_PAD_SDL=0: real
+ * controllers ignored) keeps them out too unless PS3_KBM=1: the game window
+ * can take the focus while someone types in another one. PAD_NO_KEYBOARD=1
+ * (the XInput build's old switch) = off as well. */
+int cellPad_host_overlay_open(void);
+static int pad_kbm_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("PS3_KBM");
+        const char* sdl = getenv("PS3_PAD_SDL");
+        int v;
+        if (e && *e) v = e[0] != '0';
+        else if (getenv("PAD_NO_KEYBOARD")) v = 0;
+        else v = !(sdl && sdl[0] == '0');
+        fprintf(stderr, "[cellPad] keyboard and mouse: %s\n",
+                v ? "on" : "off (PS3_KBM=0, PAD_NO_KEYBOARD, or a test run's PS3_PAD_SDL=0; PS3_KBM=1 forces them on)");
+        on = v;
+    }
+    return on;
+}
+/* PS3_KBM_TEST=1 (tests only): keys count without the focus check and raw
+ * mouse motion without a capture (the cursor is never grabbed), so an
+ * injector can drive keyboard and mouse into a game window that does not
+ * have the focus -- with keys nobody types (F13-F24) and small moves. */
+static int pad_kbm_test(void)
+{
+    static int t = -1;
+    if (t < 0) { const char* e = getenv("PS3_KBM_TEST"); t = e && *e && *e != '0'; }
+    return t;
+}
+/* Is macOS key code vk bound to any PS3 control? */
+static int pad_key_bound(unsigned vk)
+{
+    const PadInputMap* m = pad_map();
+    for (int c = 0; c < PIM_N_CONTROLS; c++)
+        if (m->key[c][(vk >> 5) & 3] >> (vk & 31) & 1u) return 1;
+    return 0;
+}
+
+#if defined(_WIN32) && PAD_BACKEND_SDL2
+static int pad_win_focused(void)
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+/* Keys by POSITION: scan code (set 1) -> the macOS key code of the US key at
+ * that spot, resolved to the current layout's virtual key at the poll (so W
+ * is the key left of E on AZERTY too, like the Mac's key codes). */
+static const unsigned char kWinScanMac[][2] = {
+    {0x29, 0x32}, {0x02, 0x12}, {0x03, 0x13}, {0x04, 0x14}, {0x05, 0x15}, {0x06, 0x17}, {0x07, 0x16},
+    {0x08, 0x1A}, {0x09, 0x1C}, {0x0A, 0x19}, {0x0B, 0x1D}, {0x0C, 0x1B}, {0x0D, 0x18},
+    {0x10, 0x0C}, {0x11, 0x0D}, {0x12, 0x0E}, {0x13, 0x0F}, {0x14, 0x11}, {0x15, 0x10}, {0x16, 0x20},
+    {0x17, 0x22}, {0x18, 0x1F}, {0x19, 0x23}, {0x1A, 0x21}, {0x1B, 0x1E},
+    {0x1E, 0x00}, {0x1F, 0x01}, {0x20, 0x02}, {0x21, 0x03}, {0x22, 0x05}, {0x23, 0x04}, {0x24, 0x26},
+    {0x25, 0x28}, {0x26, 0x25}, {0x27, 0x29}, {0x28, 0x27}, {0x2B, 0x2A},
+    {0x2C, 0x06}, {0x2D, 0x07}, {0x2E, 0x08}, {0x2F, 0x09}, {0x30, 0x0B}, {0x31, 0x2D}, {0x32, 0x2E},
+    {0x33, 0x2B}, {0x34, 0x2F}, {0x35, 0x2C},
+    {0x56, 0x0A},                                             /* ISO key left of Z */
+};
+/* Keys whose virtual key is the same on every layout. */
+static const unsigned char kWinVkMac[][2] = {
+    {VK_RETURN, 0x24}, {VK_TAB, 0x30}, {VK_SPACE, 0x31}, {VK_BACK, 0x33}, {VK_ESCAPE, 0x35},
+    {VK_LSHIFT, 0x38}, {VK_RSHIFT, 0x3C}, {VK_LCONTROL, 0x3B}, {VK_RCONTROL, 0x3E},
+    {VK_LMENU, 0x3A}, {VK_RMENU, 0x3D}, {VK_CAPITAL, 0x39},
+    {VK_F1, 0x7A}, {VK_F2, 0x78}, {VK_F3, 0x63}, {VK_F4, 0x76}, {VK_F5, 0x60}, {VK_F6, 0x61},
+    {VK_F7, 0x62}, {VK_F8, 0x64}, {VK_F9, 0x65}, {VK_F10, 0x6D}, {VK_F11, 0x67}, {VK_F12, 0x6F},
+    {VK_F13, 0x69}, {VK_F14, 0x6B}, {VK_F15, 0x71}, {VK_F16, 0x6A}, {VK_F17, 0x40}, {VK_F18, 0x4F},
+    {VK_F19, 0x50}, {VK_F20, 0x5A},
+    {VK_SNAPSHOT, 0x69}, {VK_SCROLL, 0x6B}, {VK_PAUSE, 0x71},
+    {VK_INSERT, 0x72}, {VK_HOME, 0x73}, {VK_PRIOR, 0x74}, {VK_DELETE, 0x75}, {VK_END, 0x77}, {VK_NEXT, 0x79},
+    {VK_LEFT, 0x7B}, {VK_RIGHT, 0x7C}, {VK_DOWN, 0x7D}, {VK_UP, 0x7E},
+    {VK_NUMPAD0, 0x52}, {VK_NUMPAD1, 0x53}, {VK_NUMPAD2, 0x54}, {VK_NUMPAD3, 0x55}, {VK_NUMPAD4, 0x56},
+    {VK_NUMPAD5, 0x57}, {VK_NUMPAD6, 0x58}, {VK_NUMPAD7, 0x59}, {VK_NUMPAD8, 0x5B}, {VK_NUMPAD9, 0x5C},
+    {VK_DECIMAL, 0x41}, {VK_MULTIPLY, 0x43}, {VK_ADD, 0x45}, {VK_NUMLOCK, 0x47}, {VK_DIVIDE, 0x4B},
+    {VK_SUBTRACT, 0x4E}, {VK_APPS, 0x6E},
+};
+#define PAD_N_SCAN_KEYS ((int)(sizeof kWinScanMac / sizeof kWinScanMac[0]))
+#define PAD_N_VK_KEYS   ((int)(sizeof kWinVkMac / sizeof kWinVkMac[0]))
+
+/* The bound keys that are down, read now (GetAsyncKeyState: the keyboard's
+ * state at this instant, not a queue the window thread drains every few
+ * ms). Only while a window of this process has the focus and no menu is
+ * open; only the keys some control uses are asked for. */
+static void pad_win_keys(uint32_t keys[4], const PadInputMap* map)
+{
+    if (!pad_kbm_on() || cellPad_host_overlay_open() || !(pad_win_focused() || pad_kbm_test())) return;
+    uint32_t want[4] = { 0, 0, 0, 0 };
+    for (int c = 0; c < PIM_N_CONTROLS; c++)
+        for (int w = 0; w < 4; w++) want[w] |= map->key[c][w];
+    if (!(want[0] | want[1] | want[2] | want[3])) return;
+    static HKL s_hkl;
+    static int s_hkl_set;
+    static unsigned char s_scan_vk[PAD_N_SCAN_KEYS];
+    const HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
+    if (!s_hkl_set || hkl != s_hkl) {
+        for (int i = 0; i < PAD_N_SCAN_KEYS; i++)
+            s_scan_vk[i] = (unsigned char)MapVirtualKeyExW(kWinScanMac[i][0], MAPVK_VSC_TO_VK_EX, hkl);
+        s_hkl = hkl; s_hkl_set = 1;
+    }
+#define PAD_WANT(mac) (want[(mac) >> 5] >> ((mac) & 31) & 1u)
+#define PAD_SET(mac)  (keys[(mac) >> 5] |= 1u << ((mac) & 31))
+    /* Alt (unless a control uses it) or a Windows key held: a system chord
+     * (Alt+Tab, Alt+F4, Win+...), not the game's -- Tab is SELECT. */
+    if (((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) ||
+        ((GetAsyncKeyState(VK_LMENU) & 0x8000) && !PAD_WANT(0x3Au)) ||
+        ((GetAsyncKeyState(VK_RMENU) & 0x8000) && !PAD_WANT(0x3Du)))
+        return;
+    for (int i = 0; i < PAD_N_SCAN_KEYS; i++) {
+        const unsigned mac = kWinScanMac[i][1];
+        if (PAD_WANT(mac) && s_scan_vk[i] && (GetAsyncKeyState(s_scan_vk[i]) & 0x8000)) PAD_SET(mac);
+    }
+    for (int i = 0; i < PAD_N_VK_KEYS; i++) {
+        const unsigned mac = kWinVkMac[i][1];
+        if (PAD_WANT(mac) && (GetAsyncKeyState(kWinVkMac[i][0]) & 0x8000)) PAD_SET(mac);
+    }
+    /* keypad Enter is VK_RETURN too: one Enter for both */
+    if (PAD_WANT(0x4Cu) && (GetAsyncKeyState(VK_RETURN) & 0x8000)) PAD_SET(0x4Cu);
+#undef PAD_WANT
+#undef PAD_SET
+}
+
+/* ---- the host input thread -------------------------------------------------
+ * One thread with a message loop, for two things that need one:
+ *   1. SDL's joystick subsystem is started here, so the hidden windows SDL
+ *      makes for device notifications belong to a thread that pumps them
+ *      (cellPadInit runs on a game thread that never does: a HIDAPI pad
+ *      switched on mid-game was never noticed).
+ *   2. The mouse, through raw input (RIDEV_INPUTSINK on a message-only
+ *      window): motion and buttons land in g_pad_mouse_* the moment the
+ *      mouse reports them, not when the window's event pump next runs (a
+ *      pass every ~4-16 ms on the RSX thread), so the camera neither lags
+ *      nor judders. They count only while the game window holds the mouse
+ *      (g_pad_mouse_captured, set by the window: rsx_vulkan_backend.c).
+ * SDL's relative mouse mode is not used: it registers raw mouse input for
+ * the process too, and only one window per process can have it. */
+volatile int g_pad_mouse_captured;
+static HANDLE s_host_thread, s_host_ready;
+static DWORD  s_host_tid;
+static int    s_abs_have, s_abs_x, s_abs_y;
+
+static void pad_host_raw_mouse(const RAWMOUSE* m)
+{
+    if (!__atomic_load_n(&g_pad_mouse_captured, __ATOMIC_ACQUIRE) && !pad_kbm_test()) { s_abs_have = 0; return; }
+    if (m->usFlags & MOUSE_MOVE_ABSOLUTE) {
+        /* tablets, remote desktop: absolute 0..65535 -> pixel deltas */
+        const int vd = (m->usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
+        const int w = GetSystemMetrics(vd ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
+        const int h = GetSystemMetrics(vd ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
+        const int x = (int)((long long)m->lLastX * w / 65535), y = (int)((long long)m->lLastY * h / 65535);
+        if (s_abs_have) {
+            __atomic_add_fetch(&g_pad_mouse_dx, (x - s_abs_x) * 16, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_pad_mouse_dy, (y - s_abs_y) * 16, __ATOMIC_RELAXED);
+        }
+        s_abs_x = x; s_abs_y = y; s_abs_have = 1;
+    } else if (m->lLastX || m->lLastY) {
+        __atomic_add_fetch(&g_pad_mouse_dx, (int32_t)m->lLastX * 16, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_pad_mouse_dy, (int32_t)m->lLastY * 16, __ATOMIC_RELAXED);
+    }
+    const USHORT f = m->usButtonFlags;
+    if (!f) return;
+    static const USHORT down[5] = { RI_MOUSE_BUTTON_1_DOWN, RI_MOUSE_BUTTON_2_DOWN, RI_MOUSE_BUTTON_3_DOWN,
+                                    RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_5_DOWN };
+    static const USHORT up[5]   = { RI_MOUSE_BUTTON_1_UP, RI_MOUSE_BUTTON_2_UP, RI_MOUSE_BUTTON_3_UP,
+                                    RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_UP };
+    for (int k = 0; k < 5; k++) {   /* 1 left, 2 right, 4 middle, 8 button 4, 16 button 5 */
+        if (f & down[k]) __atomic_or_fetch(&g_pad_mouse_buttons, 1u << k, __ATOMIC_RELAXED);
+        if (f & up[k])   __atomic_and_fetch(&g_pad_mouse_buttons, ~(1u << k), __ATOMIC_RELAXED);
+    }
+    if (f & RI_MOUSE_WHEEL)
+        __atomic_add_fetch(&g_pad_mouse_wheel, (int32_t)(short)m->usButtonData * 16 / WHEEL_DELTA, __ATOMIC_RELAXED);
+}
+
+static LRESULT CALLBACK pad_host_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_INPUT) {
+        RAWINPUT ri;
+        UINT sz = sizeof ri;
+        if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+            ri.header.dwType == RIM_TYPEMOUSE)
+            pad_host_raw_mouse(&ri.data.mouse);
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static DWORD WINAPI pad_host_thread_main(LPVOID arg)
+{
+    (void)arg;
+    if (pad_kbm_on()) {
+        WNDCLASSEXW wc;
+        memset(&wc, 0, sizeof wc);
+        wc.cbSize = sizeof wc;
+        wc.lpfnWndProc = pad_host_wndproc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = L"ps3recomp_pad_host";
+        RegisterClassExW(&wc);
+        HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"ps3recomp pad host", 0, 0, 0, 0, 0,
+                                    HWND_MESSAGE, NULL, wc.hInstance, NULL);
+        RAWINPUTDEVICE rid;
+        rid.usUsagePage = 0x01; rid.usUsage = 0x02;          /* generic desktop: mouse */
+        rid.dwFlags = RIDEV_INPUTSINK; rid.hwndTarget = hwnd;
+        if (!hwnd || !RegisterRawInputDevices(&rid, 1, sizeof rid))
+            fprintf(stderr, "[cellPad] raw mouse input unavailable (error %lu): no mouse camera\n", (unsigned long)GetLastError());
+    }
+    if (!pad_sdl_off()) pad_sdl_init_subsystem();
+    SetEvent(s_host_ready);
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return 0;
+}
+
+static void pad_host_thread_start(void)
+{
+    if (s_host_thread) return;
+    if (pad_sdl_off() && !pad_kbm_on()) return;
+    s_host_ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+    s_host_thread = CreateThread(NULL, 0, pad_host_thread_main, NULL, 0, &s_host_tid);
+    if (!s_host_thread) {
+        fprintf(stderr, "[cellPad] host input thread: CreateThread failed (%lu); SDL on this thread, no raw mouse\n",
+                (unsigned long)GetLastError());
+        if (!pad_sdl_off()) pad_sdl_init_subsystem();
+        return;
+    }
+    SetThreadPriority(s_host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    const DWORD w = WaitForSingleObject(s_host_ready, 15000);
+    fprintf(stderr, "[cellPad] host input thread %lu: %s%s\n", (unsigned long)s_host_tid,
+            pad_sdl_off() ? "SDL controllers off (PS3_PAD_SDL=0)" : (s_sdl_inited ? "SDL controllers up" : "SDL init failed"),
+            w == WAIT_OBJECT_0 ? "" : " (still starting after 15 s)");
+}
+#endif /* _WIN32 && PAD_BACKEND_SDL2 */
+
 static void pad_poll_keys(int merge)
 {
     const PadInputMap* map = pad_map();
     uint32_t keys[4];
     for (int i = 0; i < 4; i++) keys[i] = g_pad_host_keys[i];
+#if defined(_WIN32) && PAD_BACKEND_SDL2
+    pad_win_keys(keys, map);
+#endif
     uint32_t ctl = 0;
     if (keys[0] | keys[1] | keys[2] | keys[3])
         for (int c = 0; c < PIM_N_CONTROLS; c++)
@@ -1136,25 +1826,146 @@ static void pad_overlay_neutral(void)
     }
 }
 
+/* An in-game menu is open: the game gets neutral input, the mouse is not
+ * captured, keys are not read. THE one place that answers it -- an overlay
+ * with a flag of its own adds it here. */
+int cellPad_host_overlay_open(void)
+{
+    return g_pad_overlay_open != 0;
+}
+
+/* ---- the game window and the mouse (Windows: rsx_vulkan_backend.c) ---------
+ * The window tells cellPad what happens to it and asks whether it should
+ * hold the mouse; cellPad owns the decision so every window backend behaves
+ * alike:
+ *   - nothing is captured until the player clicks into the game window
+ *     (a test run's window that takes the focus never grabs anyone's cursor);
+ *     that click is the capture's own and does not reach the game
+ *   - captured = cursor hidden and kept inside the window, raw motion turns
+ *     the camera; only while the window has the focus, the mouse camera is
+ *     on (PS3_MOUSE, the input mode) and no menu is open
+ *   - Esc is the window's, not the game's (unless [keyboard] binds Escape):
+ *     it counts up g_pad_overlay_toggle (the in-game menu opens/closes on
+ *     each change, as for L3+R3) and, when no menu exists
+ *     (g_pad_overlay_present = 0), releases the mouse. Alt+F4 or closing
+ *     the window quits.
+ *   - PS3_MOUSE_CAPTURE=0 / [mouse] capture = false: no capture; motion
+ *     counts whenever the window has the focus, with the cursor visible */
+volatile int g_pad_overlay_present;   /* set by an in-game menu that opens on g_pad_overlay_toggle */
+static volatile int s_cap_engaged, s_cap_focused;
+enum { PAD_WIN_CLICK = 1, PAD_WIN_ESCAPE = 2 };
+void cellPad_host_window_focus(int focused) { s_cap_focused = focused != 0; }
+int cellPad_host_window_event(int ev)
+{
+    if (ev == PAD_WIN_CLICK) {
+        if (!s_cap_engaged && pad_kbm_on() && cellPad_host_mouse_active() && !cellPad_host_overlay_open() &&
+            cellPad_host_mouse_capture_setting()) {
+            s_cap_engaged = 1;
+            fprintf(stderr, "[cellPad] mouse captured (Esc releases it)\n");
+            return 1;
+        }
+        return 0;
+    }
+    if (ev == PAD_WIN_ESCAPE) {
+        if (pad_key_bound(0x35)) return 0;            /* [keyboard] gives Escape to the game */
+        __atomic_add_fetch(&g_pad_overlay_toggle, 1, __ATOMIC_RELEASE);
+        if (!g_pad_overlay_present && s_cap_engaged) {
+            s_cap_engaged = 0;
+            fprintf(stderr, "[cellPad] mouse released (click in the game to capture it again)\n");
+        }
+        return 1;
+    }
+    return 0;
+}
+/* 0: the mouse does nothing now; 1: raw motion counts, cursor left alone
+ * (capture off); 2: hold it -- hide the cursor and keep it in the window. */
+int cellPad_host_capture_wanted_now(void)
+{
+    if (!s_cap_focused || !pad_kbm_on() || !cellPad_host_mouse_active() || cellPad_host_overlay_open()) return 0;
+    if (!cellPad_host_mouse_capture_setting()) return 1;
+    return s_cap_engaged ? 2 : 0;
+}
+/* The window applied it: motion and buttons count from now on (or stop). */
+void cellPad_host_set_mouse_captured(int on)
+{
+    __atomic_store_n(&g_pad_mouse_buttons, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pad_mouse_dx, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pad_mouse_dy, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pad_mouse_wheel, 0, __ATOMIC_RELAXED);
+#if defined(_WIN32) && PAD_BACKEND_SDL2
+    __atomic_store_n(&g_pad_mouse_captured, on ? 1 : 0, __ATOMIC_RELEASE);
+#else
+    (void)on;
+#endif
+}
+
+/* The per-port host state is final for this poll here: every source has
+ * been merged (controllers, keys, mouse, PS3_PAD_FILE). Anything that must
+ * hold the game's input (a menu) does it in this one function. */
+static void pad_finalize_ports(void)
+{
+    if (cellPad_host_overlay_open()) pad_overlay_neutral();
+    pad_track_assign();
+}
+
+/* PS3_PAD_STATS=1: once a second, what the game asked for and what a poll
+ * cost (stdout):  reads per port, packets handed out (len > 0), host polls,
+ * the controller read (SDL_GameControllerUpdate + state) and the key read. */
+static struct {
+    int on;
+    unsigned long long t0;
+    unsigned reads[PAD_MAX_HOST_PORTS], packets[PAD_MAX_HOST_PORTS], polls;
+    unsigned long long sdl_us, sdl_max, keys_us, keys_max;
+} s_ps;
+static int pad_stats_on(void)
+{
+    if (!s_ps.on) { const char* e = getenv("PS3_PAD_STATS"); s_ps.on = (e && *e && *e != '0') ? 1 : -1; }
+    return s_ps.on > 0;
+}
+static void pad_stats_tick(void)
+{
+    const unsigned long long now = pad_now_us();
+    if (!s_ps.t0) { s_ps.t0 = now; return; }
+    if (now - s_ps.t0 < 1000000ull) return;
+    const double s = (double)(now - s_ps.t0) / 1e6;
+    printf("[padstats] %.1fs: reads/s p0 %.0f p1 %.0f p2 %.0f p3 %.0f, packets/s p0 %.0f, polls/s %.0f, "
+           "controller read avg %.1f us max %llu us, keys avg %.1f us max %llu us\n",
+           s, s_ps.reads[0] / s, s_ps.reads[1] / s, s_ps.reads[2] / s, s_ps.reads[3] / s, s_ps.packets[0] / s,
+           s_ps.polls / s, s_ps.polls ? (double)s_ps.sdl_us / s_ps.polls : 0.0, s_ps.sdl_max,
+           s_ps.polls ? (double)s_ps.keys_us / s_ps.polls : 0.0, s_ps.keys_max);
+    fflush(stdout);
+    memset(s_ps.reads, 0, sizeof s_ps.reads);
+    memset(s_ps.packets, 0, sizeof s_ps.packets);
+    s_ps.polls = 0; s_ps.sdl_us = s_ps.sdl_max = s_ps.keys_us = s_ps.keys_max = 0;
+    s_ps.t0 = now;
+}
+
 static void pad_poll_backend(void)
 {
     /* Benign race: two threads may poll in the same tick. That costs one extra
      * sweep, never a missed or stale-forever read. */
-    static unsigned long long s_last_ms = 0;
-    unsigned long long now = pad_now_ms();
-    if (s_last_ms && now - s_last_ms < PAD_POLL_INTERVAL_MS) return;
+    static unsigned long long s_last_us = 0;
+    const unsigned long long now = pad_now_us();
+    if (s_last_us && now - s_last_us < pad_poll_interval_us()) return;
     if (!pad_lock_try()) return;   /* another thread is polling: its result serves this read */
-    s_last_ms = now;
+    s_last_us = now;
     /* A real pad streams reports at roughly this rate whether or not anything
      * changed, and libpad buffers them; a fresh sweep is a fresh report for
      * every port. cellPadGetData hands each one out exactly once. */
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
+    const int stats = pad_stats_on();
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
+    unsigned long long t_ctl = 0;
+    if (stats) {
+        t_ctl = pad_now_us();
+        const unsigned long long d = t_ctl - now;
+        s_ps.polls++; s_ps.sdl_us += d; if (d > s_ps.sdl_max) s_ps.sdl_max = d;
+    }
 #if defined(_WIN32) && PAD_BACKEND_XINPUT
     /* The XInput build's own keyboard fallback; the SDL build reads keys
      * through the input map below like every other host. */
@@ -1172,8 +1983,11 @@ static void pad_poll_backend(void)
     /* Keyboard, mouse and PS3_PAD_FILE always count; with a real pad on port 0
      * they are merged into it (pad_poll_keys). */
     pad_poll_keys(s_host_state[0].connected);
-    if (g_pad_overlay_open) pad_overlay_neutral();
-    pad_track_assign();
+    if (stats) {
+        const unsigned long long d = pad_now_us() - t_ctl;
+        s_ps.keys_us += d; if (d > s_ps.keys_max) s_ps.keys_max = d;
+    }
+    pad_finalize_ports();
     pad_unlock();
 }
 
@@ -1238,6 +2052,54 @@ void cellPad_poll(void)
     if (s_pad_initialized) {
         pad_poll_backend();
     }
+}
+
+/* PS3_PAD_TRACE: the pad state the game RECEIVES (after every source and
+ * injection: controllers, keys, mouse, PAD_SCRIPT, PAD_FILE, ...), on stdout.
+ *   1     a line whenever port 0's packet changes (len > 0 packets only)
+ *   2     a line for every port-0 packet (one per game frame)
+ *   all   as 1, for every port
+ * "t" is seconds since the first read, "dt" ms since that port's last packet
+ * -- the game's own read cadence. */
+static void pad_trace_packet(u32 port, const CellPadData* d)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("PS3_PAD_TRACE");
+        mode = !e || !*e || *e == '0' ? 0 : !strcmp(e, "all") ? 3 : atoi(e) == 2 ? 2 : 1;
+    }
+    if (!mode || !d->len || port >= PAD_MAX_HOST_PORTS || (mode != 3 && port != 0)) return;
+    static u16 last[PAD_MAX_HOST_PORTS][CELL_PAD_BTN_OFFSET_SENSOR_G + 1];
+    static unsigned long long t0, last_us[PAD_MAX_HOST_PORTS];
+    static int have[PAD_MAX_HOST_PORTS];
+    const unsigned long long now = pad_now_us();
+    if (!t0) t0 = now;
+    /* buttons and sticks exactly; the tilt only when it moves (a real
+     * accelerometer jitters by a few counts every report) */
+    const int same = have[port] && !memcmp(last[port], d->button, (CELL_PAD_BTN_OFFSET_PRESS_R2 + 1) * sizeof(u16)) &&
+                     abs((int)last[port][CELL_PAD_BTN_OFFSET_SENSOR_X] - (int)d->button[CELL_PAD_BTN_OFFSET_SENSOR_X]) < 12;
+    const double dt = have[port] ? (double)(now - last_us[port]) / 1000.0 : 0.0;
+    last_us[port] = now;
+    if (same && mode != 2) return;
+    memcpy(last[port], d->button, sizeof last[port]);
+    have[port] = 1;
+    const u16 b = (u16)(d->button[CELL_PAD_BTN_OFFSET_DIGITAL1] | (d->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8));
+    static const char* const names[16] = { "SELECT", "L3", "R3", "START", "UP", "RIGHT", "DOWN", "LEFT",
+                                           "L2", "R2", "L1", "R1", "TRIANGLE", "CIRCLE", "CROSS", "SQUARE" };
+    char list[160]; size_t len = 0; list[0] = 0;
+    for (int i = 0; i < 16; i++)
+        if (b >> i & 1) {
+            const int w = snprintf(list + len, sizeof list - len, "%s%s", len ? "+" : "", names[i]);
+            if (w > 0 && (size_t)w < sizeof list - len) len += (size_t)w;
+        }
+    printf("[padtrace] t=%.3f dt=%.1f port%u len=%d btn=0x%04X %-24s L=(%3u,%3u) R=(%3u,%3u) L2=%3u R2=%3u tilt=(%u,%u,%u)\n",
+           (double)(now - t0) / 1e6, dt, port, (int)d->len, b, len ? list : "-",
+           d->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X], d->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y],
+           d->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X], d->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y],
+           d->button[CELL_PAD_BTN_OFFSET_PRESS_L2], d->button[CELL_PAD_BTN_OFFSET_PRESS_R2],
+           d->button[CELL_PAD_BTN_OFFSET_SENSOR_X], d->button[CELL_PAD_BTN_OFFSET_SENSOR_Y],
+           d->button[CELL_PAD_BTN_OFFSET_SENSOR_Z]);
+    fflush(stdout);
 }
 
 /* HLE args are GUEST effective addresses; guest structs are BIG-ENDIAN. The
@@ -1368,9 +2230,10 @@ skip_inject: ;
      * 0x20000 down, 0x40000 left, 0x80000 right -- so a hold walks: inFAMOUS 2
      * moves on the stick only, and its lit streets are a walk from the save.
      * Bits 20..23 drive the right stick the same way (0x100000 up, 0x200000
-     * down, 0x400000 left, 0x800000 right): the camera, to look at something. */
+     * down, 0x400000 left, 0x800000 right): the camera, to look at something.
+     * Up to 64 events (32 did not reach inFAMOUS 2's Beast fight). */
     { static int s_sc = -1;
-      static struct { double t; unsigned mask; double hold; int world; } ev[32]; static int n_ev = 0;
+      static struct { double t; unsigned mask; double hold; int world; } ev[64]; static int n_ev = 0;
       /* A time written "w<sec>" counts from the moment the file named by
        * PAD_SCRIPT_WAIT appears (the draw engine creates it on the first
        * world frame, PS3RECOMP_ENG_WORLD_MARK): a walk scripted from the
@@ -1385,7 +2248,7 @@ skip_inject: ;
           if (e && *e) {
               s_sc = 1; t0 = GetTickCount64();
               const char* p = e;
-              while (*p && n_ev < 32) {
+              while (*p && n_ev < 64) {
                   int world = 0;
                   if (*p == 'w') { world = 1; p++; }
                   double t = strtod(p, (char**)&p);
@@ -1411,7 +2274,7 @@ skip_inject: ;
            * happens. Fire on the first poll at or after the event time and
            * hold it for a fixed number of polls, which is what a real press
            * looks like regardless of poll rate. */
-          static int fired[32], held[32], stick_was;
+          static int fired[64], held[64], stick_was;
           int stick_on = 0; unsigned char lx = 128, ly = 128, rx = 128, ry = 128;
           for (int i = 0; i < n_ev; i++) {
               const double tn = ev[i].world ? now_world : now;
@@ -1430,7 +2293,7 @@ skip_inject: ;
                       if (ev[i].mask & 0x400000u) rx = 0;   if (ev[i].mask & 0x800000u) rx = 255;
                       if (ev[i].mask & 0x100000u) ry = 0;   if (ev[i].mask & 0x200000u) ry = 255;
                   }
-                  static int said[32];
+                  static int said[64];
                   if (!said[i]) { said[i] = 1;
                       if (ev[i].hold > 0)
                           printf("[cellPad] PAD_SCRIPT t=%.1fs hold 0x%04X for %.0fs\n", ev[i].t, ev[i].mask, ev[i].hold);
@@ -1477,9 +2340,20 @@ skip_inject: ;
                   if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
           }
+          /* Stick bits as in PAD_SCRIPT (0x10000.. left, 0x100000.. right
+           * stick): "0x10000 600" walks forward for 600 polls, so a driver can
+           * steer a character by looking at screenshots between steps. */
+          static int pf_stick;
           if (held_n > 0) { held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF);
+              if (held_mask & 0xFF0000u) {
+                  hs->analog_lx = (held_mask & 0x40000u) ? 0 : (held_mask & 0x80000u) ? 255 : 128;
+                  hs->analog_ly = (held_mask & 0x10000u) ? 0 : (held_mask & 0x20000u) ? 255 : 128;
+                  hs->analog_rx = (held_mask & 0x400000u) ? 0 : (held_mask & 0x800000u) ? 255 : 128;
+                  hs->analog_ry = (held_mask & 0x100000u) ? 0 : (held_mask & 0x200000u) ? 255 : 128;
+                  pf_stick = 1; } }
+          else if (pf_stick) { hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128; pf_stick = 0; }
       } }
 
     /* Analog sticks */
@@ -1579,18 +2453,28 @@ skip_inject: ;
             { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x08, CELL_PAD_BTN_OFFSET_PRESS_R1 },
             { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x01, CELL_PAD_BTN_OFFSET_PRESS_L2 },
             { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x02, CELL_PAD_BTN_OFFSET_PRESS_R2 } };
+        /* Only where the host gave no pressure at all: an analog trigger
+         * pressed past its threshold keeps its own travel (this used to
+         * force 255 as soon as the digital bit was set: L2/R2 lost their
+         * analog range). */
         for (unsigned k = 0; k < sizeof pm / sizeof pm[0]; k++)
-            if ((data->button[pm[k].word] & pm[k].bit) && data->button[pm[k].off] < 255)
+            if ((data->button[pm[k].word] & pm[k].bit) && data->button[pm[k].off] == 0)
                 data->button[pm[k].off] = 255;
     }
 
     /* Sensor data (only meaningful if SENSOR_ON) */
     if (setting & CELL_PAD_SETTING_SENSOR_ON) {
-        /* Default sensor values: accelerometer at rest (512 = 1g center) */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399; /* gravity */
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
+        /* SIXAXIS: the controller's accelerometer if it has one, else tilt
+         * from the left stick (s_ctl.tilt), else level (X 512, Y 399 =
+         * gravity, Z 512, gyro 512). inFAMOUS 2 steers the Ionic Storm
+         * with it. */
+        u16 sx, sy, sz, sg;
+        if (hs->has_sensor) { sx = hs->sensor_x; sy = hs->sensor_y; sz = hs->sensor_z; sg = hs->sensor_g; }
+        else pad_tilt_fallback(hs, &sx, &sy, &sz, &sg);
+        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = sx;
+        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = sy;
+        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = sz;
+        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = sg;
     }
     }  /* end connected block */
 
@@ -1627,6 +2511,12 @@ emit:
             else                        s_data_fresh[port_no] = 0;
         }
     }
+    if (port_no < PAD_MAX_HOST_PORTS && pad_stats_on()) {
+        s_ps.reads[port_no]++;
+        if (data->len) s_ps.packets[port_no]++;
+        pad_stats_tick();
+    }
+    pad_trace_packet(port_no, data);
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */

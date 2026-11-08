@@ -1,0 +1,109 @@
+# input.example.toml -- every built-in binding (docs/INPUT.md). Copy it to input.toml next to the
+# exe, or point PS3_INPUT_MAP at it, and edit. Lines you delete keep their default.
+
+# Controls, read by the game through PS3_INPUT_MAP (format: the toolkit's
+# libs/input/pad_input_map.h). Written by the in-game menu (Controls) or the
+# launcher; hand edits are fine, but comments in [keyboard], [mouse_buttons]
+# and [controller] are not kept. "" unbinds a control.
+
+[keyboard]
+cross    = "Space"
+circle   = "Shift"
+square   = "F"
+triangle = "Q"
+l1       = "Z"
+r1       = "E"
+l2       = "C"
+r2       = "R"
+l3       = "V"
+r3       = "X"
+start    = "Return, KeypadEnter"
+select   = "M, Tab"
+up       = "1, Up"
+down     = "2, Down"
+left     = "3, Left"
+right    = "4, Right"
+ls_up    = "W"
+ls_down  = "S"
+ls_left  = "A"
+ls_right = "D"
+rs_up    = "I"
+rs_down  = "K"
+rs_left  = "J"
+rs_right = "L"
+
+[mouse_buttons]
+cross    = ""
+circle   = ""
+square   = ""
+triangle = ""
+l1       = "Right"
+r1       = "Left"
+l2       = "Button5"
+r2       = "Button4"
+l3       = ""
+r3       = "Middle"
+start    = ""
+select   = ""
+up       = "WheelUp"
+down     = ""
+left     = ""
+right    = ""
+ls_up    = ""
+ls_down  = ""
+ls_left  = ""
+ls_right = ""
+rs_up    = ""
+rs_down  = ""
+rs_left  = ""
+rs_right = ""
+
+[controller]
+cross    = "a"
+circle   = "b"
+square   = "x"
+triangle = "y"
+l1       = "leftshoulder"
+r1       = "rightshoulder"
+l2       = "lefttrigger"
+r2       = "righttrigger"
+l3       = "leftstick"
+r3       = "rightstick"
+start    = "start"
+select   = "back, touchpad"
+up       = "dpup"
+down     = "dpdown"
+left     = "dpleft"
+right    = "dpright"
+ls_up    = ""
+ls_down  = ""
+ls_left  = ""
+ls_right = ""
+rs_up    = ""
+rs_down  = ""
+rs_left  = ""
+rs_right = ""
+
+[mouse]
+# camera      = true     # the mouse turns the camera (right stick)
+# sensitivity = 1.0
+# invert_x    = false
+# invert_y    = false
+# deadzone    = 30       # first stick step past centre (skips the game's own dead zone)
+# capture     = true     # click in the window to capture the mouse, Esc releases it
+
+[controller_settings]
+# deadzone          = 0.08   # radial, both sticks (deadzone_left / deadzone_right)
+# anti_deadzone     = 0.0    # anti_deadzone_left / _right
+# outer             = 0.97   # outer_left / _right
+# squircle          = 0.5    # 0 round .. 1 square diagonals (squircle_left / _right)
+# trigger_threshold = 0.12
+# trigger_deadzone  = 0.02
+# left_stick        = "left"   # "right" + right_stick = "left": southpaw
+# right_stick       = "right"
+# invert_right_y    = false
+# nintendo_layout   = "position"   # "label": A = Cross on Nintendo pads
+# tilt              = "sensor"     # SIXAXIS tilt: "sensor" (else left stick), "left_stick", "none"
+# tilt_invert       = false
+# [controller.xbox]          # lines for one family only: .playstation .xbox .nintendo .other
+# select = "back"

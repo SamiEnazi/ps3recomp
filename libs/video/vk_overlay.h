@@ -93,6 +93,9 @@ int  vk_overlay_event(const void* sdl_event);
 /* A notice in a corner for a few seconds (any thread). */
 void vk_overlay_notice(const char* text);
 
+/* Open the menu (Esc with the menu closed). 1 = opened, 0 = no overlay. */
+int  vk_overlay_open_menu(void);
+
 /* Window teardown (device alive and idle): frees everything. */
 void vk_overlay_shutdown(void);
 

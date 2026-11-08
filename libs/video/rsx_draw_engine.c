@@ -3817,6 +3817,25 @@ static int eng_gpu_light_blit(u32 location, u32 offset, u32 pitch, int dst_local
       return ssao || (nowb && is_n); }
 }
 
+/* At an NV3089 blit: may the guest-memory copy itself be skipped? With both GPU
+ * passes on, eng_gpu_light_blit already skips the write-back of the source
+ * target, so the blit would copy the same stale VRAM bytes into the light job's
+ * two buffers every frame -- 2 x 3.6 MB of memmove on the RSX thread (~9% of it
+ * in the docks walk, 2026-11-08 ETW profile) -- for buffers that no SPU job
+ * reads any more and whose texture units the engine binds to the GPU outputs.
+ * PS3RECOMP_ENG_GPU_LIGHT_SKIPCOPY=0 keeps the copy. */
+/* set by rsx_draw_engine_write_back_to: its last call skipped the write-back for a light input */
+static int s_gl_wb_skipped;
+int rsx_draw_engine_gpu_light_dst_dead(int dst_local, u32 dst_offset, u32 pitch)
+{
+    static int on = -1, ssao = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_GPU_LIGHT_SKIPCOPY"); on = e ? atoi(e) : 1; }
+    if (ssao < 0) { const char* e = getenv("PS3RECOMP_ENG_GPU_SSAO"); ssao = (e && *e) ? 1 : 0; }
+    if (!on || !ssao || !s_gl_wb_skipped || dst_local != 0 || !g.ready || !eng_gpu_light_on()) return 0;
+    return (dst_offset >= s_gl.diff_off && dst_offset < s_gl.diff_off + pitch) ||
+           (dst_offset >= s_gl.spec_off && dst_offset < s_gl.spec_off + pitch);
+}
+
 /* ---- GPU SSAO (PS3RECOMP_ENG_GPU_SSAO=<local offset of the AO texture>) ----
  * Same idea for the title's SSAO job: the port hands over the constants of its
  * passes, the backend runs them from the light path's depth and normals
@@ -5601,9 +5620,10 @@ int rsx_draw_engine_write_back(int local, u32 offset, u32 pitch)
 
 int rsx_draw_engine_write_back_to(int local, u32 offset, u32 pitch, int dst_local, u32 dst_offset)
 {
+    s_gl_wb_skipped = 0;
     if (!g.ready || !g.be->readback || !g.be->submit_and_wait) return 0;
     if (eng_gpu_light_blit(local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN, offset, pitch,
-                           dst_local, dst_offset)) return 0;
+                           dst_local, dst_offset)) { s_gl_wb_skipped = 1; return 0; }
     /* PS3RECOMP_ENG_WRITEBACK=0 turns the write-back off, 1 writes colour
      * targets only, 2 depth only (bisecting); unset or 3 is both. */
     static int on = -1;

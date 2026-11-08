@@ -123,6 +123,30 @@ int SDL_PeepEvents(SDL_Event* ev, int n, SDL_eventaction action, Uint32 lo, Uint
 Uint32 SDL_WasInit(Uint32 flags) { (void)flags; return flags; }
 int SDL_InitSubSystem(Uint32 flags) { (void)flags; return 0; }
 const char* SDL_GetError(void) { return "fake"; }
+/* start-up: hints, the mapping database, no joystick events (pad_sdl_init_subsystem) */
+SDL_bool SDL_SetHint(const char* n, const char* v) { (void)n; (void)v; return SDL_TRUE; }
+int SDL_GameControllerNumMappings(void) { return 0; }
+int SDL_GameControllerAddMapping(const char* m) { (void)m; return 1; }
+SDL_RWops* SDL_RWFromFile(const char* f, const char* mode) { (void)f; (void)mode; return NULL; }
+int SDL_GameControllerAddMappingsFromRW(SDL_RWops* rw, int freerw) { (void)rw; (void)freerw; return -1; }
+int SDL_GameControllerEventState(int s) { (void)s; return 0; }
+int SDL_JoystickEventState(int s) { (void)s; return 0; }
+/* the connect line (pad_sdl_describe) */
+void SDL_JoystickGetGUIDString(SDL_JoystickGUID g, char* out, int n) { (void)g; if (n > 0) snprintf(out, (size_t)n, "fake"); }
+Uint16 SDL_GameControllerGetVendor(SDL_GameController* gc) { (void)gc; return 0x054C; }
+Uint16 SDL_GameControllerGetProduct(SDL_GameController* gc) { (void)gc; return 0x0CE6; }
+char* SDL_GameControllerMapping(SDL_GameController* gc) { (void)gc; return NULL; }
+void SDL_free(void* p) { free(p); }
+/* PS3_PAD_VIRTUAL (not set here) */
+int SDL_JoystickAttachVirtualEx(const SDL_VirtualJoystickDesc* d) { (void)d; return -1; }
+SDL_Joystick* SDL_JoystickOpen(int i) { (void)i; return NULL; }
+int SDL_JoystickSetVirtualAxis(SDL_Joystick* j, int a, Sint16 v) { (void)j; (void)a; (void)v; return -1; }
+int SDL_JoystickSetVirtualButton(SDL_Joystick* j, int b, Uint8 v) { (void)j; (void)b; (void)v; return -1; }
+/* SIXAXIS tilt: the fake pad has no motion sensor */
+SDL_bool SDL_GameControllerHasSensor(SDL_GameController* gc, SDL_SensorType t) { (void)gc; (void)t; return SDL_FALSE; }
+int SDL_GameControllerSetSensorEnabled(SDL_GameController* gc, SDL_SensorType t, SDL_bool on) { (void)gc; (void)t; (void)on; return -1; }
+SDL_bool SDL_GameControllerIsSensorEnabled(SDL_GameController* gc, SDL_SensorType t) { (void)gc; (void)t; return SDL_FALSE; }
+int SDL_GameControllerGetSensorData(SDL_GameController* gc, SDL_SensorType t, float* d, int n) { (void)gc; (void)t; (void)d; (void)n; return -1; }
 
 /* ---- helpers ---------------------------------------------------------------- */
 static void poll_once(void)
