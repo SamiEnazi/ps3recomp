@@ -1941,10 +1941,30 @@ void cellGcm_ref_on_poll(void)
     LONGLONG min_gap = s_freq.QuadPart / 5000;          /* ~200us */
     const int solo = s_solo_on && s_rp_tid == tid && now.QuadPart - s_rp_multi >= min_gap;
     int dry = 0;
+    /* GCM_REF_STATS=1: every ~5 s, how the ref reads went -- nothing queued
+     * (the RSX thread has not reached the fence: RSX lag), held back by the
+     * pacing gap, or advanced (paced / by a sole reader). */
+    static int s_rs_on = -1;
+    static u64 s_rs_n, s_rs_dry, s_rs_held, s_rs_pub, s_rs_solo; static LONGLONG s_rs_t;
+    if (s_rs_on < 0) s_rs_on = getenv("GCM_REF_STATS") ? 1 : 0;
+    const int queued = s_ref_qhead != s_ref_qtail;
     if (solo || now.QuadPart - s_last_pub >= min_gap) {
+        if (s_rs_on && queued) { s_rs_pub++; if (now.QuadPart - s_last_pub < min_gap) s_rs_solo++; }
         gcm_ref_publish_one();
         s_last_pub = now.QuadPart;
         dry = (s_ref_qhead == s_ref_qtail);
+    } else if (s_rs_on && queued) s_rs_held++;
+    if (s_rs_on) {
+        s_rs_n++; if (!queued) s_rs_dry++;
+        if (!s_rs_t) s_rs_t = now.QuadPart;
+        if (now.QuadPart - s_rs_t >= 5 * s_freq.QuadPart) {
+            const double sec = (double)(now.QuadPart - s_rs_t) / (double)s_freq.QuadPart;
+            fprintf(stderr, "[refstats] per s: %.0f ref reads, %.0f with nothing queued, %.0f held by pacing, "
+                            "%.0f advanced (%.0f by a sole reader); queue %u\n",
+                    s_rs_n / sec, s_rs_dry / sec, s_rs_held / sec, s_rs_pub / sec, s_rs_solo / sec,
+                    (unsigned)(s_ref_qtail - s_ref_qhead));
+            s_rs_n = s_rs_dry = s_rs_held = s_rs_pub = s_rs_solo = 0; s_rs_t = now.QuadPart;
+        }
     }
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
     if (dry && s_gcm_kick_ev)
