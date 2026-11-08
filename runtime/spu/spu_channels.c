@@ -655,6 +655,40 @@ static inline spu_mfc_slot* mfc_slot(int i)
 /* spu_dma.h: PS3_SPU_DMA_LEAN. 1 until the toggle is read (the first
  * spu_wrch reads it). */
 volatile int g_spu_dma_lean = 1;
+
+/* spu_dma.h: PS3_SPU_DMA_FAST. -1 until decided. On unless PS3_SPU_DMA_FAST=0
+ * or any variable that gates a probe in mfc_do_transfer_raw / mfc_run_list /
+ * mfc_submit_body is set (this list is every getenv in them, plus the two
+ * probes they call out to), so a diagnostic never silently stops working. */
+int g_spu_dma_fast = -1;
+int spu_dma_fast_init(void)
+{
+    static const char* const diag[] = {
+        "LBP_SKIP_NULL_DMA", "SPU_CMDDUMP", "SPU_CMDHIST", "SPU_DMA_LAX", "SPU_DMA_RANGE",
+        "SPU_DMA_REPEAT_LIMIT", "SPU_DMA_SKIP_DUMP", "SPU_DMA_STACK_CHECK", "SPU_DMA_WATCH",
+        "SPU_DMACHK", "SPU_DMATRACE", "SPU_DMATRACE_ALL", "SPU_DMATRACE_RAW", "SPU_DSP_IMAGE_EA",
+        "SPU_DUMP_GET", "SPU_GET_EA", "SPU_GET_EA_AFTER", "SPU_GET_EA_MAX", "SPU_GET_HAS",
+        "SPU_GET_JOB", "SPU_GET1_EA", "SPU_GETHIST", "SPU_H2LSRC", "SPU_IMG_DMA",
+        "SPU_IMG_DMA_CODE", "SPU_IMG_DMA_HEAP", "SPU_LS_DUMP_FILE", "SPU_LS_DUMP_LIST",
+        "SPU_MFC_TRACE", "SPU_OVL_DIAG", "SPU_PUT_EA", "SPU_PUT_EA_AFTER", "SPU_PUT_EA_MAX",
+        "SPU_PUT_JOB", "SPU_PUT_RANGE", "SPU_PUTEA", "SPU_PUTHIST", "SPU_ROWCOV", "SPU_SMC_HI",
+        "SPU_SMC_LO", "SPU_SMC_WATCH", "SPU_STACKEA_WATCH", "SPU_TRACE_N", "SPU_VRAMPC",
+        "SPU_WATCHEA", "SPU_WATCHEA_EVERY", "SPU_WATCHLSA", "YDKJ_CRI_CHAIN", "YDKJ_DMA_IMG",
+        "YDKJ_NO_CRI_R4",
+        "SPU_LOCKGUARD", "SPU_POISON_DMA" };
+    const char* e = getenv("PS3_SPU_DMA_FAST");
+    int on = !(e && e[0] == '0');
+#ifdef SPU_DMA_LOG
+    on = 0;
+#endif
+    for (size_t i = 0; on && i < sizeof diag / sizeof diag[0]; i++)
+        if (getenv(diag[i])) {
+            on = 0;
+            fprintf(stderr, "[spu] PS3_SPU_DMA_FAST off: %s is set (the full DMA path keeps its probes)\n", diag[i]);
+        }
+    __atomic_store_n(&g_spu_dma_fast, on, __ATOMIC_RELAXED);
+    return on;
+}
 static void spu_dma_lean_set(int id, int on)
 {
     (void)id;

@@ -496,23 +496,32 @@ void (*spu_take_interrupt(spu_context* ctx,
 }
 
 /* See the declaration in spu_context.h. */
-void spu_depth_guard(spu_context* ctx)
+static uint32_t s_depth_max = 0;   /* SPU_HOST_DEPTH_MAX, 0 until read */
+enum { SPU_DEPTH_RING = 24 };
+static __attribute__((noinline, cold)) void spu_depth_guard_trip(spu_context* ctx, uint32_t s_n);
+static inline __attribute__((always_inline)) void spu_depth_guard_inl(spu_context* ctx)
 {
-    static _Atomic uint32_t s_max = 0;
-    if (!s_max) {
+    uint32_t mx = __atomic_load_n(&s_depth_max, __ATOMIC_RELAXED);
+    if (__builtin_expect(!mx, 0)) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
-        s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+        mx = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+        __atomic_store_n(&s_depth_max, mx, __ATOMIC_RELAXED);
     }
 
     /* Ring of recent drain sites. When the depth trips, the useful question is
      * not "where are we" but "what cycle got us here" -- one pc names a point,
      * a ring names the loop. */
-    enum { RING = 24 };
-    uint32_t* const s_ring = ctx->depth_ring;     /* per SPU context: its own cycle */
-    const uint32_t s_n = ++ctx->depth_ring_n;
-    s_ring[(s_n - 1) % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
+    const uint32_t s_n = ++ctx->depth_ring_n;   /* per SPU context: its own cycle */
+    ctx->depth_ring[(s_n - 1) % SPU_DEPTH_RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
 
-    if (ctx->host_depth < s_max) return;
+    if (__builtin_expect(ctx->host_depth < mx, 1)) return;
+    spu_depth_guard_trip(ctx, s_n);
+}
+void spu_depth_guard(spu_context* ctx) { spu_depth_guard_inl(ctx); }
+static void spu_depth_guard_trip(spu_context* ctx, uint32_t s_n)
+{
+    enum { RING = SPU_DEPTH_RING };
+    uint32_t* const s_ring = ctx->depth_ring;
     static _Atomic int s_reported = 0;
     if (s_reported < 1) {   /* one report: five SPU threads all trip together */
         s_reported++;
@@ -557,7 +566,42 @@ int spu_tailret_enabled(void)
 typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
+/* PS3_SPU_DRAIN_FAST (default 1): every lifted call is followed by a
+ * spu_drain_call, and nearly always the callee has already come back -- its
+ * `bi $r0` left pc at return_pc with nothing (or the depth-0 dispatcher)
+ * pending -- so the drain below does its depth guard, finds that, and
+ * returns. It still paid a 0x158-byte frame (the interrupt frame's jmp_buf),
+ * eight saved registers and a stack cookie each time. The front function
+ * takes exactly that case with the same steps (the guard, the transfer
+ * cleared, drain_ret_pc cleared; no interrupt frame was armed) and hands
+ * everything else to the full drain. 0 = always the full drain. */
+static void spu_drain_call_full(spu_context* ctx, uint32_t return_pc);
+static int s_drain_fast = -1;
+static __attribute__((noinline, cold)) int spu_drain_fast_init(void)
+{
+    const char* e = getenv("PS3_SPU_DRAIN_FAST");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_drain_fast, on, __ATOMIC_RELAXED);
+    return on;
+}
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+{
+    int fast = __atomic_load_n(&s_drain_fast, __ATOMIC_RELAXED);
+    if (__builtin_expect(fast < 0, 0)) fast = spu_drain_fast_init();
+    if (__builtin_expect(fast && g_spu_direct >= 0, 1)) {
+        void (*const tf)(spu_context*) = g_spu_trampoline_fn;
+        if ((!tf || tf == spu_indirect_branch) && !((ctx->pc ^ return_pc) & SPU_LS_MASK)) {
+            spu_depth_guard_inl(ctx);
+            /* the full drain re-reads both after its guard: the guard changes neither */
+            g_spu_trampoline_fn = 0;
+            ctx->drain_ret_pc = 0;
+            return;
+        }
+    }
+    spu_drain_call_full(ctx, return_pc);
+}
+
+static void spu_drain_call_full(spu_context* ctx, uint32_t return_pc)
 {
     if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
     spu_depth_guard(ctx);

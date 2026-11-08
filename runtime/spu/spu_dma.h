@@ -822,6 +822,135 @@ static inline int mfc_do_transfer_raw(spu_context* spu, uint32_t lsa, uint64_t e
     return 0;
 }
 
+/* PS3_SPU_DMA_FAST (default 1; spu_channels.c spu_dma_fast_init): the DMA
+ * path without its diagnostics. mfc_do_transfer_raw and mfc_submit_body carry
+ * some fifty environment-gated probes -- each a static load and a branch on
+ * every transfer, spread over as many cache lines -- in a 0x268-byte frame with
+ * a stack cookie; ~2.5 million transfers a second in combat. When none of
+ * those variables is set (and PS3_SPU_DMA_LEAN is on), the probes can only
+ * fall through, and the two functions below do exactly what is left: the same
+ * checks in the same order, the same copy, the same overlay note and LS watch
+ * for a GET, the same coherence, PUT hook and sync-line watch for a PUT, the
+ * same tag bookkeeping. Any of the variables set (or PS3_SPU_DMA_FAST=0)
+ * selects the full functions as before. */
+extern int g_spu_dma_fast;
+int spu_dma_fast_init(void);
+static inline int spu_dma_fast(void)
+{
+    int v = __atomic_load_n(&g_spu_dma_fast, __ATOMIC_RELAXED);
+    if (__builtin_expect(v < 0, 0)) v = spu_dma_fast_init();
+    return v && g_spu_dma_lean;
+}
+
+static inline int mfc_do_transfer_lean(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                       uint32_t size, uint32_t cmd)
+{
+    /* mfc_do_transfer_raw with SPU_DMA_LAX unset: malformed transfers are rejected. */
+    if (size == 0) return 0;
+    if ((size > 0x4000) || (size >= 16 && (size & 15)) || (((lsa ^ (uint32_t)ea) & 15) != 0) ||
+        (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u)) {
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 8))
+            fprintf(stderr, "[mfc] REJECTED malformed transfer: img=%d pc=0x%05X"
+                            " cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                    spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd,
+                    lsa, (uint32_t)ea, size);
+        return 0;
+    }
+    if (size > MFC_MAX_DMA_SIZE)
+        return -1;
+    lsa &= SPU_LS_MASK;
+    if ((uint64_t)lsa + (uint64_t)size > (uint64_t)SPU_LS_SIZE)
+        return -1;
+    if (!mfc_ea_range_committed(ea, size)) {
+        static int s_warned = 0;
+        if (PS3_LOG_FIRST(s_warned, 32))
+            fprintf(stderr, "[spu-dma] SKIP %s img=%d pc=0x%05X lsa=0x%05X ea=0x%08X "
+                    "size=%u%s (EA not committed -- bad/garbage DMA target)\n",
+                    mfc_is_get(cmd) ? "GET" : "PUT", spu->image_id,
+                    (uint32_t)spu->pc & SPU_LS_MASK, lsa, (uint32_t)ea, size,
+                    (size <= 8 && ((uint32_t)ea & (size - 1))) ? " MISALIGNED" : "");
+        return -1;
+    }
+    uint8_t* ls_ptr = &spu->ls[lsa];
+    uint8_t* ea_ptr = vm_base + (uint32_t)ea;
+    { extern int g_cri_video_dma;
+      if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
+          g_cri_video_dma = 1; }
+    if (mfc_is_get(cmd)) {
+        gm_copy_from(ls_ptr, (const uint8_t*)ea_ptr, size);
+        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+          spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+        { int _n; unsigned* _w = spu_ls_watch_list(&_n);
+          for (int _i = 0; _i < _n; _i++) {
+              if (_w[_i] >= lsa && _w[_i] < lsa + size) {
+                  const uint8_t* q = &spu->ls[_w[_i] & (SPU_LS_MASK & ~0xFu)];
+                  if (!spu_ls_watch_ring_dma(spu, _w[_i], (uint32_t)ea, size, q)) {
+                      fprintf(stderr, "[spu-watch DMA-GET 0x%05X <- ea=0x%08X sz=%u img=%d] "
+                              "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                              _w[_i], (uint32_t)ea, size, spu->image_id,
+                              q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
+                              q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15]);
+                      fflush(stderr);
+                  }
+              }
+          } }
+    } else if (mfc_is_put(cmd)) {
+        /* mfc_do_transfer_raw's PUT: the same copy-and-notify protocol. */
+        extern int  spu_coh_is_reserved(uint32_t);
+        extern void spu_coh_notify_write_except(uint32_t, const void*);
+        extern uint64_t spu_lockline_mask_ea(uint32_t);
+        extern uint64_t spu_lockline_mask_range(uint32_t, uint32_t);
+        extern void spu_lockline_lock_mask(uint64_t);
+        extern void spu_lockline_unlock_mask(uint64_t);
+        uint32_t a0 = (uint32_t)ea & ~127u;
+        uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+        int span_reserved = 0;
+        for (uint32_t a = a0; ; a += 128u) {
+            if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+            if (a == a1) break;
+        }
+        if (span_reserved) {
+            const uint64_t llm = spu_lockline_mask_range((uint32_t)ea, size);
+            spu_lockline_lock_mask(llm);
+            gm_copy_to((uint8_t*)ea_ptr, ls_ptr, size);
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                if (a == a1) break;
+            }
+            spu_lockline_unlock_mask(llm);
+        } else {
+            gm_copy_to((uint8_t*)ea_ptr, ls_ptr, size);
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) {
+                    const uint64_t llm = spu_lockline_mask_ea(a);
+                    spu_lockline_lock_mask(llm);
+                    spu_coh_notify_write_except(a, spu);
+                    spu_lockline_unlock_mask(llm);
+                }
+                if (a == a1) break;
+            }
+        }
+        { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+        { extern uint32_t g_barrier_sync_watch;
+          uint32_t b = g_barrier_sync_watch;
+          if (b && (uint32_t)ea < b + 0xC0 && (uint32_t)ea + size > b + 0x40) {
+              static int _n = 0;
+              if (PS3_LOG_FIRST(_n, 64)) {
+                  uint32_t sn = ((uint32_t)spu->ls[0x1C8]<<24)|((uint32_t)spu->ls[0x1C9]<<16)|
+                                ((uint32_t)spu->ls[0x1CA]<<8)|spu->ls[0x1CB];
+                  const uint8_t* lp = (const uint8_t*)ls_ptr;
+                  fprintf(stderr, "[sync-PUT] spuNum=%u pc=0x%05X ea=0x%08X (sync+0x%X) row={%02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X %02X%02X}\n",
+                          sn, (uint32_t)spu->pc, (uint32_t)ea, (uint32_t)ea - b,
+                          lp[0],lp[1],lp[2],lp[3],lp[4],lp[5],lp[6],lp[7],
+                          lp[8],lp[9],lp[10],lp[11],lp[12],lp[13],lp[14],lp[15]);
+              }
+          } }
+    }
+    return 0;
+}
+
 /* Every GET/PUT data transfer goes through here: with the job recorder on
  * (spu_jobrec.h, PS3_JOBREC / PS3_JOBREPLAY) a job being recorded logs its
  * transfers and one being replayed is served from its recording. Off, this is
@@ -833,6 +962,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         int rc;
         if (spu_jobrec_dma(spu, lsa, ea, size, cmd, &rc)) return rc;
     }
+    if (__builtin_expect(spu_dma_fast(), 1)) return mfc_do_transfer_lean(spu, lsa, ea, size, cmd);
     return mfc_do_transfer_raw(spu, lsa, ea, size, cmd);
 }
 
@@ -866,7 +996,9 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
         uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
 
         /* SPU_PUT_EA=<lo>:<hi>: log list-PUT elements landing in [lo,hi), with
-         * the resident WWS job header (same format as the RPCS3 oracle). */
+         * the resident WWS job header (same format as the RPCS3 oracle).
+         * (PS3_SPU_DMA_FAST: none of these variables is set.) */
+        if (!spu_dma_fast())
         { static _Atomic int on = -1; static _Atomic uint32_t lo, hi;
           static _Atomic int gon = -1; static _Atomic uint32_t glo, ghi;
           if (gon < 0) { const char* e = getenv("SPU_GET_EA"); gon = e != 0;
@@ -1021,8 +1153,64 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  * Submit and immediately execute an MFC command.
  * This is the main entry point called when the SPU writes to MFC_Cmd.
  */
+/* PS3_SPU_DMA_FAST: mfc_submit_body below with none of its diagnostic
+ * variables set (see mfc_do_transfer_lean) -- what is left, in its order. */
+static inline int mfc_submit_lean(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+{
+    uint32_t lsa  = spu->mfc_lsa;
+    uint64_t ea   = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
+    uint32_t size = spu->mfc_size;
+    uint32_t tag  = spu->mfc_tag & 0x1F;
+    int rc = 0;
+    mfc->tag_completed &= ~(1u << tag);
+    if (cmd == MFC_BARRIER_CMD || cmd == MFC_EIEIO_CMD || cmd == MFC_SYNC_CMD) {
+        mfc->tag_completed |= (1u << tag);
+        return 0;
+    }
+    if (spu->policy_mode) {   /* mfc_submit_body's always-on policy-module trace */
+        static int _pn = 0;
+        extern uint32_t g_barrier_sync_watch;
+        static int _post = 0;
+        int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
+        if (open) {
+            if (_pn >= 96) _post++;
+            fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
+                    cmd, lsa, (unsigned long long)ea, size, tag);
+        } else if (_pn == 96)
+            fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
+        _pn++;
+    }
+    if (mfc_is_list(cmd)) {
+        { static int _l = 0; if (PS3_LOG_FIRST(_l, 32))
+            fprintf(stderr, "[mfc-list] ISSUE img=%d cmd=0x%02X dest_lsa=0x%05X "
+                    "list\n0x%05X size=0x%X (%u elems) tag=%u\n",
+                    spu->image_id, cmd, lsa, (uint32_t)ea & SPU_LS_MASK,
+                    size, size / 8, tag); }
+        rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
+                                  ea & 0xFFFFFFFF00000000ull, size, cmd);
+    } else {
+        rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
+    }
+    if (spu->image_id == 2 && lsa == 0xC00 && cmd == 0x40 && rc == 0) {   /* wwsjob batch-fetch probe */
+        { extern volatile unsigned g_wws_batch_gets; g_wws_batch_gets++; }
+        static int _n = 0;
+        if (PS3_LOG_FIRST(_n, 8)) {
+            const uint8_t* p = spu->ls + 0xC00;
+            fprintf(stderr, "[wws-batch] GET 0xC00 ea=0x%09llX size=0x%X:",
+                    (unsigned long long)ea, size);
+            for (uint32_t i = 0; i < size && i < 0x40; i += 4)
+                fprintf(stderr, " %02X%02X%02X%02X", p[i], p[i+1], p[i+2], p[i+3]);
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+    }
+    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))))
+        mfc->tag_completed |= (1u << tag);
+    return rc;
+}
+
 static inline int mfc_submit_body(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
+    if (__builtin_expect(spu_dma_fast(), 1)) return mfc_submit_lean(mfc, spu, cmd);
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
