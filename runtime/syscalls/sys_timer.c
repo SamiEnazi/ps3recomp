@@ -336,14 +336,18 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
-        /* PS3_USLEEP_TIMER_US=<n> (A/B, off by default): a sleep of n us or more is
+        /* PS3_USLEEP_TIMER_US=<n> (default 500; 0 = off, the old spin): a sleep of n us or more is
          * slept on a high-resolution waitable timer, not spun. inFAMOUS 2's SPU task
          * kickers poll with usleep(100/500/900) -- spun, that is most of two P-cores
          * while the SPU worker threads that set the frame rate in the heavy view run
          * partly on E-cores. The timer here wakes on ~0.5 ms ticks, so the sleep may
-         * end up to ~0.5 ms late; whatever is left of the request is still spun. */
+         * end up to ~0.5 ms late; whatever is left of the request is still spun.
+         * Same-session A/B on the register-locals build (2026-11-08): +3.5% fps over the
+         * run, the heavy pier view's slowest half-seconds 55.3 -> 58.0 fps (the SPU
+         * threads did the same work in 5% less core time). The main thread's usleep(1)
+         * job polls stay spun. */
         { static int s_tus = -1;
-          if (s_tus < 0) { const char* e = getenv("PS3_USLEEP_TIMER_US"); s_tus = e ? atoi(e) : 0; if (s_tus < 0) s_tus = 0; }
+          if (s_tus < 0) { const char* e = getenv("PS3_USLEEP_TIMER_US"); s_tus = e ? atoi(e) : 500; if (s_tus < 0) s_tus = 0; }
           if (s_tus > 0 && usec >= (uint64_t)s_tus) {
               static __declspec(thread) HANDLE t_ht;
               if (!t_ht) t_ht = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
