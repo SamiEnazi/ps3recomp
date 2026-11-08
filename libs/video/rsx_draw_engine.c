@@ -2144,7 +2144,17 @@ static eng_vp_memo* s_vpgen_memo;
 static u32 s_vpgen_gen, s_vpgen_start;
 static int s_vpgen_on = -1;
 static void eng_vpgen_set(int id, int v) { (void)id; __atomic_store_n(&s_vpgen_on, v != 0, __ATOMIC_RELAXED); }
-static eng_fp_memo s_fp_memo[ENG_PROG_MEMO];
+/* PS3RECOMP_ENG_FP_MEMO (default 64, 1..64; 8 = the old size): how many
+ * fragment programs are kept. A heavy frame runs far more than eight, so the
+ * old table missed and re-analysed (copy, structural hash, constants, three
+ * microcode walks) on many draws. The lookup scans compact key arrays, not the
+ * 32 KB entries. */
+#define ENG_FP_MEMO_MAX 64u
+static eng_fp_memo s_fp_memo[ENG_FP_MEMO_MAX];
+static u64 s_fp_key[ENG_FP_MEMO_MAX];           /* loc << 32 | off */
+static u32 s_fp_sz[ENG_FP_MEMO_MAX];            /* 0: unused */
+static u32 s_fp_use[ENG_FP_MEMO_MAX];           /* recency */
+static u32 s_fp_cap;
 static u32 s_memo_clock;
 static u64 ds_memo_hit[2], ds_memo_miss[2];     /* drawstats: vp, fp */
 
@@ -2222,12 +2232,18 @@ static const eng_fp_memo* eng_fp_current(void)
     if (!rsx_dsp_reg(&g.rsx, 0x08E4)) return NULL;
     u32 loc = 0;
     const u32 off = rsx_dsp_fragment_program(&g.rsx, &loc);
-    for (u32 i = 0; i < ENG_PROG_MEMO; i++) {
+    if (__builtin_expect(!s_fp_cap, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_FP_MEMO");
+        const long n = e ? strtol(e, NULL, 10) : (long)ENG_FP_MEMO_MAX;
+        s_fp_cap = n < 1 ? 1u : n > (long)ENG_FP_MEMO_MAX ? ENG_FP_MEMO_MAX : (u32)n;
+    }
+    const u64 key = ((u64)loc << 32) | off;
+    for (u32 i = 0; i < s_fp_cap; i++) {
+        if (!s_fp_sz[i] || s_fp_key[i] != key) continue;
         eng_fp_memo* m = &s_fp_memo[i];
-        if (!m->size || m->loc != loc || m->off != off) continue;
         const u8* uc = eng_guest_ptr(NULL, loc, off, m->size);
         if (uc && !memcmp(m->bytes, uc, m->size)) {
-            m->used = ++s_memo_clock;
+            s_fp_use[i] = m->used = ++s_memo_clock;
             ds_memo_hit[1]++;
             return m;
         }
@@ -2239,8 +2255,8 @@ static const eng_fp_memo* eng_fp_current(void)
     if (!uc || !size) return NULL;
 
     u32 v = 0;
-    for (u32 i = 1; i < ENG_PROG_MEMO; i++)
-        if (s_fp_memo[i].used < s_fp_memo[v].used) v = i;
+    for (u32 i = 1; i < s_fp_cap; i++)
+        if (s_fp_use[i] < s_fp_use[v]) v = i;
     eng_fp_memo* m = &s_fp_memo[v];
     u8* copy = (u8*)realloc(m->bytes, size);
     if (!copy) return NULL;
@@ -2250,6 +2266,7 @@ static const eng_fp_memo* eng_fp_current(void)
     m->off = off;
     m->size = size;
     m->used = ++s_memo_clock;
+    s_fp_key[v] = key; s_fp_sz[v] = size; s_fp_use[v] = m->used;
     m->structural = rsx_fp_structural_hash(uc, size, 1469598103934665603ull);
     m->constants.count = 0;
     m->constants_ok = rsx_fp_collect_constants(uc, size, &m->constants) >= 0;
