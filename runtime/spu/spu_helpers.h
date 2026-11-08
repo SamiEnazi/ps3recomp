@@ -2288,4 +2288,31 @@ static inline __attribute__((always_inline)) void spu_wrch_inl(spu_context* ctx,
 #define spu_wrch(ctx, ch, v) spu_wrch_inl((ctx), (ch), (v))
 #endif
 
+/* PS3_SPU_DRAIN_INLINE (default 1; lifted TUs only, spu3 2026-11-08): the call drain after every
+ * lifted call, when the callee has already come back (pc == return pc, no transfer pending other
+ * than the depth-0 dispatcher) -- spu_drain_call's PS3_SPU_DRAIN_FAST front case, the same steps
+ * (depth ring, transfer and drain_ret_pc cleared) inline instead of a call. Anything else, or a
+ * depth at the limit (the guard reports it), goes to spu_drain_call. g_spu_drain_inline is
+ * published by the first spu_drain_call. */
+#if defined(SPU_LS_FASTPATH) && SPU_LS_FASTPATH && !defined(SPU_NO_DRAIN_INLINE)
+extern int g_spu_drain_inline;
+extern uint32_t g_spu_depth_max_pub;
+void spu_indirect_branch(spu_context* ctx);
+static inline __attribute__((always_inline)) void spu_drain_call_inl(spu_context* ctx, uint32_t return_pc)
+{
+    void (*const tf)(spu_context*) = ctx->tramp_fn;
+    if (__builtin_expect(__atomic_load_n(&g_spu_drain_inline, __ATOMIC_ACQUIRE) > 0, 1) &&
+        (!tf || tf == spu_indirect_branch) && !((ctx->pc ^ return_pc) & SPU_LS_MASK) &&
+        ctx->host_depth < g_spu_depth_max_pub) {
+        const uint32_t n = ++ctx->depth_ring_n;
+        ctx->depth_ring[(n - 1) % 24u] = (uint32_t)ctx->pc & SPU_LS_MASK;
+        ctx->tramp_fn = 0;
+        ctx->drain_ret_pc = 0;
+        return;
+    }
+    spu_drain_call(ctx, return_pc);
+}
+#define spu_drain_call(ctx, pc) spu_drain_call_inl((ctx), (pc))
+#endif
+
 #endif /* SPU_HELPERS_H */

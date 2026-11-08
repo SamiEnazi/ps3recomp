@@ -499,14 +499,17 @@ void (*spu_take_interrupt(spu_context* ctx,
 static uint32_t s_depth_max = 0;   /* SPU_HOST_DEPTH_MAX, 0 until read */
 enum { SPU_DEPTH_RING = 24 };
 static __attribute__((noinline, cold)) void spu_depth_guard_trip(spu_context* ctx, uint32_t s_n);
+static uint32_t spu_depth_guard_inl_max_init(void)
+{
+    const char* e = getenv("SPU_HOST_DEPTH_MAX");
+    const uint32_t mx = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+    __atomic_store_n(&s_depth_max, mx, __ATOMIC_RELAXED);
+    return mx;
+}
 static inline __attribute__((always_inline)) void spu_depth_guard_inl(spu_context* ctx)
 {
     uint32_t mx = __atomic_load_n(&s_depth_max, __ATOMIC_RELAXED);
-    if (__builtin_expect(!mx, 0)) {
-        const char* e = getenv("SPU_HOST_DEPTH_MAX");
-        mx = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
-        __atomic_store_n(&s_depth_max, mx, __ATOMIC_RELAXED);
-    }
+    if (__builtin_expect(!mx, 0)) mx = spu_depth_guard_inl_max_init();
 
     /* Ring of recent drain sites. When the depth trips, the useful question is
      * not "where are we" but "what cycle got us here" -- one pc names a point,
@@ -584,10 +587,24 @@ static __attribute__((noinline, cold)) int spu_drain_fast_init(void)
     __atomic_store_n(&s_drain_fast, on, __ATOMIC_RELAXED);
     return on;
 }
+/* PS3_SPU_DRAIN_INLINE (spu_helpers.h, lifted TUs; default 1): the front case above,
+ * inline at every lifted call site. Published once DRAIN_FAST, g_spu_direct and the
+ * depth limit are known: 1 = the inline path may take it, 0 = always call. */
+int g_spu_drain_inline = -1;
+uint32_t g_spu_depth_max_pub;
+static __attribute__((noinline, cold)) void spu_drain_inline_init(int fast)
+{
+    const char* e = getenv("PS3_SPU_DRAIN_INLINE");
+    spu_depth_guard_inl_max_init();
+    g_spu_depth_max_pub = __atomic_load_n(&s_depth_max, __ATOMIC_RELAXED);
+    const int on = !(e && e[0] == '0') && fast && g_spu_direct >= 0 && SPU_DEPTH_RING == 24;
+    __atomic_store_n(&g_spu_drain_inline, on, __ATOMIC_RELEASE);
+}
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
     int fast = __atomic_load_n(&s_drain_fast, __ATOMIC_RELAXED);
     if (__builtin_expect(fast < 0, 0)) fast = spu_drain_fast_init();
+    if (__builtin_expect(g_spu_drain_inline < 0, 0) && g_spu_direct >= 0) spu_drain_inline_init(fast);
     if (__builtin_expect(fast && g_spu_direct >= 0, 1)) {
         void (*const tf)(spu_context*) = g_spu_trampoline_fn;
         if ((!tf || tf == spu_indirect_branch) && !((ctx->pc ^ return_pc) & SPU_LS_MASK)) {
