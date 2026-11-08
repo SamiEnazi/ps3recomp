@@ -445,6 +445,10 @@ static struct {
     rsx_vertex_ref* refs;
     u32 n_refs, cap_refs, n_source_refs;
     int refs_remapped;
+    /* An index-cache hit leaves refs[1..n_refs) unwritten (they are span
+     * consecutive ids from refs[0], base lazy_base): dc_refs_fill() writes them
+     * for the one later reader (a non-indexed refetch). 0 = all written. */
+    u32 refs_lazy, lazy_base;
     rsx_vertex_remap ref_remap;
 
     u32* cuts;
@@ -3466,9 +3470,17 @@ static void eng_ic_after_draw(eng_ic_entry* e, u64 content, u32 n_draw)
     e->content = content; e->seen = 1; e->seen_frame = g.frames; e->last_frame = g.frames;
 }
 
+/* Write the references an index-cache hit left out (dc.refs_lazy). */
+static void dc_refs_fill(void)
+{
+    if (!dc.refs_lazy) return;
+    const u32 lo = dc.refs[0].vertex_id;
+    for (u32 i = 1; i < dc.n_refs; i++) { dc.refs[i].vertex_id = lo + i; dc.refs[i].base_index = dc.lazy_base; }
+    dc.refs_lazy = 0;
+}
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
-    s_ic_cur = NULL; s_ic_hit = 0; s_ic_ranged = 0;
+    s_ic_cur = NULL; s_ic_hit = 0; s_ic_ranged = 0; dc.refs_lazy = 0;
     /* PS3RECOMP_ENG_ICACHE: an index-only draw whose rebuilt list is resident
      * and whose vertices the vertex cache holds skips the index work. */
     if (dc.n_idx && !dc.n_arr && !dc.inl && dc.fetch_ok && allow_remap && layout->stride &&
@@ -3485,11 +3497,25 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             dc_reserve_refs(e->span)) {
             /* The references the range remap would have left: span
              * consecutive vertex ids from lo. */
-            for (u32 i = 0; i < e->span; i++) { dc.refs[i].vertex_id = e->lo + i; dc.refs[i].base_index = base_index; }
             dc.n_refs = e->span; dc.n_source_refs = e->n_src; dc.refs_remapped = 1; dc.n_cuts = 0;
             dc.layout = *layout;
             rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
             rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, NULL, 0);
+            /* PS3RECOMP_ENG_LAZY_REFS (default 1): the plan below reads only
+             * refs[0] of a consecutive run unless an attribute has a frequency
+             * divider; a hit never reads the rest (writing them was ~0.3 ms of
+             * the RSX thread a frame in the pier view). */
+            static int lazy_on = -1;
+            if (lazy_on < 0) { const char* ev = getenv("PS3RECOMP_ENG_LAZY_REFS"); lazy_on = !(ev && ev[0] == '0'); }
+            /* ... and only while the run does not wrap the 20-bit element index
+             * (prepare walks every reference then). */
+            int lazy = lazy_on && e->span > 1 &&
+                       (u64)rsx_vertex_element_index(e->lo, base_index, 0, 0) + e->span - 1u <= 0x000FFFFFu;
+            for (u32 slot = 0; lazy && slot < dc.fetch_plan.layout.count; slot++)
+                if (dc.fetch_plan.attr[dc.fetch_plan.layout.attrs[slot]].desc.frequency > 1) lazy = 0;
+            const u32 nw = lazy ? 1u : e->span;
+            for (u32 i = 0; i < nw; i++) { dc.refs[i].vertex_id = e->lo + i; dc.refs[i].base_index = base_index; }
+            dc.refs_lazy = lazy; dc.lazy_base = base_index;
             rsx_vertex_fetch_plan_prepare_ex(&dc.fetch_plan, dc.refs, dc.n_refs, 1);
             u64 vc_content = 0;
             eng_vc_entry* ve = eng_vc_probe(layout, &vc_content);
@@ -3503,7 +3529,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                 return;
             }
             /* The vertices changed: the whole way, as if nothing were cached. */
-            dc.n_refs = dc.n_source_refs = 0; dc.refs_remapped = 0;
+            dc.n_refs = dc.n_source_refs = 0; dc.refs_remapped = 0; dc.refs_lazy = 0;
         }
         if (s_ic_cur) ds_ic_miss++;
     }
@@ -4490,6 +4516,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* The cache hands over a buffer of unique vertices for an indexed draw;
      * one that ended up non-indexed needs dc.verts after all. */
     if (dc.vbuf_hit && !indexed) {
+        dc_refs_fill();
         if (!dc_reserve_verts((u64)dc.n_refs * dc.layout.stride) ||
             !rsx_vertex_fetch_all(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts)) {
             eng_drop("fetch", prim); return; }
