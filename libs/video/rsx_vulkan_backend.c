@@ -1756,16 +1756,195 @@ static int vk_sc_hlsl_to_spirv(const char* hlsl, int stage, u32* words, u32 max_
     free(un);
     return rc;
 }
+/* ---- the session's SPIR-V in memory + a background writer for new .spv files ----
+ * Cold-cache runs (2026-11-08, pl-c1-cold): every frame over 50 ms was a NEW
+ * fragment shader on the RSX thread -- 455 of them in 150-380 s cost 3.9 s,
+ * single ones 100-830 ms -- while glslang itself totalled ~1 s over the whole
+ * run: the rest was writing the new <key>.spv (temp file + MoveFileEx, which an
+ * on-access virus scan can hold for a long time). Now a new shader's SPIR-V is
+ * kept in memory (a repeat in this session needs neither the disk nor glslang;
+ * the engine asks again for the same text under another render state) and the
+ * file is written by a background thread. PS3RECOMP_VK_SC_ASYNC=0: written on
+ * the RSX thread and read back from disk, as before. PS3_FTRACE: kind 16 who 6
+ * = glslang alone (a = stage, b = 1 ok), who 7 = one .spv write (a = bytes,
+ * b = 1 written by the background thread). */
+typedef struct vk_sc_mem_ent { vk_sc_key k; u32 n; u32* w; } vk_sc_mem_ent;
+static struct { vk_sc_mem_ent* e; u32 cap, cnt; } s_scm;      /* RSX thread only */
+typedef struct vk_sc_wjob { struct vk_sc_wjob* next; char path[VK_SC_PATH]; size_t bytes; u8 data[]; } vk_sc_wjob;
+static struct {
+    int on;                            /* -1 unread */
+    vk_sc_wjob *head, *tail;
+    volatile int pending, running;
+    unsigned long long write_ns, writes;
+#ifdef _WIN32
+    SRWLOCK lock; CONDITION_VARIABLE cv;
+#else
+    pthread_mutex_t lock; pthread_cond_t cv;
+#endif
+} s_scw = { -1
+#ifndef _WIN32
+    , NULL, NULL, 0, 0, 0, 0, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER
+#endif
+};
+static int vk_sc_async_on(void)
+{
+    if (s_scw.on < 0) { const char* e = getenv("PS3RECOMP_VK_SC_ASYNC"); s_scw.on = !(e && *e == '0'); }
+    return s_scw.on;
+}
+static u32 vk_sc_mem_slot(vk_sc_key k) { return (u32)(k.a ^ (k.b >> 7)) & (s_scm.cap - 1u); }
+static const vk_sc_mem_ent* vk_sc_mem_get(vk_sc_key k)
+{
+    if (!s_scm.cap) return NULL;
+    for (u32 i = vk_sc_mem_slot(k);; i = (i + 1u) & (s_scm.cap - 1u)) {
+        const vk_sc_mem_ent* e = &s_scm.e[i];
+        if (!e->w) return NULL;
+        if (e->k.a == k.a && e->k.b == k.b) return e;
+    }
+}
+static void vk_sc_mem_put(vk_sc_key k, const u32* words, u32 n)
+{
+    if (vk_sc_mem_get(k)) return;
+    if ((s_scm.cnt + 1u) * 2u > s_scm.cap) {           /* grow: load factor <= 1/2 */
+        const u32 ncap = s_scm.cap ? s_scm.cap * 2u : 1024u;
+        vk_sc_mem_ent* ne = (vk_sc_mem_ent*)calloc(ncap, sizeof *ne);
+        if (!ne) return;
+        vk_sc_mem_ent* old = s_scm.e; const u32 ocap = s_scm.cap;
+        s_scm.e = ne; s_scm.cap = ncap;
+        for (u32 i = 0; i < ocap; i++) if (old[i].w) {
+            u32 j = vk_sc_mem_slot(old[i].k);
+            while (s_scm.e[j].w) j = (j + 1u) & (ncap - 1u);
+            s_scm.e[j] = old[i];
+        }
+        free(old);
+    }
+    u32* w = (u32*)malloc((size_t)n * 4u);
+    if (!w) return;
+    memcpy(w, words, (size_t)n * 4u);
+    u32 j = vk_sc_mem_slot(k);
+    while (s_scm.e[j].w) j = (j + 1u) & (s_scm.cap - 1u);
+    s_scm.e[j].k = k; s_scm.e[j].n = n; s_scm.e[j].w = w;
+    s_scm.cnt++;
+}
+static void vk_sc_wlock(void)
+{
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_scw.lock);
+#else
+    pthread_mutex_lock(&s_scw.lock);
+#endif
+}
+static void vk_sc_wunlock(void)
+{
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&s_scw.lock);
+#else
+    pthread_mutex_unlock(&s_scw.lock);
+#endif
+}
+#ifdef _WIN32
+static DWORD WINAPI vk_sc_writer(LPVOID unused)
+#else
+static void* vk_sc_writer(void* unused)
+#endif
+{
+    (void)unused;
+    for (;;) {
+        vk_sc_wlock();
+        while (!s_scw.head) {
+#ifdef _WIN32
+            SleepConditionVariableSRW(&s_scw.cv, &s_scw.lock, INFINITE, 0);
+#else
+            pthread_cond_wait(&s_scw.cv, &s_scw.lock);
+#endif
+        }
+        vk_sc_wjob* j = s_scw.head;
+        s_scw.head = j->next;
+        if (!s_scw.head) s_scw.tail = NULL;
+        vk_sc_wunlock();
+        const u64 t0 = ps3_ft_now();
+        const int ok = vk_sc_write_file(j->path, NULL, 0, j->data, j->bytes) == 0;
+        const u64 t1 = ps3_ft_now();
+        if (PS3_FT_ON()) ps3_ft_span(PS3_FT_COMPILE, 7, (u32)j->bytes, 1u, t0, t1);
+        __atomic_add_fetch(&s_scw.write_ns, t1 - t0, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&s_scw.writes, 1ull, __ATOMIC_RELAXED);
+        if (!ok && !(s_sc.warned & 1u)) { VK_LOG("shader cache: cannot write %s\n", j->path); s_sc.warned |= 1u; }
+        free(j);
+        __atomic_sub_fetch(&s_scw.pending, 1, __ATOMIC_ACQ_REL);
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+/* Queue one .spv write; 0 queued, -1 not (the caller writes it itself). */
+static int vk_sc_write_async(const char* path, const u32* words, size_t bytes)
+{
+    if (!s_scw.running) {
+#ifdef _WIN32
+        InitializeSRWLock(&s_scw.lock); InitializeConditionVariable(&s_scw.cv);
+        HANDLE h = CreateThread(NULL, 0, vk_sc_writer, NULL, 0, NULL);
+        if (!h) return -1;
+        SetThreadPriority(h, THREAD_PRIORITY_BELOW_NORMAL);
+        CloseHandle(h);
+#else
+        pthread_t t;
+        if (pthread_create(&t, NULL, vk_sc_writer, NULL) != 0) return -1;
+        pthread_detach(t);
+#endif
+        s_scw.running = 1;
+    }
+    vk_sc_wjob* j = (vk_sc_wjob*)malloc(sizeof *j + bytes);
+    if (!j) return -1;
+    j->next = NULL; j->bytes = bytes;
+    snprintf(j->path, sizeof j->path, "%s", path);
+    memcpy(j->data, words, bytes);
+    __atomic_add_fetch(&s_scw.pending, 1, __ATOMIC_ACQ_REL);
+    vk_sc_wlock();
+    if (s_scw.tail) s_scw.tail->next = j; else s_scw.head = j;
+    s_scw.tail = j;
+#ifdef _WIN32
+    WakeConditionVariable(&s_scw.cv);
+#else
+    pthread_cond_signal(&s_scw.cv);
+#endif
+    vk_sc_wunlock();
+    return 0;
+}
+/* At shutdown: let queued .spv writes finish (at most ~2 s). */
+static void vk_sc_write_flush(void)
+{
+    for (int i = 0; i < 2000 && __atomic_load_n(&s_scw.pending, __ATOMIC_ACQUIRE) > 0; i++) {
+#ifdef _WIN32
+        Sleep(1);
+#else
+        sched_yield();
+#endif
+    }
+}
+
 static int vk_sc_hlsl_to_spirv_raw(const char* hlsl, int stage, u32* words, u32 max_words,
                                    u32* out_words, char* log, u32 log_size, int* from_disk)
 {
     *from_disk = 0;
     char path[VK_SC_PATH];
     int cached = 0;
+    vk_sc_key key = { 0, 0 };
+    const int async = vk_sc_async_on();
     if (s_sc.on && hlsl && words && out_words) {
         if (!s_sc.fp_done) vk_sc_fingerprint(words, max_words);
-        const vk_sc_key k = vk_sc_spv_key(VK_SC_VERSION, s_sc.fp, s_sc.frag_rcp, stage, hlsl);
-        cached = vk_sc_spv_path(path, sizeof path, s_sc.dir, k) == 0;
+        key = vk_sc_spv_key(VK_SC_VERSION, s_sc.fp, s_sc.frag_rcp, stage, hlsl);
+        cached = vk_sc_spv_path(path, sizeof path, s_sc.dir, key) == 0;
+    }
+    if (cached && async) {
+        const vk_sc_mem_ent* m = vk_sc_mem_get(key);
+        if (m && m->n <= max_words) {
+            memcpy(words, m->w, (size_t)m->n * 4u);
+            *out_words = m->n;
+            *from_disk = 1;
+            s_sc.hits++;
+            return 0;
+        }
     }
     if (cached) {
         size_t got = 0;
@@ -1774,6 +1953,7 @@ static int vk_sc_hlsl_to_spirv_raw(const char* hlsl, int stage, u32* words, u32 
             *out_words = (u32)(got / 4u);
             *from_disk = 1;
             s_sc.hits++;
+            if (async) vk_sc_mem_put(key, words, *out_words);
             return 0;
         }
         s_sc.misses++;
@@ -1782,13 +1962,27 @@ static int vk_sc_hlsl_to_spirv_raw(const char* hlsl, int stage, u32* words, u32 
     }
     const u64 t0 = ps3_ft_now();
     const int rc = rsx_hlsl_to_spirv(hlsl, stage, words, max_words, out_words, log, log_size);
-    s_sc.spv_ns += ps3_ft_now() - t0;
+    const u64 t1 = ps3_ft_now();
+    s_sc.spv_ns += t1 - t0;
+    if (PS3_FT_ON()) ps3_ft_span(PS3_FT_COMPILE, 6, (u32)stage, rc == 0 ? 1u : 0u, t0, t1);
     if (cached && rc == 0) {
         const size_t bytes = (size_t)*out_words * 4u;
+        int wrote = -1;
+        if (vk_sc_spirv_ok(words, bytes) && async) {
+            vk_sc_mem_put(key, words, *out_words);
+            wrote = vk_sc_write_async(path, words, bytes);
+        }
+        if (wrote != 0 && vk_sc_spirv_ok(words, bytes)) {
+            const u64 w0 = ps3_ft_now();
+            wrote = vk_sc_write_file(path, NULL, 0, words, bytes);
+            const u64 w1 = ps3_ft_now();
+            s_scw.write_ns += w1 - w0; s_scw.writes++;
+            if (PS3_FT_ON()) ps3_ft_span(PS3_FT_COMPILE, 7, (u32)bytes, 0u, w0, w1);
+        }
         if (!vk_sc_spirv_ok(words, bytes)) {
             if (!(s_sc.warned & 2u)) VK_LOG("shader cache: glslang wrote SPIR-V the cache's check refuses -- not stored\n");
             s_sc.warned |= 2u;
-        } else if (vk_sc_write_file(path, NULL, 0, words, bytes) == 0) {
+        } else if (wrote == 0) {
             s_sc.stored++;
         } else {
             if (!(s_sc.warned & 1u)) VK_LOG("shader cache: cannot write %s\n", path);
@@ -1802,10 +1996,12 @@ static void vk_sc_stats(const char* when)
 {
     VK_LOG("shader cache: %llu hits, %llu misses; pipelines: %llu created "
            "(%s; glslang %.0f ms, vkCreateGraphicsPipelines %.0f ms, "
-           "%llu stored, %llu rejected; pipelines.bin %llu KB, %llu saves %.0f ms)\n",
+           "%llu stored, %llu rejected; pipelines.bin %llu KB, %llu saves %.0f ms; "
+           ".spv writes %llu, %.0f ms%s)\n",
            s_sc.hits, s_sc.misses, s_sc.pipes, when,
            (double)s_sc.spv_ns / 1e6, (double)s_sc.pipe_ns / 1e6, s_sc.stored, s_sc.rejected,
-           (unsigned long long)(s_sc.pc_size / 1024u), s_sc.saves, (double)s_sc.save_ns / 1e6);
+           (unsigned long long)(s_sc.pc_size / 1024u), s_sc.saves, (double)s_sc.save_ns / 1e6,
+           s_scw.writes, (double)s_scw.write_ns / 1e6, s_scw.running ? " in the background" : "");
     s_sc.stats_at = s_sc.hits + s_sc.misses + s_sc.pipes;
 }
 
@@ -1992,6 +2188,7 @@ static void vk_sc_open(const char* title)
 /* Before the device goes: the last save, the stats, the cache object. */
 static void vk_sc_close(void)
 {
+    vk_sc_write_flush();                       /* queued .spv files */
     vk_sc_save_wait();                         /* a background save first */
     if (s_sc.pc && s_sc.pc_new) { s_sc.pc_new = 0; vk_sc_save_pipelines(2); }
     if (s_sc.hits + s_sc.misses + s_sc.pipes) vk_sc_stats(s_sc.on ? "shutdown" : "shutdown, cache off");
@@ -6660,7 +6857,7 @@ static struct {
     double t0, last, sec_start;
     float  dt[4096];
     u32    n;
-    u32    draws0;
+    double draw_sum;                    /* guest draws of the frames in dt[] */
     int    mark;
 } s_pl;
 static double vk_pl_now(void)
@@ -6696,14 +6893,19 @@ static void vk_playlog_frame(void)
     }
     if (s_pl.state != 1) return;
     const double now = vk_pl_now();
-    if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; s_pl.draws0 = rsx_vulkan_backend_guest_draws(); return; }
+    if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; return; }
     const double dt = now - s_pl.last;
     s_pl.last = now;
-    if (s_pl.n < sizeof s_pl.dt / sizeof s_pl.dt[0]) s_pl.dt[s_pl.n++] = (float)(dt * 1000.0);
+    if (s_pl.n < sizeof s_pl.dt / sizeof s_pl.dt[0]) {
+        s_pl.dt[s_pl.n++] = (float)(dt * 1000.0);
+        /* the draw engine's count is per frame (the last presented one), not a
+         * running total: sum it per frame. Differencing it as a total printed
+         * garbage (148102288 draws/frame) whenever a frame drew fewer. */
+        s_pl.draw_sum += (double)rsx_vulkan_backend_guest_draws();
+    }
     if (dt > 0.050) fprintf(s_pl.f, "HITCH	%.2f	%.1f\n", now - s_pl.t0, dt * 1000.0);
     if (s_pl.mark) { fprintf(s_pl.f, "MARK	%.2f\n", now - s_pl.t0); s_pl.mark = 0; }
     if (now - s_pl.sec_start < 1.0 || !s_pl.n) return;
-    const u32 draws = rsx_vulkan_backend_guest_draws();
     u32 c17 = 0, c25 = 0, c33 = 0, c50 = 0;
     for (u32 i = 0; i < s_pl.n; i++) {
         const float d = s_pl.dt[i];
@@ -6713,9 +6915,9 @@ static void vk_playlog_frame(void)
     const double span = now - s_pl.sec_start;
     fprintf(s_pl.f, "%.1f	%.1f	%.1f	%.1f	%.1f	%u	%u	%u	%u	%.0f\n",
             now - s_pl.t0, s_pl.n / span, s_pl.dt[s_pl.n / 2], s_pl.dt[(s_pl.n * 99) / 100],
-            s_pl.dt[s_pl.n - 1], c17, c25, c33, c50, (double)(draws >= s_pl.draws0 ? draws - s_pl.draws0 : 0u) / s_pl.n);
+            s_pl.dt[s_pl.n - 1], c17, c25, c33, c50, s_pl.draw_sum / s_pl.n);
     fflush(s_pl.f);
-    s_pl.draws0 = draws;
+    s_pl.draw_sum = 0.0;
     s_pl.n = 0;
     s_pl.sec_start = now;
 }

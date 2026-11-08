@@ -94,6 +94,9 @@ static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 #endif
 }
 
+static int savedata_legacy(void);
+static s64 save_mtime(const char* save_path);
+
 /* The generic HLE adapter passes PPC register values raw, so string args
  * arrive as GUEST addresses (< 4GB). Translate to a host pointer once at
  * the entry point; the internal helpers all expect host char*. */
@@ -429,7 +432,34 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
     const uint32_t newd = vm_read32(set_ea + 16), focus = vm_read32(set_ea + 4);
     const uint32_t new_name = newd ? vm_read32(newd + 4) : 0;
     uint32_t pick = 0;
-    if (is_save && new_name && fixed_n == 0) pick = new_name;
+    /* Headless, nobody moves the cursor: take what the cursor starts on, the
+     * title's focusPosition -- what a player pressing X at once would pick.
+     * (Picking the first fixed entry instead overwrote a save on every
+     * manual save once any existed.) PS3_SAVEDATA_LEGACY=1: the old order. */
+    const uint32_t focus_pos = vm_read32(set_ea + 0);
+    if (!savedata_legacy()) {
+        switch (focus_pos) {
+        case CELL_SAVEDATA_FOCUSPOS_NEWDATA:  if (is_save) pick = new_name; break;
+        case CELL_SAVEDATA_FOCUSPOS_DIRNAME:  pick = focus; break;
+        case CELL_SAVEDATA_FOCUSPOS_LISTHEAD: if (fixed_n && fixed) pick = fixed; break;
+        case CELL_SAVEDATA_FOCUSPOS_LISTTAIL: if (fixed_n && fixed) pick = fixed + (fixed_n - 1) * 48u; break;
+        case CELL_SAVEDATA_FOCUSPOS_LATEST:
+        case CELL_SAVEDATA_FOCUSPOS_OLDEST: {
+            s64 best = 0;
+            for (uint32_t i = 0; fixed && i < fixed_n; i++) {
+                char nm[CELL_SAVEDATA_DIRNAME_SIZE], path[1024];
+                for (int c = 0; c < CELL_SAVEDATA_DIRNAME_SIZE; c++) nm[c] = (char)vm_read8(fixed + i * 48u + (uint32_t)c);
+                nm[CELL_SAVEDATA_DIRNAME_SIZE - 1] = 0;
+                build_save_path(path, sizeof path, nm);
+                const s64 t = save_mtime(path);
+                if (!pick || (focus_pos == CELL_SAVEDATA_FOCUSPOS_LATEST ? t > best : t < best)) { pick = fixed + i * 48u; best = t; }
+            }
+            break; }
+        default: break;
+        }
+    }
+    if (pick) {}
+    else if (is_save && new_name && fixed_n == 0) pick = new_name;
     else if (fixed_n && fixed)               pick = fixed;
     else if (new_name)                       pick = new_name;
     else if (focus)                          pick = focus;
@@ -440,8 +470,8 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
         }
         selected[63] = '\0';
     }
-    printf("[cellSaveData] %s returned cbResult.result=%d fixed=%u newData=%s -> '%s'%c",
-           who, result, fixed_n, new_name ? "yes" : "no", selected, 10);
+    printf("[cellSaveData] %s returned cbResult.result=%d fixed=%u newData=%s focus=%u -> '%s'%c",
+           who, result, fixed_n, new_name ? "yes" : "no", focus_pos, selected, 10);
     return result;
 }
 
@@ -750,10 +780,144 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     }
 }
 
-/* Write a simplified PARAM.SFO with the save's title/subtitle/detail */
+/* PS3_SAVEDATA_LEGACY=1 puts back the behaviour before 2026-11-08 in one
+ * variable: the text PARAM.SFO, PARAM.SFO written before the files, the
+ * directory list in host order, and the first-entry pick in List callbacks. */
+static int savedata_legacy(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3_SAVEDATA_LEGACY"); v = (e && *e == '1') ? 1 : 0; }
+    return v;
+}
+
+/* PARAM.SFO in the console's own PSF format (also what RPCS3 reads), so a
+ * save made here can be inspected with any SFO tool and moved to and from an
+ * emulator. Layout (little-endian): "\0PSF", version 0x0101, key-table offset,
+ * data-table offset, entry count; 16-byte index entries {u16 key offset,
+ * u16 format (0x0004 raw, 0x0204 UTF-8 with NUL, 0x0404 u32), u32 length,
+ * u32 max length, u32 data offset}; keys sorted, NUL-terminated, padded to 4;
+ * each value takes its max length. The keys are the ones a console save has. */
+typedef struct { const char* key; u16 fmt; u32 len, max; const void* data; } psf_entry;
+
+static void psf_le16(unsigned char* p, u32 v) { p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8); }
+static void psf_le32(unsigned char* p, u32 v) { psf_le16(p, v & 0xFFFF); psf_le16(p + 2, v >> 16); }
+static u32 psf_rd16(const unsigned char* p) { return (u32)p[0] | ((u32)p[1] << 8); }
+static u32 psf_rd32(const unsigned char* p) { return psf_rd16(p) | (psf_rd16(p + 2) << 16); }
+
+static int psf_write(const char* path, const psf_entry* e, int n)
+{
+    u32 key_bytes = 0, data_bytes = 0;
+    for (int i = 0; i < n; i++) { key_bytes += (u32)strlen(e[i].key) + 1; data_bytes += (e[i].max + 3u) & ~3u; }
+    const u32 key_start = 20u + 16u * (u32)n, data_start = key_start + ((key_bytes + 3u) & ~3u);
+    const u32 total = data_start + data_bytes;
+    unsigned char* b = (unsigned char*)calloc(1, total);
+    if (!b) return -1;
+    memcpy(b, "\0PSF", 4); psf_le32(b + 4, 0x0101); psf_le32(b + 8, key_start);
+    psf_le32(b + 12, data_start); psf_le32(b + 16, (u32)n);
+    u32 ko = 0, dof = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned char* x = b + 20 + 16 * i;
+        u32 len = e[i].len > e[i].max ? e[i].max : e[i].len;
+        psf_le16(x, ko); psf_le16(x + 2, e[i].fmt); psf_le32(x + 4, len);
+        psf_le32(x + 8, e[i].max); psf_le32(x + 12, dof);
+        memcpy(b + key_start + ko, e[i].key, strlen(e[i].key) + 1);
+        if (e[i].data && len) memcpy(b + data_start + dof, e[i].data, len);
+        ko += (u32)strlen(e[i].key) + 1;
+        dof += (e[i].max + 3u) & ~3u;
+    }
+    /* Under a temporary name, then renamed over the old file: a game killed
+     * here never leaves a torn PARAM.SFO behind. */
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE* fp = fopen(tmp, "wb");
+    int ok = fp && fwrite(b, 1, total, fp) == total;
+    if (fp && fclose(fp) != 0) ok = 0;
+    free(b);
+#ifdef _WIN32
+    ok = ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+    ok = ok && rename(tmp, path) == 0;
+#endif
+    if (!ok) { remove(tmp); printf("[cellSaveData] PARAM.SFO: cannot write '%s'\n", path); }
+    return ok ? 0 : -1;
+}
+
+static u32 sfo_strlen(const char* s, u32 cap) { return (u32)strnlen(s, cap - 1) + 1; }
+
+static void write_param_sfo_psf(const char* save_path, const char* sfo_path,
+                                const CellSaveDataSystemFileParam* param)
+{
+    const char* dir = save_path + strlen(save_path);
+    while (dir > save_path && dir[-1] != '/' && dir[-1] != '\\') dir--;
+    unsigned char attr[4], plevel[4], params[1024] = {0}, params2[12] = {0};
+    psf_le32(attr, param->attribute);
+    const unsigned char* r2 = (const unsigned char*)param->reserved2;   /* guest parentalLevel, big-endian */
+    psf_le32(plevel, ((u32)r2[0] << 24) | ((u32)r2[1] << 16) | ((u32)r2[2] << 8) | r2[3]);
+    char lp[9] = {0};
+    memcpy(lp, param->listParam, 8);
+    const psf_entry e[] = {
+        {"ACCOUNT_ID",          0x0004, 16, 16, "0000000000000000"},
+        {"ATTRIBUTE",           0x0404, 4, 4, attr},
+        {"CATEGORY",            0x0204, 3, 4, "SD"},
+        {"DETAIL",              0x0204, sfo_strlen(param->detail, CELL_SAVEDATA_SYSP_DETAIL_SIZE),
+                                        CELL_SAVEDATA_SYSP_DETAIL_SIZE, param->detail},
+        {"PARAMS",              0x0004, 1024, 1024, params},
+        {"PARAMS2",             0x0004, 12, 12, params2},
+        {"PARENTAL_LEVEL",      0x0404, 4, 4, plevel},
+        {"SAVEDATA_DIRECTORY",  0x0204, sfo_strlen(dir, 64), 64, dir},
+        {"SAVEDATA_LIST_PARAM", 0x0204, sfo_strlen(lp, 9) > 8 ? 8 : sfo_strlen(lp, 9), 8, lp},
+        {"SUB_TITLE",           0x0204, sfo_strlen(param->subTitle, CELL_SAVEDATA_SYSP_SUBTITLE_SIZE),
+                                        CELL_SAVEDATA_SYSP_SUBTITLE_SIZE, param->subTitle},
+        {"TITLE",               0x0204, sfo_strlen(param->title, CELL_SAVEDATA_SYSP_TITLE_SIZE),
+                                        CELL_SAVEDATA_SYSP_TITLE_SIZE, param->title},
+    };
+    psf_write(sfo_path, e, (int)(sizeof e / sizeof e[0]));
+}
+
+/* Fill `param` from a PSF PARAM.SFO; 0 when the file is not PSF. */
+static int read_param_sfo_psf(FILE* fp, CellSaveDataSystemFileParam* param)
+{
+    unsigned char b[8192];
+    size_t n = fread(b, 1, sizeof b, fp);
+    if (n < 20 || memcmp(b, "\0PSF", 4) != 0) return 0;
+    const u32 ks = psf_rd32(b + 8), ds = psf_rd32(b + 12), cnt = psf_rd32(b + 16);
+    for (u32 i = 0; i < cnt && 20 + 16 * (i + 1) <= n; i++) {
+        const unsigned char* x = b + 20 + 16 * i;
+        const u32 ko = ks + psf_rd16(x), fmt = psf_rd16(x + 2), len = psf_rd32(x + 4), dof = ds + psf_rd32(x + 12);
+        if (ko >= n || dof + len > n) continue;
+        const char* key = (const char*)b + ko;
+        if (!memchr(key, 0, n - ko)) continue;
+        const char* d = (const char*)b + dof;
+        char* dst = NULL; u32 cap = 0;
+        if (!strcmp(key, "TITLE"))                    { dst = param->title;     cap = CELL_SAVEDATA_SYSP_TITLE_SIZE; }
+        else if (!strcmp(key, "SUB_TITLE"))           { dst = param->subTitle;  cap = CELL_SAVEDATA_SYSP_SUBTITLE_SIZE; }
+        else if (!strcmp(key, "DETAIL"))              { dst = param->detail;    cap = CELL_SAVEDATA_SYSP_DETAIL_SIZE; }
+        else if (!strcmp(key, "SAVEDATA_LIST_PARAM")) { memcpy(param->listParam, d, strnlen(d, len < 8 ? len : 8)); }
+        else if (!strcmp(key, "ATTRIBUTE") && fmt == 0x0404 && len >= 4) param->attribute = psf_rd32((const unsigned char*)d);
+        else if (!strcmp(key, "PARENTAL_LEVEL") && fmt == 0x0404 && len >= 4) {
+            u32 v = psf_rd32((const unsigned char*)d);
+            unsigned char* r2 = (unsigned char*)param->reserved2;
+            r2[0] = (unsigned char)(v >> 24); r2[1] = (unsigned char)(v >> 16); r2[2] = (unsigned char)(v >> 8); r2[3] = (unsigned char)v;
+        }
+        if (dst) { u32 m = len < cap - 1 ? len : cap - 1; memcpy(dst, d, strnlen(d, m)); }
+    }
+    return 1;
+}
+
+/* Write the save's PARAM.SFO: PSF (above), or the old text form under
+ * PS3_SAVEDATA_LEGACY=1. read_param_sfo takes either. */
 static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileParam* param)
 {
     if (!param) return;
+    if (!savedata_legacy()) {
+        char sfo[1024];
+        snprintf(sfo, sizeof(sfo), "%s/PARAM.SFO", save_path);
+#ifdef _WIN32
+        for (char* p = sfo; *p; p++) if (*p == '/') *p = '\\';
+#endif
+        write_param_sfo_psf(save_path, sfo, param);
+        return;
+    }
 
     char sfo_path[1024];
     snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
@@ -792,6 +956,8 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
 
     FILE* fp = fopen(sfo_path, "rb");
     if (!fp) return;
+    if (read_param_sfo_psf(fp, param)) { fclose(fp); return; }
+    rewind(fp);
 
     char line[2048];
     while (fgets(line, sizeof(line), fp)) {
@@ -812,6 +978,91 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
             strncpy(param->listParam, line + 11, CELL_SAVEDATA_SYSP_LPARAM_SIZE - 1);
     }
     fclose(fp);
+}
+
+/* When a save was last written: its PARAM.SFO is rewritten on every save,
+ * while an NTFS directory's own time only moves when a file is added or
+ * removed, so take the later of the two. 0 = no such directory. */
+static s64 save_mtime(const char* save_path)
+{
+    HOST_STAT_T st;
+    s64 t = 0;
+    char sfo[1024];
+    if (HOST_STAT(save_path, &st) == 0) t = (s64)st.st_mtime;
+    snprintf(sfo, sizeof sfo, "%s/PARAM.SFO", save_path);
+    if (HOST_STAT(sfo, &st) == 0 && (s64)st.st_mtime > t) t = (s64)st.st_mtime;
+    return t;
+}
+
+/* The directory list the way the system utility hands it to a List/Fixed
+ * callback: sorted by the title's CellSaveDataSetList (sortType at +0:
+ * modified time or subtitle; sortOrder at +4: descending or ascending) and
+ * with each entry's listParam from its PARAM.SFO. A title that takes the
+ * first entry of a newest-first list as "the latest save" (Continue) gets
+ * the one it means, not whichever FindFirstFile returned first. Returns the
+ * number of matching directories, fills `dirList` with up to `max`. */
+static u32 enumerate_save_dirs_sorted(u32 setList_ea, const char* prefix,
+                                      CellSaveDataDirList* dirList, u32 max)
+{
+    u32 total = enumerate_save_dirs(prefix, NULL, 0);
+    if (savedata_legacy() || total == 0 || !dirList || !max)
+        return enumerate_save_dirs(prefix, dirList, max);
+    CellSaveDataDirList* all = (CellSaveDataDirList*)calloc(total, sizeof *all);
+    struct sd_key { s64 mtime; char sub[CELL_SAVEDATA_SYSP_SUBTITLE_SIZE]; u32 idx; }* k =
+        (struct sd_key*)calloc(total, sizeof *k);
+    if (!all || !k) { free(all); free(k); return enumerate_save_dirs(prefix, dirList, max); }
+    u32 got = enumerate_save_dirs(prefix, all, total);
+    if (got > total) got = total;
+    const u32 sort_type = setList_ea ? vm_read32(setList_ea + 0) : CELL_SAVEDATA_SORTTYPE_MODIFIEDTIME;
+    const u32 ascending = setList_ea ? vm_read32(setList_ea + 4) == CELL_SAVEDATA_SORTORDER_ASCENT : 0;
+    CellSaveDataSystemFileParam sp;
+    for (u32 i = 0; i < got; i++) {
+        char path[1024];
+        build_save_path(path, sizeof path, all[i].dirName);
+        k[i].idx = i;
+        k[i].mtime = save_mtime(path);
+        read_param_sfo(path, &sp);
+        memcpy(k[i].sub, sp.subTitle, sizeof k[i].sub);
+        k[i].sub[sizeof k[i].sub - 1] = 0;
+        memcpy(all[i].listParam, sp.listParam, CELL_SAVEDATA_SYSP_LPARAM_SIZE);
+    }
+    /* insertion sort: a handful of saves */
+    for (u32 i = 1; i < got; i++) {
+        struct sd_key x = k[i];
+        u32 j = i;
+        while (j > 0) {
+            const struct sd_key* y = &k[j - 1];
+            int c = sort_type == CELL_SAVEDATA_SORTTYPE_SUBTITLE ? strcmp(y->sub, x.sub)
+                  : (y->mtime > x.mtime) - (y->mtime < x.mtime);
+            if (!c) c = strcmp(all[y->idx].dirName, all[x.idx].dirName);
+            if (ascending ? c <= 0 : c >= 0) break;
+            k[j] = k[j - 1];
+            j--;
+        }
+        k[j] = x;
+    }
+    for (u32 i = 0; i < got && i < max; i++) dirList[i] = all[k[i].idx];
+    printf("[cellSaveData] %u save dir(s) for prefix '%s', sorted by %s %s%s%s\n", got,
+           prefix ? prefix : "", sort_type == CELL_SAVEDATA_SORTTYPE_SUBTITLE ? "subtitle" : "time",
+           ascending ? "ascending" : "descending", got ? ", first " : "", got ? dirList[0].dirName : "");
+    free(all); free(k);
+    return got;
+}
+
+/* A List save/load with nothing to pick: on the console the list shows
+ * "There is no saved data." and the player backs out, which returns
+ * CELL_SAVEDATA_RET_CANCEL (1) -- not an error. inFAMOUS 2's pause menu
+ * "Load Game" with no save got ERROR_NODATA instead, showed "There was an
+ * error while loading." and called ListLoad2 again ~200 times a second: the
+ * menu hung behind a dimmed screen. PS3_SAVEDATA_LEGACY=1: ERROR_NODATA. */
+#ifndef CELL_SAVEDATA_RET_CANCEL
+#define CELL_SAVEDATA_RET_CANCEL 1
+#endif
+static s32 savedata_list_nothing(const char* fn)
+{
+    if (savedata_legacy()) return CELL_SAVEDATA_ERROR_NODATA;
+    printf("[cellSaveData] %s: no saved data to pick -- returning CANCEL (the player backed out)\n", fn);
+    return CELL_SAVEDATA_RET_CANCEL;
 }
 
 /* Core save/load implementation shared by List/Fixed/Auto variants */
@@ -888,7 +1139,8 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
         if (HOST_STAT(save_path, &hst) == 0) {
 #ifdef _WIN32
             statGet.dir.st_atime = (s64)hst.st_atime;
-            statGet.dir.st_mtime = (s64)hst.st_mtime;
+            /* the time of the last save, as the sorted list uses it */
+            statGet.dir.st_mtime = savedata_legacy() ? (s64)hst.st_mtime : save_mtime(save_path);
             statGet.dir.st_ctime = (s64)hst.st_ctime;
 #elif defined(__APPLE__)
 /* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
@@ -935,13 +1187,19 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
 
-    /* Write PARAM.SFO if stat set provided params and we're saving */
-    if (is_save && statSet.setParam) {
+    /* Write PARAM.SFO if stat set provided params and we're saving. Since
+     * 2026-11-08 it is written AFTER the files (the params are copied now,
+     * before the file callbacks reuse guest memory): PARAM.SFO is what makes
+     * a directory a save (dir_has_save), so a new save cut short by a crash
+     * or a kill stays invisible instead of loading half-written.
+     * PS3_SAVEDATA_LEGACY=1: written first, as before. */
+    CellSaveDataSystemFileParam params;
+    const int sfo_pending = is_save && statSet.setParam;
+    if (sfo_pending) {
         ensure_dirs(save_path);
-        CellSaveDataSystemFileParam params;
         memcpy(&params, statSet.setParam, sizeof(params));
         params.attribute = ps3_bswap32(params.attribute);
-        write_param_sfo(save_path, &params);
+        if (savedata_legacy()) write_param_sfo(save_path, &params);
     }
 
     /* Each NEXT callback requests one operation. LAST ends the sequence;
@@ -970,6 +1228,7 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
             return CELL_SAVEDATA_ERROR_NODATA;
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
+    if (sfo_pending && !savedata_legacy()) write_param_sfo(save_path, &params);
 
     printf("[cellSaveData] %s complete for '%s'\n",
            is_save ? "SAVE" : "LOAD", dirName);
@@ -1002,7 +1261,7 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
     if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
     CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
 
-    u32 dirCount = enumerate_save_dirs(
+    u32 dirCount = enumerate_save_dirs_sorted((u32)(uintptr_t)setList,
         savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
             savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
         dirList, dir_max);
@@ -1034,7 +1293,7 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
         strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
     if (!selectedDir[0]) {
         free(dirList);
-        return CELL_SAVEDATA_ERROR_NODATA;
+        return savedata_list_nothing(__func__);
     }
 
     s32 result = savedata_execute(selectedDir, 1, setBuf, funcStat, funcFile, userdata);
@@ -1063,7 +1322,7 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
     if (dir_max == 0) dir_max = CELL_SAVEDATA_DIRLIST_MAX;
     CellSaveDataDirList* dirList = (CellSaveDataDirList*)calloc(dir_max, sizeof(CellSaveDataDirList));
 
-    u32 dirCount = enumerate_save_dirs(
+    u32 dirCount = enumerate_save_dirs_sorted((u32)(uintptr_t)setList,
         savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) ?
             savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8)) : "",
         dirList, dir_max);
@@ -1094,7 +1353,7 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
         strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
     if (!selectedDir[0]) {
         free(dirList);
-        return CELL_SAVEDATA_ERROR_NODATA;
+        return savedata_list_nothing(__func__);
     }
 
     s32 result = savedata_execute(selectedDir, 0, setBuf, funcStat, funcFile, userdata);
@@ -1133,7 +1392,8 @@ static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
     CellSaveDataDirList* dirs = dir_max ? calloc(dir_max, sizeof(*dirs)) : NULL;
     if (dir_max && !dirs) return CELL_SAVEDATA_ERROR_INTERNAL;
     u32 prefix = vm_read32((u32)(uintptr_t)setList + 8);
-    u32 count = enumerate_save_dirs(prefix ? (char*)vm_base + prefix : "", dirs, dir_max);
+    u32 count = enumerate_save_dirs_sorted((u32)(uintptr_t)setList,
+                                           prefix ? (char*)vm_base + prefix : "", dirs, dir_max);
     u32 listed = count < dir_max ? count : dir_max;
     scratch_reset();
     u32 cb = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
