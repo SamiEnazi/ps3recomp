@@ -1627,8 +1627,14 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     if (!yz_ch_block() || spu_ch_ready(ctx, channel)) return;
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
 
-    { static unsigned long bn = 0; unsigned long n = __atomic_add_fetch(&bn, 1, __ATOMIC_RELAXED);
-      if (n <= 50 || (n % 512) == 0)
+    /* The first 50 blocks, then every 512th only with PS3_VERBOSE=1: at ~45 lines/s the
+     * periodic line went through the unbuffered stderr (one FILE lock, one WriteFile each)
+     * from the SPU threads during play (rsx3, 2026-11-08: suspected in short whole-game
+     * stalls when the log reader lags). */
+    { static unsigned long bn = 0; static int vb = -1;
+      if (vb < 0) { const char* v = getenv("PS3_VERBOSE"); vb = (v && *v && *v != '0') ? 1 : 0; }
+      unsigned long n = __atomic_add_fetch(&bn, 1, __ATOMIC_RELAXED);
+      if (n <= 50 || (vb && (n % 512) == 0))
         fprintf(stderr, "[ch-block] spu=%X pc=0x%05X op=%s ch=%u evstat=0x%X evmask=0x%X\n",
                 ctx->spu_id, ctx->pc & SPU_LS_MASK, op, channel,
                 spu_ev_get(ctx), ctx->event_mask); }
