@@ -2317,21 +2317,23 @@ static u64 eng_current_fp_structural(void)
  * 0 = each decodes its own. */
 static int s_texreg_once = -1;
 static void eng_texreg_once_set(int id, int v) { (void)id; __atomic_store_n(&s_texreg_once, v != 0, __ATOMIC_RELAXED); }
-static void eng_draw_textures(rsx_dsp_texture tex[RSX_DSP_NUM_TEXTURES])
+/* Read-only: the decoded units themselves, not a copy (copying all sixteen
+ * twice a draw was ~0.17 ms of the RSX thread a frame in the pier view). */
+static const rsx_dsp_texture* eng_draw_textures(void)
 {
     static u32 serial;
     static rsx_dsp_texture c[RSX_DSP_NUM_TEXTURES];
     if (__builtin_expect(s_texreg_once < 0, 0)) ps3_toggle_watch(PS3T_ENG_TEXREG_ONCE, eng_texreg_once_set);
     if (!__atomic_load_n(&s_texreg_once, __ATOMIC_RELAXED)) {
-        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) rsx_dsp_get_texture(&g.rsx, u, &tex[u]);
+        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) rsx_dsp_get_texture(&g.rsx, u, &c[u]);
         serial = 0;
-        return;
+        return c;
     }
     if (serial != s_draw_serial) {
         for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) rsx_dsp_get_texture(&g.rsx, u, &c[u]);
         serial = s_draw_serial;
     }
-    memcpy(tex, c, sizeof c);
+    return c;
 }
 
 /* The layout the active vertex program actually reads. An uncertain analysis
@@ -2493,8 +2495,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                   rsx_dsp_reg(&g.rsx, 0x1FECu), rs->alpha_ref_format & 0x1Fu); } }
     /* Every unit decoded once for the masks below (they took five decodes
      * of all sixteen units and three microcode walks per draw). */
-    rsx_dsp_texture tex[RSX_DSP_NUM_TEXTURES];
-    eng_draw_textures(tex);
+    const rsx_dsp_texture* tex = eng_draw_textures();
     const u32 cube_mask = eng_cube_mask(tex);
     const u32 vol_mask = eng_volume_mask(tex);
     const u32 vtex_mask = eng_vtex_mask();
@@ -4182,8 +4183,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     u32 mask = 0;
     s_fbf.cand = 0; s_fbf.applied = 0;
     const u32 fp_reads = eng_bind_unread() ? 0xFFFFu : eng_fp_tex_mask();
-    rsx_dsp_texture units[RSX_DSP_NUM_TEXTURES];
-    eng_draw_textures(units);
+    const rsx_dsp_texture* units = eng_draw_textures();
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t = units[u];
         /* A unit left enabled by an earlier draw but not sampled by this
