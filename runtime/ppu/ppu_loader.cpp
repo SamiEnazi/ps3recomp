@@ -2187,6 +2187,7 @@ typedef void (*ppu_fn)(ppu_context*);
 static uint32_t g_addr[PPU_HASH_SIZE];
 static ppu_fn   g_fn[PPU_HASH_SIZE];
 static uint32_t g_fn_count = 0;
+static void ppu_icache_invalidate(void);   /* the indirect-call cache, below */
 
 extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
 {
@@ -2196,7 +2197,7 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
      * count >= PPU_HASH_SIZE) would otherwise spin forever here at startup. */
     for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
         if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; return; }
-        if (g_addr[i] == a) { g_fn[i] = fn; return; }   /* overwrite */
+        if (g_addr[i] == a) { if (g_fn[i] != fn) { g_fn[i] = fn; ppu_icache_invalidate(); } return; }   /* overwrite */
         i = (i + 1) & PPU_HASH_MASK;
     }
     static int warned = 0;
@@ -2233,7 +2234,51 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
     return lo ? g_inv[lo - 1].guest : 0;
 }
 
-static ppu_fn ppu_lookup(uint32_t a)
+/* The indirect-call target cache (ppu3 agent, 2026-11-08; PS3_ICALL_CACHE=0 = off).
+ * The table above is 3 MB of two parallel arrays; a scene walk's virtual calls
+ * spread over it, so each lookup is two cache misses. In front of it: 8192 entries
+ * of one 64-bit word each (64 KB), guest address in the high half, the function's
+ * signed offset from ppu_lookup_slow in the low half, read and written whole (a
+ * lookup never sees half of one entry and half of another). A miss asks the table
+ * and fills the slot. Only found functions are cached, so a new registration
+ * cannot make an entry wrong; one that REPLACES an address's function bumps the
+ * generation and empties the cache, and a fill that raced with it takes its entry
+ * back -- the cache never answers what the table would not. */
+#define PPU_ICACHE_BITS 13
+static uint64_t g_icache[1u << PPU_ICACHE_BITS];
+static uint32_t g_icache_gen = 0;
+static int g_icache_on = -1;
+static ppu_fn ppu_lookup_slow(uint32_t a);
+static inline const char* ppu_icache_anchor(void) { return (const char*)(void*)&ppu_lookup_slow; }
+static void ppu_icache_invalidate(void)
+{
+    __atomic_add_fetch(&g_icache_gen, 1, __ATOMIC_SEQ_CST);
+    for (uint32_t i = 0; i < (1u << PPU_ICACHE_BITS); i++) __atomic_store_n(&g_icache[i], 0, __ATOMIC_RELAXED);
+}
+static inline ppu_fn ppu_lookup(uint32_t a)
+{
+    int on = __atomic_load_n(&g_icache_on, __ATOMIC_RELAXED);
+    if (__builtin_expect(on < 0, 0)) {
+        const char* e = getenv("PS3_ICALL_CACHE");
+        on = !(e && e[0] == '0');
+        __atomic_store_n(&g_icache_on, on, __ATOMIC_RELAXED);
+    }
+    if (!on || !a) return ppu_lookup_slow(a);
+    uint64_t* slot = &g_icache[(a >> 2) & ((1u << PPU_ICACHE_BITS) - 1)];
+    const uint64_t e = __atomic_load_n(slot, __ATOMIC_RELAXED);
+    if ((uint32_t)(e >> 32) == a) return (ppu_fn)(void*)(ppu_icache_anchor() + (int32_t)(uint32_t)e);
+    const uint32_t g = __atomic_load_n(&g_icache_gen, __ATOMIC_ACQUIRE);
+    ppu_fn fn = ppu_lookup_slow(a);
+    const intptr_t off = (intptr_t)(void*)fn - (intptr_t)ppu_icache_anchor();
+    if (fn && off == (intptr_t)(int32_t)off) {
+        uint64_t ne = ((uint64_t)a << 32) | (uint32_t)(int32_t)off;
+        __atomic_store_n(slot, ne, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&g_icache_gen, __ATOMIC_SEQ_CST) != g)
+            __atomic_compare_exchange_n(slot, &ne, (uint64_t)0, false, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
+    }
+    return fn;
+}
+static ppu_fn ppu_lookup_slow(uint32_t a)
 {
     uint32_t i = (a * 2654435761u) & PPU_HASH_MASK;
     for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
@@ -2271,6 +2316,93 @@ extern "C" void ydkj_memmove_0036FA74(ppu_context* ctx)
     }
     if (n && vm_base) memmove(vm_base + dst, vm_base + src, n);
     /* r3 (dst) is preserved as the return value. */
+}
+
+/* Native libc bodies for lifted functions (ppu3 agent, 2026-11-08). A lift with
+ * PPU_NATIVE_FILE=<list> (tools/ppu_fastpath.py; the list names guest addresses and
+ * which of these each is -- title knowledge, kept with the title, not here) turns
+ * each listed func_X into `if (ppu_native_<kind>(ctx)) return; func_X_lifted(ctx);`.
+ * A native answers 1 only when the result is the one the lifted body would leave
+ * in memory and in r3, else 0 and the lifted body runs:
+ *  - both ranges inside the span the inline accessors serve (vm_inline_ok, from
+ *    0x10000 to the end of the mapping / the raw SPU windows), the gcm ref-poll word
+ *    not read, and no line of the destination reserved (by an SPU or a PPU lwarx):
+ *    those stores take the locked path, one by one, in the lifted body;
+ *  - memcpy: the ranges do not overlap (an overlapping memcpy's result depends on the
+ *    body's copy order, which only the body knows);
+ *  - after the copy, the reservation re-check of the inline store path, per line:
+ *    a line reserved meanwhile is notified (ppu_store_coh_notify), as each store's
+ *    own re-check would have done.
+ * Volatile registers other than r3 are left as they were (an ABI caller never reads
+ * them after a call). PS3_NATIVE=0 = every native declines (the lifted bodies run). */
+extern "C" uint32_t ppu_hle_inject_base;
+extern "C" int* const           g_spu_coh_armed;
+extern "C" unsigned char* const g_spu_coh_bitmap;
+static int ppu_native_on(void)
+{
+    static int on = -1;
+    int v = __atomic_load_n(&on, __ATOMIC_RELAXED);
+    if (v < 0) { const char* e = getenv("PS3_NATIVE"); v = !(e && e[0] == '0'); __atomic_store_n(&on, v, __ATOMIC_RELAXED); }
+    return v;
+}
+/* [ea, ea + n) inside the inline accessors' span (n > 0) */
+static inline int ppu_native_span(uint32_t ea, uint64_t n)
+{
+    const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
+    return __atomic_load_n(&vm_inline_ok, __ATOMIC_RELAXED) && ea >= 0x10000u && (uint64_t)ea + n <= hi;
+}
+/* any line of [ea, ea + n) reserved (n > 0) */
+static inline int ppu_native_resv(uint32_t ea, uint64_t n)
+{
+    if (!__atomic_load_n(g_spu_coh_armed, __ATOMIC_ACQUIRE)) return 0;
+    for (uint32_t l = ea >> 7, e = (uint32_t)((ea + n - 1) >> 7); ; l++) {
+        if ((__atomic_load_n(&g_spu_coh_bitmap[l >> 3], __ATOMIC_RELAXED) >> (l & 7)) & 1u) return 1;
+        if (l == e) return 0;
+    }
+}
+static void ppu_native_after(uint32_t ea, uint64_t n)
+{
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    if (!__atomic_load_n(g_spu_coh_armed, __ATOMIC_ACQUIRE)) return;
+    for (uint32_t l = ea >> 7, e = (uint32_t)((ea + n - 1) >> 7); ; l++) {
+        if ((__atomic_load_n(&g_spu_coh_bitmap[l >> 3], __ATOMIC_RELAXED) >> (l & 7)) & 1u) {
+            const uint32_t lo = l == (ea >> 7) ? ea : l << 7;
+            const uint32_t end = l == e ? (uint32_t)(ea + n) : (l + 1) << 7;
+            ppu_store_coh_notify(lo, end - lo);
+        }
+        if (l == e) return;
+    }
+}
+/* memcpy(r3 = dst, r4 = src, r5 = n) -> r3 = dst (zero-extended, as the 32-bit ABI's) */
+extern "C" int ppu_native_memcpy(ppu_context* ctx)
+{
+    const uint64_t d64 = ctx->gpr[3], s64 = ctx->gpr[4], n = ctx->gpr[5];
+    const uint32_t d = (uint32_t)d64, s = (uint32_t)s64;
+    if (!ppu_native_on() || n >= 0x80000000ull) return 0;
+    if (n) {
+        if (!ppu_native_span(d, n) || !ppu_native_span(s, n)) return 0;
+        if (!((uint64_t)d + n <= s || (uint64_t)s + n <= d)) return 0;          /* overlap */
+        const uint32_t poll = ppu_hle_inject_base + 0x2008u;
+        if (poll + 4 > s && poll < (uint64_t)s + n) return 0;
+        if (ppu_native_resv(d, n)) return 0;
+        memcpy(vm_base + d, vm_base + s, (size_t)n);
+        ppu_native_after(d, n);
+    }
+    ctx->gpr[3] = d;
+    return 1;
+}
+/* memset(r3 = dst, r4 = byte, r5 = n, compared as 32 bits) -> r3 unchanged */
+extern "C" int ppu_native_memset(ppu_context* ctx)
+{
+    const uint32_t d = (uint32_t)ctx->gpr[3];
+    const uint64_t n = ctx->gpr[5];
+    if (!ppu_native_on() || n >= 0x80000000ull || (uint64_t)(uint32_t)ctx->gpr[3] != ctx->gpr[3]) return 0;
+    if (n) {
+        if (!ppu_native_span(d, n) || ppu_native_resv(d, n)) return 0;
+        memset(vm_base + d, (int)(uint8_t)ctx->gpr[4], (size_t)n);
+        ppu_native_after(d, n);
+    }
+    return 1;
 }
 
 /* Bridge the lifter-emitted function_table[] (declared in ppu_recomp.h) into the

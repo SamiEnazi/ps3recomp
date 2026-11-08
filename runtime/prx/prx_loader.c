@@ -44,8 +44,52 @@ static void prx_export_register(uint32_t nid, uint32_t guest_addr)
         fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
 }
 
+/* The NID index (ppu3 agent, 2026-11-08). ps3_hle_call asks this registry on EVERY
+ * HLE call (a firmware module may serve the NID), so the linear scan over a few
+ * hundred exports ran a few thousand times a frame on the game's main thread.
+ * NIDs are unique in the registry (a re-export overwrites), so an open-addressed
+ * table of the same (nid, addr) pairs answers the same. It is rebuilt whenever a
+ * module's exports are published or withdrawn, inside a sequence counter: odd
+ * while the registry changes, and a lookup that sees it odd or changed takes the
+ * old scan. PS3_PRX_HASH=0 = the scan only. */
+#define PRX_HASH_BITS 12                          /* 4096 slots > 2 x PRX_EXPORT_REG_CAP */
+static prx_export_reg_entry s_export_hash[1u << PRX_HASH_BITS];   /* nid 0 = empty */
+static volatile long        s_export_seq = 0;
+static int                  s_export_hash_on = -1;
+static inline uint32_t prx_hash_slot(uint32_t nid) { return (nid * 2654435761u) >> (32 - PRX_HASH_BITS); }
+static void prx_hash_begin(void) { __atomic_add_fetch(&s_export_seq, 1, __ATOMIC_SEQ_CST); }
+static void prx_hash_end(void)
+{
+    memset(s_export_hash, 0, sizeof s_export_hash);
+    for (uint32_t i = 0; i < s_export_reg_n; i++) {
+        uint32_t k = prx_hash_slot(s_export_reg[i].nid);
+        while (s_export_hash[k].nid) k = (k + 1) & ((1u << PRX_HASH_BITS) - 1);
+        s_export_hash[k] = s_export_reg[i];
+    }
+    __atomic_add_fetch(&s_export_seq, 1, __ATOMIC_SEQ_CST);
+}
+
 uint32_t prx_resolve_export(uint32_t nid)
 {
+    int on = __atomic_load_n(&s_export_hash_on, __ATOMIC_RELAXED);
+    if (on < 0) {
+        const char* e = getenv("PS3_PRX_HASH");
+        on = !(e && e[0] == '0');
+        __atomic_store_n(&s_export_hash_on, on, __ATOMIC_RELAXED);
+    }
+    if (on && nid) {
+        const long q = __atomic_load_n(&s_export_seq, __ATOMIC_ACQUIRE);
+        if (!(q & 1)) {
+            uint32_t r = 0;
+            for (uint32_t k = prx_hash_slot(nid), n = 0; n < (1u << PRX_HASH_BITS); n++, k = (k + 1) & ((1u << PRX_HASH_BITS) - 1)) {
+                const uint32_t h = __atomic_load_n(&s_export_hash[k].nid, __ATOMIC_RELAXED);
+                if (!h) break;
+                if (h == nid) { r = __atomic_load_n(&s_export_hash[k].guest_addr, __ATOMIC_RELAXED); break; }
+            }
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (__atomic_load_n(&s_export_seq, __ATOMIC_RELAXED) == q) return r;
+        }
+    }
     for (uint32_t i = 0; i < s_export_reg_n; i++)
         if (s_export_reg[i].nid == nid)
             return s_export_reg[i].guest_addr;
@@ -76,15 +120,19 @@ int prx_place_module(const prx_module* m, prx_register_fn reg)
 
 void prx_publish_exports(const prx_module* m)
 {
+    prx_hash_begin();
     for (uint32_t i = 0; m && m->exports && i < m->export_count; i++)
         if (m->exports[i].nid) prx_export_register(m->exports[i].nid, m->base + m->exports[i].vaddr);
+    prx_hash_end();
     if (m) { prx_watch_add(m); prx_watch_start(); }
 }
 
 void prx_withdraw_exports(const prx_module* m)
 {
+    prx_hash_begin();
     for (uint32_t i = 0; m && m->exports && i < m->export_count; i++)
         if (m->exports[i].nid) prx_export_unregister(m->exports[i].nid, m->base + m->exports[i].vaddr);
+    prx_hash_end();
     if (m) prx_watch_remove(m);
 }
 
@@ -248,6 +296,7 @@ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
      * resolver can dispatch into this module by NID. Function exports point at
      * an OPD in the freshly-placed image; ps3_indirect_call walks it. */
     uint32_t exports_published = 0;
+    prx_hash_begin();
     if (m->exports) {
         for (uint32_t i = 0; i < m->export_count; i++) {
             const prx_export* e = &m->exports[i];
@@ -257,6 +306,7 @@ prx_load_result prx_load_module(const prx_module* m, prx_register_fn reg)
             exports_published++;
         }
     }
+    prx_hash_end();
 
     prx_watch_add(m);
     prx_watch_start();
