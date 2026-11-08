@@ -804,14 +804,15 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
  * when a slot is (re)assigned (eng_surface_get is the only writer): 0 means no
  * target is at that address, so a texture unit's search over every target can
  * be skipped. A stale filter only errs towards 1. PS3RECOMP_ENG_SURF_FILTER=1 to
- * use it (default off: no measured gain). */
+ * use it (default off: no measured gain). rsx3 2026-11-08: default ON (=0 off) -- with
+ * LAZY_REFS, FP_MEMO=64, PLAN_LAYOUT and the E-core worker, city heavy view +4.7%. */
 static u32 s_surf_gen, s_surf_filter_gen = ~0u;
 static u64 s_surf_filter[16];
 static u32 eng_surf_hash(u32 location, u32 offset) { return ((offset ^ (location << 30)) * 0x9E3779B1u) >> 22; }
 static int eng_surface_maybe(u32 location, u32 offset)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_SURF_FILTER"); on = e && e[0] == '1'; }
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_SURF_FILTER"); on = !(e && e[0] == '0'); }   /* rsx3: default on */
     if (!on) return 1;
     if (s_surf_filter_gen != s_surf_gen) {
         memset(s_surf_filter, 0, sizeof s_surf_filter);
@@ -2171,7 +2172,7 @@ static eng_vp_memo* s_vpgen_memo;
 static u32 s_vpgen_gen, s_vpgen_start;
 static int s_vpgen_on = -1;
 static void eng_vpgen_set(int id, int v) { (void)id; __atomic_store_n(&s_vpgen_on, v != 0, __ATOMIC_RELAXED); }
-/* PS3RECOMP_ENG_FP_MEMO (1..64, default 8 = the old size; 64 showed no gain): how many
+/* PS3RECOMP_ENG_FP_MEMO (1..64, default 64 since rsx3; 8 = the old size): how many
  * fragment programs are kept. A heavy frame runs far more than eight, so the
  * old table missed and re-analysed (copy, structural hash, constants, three
  * microcode walks) on many draws. The lookup scans compact key arrays, not the
@@ -2261,7 +2262,7 @@ static const eng_fp_memo* eng_fp_current(void)
     const u32 off = rsx_dsp_fragment_program(&g.rsx, &loc);
     if (__builtin_expect(!s_fp_cap, 0)) {
         const char* e = getenv("PS3RECOMP_ENG_FP_MEMO");
-        const long n = e ? strtol(e, NULL, 10) : 8L;
+        const long n = e ? strtol(e, NULL, 10) : 64L;   /* rsx3: default 64 (=8 the old size) */
         s_fp_cap = n < 1 ? 1u : n > (long)ENG_FP_MEMO_MAX ? ENG_FP_MEMO_MAX : (u32)n;
     }
     const u64 key = ((u64)loc << 32) | off;
@@ -3594,7 +3595,7 @@ static void eng_ic_after_draw(eng_ic_entry* e, u64 content, u32 n_draw)
 static void eng_plan_init(const rsx_vertex_layout_plan* layout)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_PLAN_LAYOUT"); on = e && e[0] == '1'; }
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_PLAN_LAYOUT"); on = !(e && e[0] == '0'); }   /* rsx3: default on */
     if (on) rsx_vertex_fetch_plan_init_layout(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
     else    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
 }
@@ -3634,7 +3635,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
              * divider; a hit never reads the rest (writing them was ~0.3 ms of
              * the RSX thread a frame in the pier view). */
             static int lazy_on = -1;
-            if (lazy_on < 0) { const char* ev = getenv("PS3RECOMP_ENG_LAZY_REFS"); lazy_on = ev && ev[0] == '1'; }
+            if (lazy_on < 0) { const char* ev = getenv("PS3RECOMP_ENG_LAZY_REFS"); lazy_on = !(ev && ev[0] == '0'); }   /* rsx3: default on */
             /* ... and only while the run does not wrap the 20-bit element index
              * (prepare walks every reference then). */
             int lazy = lazy_on && e->span > 1 &&

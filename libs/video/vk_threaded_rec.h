@@ -589,7 +589,9 @@ static void vk_tq_install(void)
     s_tq.thread = CreateThread(NULL, 0, tq_worker, NULL, 0, NULL);
     if (!s_tq.thread) { VirtualFree(s_tq.ring, 0, MEM_RELEASE); s_tq.ring = NULL; return; }
     SetThreadPriority(s_tq.thread, GetThreadPriority(GetCurrentThread()));
-    if (e && atoi(e) == 2) {                /* =2: the worker on the E-cores (hybrid CPUs) */
+    /* =2 (rsx3: the default; =1 = on, unpinned): the worker on the E-cores (hybrid CPUs). Its real
+     * driver work is ~1-2 ms a frame; on a P-core its idle spin shared a core with the hot threads. */
+    if (!e || atoi(e) == 2) {
         ULONG len = 0;
         GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
         u8* buf = len ? (u8*)malloc(len) : NULL;
