@@ -211,10 +211,13 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * test that stores through vm_write* paying one compare against a hot global.
  * Written once, under the lock; read unlocked, where a stale zero costs at most
  * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+/* On a cache line of its own: every PPU store reads it, and a neighbour that is
+ * written (a counter, a pointer table) would take that line away from the PPU. */
+static struct { int v; char pad[60]; } __attribute__((aligned(64))) s_coh_armed_line;
+#define s_coh_armed (s_coh_armed_line.v)
 /* The lifted code's inline store fast path (ppu_lifter.py's header) reads
  * the same two objects spu_coh_is_reserved does. */
-int* const           g_spu_coh_armed  = &s_coh_armed;
+int* const           g_spu_coh_armed  = &s_coh_armed_line.v;
 unsigned char* const g_spu_coh_bitmap = s_coh_bitmap;
 
 /* The SPU contexts that have reserved a line. Sized to match the MFC engine
@@ -268,6 +271,19 @@ void spu_process_barrier(void)
 void spu_process_barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 #endif
 
+static int s_coh_mark_once = -1;
+static __attribute__((noinline, cold)) int coh_mark_once_init(void)
+{
+    const char* e = getenv("PS3_SPU_COH_MARK_ONCE");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_coh_mark_once, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int coh_mark_once_on(void)
+{
+    const int v = __atomic_load_n(&s_coh_mark_once, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : coh_mark_once_init();
+}
 static void coh_mark_line(uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
@@ -281,6 +297,16 @@ static void coh_mark_line(uint32_t ea)
      * the bit on its re-check and breaks the reservation. Bits are never
      * cleared, so the barrier runs once per line, ever. */
     const unsigned char bit = (unsigned char)(1u << (line & 7));
+    /* PS3_SPU_COH_MARK_ONCE (default 1; spu3 2026-11-08): a line already marked, with the
+     * bitmap armed, needs neither write -- bits are never cleared and armed is set once --
+     * and each was a locked write on every GETLLAR to cache lines every PPU store reads
+     * (armed, and the bitmap bytes of the SPURS/job-queue lines the PPU itself writes),
+     * taking them away from the main thread ~100k times a second. The atomic's own
+     * fences (spu_mfc_atomic) still order this GETLLAR. 0 = mark on every reservation. */
+    if (__builtin_expect(coh_mark_once_on(), 1) &&
+        (__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_ACQUIRE) & bit) &&
+        __atomic_load_n(&s_coh_armed, __ATOMIC_ACQUIRE))
+        return;
     const unsigned char was = __atomic_fetch_or(&s_coh_bitmap[line >> 3], bit, __ATOMIC_SEQ_CST);
     __atomic_store_n(&s_coh_armed, 1, __ATOMIC_SEQ_CST);
     if (!(was & bit)) spu_process_barrier();
