@@ -4273,6 +4273,12 @@ typedef struct vk_eng_pipe {
     /* Units the fragment program declares TextureCube / Texture3D: a sampled
      * image's view type has to match the declaration, bound or not. */
     u32                 cube_mask, vol_mask;
+    /* FUNC_ADD_SIGNED emulation (vk_eng_sblend_hlsl): lanes that blend signed
+     * (bit 0 RGB, bit 1 A), the fragment module of the negative half and its
+     * pipelines (REVERSE_SUBTRACT, drawn after the positive half). */
+    u32                 sblend;
+    VkShaderModule      fs_neg;
+    VkPipeline          variant_neg[VK_ENG_TOPOLOGIES][4];
 } vk_eng_pipe;
 
 /* Bit u set for each "<kind> rsx_tex<u>" declaration in the program text. */
@@ -4389,7 +4395,13 @@ static VkBlendOp vk_gcm_blend_op(u32 e)
     case 0x8008: return VK_BLEND_OP_MAX;
     case 0x800A: return VK_BLEND_OP_SUBTRACT;
     case 0x800B: return VK_BLEND_OP_REVERSE_SUBTRACT;
-    default:     return VK_BLEND_OP_ADD;                  /* FUNC_ADD 0x8006 */
+    case 0x8006: return VK_BLEND_OP_ADD;                  /* FUNC_ADD */
+    default: {
+        static u32 seen[8]; static u32 ns;
+        u32 k = 0; while (k < ns && seen[k] != e) k++;
+        if (k == ns && ns < 8) { seen[ns++] = e;
+            VK_LOG("blend equation 0x%04X not mapped: drawn as FUNC_ADD\n", e); }
+        return VK_BLEND_OP_ADD; }
     }
 }
 static VkCompareOp vk_gcm_compare(u32 f)
@@ -4439,6 +4451,69 @@ static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out)
     return rc;
 }
 
+/* NV4097_SET_BLEND_EQUATION FUNC_ADD_SIGNED (0xF006, per half: RGB [0:15],
+ * A [16:31]): the destination plus the source taken as a SIGNED byte -- the
+ * 8-bit value the fragment wrote, read as two's complement (128..255 are
+ * -128..-1). inFAMOUS 2's heat distortion is built on it: the map is cleared to
+ * 0x80 (no offset) and each distorting fragment (the Beast's FP
+ * d8160c63900ef8ce, fire, explosions) writes its offset as x for x >= 0 and
+ * 1 + x for x < 0, with ONE/ONE; the composite then reads the map back
+ * unsigned around 0.5. Drawn as FUNC_ADD (Vulkan has no signed blend; RPCS3
+ * does the same), every negative offset saturates the map at 1.0 instead --
+ * half of each distortion turns into a +0.5 shift, the Beast's body tears
+ * into horizontal strips. Vulkan clamps a UNORM source to [0,1] before
+ * blending, so the draw is split in two: the positive half as written with
+ * FUNC_ADD (dst x Fd + max(s, 0) x Fs), then the negative half again with
+ * REVERSE_SUBTRACT (dst x ONE - max(-s, 0) x Fs) and only the signed lanes
+ * enabled. Exact unless a lane saturates half-way; factors that read the
+ * split source itself keep FUNC_ADD (vk_eng_pipeline_create says which).
+ * The game sets 0xF006 for both halves (ONE/ONE; and SRC_ALPHA/ONE with
+ * alpha ZERO/ONE) -- the semantics are inferred from the encoding its
+ * programs write, which only adds up this way.
+ * PS3RECOMP_VK_SIGNED_BLEND=1 (default): the ONE/ONE case; =2: every
+ * factor combination the split can do; =0: FUNC_ADD, as before. */
+static int vk_sblend_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_SIGNED_BLEND"); on = e ? atoi(e) : 1; }
+    return on;
+}
+/* The fragment program with its single-target return wrapped: neg = 0 keeps
+ * the non-negative part of each signed lane, neg = 1 the magnitude of the
+ * negative part. NULL when the program's return is not one this knows. */
+static char* vk_eng_sblend_hlsl(const char* ps_hlsl, u32 lanes, int neg)
+{
+    static const char* const forms[2] = { "    return (_o == _o) ? _o : (float4)0;\n}",
+                                          "    return _rsx_out;\n}" };
+    const char* at = NULL; const char* form = NULL;
+    for (int i = 0; i < 2 && !at; i++) { at = strstr(ps_hlsl, forms[i]); form = forms[i]; }
+    const char* main_at = strstr(ps_hlsl, "float4 main(");
+    if (!at || !main_at || main_at > at || strstr(ps_hlsl, "struct PSOutput")) return NULL;
+    char fn[640];
+    snprintf(fn, sizeof fn,
+             "float4 _rsx_sblend(float4 v) {\n"
+             "    float4 b = round(saturate(v) * 255.0);\n"
+             "    float4 s = (b >= 128.0 ? b - 256.0 : b) / 255.0;   /* the byte, two's complement */\n"
+             "    float4 r = %s;\n"
+             "    return float4(%s, %s);\n"
+             "}\n",
+             neg ? "max(-s, (float4)0)" : "max(s, (float4)0)",
+             (lanes & 1u) ? "r.xyz" : "v.xyz", (lanes & 2u) ? "r.w" : "v.w");
+    const char* expr = form == forms[0] ? "(_o == _o) ? _o : (float4)0" : "_rsx_out";
+    char ret[128];
+    snprintf(ret, sizeof ret, "    return _rsx_sblend(%s);\n}", expr);
+    const size_t n = strlen(ps_hlsl) + strlen(fn) + strlen(ret) + 1;
+    char* out = (char*)malloc(n);
+    if (!out) return NULL;
+    size_t k = 0;
+    memcpy(out + k, ps_hlsl, (size_t)(main_at - ps_hlsl)); k += (size_t)(main_at - ps_hlsl);
+    memcpy(out + k, fn, strlen(fn)); k += strlen(fn);
+    memcpy(out + k, main_at, (size_t)(at - main_at)); k += (size_t)(at - main_at);
+    memcpy(out + k, ret, strlen(ret)); k += strlen(ret);
+    strcpy(out + k, at + strlen(form));
+    return out;
+}
+
 static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                   const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
                                   u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
@@ -4462,10 +4537,60 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     }
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
-    if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
-    if (vk_eng_translate(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs)) {
-        pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P); return 0;
+    /* FUNC_ADD_SIGNED lanes (see vk_eng_sblend_hlsl). A lane whose source
+     * factor is ZERO adds nothing and needs no split. The split changes the
+     * source the factors see, so it is refused (FUNC_ADD, said a few times)
+     * when a split RGB is its own factor (SRC_COLOR) or a split alpha feeds
+     * any factor (SRC_ALPHA...). inFAMOUS 2 uses ONE/ONE on both halves (the
+     * heat-distortion maps: checked against the game's look in the Beast
+     * fight) and SRC_ALPHA/ONE with alpha ZERO/ONE (some particles: whether
+     * those darken on hardware is not checked yet). PS3RECOMP_VK_SIGNED_BLEND:
+     * 1 (default) = the ONE/ONE case only, 2 = every case the split can do,
+     * 0 = none (FUNC_ADD everywhere, as before). */
+    u32 sbl = 0;
+    const int sbl_mode = vk_sblend_on();
+    if (rs->blend_enable && sbl_mode) {
+        int srgb = rs->eq_rgb == 0xF006u && rs->sf_rgb != 0u, sa = rs->eq_a == 0xF006u && rs->sf_a != 0u;
+        if (sbl_mode == 1 && ((srgb && (rs->sf_rgb != 1u || rs->df_rgb != 1u)) ||
+                              (sa && (rs->sf_a != 1u || rs->df_a != 1u)))) {
+            static int said;
+            if (said++ < 4) VK_LOG("engine: FUNC_ADD_SIGNED with factors 0x%X/0x%X 0x%X/0x%X: drawn as FUNC_ADD "
+                                   "(PS3RECOMP_VK_SIGNED_BLEND=2 splits it)\n", rs->sf_rgb, rs->df_rgb, rs->sf_a, rs->df_a);
+            srgb = sa = 0;
+        }
+        #define VK_SRC_COLOR_F(f) ((f) == 0x300u || (f) == 0x301u)
+        #define VK_SRC_ALPHA_F(f) ((f) == 0x302u || (f) == 0x303u || (f) == 0x308u)
+        const int bad = (srgb && (VK_SRC_COLOR_F(rs->sf_rgb) || VK_SRC_COLOR_F(rs->df_rgb))) ||
+                        (sa && (VK_SRC_ALPHA_F(rs->sf_rgb) || VK_SRC_ALPHA_F(rs->df_rgb) ||
+                                VK_SRC_ALPHA_F(rs->sf_a) || VK_SRC_ALPHA_F(rs->df_a) ||
+                                VK_SRC_COLOR_F(rs->sf_a) || VK_SRC_COLOR_F(rs->df_a)));
+        #undef VK_SRC_COLOR_F
+        #undef VK_SRC_ALPHA_F
+        if (bad) {
+            static int said;
+            if (said++ < 4) VK_LOG("engine: FUNC_ADD_SIGNED with factors 0x%X/0x%X 0x%X/0x%X: drawn as FUNC_ADD\n",
+                                   rs->sf_rgb, rs->df_rgb, rs->sf_a, rs->df_a);
+        } else {
+            sbl = (srgb ? 1u : 0u) | (sa ? 2u : 0u);
+        }
     }
+    char* ps_pos = sbl ? vk_eng_sblend_hlsl(ps_hlsl, sbl, 0) : NULL;
+    char* ps_neg = sbl ? vk_eng_sblend_hlsl(ps_hlsl, sbl, 1) : NULL;
+    if (sbl && (!ps_pos || !ps_neg)) {
+        static int said;
+        if (!said++) VK_LOG("engine: FUNC_ADD_SIGNED on a program whose output is not a single float4: drawn as FUNC_ADD\n");
+        free(ps_pos); free(ps_neg); ps_pos = ps_neg = NULL; sbl = 0;
+    }
+    if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) { free(ps_pos); free(ps_neg); return 0; }
+    if (vk_eng_translate(ps_pos ? ps_pos : ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs) ||
+        (ps_neg && vk_eng_translate(ps_neg, RSX_SHADER_STAGE_FRAGMENT, &P->fs_neg))) {
+        if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
+        pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P);
+        free(ps_pos); free(ps_neg); return 0;
+    }
+    free(ps_pos); free(ps_neg);
+    P->sblend = sbl;
+    if (sbl) { static int said; if (!said++) VK_LOG("engine: FUNC_ADD_SIGNED blending emulated (lanes 0x%X)\n", sbl); }
     P->rs = *rs;
     P->nslots = layout->count;
     P->stride = vertex_stride;
@@ -4486,19 +4611,31 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
     for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
         for (u32 k = 0; k < 4; k++)
             if (P->variant[t][k]) pvkDestroyPipeline(s_vk.device, P->variant[t][k], NULL);
+    for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
+        for (u32 k = 0; k < 4; k++)
+            if (P->variant_neg[t][k]) pvkDestroyPipeline(s_vk.device, P->variant_neg[t][k], NULL);
     if (P->vs) pvkDestroyShaderModule(s_vk.device, P->vs, NULL);
     if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
+    if (P->fs_neg) pvkDestroyShaderModule(s_vk.device, P->fs_neg, NULL);
     memset(P, 0, sizeof *P);
     if (s_e2.pipeline == pipeline) s_e2.pipeline = 0;
 }
 
+static VkPipeline vk_eng_variant_ex(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx, int neg);
 static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx)
+{
+    return vk_eng_variant_ex(P, topo_idx, vk_idx, 0);
+}
+/* neg: the negative half of a FUNC_ADD_SIGNED draw (vk_eng_sblend_hlsl). */
+static VkPipeline vk_eng_variant_ex(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx, int neg)
 {
     static const VkPrimitiveTopology topo[VK_ENG_TOPOLOGIES] = {
         VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
         VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
-    if (P->variant[topo_idx][vk_idx]) return P->variant[topo_idx][vk_idx];
+    VkPipeline* slotp = neg ? &P->variant_neg[topo_idx][vk_idx] : &P->variant[topo_idx][vk_idx];
+    if (*slotp) return *slotp;
+    if (neg && !P->fs_neg) return VK_NULL_HANDLE;
     VkRenderPass rp = vk_eng_render_pass(P->rt_count);
     if (!rp || P->nslots > VK_GUEST_ATTRS) return VK_NULL_HANDLE;
     const rsx_be_render_state* rs = &P->rs;
@@ -4507,7 +4644,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx)
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
           .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = P->vs, .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = P->fs, .pName = "main" } };
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = neg ? P->fs_neg : P->fs, .pName = "main" } };
     VkVertexInputBindingDescription vb = { 0, P->stride, VK_VERTEX_INPUT_RATE_VERTEX };
     VkVertexInputAttributeDescription va[VK_GUEST_ATTRS];
     for (u32 s = 0; s < P->nslots; s++)
@@ -4587,11 +4724,24 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx)
             .blendEnable = tblend ? VK_TRUE : VK_FALSE,
             .srcColorBlendFactor = vk_gcm_blend_factor(rs->sf_rgb),
             .dstColorBlendFactor = vk_gcm_blend_factor(rs->df_rgb),
-            .colorBlendOp = vk_gcm_blend_op(rs->eq_rgb),
+            .colorBlendOp = (P->sblend & 1u) ? (neg ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD)
+                                             : vk_gcm_blend_op(rs->eq_rgb),
             .srcAlphaBlendFactor = vk_gcm_blend_factor(rs->sf_a),
             .dstAlphaBlendFactor = vk_gcm_blend_factor(rs->df_a),
-            .alphaBlendOp = vk_gcm_blend_op(rs->eq_a),
+            .alphaBlendOp = (P->sblend & 2u) ? (neg ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD)
+                                             : vk_gcm_blend_op(rs->eq_a),
             .colorWriteMask = twm };
+        /* The negative half writes only the signed lanes (the others were
+         * drawn, once, by the positive half), and subtracts from what the
+         * positive half left: dst x ONE - neg x Fs, so dst x Fd is applied
+         * once and the sum is dst x Fd + (pos - neg) x Fs. */
+        if (neg) {
+            cba[r].colorWriteMask &= ((P->sblend & 1u) ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                          VK_COLOR_COMPONENT_B_BIT) : 0u) |
+                                     ((P->sblend & 2u) ? VK_COLOR_COMPONENT_A_BIT : 0u);
+            if (P->sblend & 1u) cba[r].dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            if (P->sblend & 2u) cba[r].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        }
     }
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -4607,11 +4757,11 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx)
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = s_g.pipe_layout, .renderPass = rp, .subpass = 0 };
-    if (vk_sc_create_pipeline(&gci, &P->variant[topo_idx][vk_idx], 0) != VK_SUCCESS) {
+    if (vk_sc_create_pipeline(&gci, slotp, 0) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
-        P->variant[topo_idx][vk_idx] = VK_NULL_HANDLE;
+        *slotp = VK_NULL_HANDLE;
     }
-    return P->variant[topo_idx][vk_idx];
+    return *slotp;
 }
 
 static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pipeline = pipeline; }
@@ -5399,6 +5549,15 @@ static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer
         pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+    }
+    if (P->sblend) {                            /* FUNC_ADD_SIGNED: the negative half */
+        VkPipeline npipe = vk_eng_variant_ex(P, (u32)topology - 1u, vk_idx, 1);
+        if (npipe) {
+            pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, npipe);
+            s_ecs.pipe = npipe;
+            if (has_idx) pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
+            else         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+        }
     }
     if (batched) {
         s_batch.draws++;                        /* the pass stays open in the batch */
