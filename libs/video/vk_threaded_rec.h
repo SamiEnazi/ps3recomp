@@ -59,6 +59,7 @@ static struct {
 static __declspec(align(64)) volatile u64  s_tq_w;     /* published write position */
 static __declspec(align(64)) volatile u64  s_tq_r;     /* consumed position (worker) */
 static __declspec(align(64)) volatile LONG s_tq_sleep; /* worker is (about to be) asleep */
+static __declspec(align(64)) volatile LONG s_tq_bell;  /* rsx3: rung (incremented) to wake the worker in WAKE_KB mode */
 static volatile LONG s_tq_quit;
 static u64 s_tq_spin_ticks = 500000ull;   /* PS3RECOMP_VK_TQ_SPIN_US (vk_tq_install) */
 static u64 s_tq_wake_bytes;               /* PS3RECOMP_VK_TQ_WAKE_KB (vk_tq_install) */
@@ -96,6 +97,7 @@ static DWORD WINAPI tq_worker(LPVOID arg)
     t_tq_worker = 1;
     u64 r = s_tq_r;
     for (;;) {
+        const LONG bell = __atomic_load_n(&s_tq_bell, __ATOMIC_ACQUIRE);   /* before w: a ring after this is seen */
         u64 w = __atomic_load_n(&s_tq_w, __ATOMIC_ACQUIRE);
         if (r != w) {
             do {
@@ -105,9 +107,21 @@ static DWORD WINAPI tq_worker(LPVOID arg)
                 r += size;
             } while (r != w);
             __atomic_store_n(&s_tq_r, r, __ATOMIC_RELEASE);
-            continue;
+            if (!s_tq_wake_bytes) continue;               /* the old way: chase the producer */
+            /* rsx3: no chasing -- go on only for a full burst or a ring that came meanwhile */
+            if (__atomic_load_n(&s_tq_w, __ATOMIC_ACQUIRE) - r >= s_tq_wake_bytes ||
+                __atomic_load_n(&s_tq_bell, __ATOMIC_ACQUIRE) != bell) continue;
         }
         if (s_tq_quit) break;
+        if (s_tq_wake_bytes) {                            /* sleep on the bell (or 2 ms) */
+            InterlockedExchange(&s_tq_sleep, 1);
+            LONG seen = bell;
+            if (__atomic_load_n(&s_tq_bell, __ATOMIC_ACQUIRE) == bell && !s_tq_quit &&
+                __atomic_load_n(&s_tq_w, __ATOMIC_ACQUIRE) - r < s_tq_wake_bytes)
+                WaitOnAddress((volatile VOID*)&s_tq_bell, &seen, sizeof seen, 2);
+            InterlockedExchange(&s_tq_sleep, 0);
+            continue;
+        }
         /* idle: spin a little (PS3RECOMP_VK_TQ_SPIN_US), then sleep until the
          * producer wakes it -- which it does only once PS3RECOMP_VK_TQ_WAKE_KB of
          * records are waiting, at a present, a drain or a full ring (tq_wake). */
@@ -135,14 +149,23 @@ static DWORD WINAPI tq_worker(LPVOID arg)
  * threshold is picked up by its 2 ms wait timeout at the latest -- nothing waits
  * on it until the next submit, and a submit drains. PS3RECOMP_VK_TQ_WAKE_KB=0 and
  * PS3RECOMP_VK_TQ_SPIN_US=143 = the old behaviour (wake on every record). */
+/* Wake the worker now, whichever way it sleeps (the bell is a full barrier). */
+static void tq_ring(void)
+{
+    InterlockedIncrement(&s_tq_bell);
+    s_tq.n_wakes++;
+    WakeByAddressSingle((PVOID)&s_tq_bell);
+    WakeByAddressSingle((PVOID)&s_tq_w);
+}
 static void tq_wake(void)
 {
     if (!s_tq_sleep) return;
-    if (s_tq_wake_bytes && s_tq.wlocal - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) < s_tq_wake_bytes) return;
-    s_tq.n_wakes++; WakeByAddressSingle((PVOID)&s_tq_w);
+    if (!s_tq_wake_bytes) { s_tq.n_wakes++; WakeByAddressSingle((PVOID)&s_tq_w); return; }
+    if (s_tq.wlocal - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) >= s_tq_wake_bytes) tq_ring();
 }
 static void tq_wake_force(void)
 {
+    if (s_tq_wake_bytes) { tq_ring(); return; }
     MemoryBarrier();                   /* the published position before the sleep flag is read */
     if (s_tq_sleep) { s_tq.n_wakes++; WakeByAddressSingle((PVOID)&s_tq_w); }
 }
@@ -154,12 +177,11 @@ static void vk_tq_sync(void)
     const u64 w = __atomic_load_n(&s_tq_w, __ATOMIC_ACQUIRE);
     if (__atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) == w) return;
     s_tq.n_syncs++;
-    MemoryBarrier();
-    WakeByAddressSingle((PVOID)&s_tq_w);
+    tq_ring();
     u32 spins = 0;
     while (__atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) != w) {
         _mm_pause();
-        if (++spins > 20000u) { SwitchToThread(); spins = 0; WakeByAddressSingle((PVOID)&s_tq_w); }
+        if (++spins > 20000u) { SwitchToThread(); spins = 0; tq_ring(); }
     }
     if (s_tq.err != VK_SUCCESS) {
         fprintf(stderr, "[RSX vulkan] threaded recording: op %u failed (VkResult %d)\n",
@@ -173,11 +195,11 @@ static void vk_tq_sync(void)
 static void vk_tq_present_wait(u64 seq)
 {
     if (!s_tq.running || __atomic_load_n(&s_tq_pres_done, __ATOMIC_ACQUIRE) >= seq) return;
-    WakeByAddressSingle((PVOID)&s_tq_w);
+    tq_ring();
     u32 spins = 0;
     while (__atomic_load_n(&s_tq_pres_done, __ATOMIC_ACQUIRE) < seq) {
         _mm_pause();
-        if (++spins > 20000u) { SwitchToThread(); spins = 0; WakeByAddressSingle((PVOID)&s_tq_w); }
+        if (++spins > 20000u) { SwitchToThread(); spins = 0; tq_ring(); }
     }
 }
 
@@ -192,7 +214,7 @@ static u8* tq_alloc(u32 op, u32 bytes, VkCommandBuffer cb)
     const u32 fill = (off + bytes > TQ_RING_BYTES) ? TQ_RING_BYTES - off : 0u;
     if (pos + fill + bytes - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) > TQ_RING_BYTES) {
         s_tq.n_full++;
-        WakeByAddressSingle((PVOID)&s_tq_w);
+        tq_ring();
         while (pos + fill + bytes - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) > TQ_RING_BYTES) _mm_pause();
     }
     if (fill) {
@@ -660,7 +682,7 @@ static void vk_tq_stop(void)
     if (!s_tq.running) return;
     vk_tq_sync();
     InterlockedExchange(&s_tq_quit, 1);
-    WakeByAddressSingle((PVOID)&s_tq_w);
+    tq_ring();
     WaitForSingleObject(s_tq.thread, 5000);
     CloseHandle(s_tq.thread);
     s_tq.running = 0;
