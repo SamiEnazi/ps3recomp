@@ -393,6 +393,9 @@ typedef struct spu_context {
      * spu_channels.c casts to the real types. */
     void* ch_wait_cv;
     void* ch_wait_lock;
+    /* PS3_FTRACE only: when a producer first woke this SPU's current channel
+     * wait (spu_ch_wake), for the PS3_FT_SPU_WAKE latency span; 0 = none yet. */
+    uint64_t ft_wake_ns;
 
     /* --- SPU interrupt facility (faithful; WWS jobmanager depends on it) ---
      * The bi-family E/D bits (bie/bid, irete/iretd...) toggle int_enable; while

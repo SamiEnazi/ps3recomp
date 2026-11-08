@@ -1085,15 +1085,69 @@ SPU__X_SLOW u128 spu__xln_fma_slow(u128 a, u128 b, u128 c, uint32_t negp, uint32
 #else
 #define SPU__X_VC
 #endif
+/* PS3_SPU_RZ_VSLOW (default 1; 0 = the per-lane integer fix-ups; spu3 2026-11-08): the RZ forms'
+ * fix-ups below, which only run under the RZ MXCSR (round toward zero, FTZ, DAZ), done in four
+ * lanes of double instead of four lanes of 128-bit integer arithmetic. Each SPU single is
+ * rebuilt as the double of the same value by moving its fields (biased exponent 1..255 -- the
+ * SPU's extended range included -- is an ordinary double; exponent 0 is zero), so nothing is
+ * Inf or NaN. A product of two 24-bit significands is exact in double, and a round-toward-zero
+ * double add gives trunc53(x + y); since every 24-bit value is also a 53-bit one,
+ * trunc24(trunc53(v)) = trunc24(v): masking the low 29 bits is the SPU's one truncation of the
+ * exact result. The narrowing then applies the SPU's range by fields: above Smax saturates to
+ * +-Smax, below 2^-126 (zero included) is +0. Products and sums stay within 2^-252..2^259, so
+ * no double is denormal or infinite and FTZ/DAZ never act. Same bits as spu__*_lane:
+ * tests/test_spu_float_rz_x86.c. */
+#if defined(_MSC_VER)
+__declspec(selectany) int g_spu_rz_vslow = -1;
+#else
+__attribute__((weak)) int g_spu_rz_vslow = -1;
+#endif
+static inline int spu__rz_vslow_on(void) {                  /* read once; only cold paths ask */
+    int v = __atomic_load_n(&g_spu_rz_vslow, __ATOMIC_RELAXED);
+    if (__builtin_expect(v < 0, 0)) {
+        const char* e = getenv("PS3_SPU_RZ_VSLOW");
+        v = !(e && e[0] == '0');
+        __atomic_store_n(&g_spu_rz_vslow, v, __ATOMIC_RELAXED);
+    }
+    return v;
+}
+SPU__X_INLINE __m256d spu__xw_wide(__m128i x) {            /* SPU single -> the same value as a double */
+    const __m256i q = _mm256_cvtepu32_epi64(x);
+    const __m256i e = _mm256_and_si256(_mm256_srli_epi64(q, 23), _mm256_set1_epi64x(0xFF));
+    const __m256i d = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi64(_mm256_srli_epi64(q, 31), 63),
+                                                      _mm256_slli_epi64(_mm256_add_epi64(e, _mm256_set1_epi64x(896)), 52)),
+                                      _mm256_slli_epi64(_mm256_and_si256(q, _mm256_set1_epi64x(0x7FFFFF)), 29));
+    return _mm256_castsi256_pd(_mm256_andnot_si256(_mm256_cmpeq_epi64(e, _mm256_setzero_si256()), d));
+}
+SPU__X_INLINE __m128i spu__xw_narrow(__m256d v) {          /* truncated, saturated, +0 below Smin */
+    const __m256i d = _mm256_castpd_si256(v);
+    const __m256i sgn = _mm256_and_si256(_mm256_srli_epi64(d, 32), _mm256_set1_epi64x(0x80000000ll));
+    const __m256i b = _mm256_sub_epi64(_mm256_and_si256(_mm256_srli_epi64(d, 52), _mm256_set1_epi64x(0x7FF)),
+                                       _mm256_set1_epi64x(896));            /* SPU biased exponent */
+    __m256i r = _mm256_or_si256(sgn, _mm256_or_si256(_mm256_slli_epi64(b, 23),
+                                                     _mm256_and_si256(_mm256_srli_epi64(d, 29), _mm256_set1_epi64x(0x7FFFFF))));
+    r = _mm256_blendv_epi8(r, _mm256_or_si256(sgn, _mm256_set1_epi64x(0x7FFFFFFF)),
+                           _mm256_cmpgt_epi64(b, _mm256_set1_epi64x(255)));
+    r = _mm256_andnot_si256(_mm256_cmpgt_epi64(_mm256_set1_epi64x(1), b), r);
+    return _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(r, _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7)));
+}
 static __attribute__((noinline, cold, pure)) __m128i SPU__X_VC spu__xv_fa_slow(__m128i a, __m128i b, uint32_t negb) {
+    if (__builtin_expect(spu__rz_vslow_on(), 1))
+        return spu__xw_narrow(_mm256_add_pd(spu__xw_wide(a), spu__xw_wide(_mm_xor_si128(b, _mm_set1_epi32((int)negb)))));
     u128 x, y; _mm_storeu_si128((__m128i*)x._u8, a); _mm_storeu_si128((__m128i*)y._u8, b);
     return spu__xl(spu__xln_fa_slow(x, y, negb));
 }
 static __attribute__((noinline, cold, pure)) __m128i SPU__X_VC spu__xv_fm_slow(__m128i a, __m128i b) {
+    if (__builtin_expect(spu__rz_vslow_on(), 1))
+        return spu__xw_narrow(_mm256_mul_pd(spu__xw_wide(a), spu__xw_wide(b)));
     u128 x, y; _mm_storeu_si128((__m128i*)x._u8, a); _mm_storeu_si128((__m128i*)y._u8, b);
     return spu__xl(spu__xln_fm_slow(x, y));
 }
 static __attribute__((noinline, cold, pure)) __m128i SPU__X_VC spu__xv_fma_slow(__m128i a, __m128i b, __m128i c, uint32_t negp, uint32_t negc) {
+    if (__builtin_expect(spu__rz_vslow_on(), 1))
+        return spu__xw_narrow(_mm256_add_pd(_mm256_mul_pd(spu__xw_wide(_mm_xor_si128(a, _mm_set1_epi32((int)negp))),
+                                                          spu__xw_wide(b)),
+                                            spu__xw_wide(_mm_xor_si128(c, _mm_set1_epi32((int)negc)))));
     u128 x, y, z; _mm_storeu_si128((__m128i*)x._u8, a); _mm_storeu_si128((__m128i*)y._u8, b); _mm_storeu_si128((__m128i*)z._u8, c);
     return spu__xl(spu__xln_fma_slow(x, y, z, negp, negc));
 }
@@ -2198,6 +2252,80 @@ static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
  * scalar ones (A/B). */
 #if SPU_X86_SIMD && !(defined(SPU_X86_INT) && !SPU_X86_INT)
 #include "spu_helpers_x86int.h"
+#endif
+
+/* PS3_SPU_WRCH_INLINE (default 1; lifted TUs only, spu3 2026-11-08): a lifted `wrch` to one
+ * of the MFC parameter channels (LSA, EAH, EAL, Size, TagID, WrTagMask -- six of the ~eight
+ * channel writes of every DMA) stores the context field inline, exactly what spu_wrch's
+ * PS3_SPU_CH_LEAN switch does, instead of an out-of-line call with the u128 passed through
+ * memory (spu_wrch was 5% of SPU-thread time in a city profile). Taken only while the job
+ * recorder is off (a recorded or replayed job's writes still go through spu_wrch and its
+ * hook) and once spu_wrch has set g_spu_wrch_inline (1 = CH_LEAN on, SPU_CHHIST unset and
+ * PS3_SPU_WRCH_INLINE not 0). */
+#if defined(SPU_LS_FASTPATH) && SPU_LS_FASTPATH && !defined(SPU_NO_WRCH_INLINE)
+void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+extern int g_spu_wrch_inline;
+extern volatile int g_spu_jobrec_mode;
+static inline __attribute__((always_inline)) void spu_wrch_inl(spu_context* ctx, uint32_t ch, u128 v)
+{
+    if (__builtin_constant_p(ch) &&
+        (ch == MFC_LSA || ch == MFC_EAH || ch == MFC_EAL || ch == MFC_Size || ch == MFC_TagID ||
+         ch == MFC_WrTagMask) &&
+        __builtin_expect(g_spu_wrch_inline > 0 && !g_spu_jobrec_mode, 1)) {
+        const uint32_t x = v._u32[0];   /* channel writes use the preferred slot */
+        switch (ch) {
+        case MFC_LSA:       ctx->mfc_lsa = x; return;
+        case MFC_EAH:       ctx->mfc_eah = x; return;
+        case MFC_EAL:       ctx->mfc_eal = x; return;
+        case MFC_Size:      ctx->mfc_size = x; return;
+        case MFC_TagID:     ctx->mfc_tag = x & 0x1F; return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = x; return;
+        default: break;
+        }
+    }
+    spu_wrch(ctx, ch, v);
+}
+#define spu_wrch(ctx, ch, v) spu_wrch_inl((ctx), (ch), (v))
+/* PS3_SPU_RDCH_INLINE (default 1): the same for the two MFC status reads of every DMA wait and
+ * atomic (MFC_RdTagStat, MFC_RdAtomicStat: context fields under PS3_SPU_CH_LEAN). Published by
+ * spu_rdch's first call (CH_LEAN on, SPU_CHHIST / SPU_POLLTRACE unset); recorder off only. */
+u128 spu_rdch(spu_context* ctx, uint32_t channel);
+extern int g_spu_rdch_inline;
+static inline __attribute__((always_inline)) u128 spu_rdch_inl(spu_context* ctx, uint32_t ch)
+{
+    if (__builtin_constant_p(ch) && (ch == MFC_RdTagStat || ch == MFC_RdAtomicStat) &&
+        __builtin_expect(g_spu_rdch_inline > 0 && !g_spu_jobrec_mode, 1))
+        return spu_make_preferred_u32(ch == MFC_RdTagStat ? ctx->mfc_tag_status : ctx->atomic_stat);
+    return spu_rdch(ctx, ch);
+}
+#define spu_rdch(ctx, ch) spu_rdch_inl((ctx), (ch))
+#endif
+
+/* PS3_SPU_DRAIN_INLINE (default 1; lifted TUs only, spu3 2026-11-08): the call drain after every
+ * lifted call, when the callee has already come back (pc == return pc, no transfer pending other
+ * than the depth-0 dispatcher) -- spu_drain_call's PS3_SPU_DRAIN_FAST front case, the same steps
+ * (depth ring, transfer and drain_ret_pc cleared) inline instead of a call. Anything else, or a
+ * depth at the limit (the guard reports it), goes to spu_drain_call. g_spu_drain_inline is
+ * published by the first spu_drain_call. */
+#if defined(SPU_LS_FASTPATH) && SPU_LS_FASTPATH && !defined(SPU_NO_DRAIN_INLINE)
+extern int g_spu_drain_inline;
+extern uint32_t g_spu_depth_max_pub;
+void spu_indirect_branch(spu_context* ctx);
+static inline __attribute__((always_inline)) void spu_drain_call_inl(spu_context* ctx, uint32_t return_pc)
+{
+    void (*const tf)(spu_context*) = ctx->tramp_fn;
+    if (__builtin_expect(__atomic_load_n(&g_spu_drain_inline, __ATOMIC_ACQUIRE) > 0, 1) &&
+        (!tf || tf == spu_indirect_branch) && !((ctx->pc ^ return_pc) & SPU_LS_MASK) &&
+        ctx->host_depth < g_spu_depth_max_pub) {
+        const uint32_t n = ++ctx->depth_ring_n;
+        ctx->depth_ring[(n - 1) % 24u] = (uint32_t)ctx->pc & SPU_LS_MASK;
+        ctx->tramp_fn = 0;
+        ctx->drain_ret_pc = 0;
+        return;
+    }
+    spu_drain_call(ctx, return_pc);
+}
+#define spu_drain_call(ctx, pc) spu_drain_call_inl((ctx), (pc))
 #endif
 
 #endif /* SPU_HELPERS_H */

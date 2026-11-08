@@ -881,7 +881,8 @@ static inline int mfc_do_transfer_lean(spu_context* spu, uint32_t lsa, uint64_t 
         gm_copy_from(ls_ptr, (const uint8_t*)ea_ptr, size);
         { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
-        { int _n; unsigned* _w = spu_ls_watch_list(&_n);
+        /* no SPU_LS_WATCH (known once read): no out-of-line list call per GET */
+        if (__builtin_expect(g_spu_ls_watch_n != 0, 0)) { int _n; unsigned* _w = spu_ls_watch_list(&_n);
           for (int _i = 0; _i < _n; _i++) {
               if (_w[_i] >= lsa && _w[_i] < lsa + size) {
                   const uint8_t* q = &spu->ls[_w[_i] & (SPU_LS_MASK & ~0xFu)];

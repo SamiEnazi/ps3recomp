@@ -26,6 +26,7 @@
 #include "spu_context.h"
 #include "spu_dma.h"
 #include "spu_jobrec.h"
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FT_SPU_JOB: one span per job call (stats mode) */
 #include "../platform/win32_compat.h"
 #include <stdarg.h>
 #include <stddef.h>
@@ -502,6 +503,8 @@ int spu_jobrec_job_call(spu_context* ctx)
     jr_call_job(ctx, s_ret_pc);
     const uint64_t q1 = jr_qpc();
     const uint64_t ns = jr_ns(q1 - q0);
+    if (PS3_FT_ON() && ns >= ps3_ft_min_ns())   /* PS3_FTRACE + PS3_JOBSTAT: the job timeline */
+        ps3_ft_span(PS3_FT_SPU_JOB, ctx->spu_id, (uint32_t)ovl, pc, jr_ns(q0), jr_ns(q1));
     if (rec && t->active) {
         const uint64_t w0 = jr_qpc();
         jr_rec_end(t, ctx, ovl, pc, ns, now_ms);
