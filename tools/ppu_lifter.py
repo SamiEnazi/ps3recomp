@@ -1115,7 +1115,8 @@ def _nv_mod():
     os.environ.setdefault("PPU_FRAME_ENTRY", "0")
     os.environ.setdefault("PPU_VM_RUNS", "0")
     import ppu_nv_dirty
-    return ppu_nv_dirty
+    import ppu_fastpath   # PPU_VM_RUNS_LOADS (ppu2): the runs for loads only, on our ppu_mm gates
+    return ppu_fastpath.tune_nv(ppu_nv_dirty)
 
 
 # `func_X(ctx); DRAIN_TRAMPOLINE(ctx);` -- the drain after a direct call (PPU_DRAIN_ELIDE).
@@ -4144,8 +4145,9 @@ class PPULifter:
         every chunk file (the helpers are `static inline`, so duplicating
         them across translation units is harmless and keeps each chunk
         self-contained)."""
-        lines = [SOURCE_PREAMBLE.replace('#include "ppu_recomp.h"',
-                 f'#include "{getattr(self, "header_name", "ppu_recomp.h")}"')]
+        import ppu_fastpath   # lift-time fast paths (ppu2): all switches off = unchanged text
+        lines = [ppu_fastpath.source_preamble(SOURCE_PREAMBLE.replace('#include "ppu_recomp.h"',
+                 f'#include "{getattr(self, "header_name", "ppu_recomp.h")}"'))]
 
         # Emit helper macros
         lines.append("/* Rotate helpers */")
@@ -4507,6 +4509,8 @@ class PPULifter:
         def flush(body_lines: list[str], trailer: list[str] | None = None) -> None:
             nonlocal chunk_idx
             path = os.path.join(out_dir, f"{base}_{chunk_idx:03d}{ext}")
+            import ppu_fastpath   # statement fast paths (ppu2): all switches off = unchanged
+            body_lines = ppu_fastpath.rewrite_body(body_lines)
             with open(path, "w") as f:
                 f.write("\n".join(preamble + body_lines + (trailer or [])))
             written.append(path)

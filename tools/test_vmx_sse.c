@@ -1,0 +1,116 @@
+/* test_vmx_sse.c -- runtime/ppu/ppu_vmx_sse.h against runtime/ppu/ppu_vmx.h, bit for bit.
+ *
+ *   clang-cl /O2 /arch:AVX2 /I runtime/ppu tools/test_vmx_sse.c /Fe:test_vmx_sse.exe && test_vmx_sse.exe [cases]
+ *
+ * Every helper of the SSE header gets the same operands as its scalar namesake:
+ * lanes drawn from special values (signed zeros, denormals, infinities, quiet and
+ * signalling NaNs with payloads, extremes) and random bits, with VSCR[NJ] on and
+ * off; any byte that differs is a failure (exit 1). */
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include "ppu_vmx.h"
+static uint8_t* vm_base;
+#define PPU_VMX_SSE_NO_REDIRECT   /* call each side by its own name */
+#include "ppu_vmx_sse.h"
+
+static uint64_t s = 0x9E3779B97F4A7C15ull;
+static uint32_t rnd(void) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uint32_t)(s >> 16); }
+static const uint32_t SPECIAL[] = {
+    0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007FFFFFu, 0x807FFFFFu, 0x00400000u,
+    0x00800000u, 0x80800000u, 0x3F800000u, 0xBF800000u, 0x7F7FFFFFu, 0xFF7FFFFFu, 0x7F800000u,
+    0xFF800000u, 0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0xFF800001u, 0x7FBFFFFFu, 0x7FC12345u,
+    0xFF812345u, 0x34000000u, 0xB4000000u, 0x0C000000u, 0x8C000000u, 0x4B800000u, 0x3F7FFFFFu,
+};
+#define NSP (sizeof SPECIAL / sizeof SPECIAL[0])
+static uint32_t lane(void) {
+    uint32_t k = rnd() % 8;
+    if (k < 3) return SPECIAL[rnd() % NSP];
+    if (k == 3) return rnd() & 0x807FFFFFu;                    /* denormal / zero */
+    if (k == 4) return (rnd() & 0x80000000u) | ((rnd() % 40 + 100) << 23) | (rnd() & 0x7FFFFFu);  /* near 1 */
+    if (k == 5) return SPECIAL[rnd() % NSP] ^ (rnd() & 1);    /* next to a special */
+    return rnd();
+}
+/* big-endian register bytes, as lvx leaves them */
+static void vec(uint8_t v[16]) { for (int i = 0; i < 4; i++) { uint32_t x = lane(); v[4*i] = x >> 24; v[4*i+1] = x >> 16; v[4*i+2] = x >> 8; v[4*i+3] = x; } }
+static void bytes(uint8_t v[16]) { for (int i = 0; i < 16; i++) v[i] = (uint8_t)rnd(); }
+
+static long fails;
+static void check(const char* op, const uint8_t* want, const uint8_t* got, const uint8_t* a, const uint8_t* b, const uint8_t* c, uint32_t vscr) {
+    if (!memcmp(want, got, 16)) return;
+    if (fails++ < 12) {
+        printf("FAIL %s vscr=%08X\n  a", op, vscr);
+        for (int i = 0; i < 16; i++) printf("%s%02X", i % 4 ? "" : " ", a[i]);
+        printf("\n  b"); for (int i = 0; i < 16; i++) printf("%s%02X", i % 4 ? "" : " ", b[i]);
+        if (c) { printf("\n  c"); for (int i = 0; i < 16; i++) printf("%s%02X", i % 4 ? "" : " ", c[i]); }
+        printf("\n  want"); for (int i = 0; i < 16; i++) printf("%s%02X", i % 4 ? "" : " ", want[i]);
+        printf("\n  got "); for (int i = 0; i < 16; i++) printf("%s%02X", i % 4 ? "" : " ", got[i]);
+        printf("\n");
+    }
+}
+
+/* the scalar vperm the lifter emits inline */
+static void vperm_ref(uint8_t* d, const uint8_t* a, const uint8_t* b, const uint8_t* c) {
+    uint8_t tmp[16];
+    for (int i = 0; i < 16; i++) { uint8_t sel = c[i] & 0x1F; tmp[i] = (sel < 16) ? a[sel] : b[sel - 16]; }
+    memcpy(d, tmp, 16);
+}
+
+int main(int argc, char** argv) {
+    long n = argc > 1 ? atol(argv[1]) : 4000000;
+    uint8_t a[16], b[16], c[16], w[16], g[16];
+    for (long it = 0; it < n; it++) {
+        const uint32_t vscr = (it & 1) ? VMX_NJ : 0;
+        vec(a); vec(b); vec(c);
+        vmx_vaddfp(w, a, b, vscr);   vmx_vaddfp_sse(g, a, b, vscr);   check("vaddfp", w, g, a, b, 0, vscr);
+        vmx_vsubfp(w, a, b, vscr);   vmx_vsubfp_sse(g, a, b, vscr);   check("vsubfp", w, g, a, b, 0, vscr);
+        vmx_vmaddfp(w, a, b, c, vscr);  vmx_vmaddfp_sse(g, a, b, c, vscr);  check("vmaddfp", w, g, a, b, c, vscr);
+        vmx_vnmsubfp(w, a, b, c, vscr); vmx_vnmsubfp_sse(g, a, b, c, vscr); check("vnmsubfp", w, g, a, b, c, vscr);
+        /* aliasing as the lifted code does it: d == a */
+        memcpy(w, a, 16); memcpy(g, a, 16);
+        vmx_vmaddfp(w, w, b, c, vscr);  vmx_vmaddfp_sse(g, g, b, c, vscr);  check("vmaddfp d=a", w, g, a, b, c, vscr);
+        vmx_vrefp(w, b, vscr);        vmx_vrefp_sse(g, b, vscr);        check("vrefp", w, g, a, b, 0, vscr);
+        vmx_vrsqrtefp(w, b, vscr);    vmx_vrsqrtefp_sse(g, b, vscr);    check("vrsqrtefp", w, g, a, b, 0, vscr);
+        vmx_vmaxfp(w, a, b, vscr);    vmx_vmaxfp_sse(g, a, b, vscr);    check("vmaxfp", w, g, a, b, 0, vscr);
+        vmx_vminfp(w, a, b, vscr);    vmx_vminfp_sse(g, a, b, vscr);    check("vminfp", w, g, a, b, 0, vscr);
+        if ((it & 7) == 2) memcpy(b, a, 16);   /* equal operands, zeros of both signs */
+        { uint32_t r1 = vmx_vcmpeqfp(w, a, b, vscr), r2 = vmx_vcmpeqfp_sse(g, a, b, vscr); check("vcmpeqfp", w, g, a, b, 0, vscr);
+          if (r1 != r2) { fails++; printf("FAIL vcmpeqfp cr6 %u %u\n", r1, r2); } }
+        { uint32_t r1 = vmx_vcmpgefp(w, a, b, vscr), r2 = vmx_vcmpgefp_sse(g, a, b, vscr); check("vcmpgefp", w, g, a, b, 0, vscr);
+          if (r1 != r2) { fails++; printf("FAIL vcmpgefp cr6 %u %u\n", r1, r2); } }
+        { uint32_t r1 = vmx_vcmpgtfp(w, a, b, vscr), r2 = vmx_vcmpgtfp_sse(g, a, b, vscr); check("vcmpgtfp", w, g, a, b, 0, vscr);
+          if (r1 != r2) { fails++; printf("FAIL vcmpgtfp cr6 %u %u\n", r1, r2); } }
+        { unsigned u = rnd() & 31; bytes(b); vmx_vcfsx(w, b, u); vmx_vcfsx_sse(g, b, u); check("vcfsx", w, g, a, b, 0, u); }
+        bytes(c);
+        vperm_ref(w, a, b, c); ppu_vperm_sse(g, a, b, c); check("vperm", w, g, a, b, c, 0);
+        memcpy(w, c, 16); memcpy(g, c, 16);
+        vperm_ref(w, a, a, w); ppu_vperm_sse(g, a, a, g); check("vperm d=c a=b", w, g, a, a, c, 0);
+        /* vsldoi / vspltw against the lifter's inline text, every constant */
+#define SLD(N) { uint8_t tmp[32]; memcpy(tmp, a, 16); memcpy(tmp+16, b, 16); memcpy(w, tmp + N, 16); \
+                 PPU_VSLDOI_SSE(g, a, b, N); check("vsldoi " #N, w, g, a, b, 0, N); }
+        SLD(0) SLD(1) SLD(2) SLD(3) SLD(4) SLD(5) SLD(6) SLD(7) SLD(8) SLD(9) SLD(10) SLD(11) SLD(12) SLD(13) SLD(14) SLD(15)
+#define SPW(U) { uint32_t* d = (uint32_t*)w; uint32_t val = ((uint32_t*)b)[U]; d[0] = d[1] = d[2] = d[3] = val; \
+                 PPU_VSPLTW_SSE(g, b, U); check("vspltw " #U, w, g, a, b, 0, U); }
+        SPW(0) SPW(1) SPW(2) SPW(3)
+        /* the lifter's two-half logic ops */
+        { uint64_t* d = (uint64_t*)w; uint64_t* x = (uint64_t*)a; uint64_t* y = (uint64_t*)b; uint64_t* z = (uint64_t*)c;
+          d[0] = x[0] ^ y[0]; d[1] = x[1] ^ y[1]; PPU_VLOGIC_SSE(g, _mm_xor_si128, a, b); check("vxor", w, g, a, b, 0, 0);
+          d[0] = x[0] | y[0]; d[1] = x[1] | y[1]; PPU_VLOGIC_SSE(g, _mm_or_si128, a, b); check("vor", w, g, a, b, 0, 0);
+          for (int i = 0; i < 2; i++) d[i] = x[i] & y[i]; PPU_VLOGIC_SSE(g, _mm_and_si128, a, b); check("vand", w, g, a, b, 0, 0);
+          d[0] = x[0] & ~y[0]; d[1] = x[1] & ~y[1]; PPU_VLOGIC_SSE(g, ppu_vandc_sse, a, b); check("vandc", w, g, a, b, 0, 0);
+          d[0] = (x[0] & ~z[0]) | (y[0] & z[0]); d[1] = (x[1] & ~z[1]) | (y[1] & z[1]); PPU_VSEL_SSE(g, a, b, c); check("vsel", w, g, a, b, c, 0); }
+    }
+    /* lvx / stvx: one 16-byte access, the same bytes as vm_raw_ld16 / vm_raw_st16 */
+    {
+        static uint8_t mem[4096]; vm_base = mem;
+        for (int i = 0; i < 4096; i++) mem[i] = (uint8_t)rnd();
+        for (uint32_t ea = 0; ea + 16 <= 4096; ea += 16) {
+            uint8_t ref[16]; memcpy(ref, mem + ea, 16);
+            ppu_vld16_sse(g, ea); check("lvx", ref, g, a, b, 0, ea);
+            bytes(a); ppu_vst16_sse(ea, a); check("stvx", a, mem + ea, a, b, 0, ea);
+        }
+    }
+    printf("%ld cases: %ld failures\n", n, fails);
+    return fails != 0;
+}
