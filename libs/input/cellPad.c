@@ -2108,6 +2108,100 @@ static void pad_trace_packet(u32 port, const CellPadData* d)
  * were fixed.) These used to be redeclared here with a 64-bit address
  * parameter, which conflicts with the header now that it is included. */
 
+/* PS3_PAD_RECORD=<file> / PS3_PAD_REPLAY=<file> -- a recorded route (testspeed, 2026-11-08).
+ * Sami drives a route through New Marais once; tests replay it. Time-indexed, not frame-indexed:
+ * the game moves with a variable dt, so a slower or faster build covers the same distance in the
+ * same milliseconds, while a frame-indexed replay would not. The clock (ms) starts when the file
+ * named by PAD_SCRIPT_WAIT appears (tools\fast_driver.ps1 creates it the moment the gameplay HUD
+ * is back after the opening cutscene of the save): record and replay share that anchor.
+ * Record: port 0's packet as the game reads it (after every merge: controller, keys, mouse,
+ * scripts), one line per change: "<ms> <w0> ... <w23>" (CellPadData button words, hex).
+ * Replay: port 0's packet is replaced by the recorded state at that ms (the last line at or
+ * before it); after the last line, a neutral pad. Before the anchor nothing is touched (the
+ * driver gets the game there). */
+#define PAD_ROUTE_WORDS 24
+static unsigned long long pad_route_us(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f; LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (unsigned long long)(c.QuadPart / f.QuadPart) * 1000000ull +
+           (unsigned long long)(c.QuadPart % f.QuadPart) * 1000000ull / (unsigned long long)f.QuadPart;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
+#endif
+}
+static void pad_route_apply(u32 port_no, CellPadData* data)
+{
+    static int s_init = 0, s_mode = 0;           /* 1 record, 2 replay */
+    static const char* s_anchor; static unsigned long long s_t0;
+    static FILE* s_rec; static u16 s_last[PAD_ROUTE_WORDS]; static int s_have_last;
+    static unsigned int* s_t; static u16 (*s_w)[PAD_ROUTE_WORDS]; static int s_n, s_i, s_said_end;
+    if (port_no != 0) return;
+    if (!s_init) {
+        s_init = 1;
+        const char* r = getenv("PS3_PAD_RECORD"); const char* p = getenv("PS3_PAD_REPLAY");
+        s_anchor = getenv("PAD_SCRIPT_WAIT");
+        if (r && *r) {
+            s_rec = fopen(r, "w");
+            if (s_rec) { s_mode = 1; fprintf(s_rec, "# ps3 pad route v1: <ms after the anchor> <24 CellPadData button words, hex>\n");
+                         printf("[cellPad] PS3_PAD_RECORD: recording port 0 to %s from the anchor %s\n", r, s_anchor ? s_anchor : "(none: from the first read)"); }
+        } else if (p && *p) {
+            FILE* f = fopen(p, "r");
+            if (f) {
+                char ln[512]; int cap = 0;
+                while (fgets(ln, sizeof ln, f)) {
+                    if (ln[0] == '#') continue;
+                    unsigned int t; char* q = ln; t = (unsigned int)strtoul(q, &q, 10);
+                    if (q == ln) continue;
+                    if (s_n == cap) { cap = cap ? cap * 2 : 4096;
+                                      s_t = (unsigned int*)realloc(s_t, cap * sizeof *s_t);
+                                      s_w = (u16 (*)[PAD_ROUTE_WORDS])realloc(s_w, cap * sizeof *s_w); }
+                    for (int k = 0; k < PAD_ROUTE_WORDS; k++) s_w[s_n][k] = (u16)strtoul(q, &q, 16);
+                    s_t[s_n++] = t;
+                }
+                fclose(f);
+                s_mode = 2;
+                printf("[cellPad] PS3_PAD_REPLAY: %d states, %.1f s, from %s (anchor %s)\n", s_n,
+                       s_n ? s_t[s_n - 1] / 1000.0 : 0.0, p, s_anchor ? s_anchor : "(none: from the first read)");
+            } else printf("[cellPad] PS3_PAD_REPLAY: cannot open %s\n", p);
+        }
+        fflush(stdout);
+    }
+    if (!s_mode) return;
+    if (!s_t0) {
+        if (s_anchor && access(s_anchor, F_OK) != 0) return;
+        s_t0 = pad_route_us();
+        printf("[cellPad] pad route: anchor reached, %s starts\n", s_mode == 1 ? "recording" : "replay"); fflush(stdout);
+    }
+    const unsigned int ms = (unsigned int)((pad_route_us() - s_t0) / 1000ull);
+    if (s_mode == 1) {
+        if (!data->len) return;                      /* not a fresh packet: the game ignores it */
+        if (s_have_last && !memcmp(s_last, data->button, sizeof s_last)) return;
+        memcpy(s_last, data->button, sizeof s_last); s_have_last = 1;
+        fprintf(s_rec, "%u", ms);
+        for (int k = 0; k < PAD_ROUTE_WORDS; k++) fprintf(s_rec, " %04X", data->button[k]);
+        fputc('\n', s_rec); fflush(s_rec);
+        return;
+    }
+    /* replay */
+    while (s_i + 1 < s_n && s_t[s_i + 1] <= ms) s_i++;
+    if (!s_n || ms < s_t[0]) return;
+    if (s_i == s_n - 1 && ms > s_t[s_n - 1] + 500) {   /* past the end: neutral (sticks centred) */
+        if (!s_said_end) { s_said_end = 1; printf("[cellPad] PS3_PAD_REPLAY: end of the route at %u ms\n", ms); fflush(stdout); }
+        u16 w0 = data->button[0], w1 = data->button[1];
+        memset(data->button, 0, PAD_ROUTE_WORDS * sizeof(u16));
+        data->button[0] = w0; data->button[1] = w1;
+        for (int k = CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X; k <= CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y; k++) data->button[k] = 0x80;
+        if (CELL_PAD_BTN_OFFSET_SENSOR_X < PAD_ROUTE_WORDS) { data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512; data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399;
+                                                              data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512; data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512; }
+        return;
+    }
+    memcpy(&data->button[2], &s_w[s_i][2], (PAD_ROUTE_WORDS - 2) * sizeof(u16));   /* words 0-1 stay live */
+}
+
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
     { static int _once = 0;
@@ -2516,6 +2610,7 @@ emit:
         if (data->len) s_ps.packets[port_no]++;
         pad_stats_tick();
     }
+    pad_route_apply(port_no, data);   /* PS3_PAD_RECORD / PS3_PAD_REPLAY */
     pad_trace_packet(port_no, data);
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
