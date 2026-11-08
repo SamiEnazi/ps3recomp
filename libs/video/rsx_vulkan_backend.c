@@ -6404,7 +6404,10 @@ int rsx_vulkan_backend_pump_messages(void)
         if (e.type == SDL_QUIT) quit = 1;
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {
             if (s_vk_holding || vk_esc_quits()) quit = 1;
-            else if (!e.key.repeat) cellPad_host_window_event(2);
+            /* the window's Esc (cellPad: unless [keyboard] gives it to the game): the
+             * PC menu opens [overlay]; the mouse is free while it is open and
+             * captured again when it closes */
+            else if (!e.key.repeat && cellPad_host_window_event(2)) vk_overlay_open_menu();
         }
         else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9 && !e.key.repeat) s_pl.mark = 1;
         else if (e.type == SDL_MOUSEBUTTONDOWN) cellPad_host_window_event(1);

@@ -74,6 +74,7 @@ int   ps3_button_icons_mode_setting(void);
 int   ps3_button_icons_effective(void);
 void  ps3_host_quit(const char* why);           /* libs/system/cellSysutil.c */
 extern volatile int      g_pad_overlay_open;   /* libs/input/cellPad.c */
+extern volatile int      g_pad_overlay_present; /* cellPad: a menu exists, Esc keeps the mouse capture for after it */
 extern volatile uint32_t g_pad_overlay_nav, g_pad_overlay_nav2, g_pad_overlay_raw;
 }
 
@@ -375,6 +376,10 @@ static void notice_for(const char* text, double secs)
 }
 
 extern "C" void vk_overlay_notice(const char* text) { notice_for(text, 3.0); }
+static void set_open(int o);
+/* Esc with the menu closed (the backend's pump, after cellPad took it as the
+ * window's key): open the menu. 1 = opened (an overlay exists). */
+extern "C" int vk_overlay_open_menu(void) { if (!s_enabled) return 0; set_open(1); return 1; }
 
 /* ---- the menu opening and closing ------------------------------------------ */
 static void set_open(int o)
@@ -1512,6 +1517,7 @@ extern "C" void vk_overlay_attach(const vk_overlay_attach_info* info)
 #endif
     script_load();
     s_enabled = true;
+    g_pad_overlay_present = 1;
     if (env_on("PS3RECOMP_OVERLAY_MENU_OPEN") || env_on("PS3_OVERLAY_FORCE_OPEN")) set_open(1);
     notice_for("F2: settings    F1: performance HUD", 6.0);
     update_active();
