@@ -1537,6 +1537,12 @@ static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
  * once and give the accessors a fast path that skips the lot. PPU_HOTREAD=1
  * re-enables the spin detectors on their own. */
 extern "C" int vm_inline_ok = 0;
+/* Writes into guest memory that the host kernel makes (ReadFile under fread,
+ * recv) instead of user-mode code: called (ea, len, 0) before and (ea, len, 1)
+ * after, when set (libs/video/rsx_wtrack.c sets it: a page it write-protects
+ * would make such a call fail with ERROR_NOACCESS, and the write would go
+ * unseen). Read it once per call so both halves pair up. */
+extern "C" { void (*g_vm_host_io_hook)(uint32_t ea, uint32_t len, int end) = nullptr; }
 static std::atomic<int> g_vm_diag = -1;
 static int vm_diag_init(void)
 {

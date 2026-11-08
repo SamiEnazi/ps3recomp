@@ -28,6 +28,7 @@
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
+#include "rsx_wtrack.h"         /* page-protection write tracking of cached guest bytes */
 
 #include <math.h>
 #include <pthread.h>
@@ -290,6 +291,8 @@ typedef struct {
     u32 depth;                  /* slices of a 3D texture, else 1 */
     u8 icon_atlas;              /* the button-prompt atlas (rsx_button_icons.c) */
     u32 icon_gen;               /* the glyph set it was drawn with */
+    u8 wt_ok;                   /* rsx_wtrack: the span was armed and the upload matches it */
+    u64 wt_stamp;               /* ... the page versions it was armed with */
 } eng_texture;
 
 /* rsx_button_icons: the glyph set of this frame, and whether the upload
@@ -1804,6 +1807,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 
 /* Drawstats: the once-a-frame content re-hash of cached textures. */
 static u64 ds_th_ns, ds_th_bytes, ds_th_count, ds_th_changed;
+static u64 ds_th_wt_clean, ds_vc_wt_clean, ds_ic_wt_clean;   /* rsx_wtrack: checks skipped */
 /* Drawstats and state of the vertex cache (defined with it, below dc_reset). */
 static u64 ds_vc_hit, ds_vc_miss, ds_vc_skip, ds_vc_new, ds_vc_hashed, ds_vc_ns;
 /* ... and of the resident index buffers (PS3RECOMP_ENG_ICACHE, below the vertex cache). */
@@ -1838,6 +1842,20 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
         }
         const u32 span = e->span;
         if (!span) return 0;
+        /* rsx_wtrack (PS3RECOMP_WTRACK): pages still write-protected since the
+         * last check left the texture as uploaded -- nothing to hash. A span
+         * that is not clean is armed first and then hashed in full (exact);
+         * one that cannot be armed (pages that keep being written) takes the
+         * sparse/budgeted path below as before. */
+        int wt_mode = 0, wt_clean = 0, wt_armed = 0;
+        u64 wt_st = 0;
+        const u8* wt_src = NULL;
+        if (e->handle && e->last_hash_frame != g.frames && (wt_mode = rsx_wt_mode()) != 0 &&
+            (wt_src = eng_guest_ptr(NULL, location, offset, span)) != NULL) {
+            wt_clean = e->wt_ok && rsx_wt_query(wt_src, span, &wt_st) && wt_st == e->wt_stamp;
+            if (wt_clean && wt_mode == 1) { e->last_hash_frame = g.frames; ds_th_wt_clean++; }
+            else if (!wt_clean) { wt_st = 0; wt_armed = rsx_wt_arm(wt_src, span, &wt_st); }
+        }
         if (e->handle && e->last_hash_frame != g.frames) {
             /* Every cached texture used to be hashed in full every frame:
              * ~950 textures, 88 MB, 2.5 ms of the RSX thread a frame in New
@@ -1849,7 +1867,7 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
             const int full_always = __atomic_load_n(&s_texhash_full, __ATOMIC_RELAXED);
             /* Due by age, not by (frame + slot) & 7: a texture sampled only on
              * alternate frames could miss its turn for ever. */
-            int full = full_always || span <= 16384u;
+            int full = full_always || span <= 16384u || wt_armed || wt_clean;
             /* The age-due full hashes are budgeted per frame: textures that
              * come into view together (a camera cut) fall due together, every
              * eighth frame -- 50-73 MB of hashing, 4-7 ms of the RSX thread,
@@ -1874,6 +1892,7 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
             const u64 th0 = eng_ds_enabled() ? eng_ds_now() : 0;
             const u64 sparse = eng_texture_sparse_hash(location, offset, span, &readable);
             u64 hash = e->content_hash;
+            const u64 pre_hash = e->content_hash;
             if (readable && (full || sparse != e->sparse_hash)) {
                 hash = eng_texture_content_hash(location, offset, span, &readable);
                 e->last_full_frame = g.frames;
@@ -1895,6 +1914,14 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
                     e->icon_atlas = (u8)s_upload_atlas;
                     e->icon_gen = s_icon_gen;
                 }
+            }
+            if (wt_clean) {                     /* shadow mode: was the tracker right? */
+                if (readable && hash != pre_hash) { rsx_wt_report_miss("texture", wt_src, span); e->wt_ok = 0; }
+                else rsx_wt_note_verified();
+            } else if (wt_src) {
+                /* Clean from here on only if armed and the upload is current. */
+                e->wt_ok = (u8)(wt_armed && readable && hash == e->content_hash);
+                e->wt_stamp = wt_st;
             }
         }
         /* The prompt glyphs changed (another controller, the menu, rebound
@@ -1947,11 +1974,19 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     e.last_full_frame = g.frames - (index & 7u);   /* staggered: not all due on one frame */
     e.last_use_serial = ++g.texture_use_serial;
     const uint64_t ft_u0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-    { int readable = 0;
-      e.content_hash = eng_texture_content_hash(location, offset, span, &readable);
+    int new_readable = 0, new_armed = 0;
+    u64 new_st = 0;
+    if (rsx_wt_mode()) {                         /* armed before the hash (rsx_wtrack.h) */
+        const u8* src = eng_guest_ptr(NULL, location, offset, span);
+        if (src) new_armed = rsx_wt_arm(src, span, &new_st);
+    }
+    { e.content_hash = eng_texture_content_hash(location, offset, span, &new_readable);
+      int readable = 0;
       e.sparse_hash = eng_texture_sparse_hash(location, offset, span, &readable); }
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap, depth);
+    e.wt_ok = (u8)(new_armed && new_readable && e.handle);
+    e.wt_stamp = new_st;
     e.icon_atlas = (u8)s_upload_atlas;
     e.icon_gen = s_icon_gen;
     if (ft_u0) ps3_ft_span(PS3_FT_TEXUP, 0, span >> 10, evicted ? 2u : 0u, ft_u0, ps3_ft_now());
@@ -2015,11 +2050,15 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
 
 static u32 eng_vtex_mask(void)
 {
+    /* The three fields rsx_dsp_get_vertex_texture would decode (enable =
+     * CONTROL0 bit 31, width/height = IMAGE_RECT) read directly: this runs
+     * twice a draw and the full decode (a memset and eleven fields per unit)
+     * showed in the RSX thread's profile. */
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
-        rsx_dsp_vertex_texture vt;
-        rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
-        if (vt.enabled && vt.width && vt.height) mask |= 1u << u;
+        const u32 base = 0x0900u + u * 0x20u;    /* NV4097_SET_VERTEX_TEXTURE_OFFSET + unit block */
+        const u32 ctl0 = rsx_dsp_reg(&g.rsx, base + 0x0Cu), rect = rsx_dsp_reg(&g.rsx, base + 0x18u);
+        if ((ctl0 >> 31) && (rect >> 16) && (rect & 0xFFFFu)) mask |= 1u << u;
     }
     return mask;
 }
@@ -2961,7 +3000,7 @@ static void eng_ds_frame_end(u32 frame_draws)
 {
     static u32 wf;
     if (!eng_ds_enabled()) return;
-    if (frame_draws <= 1000) { memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss); ds_th_ns = ds_th_bytes = ds_th_count = ds_th_changed = 0; ds_vc_hit = ds_vc_miss = ds_vc_skip = ds_vc_new = ds_vc_hashed = ds_vc_ns = 0; ds_ic_hit = ds_ic_miss = ds_ic_new = ds_ic_hashed = 0; return; }
+    if (frame_draws <= 1000) { memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss); ds_th_ns = ds_th_bytes = ds_th_count = ds_th_changed = 0; ds_th_wt_clean = ds_vc_wt_clean = ds_ic_wt_clean = 0; ds_vc_hit = ds_vc_miss = ds_vc_skip = ds_vc_new = ds_vc_hashed = ds_vc_ns = 0; ds_ic_hit = ds_ic_miss = ds_ic_new = ds_ic_hashed = 0; return; }
     if (wf++ % 30 == 0 && ds.draws) {
         const double us = 1e-3;
         fprintf(stderr,
@@ -2989,9 +3028,10 @@ static void eng_ds_frame_end(u32 frame_draws)
                 ds.draws ? (double)ds_pk_scanned / ds.draws : 0.0, g.n_pipelines,
                 (unsigned long long)ds_memo_hit[0], (unsigned long long)(ds_memo_hit[0] + ds_memo_miss[0]),
                 (unsigned long long)ds_memo_hit[1], (unsigned long long)(ds_memo_hit[1] + ds_memo_miss[1]));
-        fprintf(stderr, "[drawstats] texture re-hash: %llu textures, %.1f MB, %.0f us, %llu changed\n",
+        fprintf(stderr, "[drawstats] texture re-hash: %llu textures, %.1f MB, %.0f us, %llu changed; write-tracked clean: %llu textures, %llu vertex, %llu index\n",
                 (unsigned long long)ds_th_count, ds_th_bytes / 1e6, ds_th_ns * us,
-                (unsigned long long)ds_th_changed);
+                (unsigned long long)ds_th_changed, (unsigned long long)ds_th_wt_clean,
+                (unsigned long long)ds_vc_wt_clean, (unsigned long long)ds_ic_wt_clean);
         fprintf(stderr, "[drawstats] vertex cache: %llu hits, %llu misses, %llu resting, %llu new; hashed %.1f MB in %.0f us; %u keys, %.0f MB resident\n",
                 (unsigned long long)ds_vc_hit, (unsigned long long)ds_vc_miss, (unsigned long long)ds_vc_skip,
                 (unsigned long long)ds_vc_new, ds_vc_hashed / 1e6, ds_vc_ns * us, s_vc_used, s_vc_bytes / 1e6);
@@ -3011,7 +3051,7 @@ static void eng_ds_frame_end(u32 frame_draws)
                                             (unsigned long long)ds.fmt[t][z]);
         fprintf(stderr, "%s\n", line);
     }
-    memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss); ds_th_ns = ds_th_bytes = ds_th_count = ds_th_changed = 0; ds_vc_hit = ds_vc_miss = ds_vc_skip = ds_vc_new = ds_vc_hashed = ds_vc_ns = 0; ds_ic_hit = ds_ic_miss = ds_ic_new = ds_ic_hashed = 0;
+    memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss); ds_th_ns = ds_th_bytes = ds_th_count = ds_th_changed = 0; ds_th_wt_clean = ds_vc_wt_clean = ds_ic_wt_clean = 0; ds_vc_hit = ds_vc_miss = ds_vc_skip = ds_vc_new = ds_vc_hashed = ds_vc_ns = 0; ds_ic_hit = ds_ic_miss = ds_ic_new = ds_ic_hashed = 0;
 }
 
 /* Turn this group's batches into a reference list, recording a CUT rather
@@ -3034,6 +3074,8 @@ typedef struct {
     u32 vbuf, bytes, n, stride;
     u32 last_frame, seen_frame, skip_until;
     u8 seen, changes;
+    u8 wt_ok;                    /* rsx_wtrack: spans armed, wt_content is their hash */
+    u64 wt_stamp, wt_content;
 } eng_vc_entry;
 #define ENG_VC_SIZE   65536u
 #define ENG_VC_BUDGET (512ull << 20)
@@ -3200,13 +3242,32 @@ static eng_vc_entry* eng_vc_probe(const rsx_vertex_layout_plan* layout, u64* con
             const u8* t = lo[j]; lo[j] = lo[j - 1]; lo[j - 1] = t;
             t = hi[j]; hi[j] = hi[j - 1]; hi[j - 1] = t;
         }
-    u64 c = 0x51ED270B27A3F5E1ull;
+    const u8* ms[RSX_DSP_NUM_VERTEX_ATTR]; u64 mn[RSX_DSP_NUM_VERTEX_ATTR]; u32 nm = 0;
     for (u32 i = 0; i < nr; ) {
         const u8* a0 = lo[i]; const u8* a1 = hi[i];
         for (i++; i < nr && lo[i] <= a1 + 64; i++) if (hi[i] > a1) a1 = hi[i];
-        c = eng_hash_span(a0, (u64)(a1 - a0), c);
-        ds_vc_hashed += (u64)(a1 - a0);
+        ms[nm] = a0; mn[nm] = (u64)(a1 - a0); nm++;
     }
+    /* rsx_wtrack: spans whose pages stayed write-protected hash as they did. */
+    const int wt = rsx_wt_mode();
+    int wt_clean = 0;
+    if (wt && e->wt_ok) {
+        u64 st = 0; wt_clean = 1;
+        for (u32 k = 0; k < nm && wt_clean; k++) wt_clean = rsx_wt_query(ms[k], mn[k], &st);
+        wt_clean = wt_clean && st == e->wt_stamp;
+        if (wt_clean && wt == 1) { *content = e->wt_content; ds_vc_wt_clean++; return e; }
+    }
+    u64 st = 0; int armed = wt && !wt_clean;
+    if (armed) for (u32 k = 0; k < nm; k++) armed &= rsx_wt_arm(ms[k], mn[k], &st);
+    u64 c = 0x51ED270B27A3F5E1ull;
+    for (u32 k = 0; k < nm; k++) {
+        c = eng_hash_span(ms[k], mn[k], c);
+        ds_vc_hashed += mn[k];
+    }
+    if (wt_clean) {                               /* shadow mode */
+        if (c != e->wt_content) { rsx_wt_report_miss("vertices", ms[0], (size_t)mn[0]); e->wt_ok = 0; }
+        else rsx_wt_note_verified();
+    } else if (wt) { e->wt_ok = (u8)armed; e->wt_stamp = st; e->wt_content = c; }
     *content = c;
     return e;
 }
@@ -3258,6 +3319,8 @@ typedef struct {
     u32 lo, span, n_src;         /* first vertex id, unique vertices, source references */
     u32 last_frame, seen_frame, skip_until;
     u8 seen, changes;
+    u8 wt_ok;                    /* rsx_wtrack: runs armed, wt_content is their hash */
+    u64 wt_stamp, wt_content;
 } eng_ic_entry;
 #define ENG_IC_SIZE   16384u
 #define ENG_IC_BUDGET (128ull << 20)
@@ -3327,30 +3390,57 @@ static eng_ic_entry* eng_ic_probe(const rsx_dsp_index_array* ia, u32 ia_loc, int
     key = eng_vc_mix(key, ((u64)g.rsx.current_primitive << 32) | base_index);
     key = eng_vc_mix(key, restart_en ? restart_val : 0u);
     key = eng_vc_mix(key, dc.n_idx);
-    u64 c = 0x2B992DDFA23249D6ull;
     for (u32 b = 0; b < dc.n_idx; b++) {
         const u32 first = dc.idx[b].first, count = dc.idx[b].count;
         key = eng_vc_mix(key, ((u64)first << 32) | count);
         const u64 start = (u64)ia->offset + (u64)first * esz, bytes = (u64)count * esz;
         if (!count || start + bytes > 0x100000000ull) return NULL;
-        const u8* run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
-        if (!run) return NULL;
-        c = eng_hash_span(run, bytes, c);
-        ds_ic_hashed += bytes;
+        if (!eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes)) return NULL;
     }
     if (!key) key = 1;
     u32 p = (u32)(key ^ (key >> 32)) & (ENG_IC_SIZE - 1u);
+    eng_ic_entry* e = NULL;
     for (u32 probe = 0; probe < 32; probe++, p = (p + 1) & (ENG_IC_SIZE - 1u)) {
-        if (s_ic[p].key == key) { *content = c; return &s_ic[p]; }
+        if (s_ic[p].key == key) { e = &s_ic[p]; break; }
         if (!s_ic[p].key) {
             if (s_ic_used >= ENG_IC_SIZE / 4u * 3u) { eng_ic_prune(); return NULL; }
-            eng_ic_entry* e = &s_ic[p];
+            e = &s_ic[p];
             memset(e, 0, sizeof *e); e->key = key; s_ic_used++;
-            *content = c;
-            return e;
+            break;
         }
     }
-    return NULL;
+    if (!e) return NULL;
+    /* The raw indices' hash -- or, rsx_wtrack, the one they had when their
+     * pages were armed, while those stay unwritten. */
+    const int wt = rsx_wt_mode();
+    int wt_clean = 0;
+    if (wt && e->wt_ok) {
+        u64 st = 0; wt_clean = 1;
+        for (u32 b = 0; b < dc.n_idx && wt_clean; b++) {
+            const u64 start = (u64)ia->offset + (u64)dc.idx[b].first * esz, bytes = (u64)dc.idx[b].count * esz;
+            wt_clean = rsx_wt_query(eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes), (size_t)bytes, &st);
+        }
+        wt_clean = wt_clean && st == e->wt_stamp;
+        if (wt_clean && wt == 1) { *content = e->wt_content; ds_ic_wt_clean++; return e; }
+    }
+    u64 st = 0; int armed = wt && !wt_clean;
+    u64 c = 0x2B992DDFA23249D6ull;
+    if (armed)
+        for (u32 b = 0; b < dc.n_idx; b++) {
+            const u64 start = (u64)ia->offset + (u64)dc.idx[b].first * esz, bytes = (u64)dc.idx[b].count * esz;
+            armed &= rsx_wt_arm(eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes), (size_t)bytes, &st);
+        }
+    for (u32 b = 0; b < dc.n_idx; b++) {
+        const u64 start = (u64)ia->offset + (u64)dc.idx[b].first * esz, bytes = (u64)dc.idx[b].count * esz;
+        c = eng_hash_span(eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes), bytes, c);
+        ds_ic_hashed += bytes;
+    }
+    if (wt_clean) {                               /* shadow mode */
+        if (c != e->wt_content) { rsx_wt_report_miss("indices", eng_guest_ptr(NULL, ia_loc, ia->offset, 4), 4); e->wt_ok = 0; }
+        else rsx_wt_note_verified();
+    } else if (wt) { e->wt_ok = (u8)armed; e->wt_stamp = st; e->wt_content = c; }
+    *content = c;
+    return e;
 }
 /* After an indexed draw went the whole way (the rebuilt list is in
  * g.indices): a second sighting of the same indices in a later frame makes
@@ -5503,6 +5593,7 @@ presented:;
               done = 1; FILE* f = fopen(mark, "w"); if (f) fclose(f);
               fprintf(stderr, "[rsx engine] world mark: frame %u, %u draws -> %s\n", g.frames, g.guest_draws, mark); } } }
     g.frames++;
+    if (rsx_wt_mode()) rsx_wt_frame(g.frames);
     s_icon_gen = rsx_button_icons_frame();
     eng_ds_frame_end(g.guest_draws);
     g.last_guest_draws = g.guest_draws;
@@ -5615,6 +5706,14 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
     rsx_dispatch_method(&g.rsx, m, arg);
+}
+
+/* rsx_draw_engine_method for a whole header (cellGcmSys's walker: only for
+ * methods whose mask leaves them unchanged over the burst, < 0x2000). */
+void rsx_draw_engine_burst(u32 method, int incr, const u32* be_words, u32 count)
+{
+    if (!g.ready) return;
+    rsx_dispatch_burst(&g.rsx, method & 0x1FFCu, incr, be_words, count);
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,

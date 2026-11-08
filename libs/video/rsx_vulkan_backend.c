@@ -625,8 +625,12 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
 static int vk_fif_busy(void);
 static void vk_fif_wait_other(void);
 static void vk_destroy_image_now(vk_image* im);
+/* Bumped whenever an image (and with it a view) goes away or an engine object
+ * is released: the descriptor memo (vk_eng_batch_set) holds views by handle. */
+static u32 s_eobj_gen = 1;
 static void vk_destroy_image(vk_image* im)
 {
+    s_eobj_gen++;
     /* A batched draw may still sample or render into it -- or, frames in
      * flight, the other slot's frame: destroy it when the batch has completed
      * (or finish the batch now if the list is full). */
@@ -3611,6 +3615,7 @@ static void vk_eng_release(void* user, u32 handle)
 {
     (void)user;
     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
+    s_eobj_gen++;
     if (s_eobj[handle].kind == VK_ENG_COLOR)
         for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
             if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
@@ -5165,8 +5170,42 @@ static VkDescriptorSet vk_eng_batch_set(VkBuffer ubuf)
 {
     static int reuse = -1;
     if (reuse < 0) { const char* e = getenv("PS3RECOMP_VK_DSET_REUSE"); reuse = !(e && e[0] == '0'); }
+    /* PS3RECOMP_VK_DSET_MEMO (default 1; 0 = off): the previous draw's set
+     * again when everything it was made from is unchanged -- the units'
+     * handles and sampler states, the pipeline (its cube / volume masks), the
+     * block sizes, the buffer, the anisotropy setting, no object or image
+     * destroyed since (s_eobj_gen) and the same set table (s_dset_gen).
+     * Building the sixteen views and samplers and the table key per draw was
+     * ~4% of the RSX thread. */
+    static int memo_on = -1;
+    if (memo_on < 0) { const char* e = getenv("PS3RECOMP_VK_DSET_MEMO"); memo_on = !(e && e[0] == '0'); }
+    static struct {
+        int valid, aniso;
+        u32 obj_gen, dset_gen, pipeline, tex_mask, vs, ps;
+        VkBuffer ubuf;
+        u32 tex[RSX_MAX_TEXTURES];
+        rsx_be_sampler_desc samp[RSX_MAX_TEXTURES];
+        VkDescriptorSet set;
+    } m;
+    const int memo = memo_on && reuse;
+    const u32 m_vs = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, m_ps = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
+    const int m_aniso = memo ? vk_postfx_aniso() : 0;
+    if (memo && m.valid && m.obj_gen == s_eobj_gen && m.dset_gen == s_dset_gen && m.ubuf == ubuf &&
+        m.vs == m_vs && m.ps == m_ps && m.pipeline == s_e2.pipeline && m.tex_mask == s_e2.tex_mask &&
+        m.aniso == m_aniso && !memcmp(m.tex, s_e2.tex, sizeof m.tex)) {
+        int same = 1;
+        for (u32 u = 0; u < RSX_MAX_TEXTURES && same; u++)
+            if (((s_e2.tex_mask >> u) & 1u) && memcmp(&m.samp[u], &s_e2.samp[u], sizeof m.samp[u])) same = 0;
+        if (same) { s_dset_hit++; return m.set; }
+    }
+    m.valid = 0;
     VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
     vk_eng_image_infos(ii, si);
+    if (memo) {   /* filled now; valid once the set below exists */
+        m.obj_gen = s_eobj_gen; m.pipeline = s_e2.pipeline; m.tex_mask = s_e2.tex_mask;
+        m.vs = m_vs; m.ps = m_ps; m.aniso = m_aniso; m.ubuf = ubuf;
+        memcpy(m.tex, s_e2.tex, sizeof m.tex); memcpy(m.samp, s_e2.samp, sizeof m.samp);
+    }
     if (!reuse) {
         VkDescriptorSet set = vk_batch_alloc_set();
         if (set) vk_eng_write_set(set, ubuf, ii, si);
@@ -5187,6 +5226,7 @@ static VkDescriptorSet vk_eng_batch_set(VkBuffer ubuf)
     const u32 slot = (u32)h & (VK_DSET_CACHE - 1u);
     if (s_dset_tab[slot].gen == s_dset_gen && !memcmp(&s_dset_tab[slot].key, &k, sizeof k)) {
         s_dset_hit++;
+        if (memo) { m.set = s_dset_tab[slot].set; m.dset_gen = s_dset_gen; m.valid = m.obj_gen == s_eobj_gen; }
         return s_dset_tab[slot].set;
     }
     VkDescriptorSet set = vk_batch_alloc_set();
@@ -5196,6 +5236,7 @@ static VkDescriptorSet vk_eng_batch_set(VkBuffer ubuf)
     s_dset_tab[slot].key = k;
     s_dset_tab[slot].set = set;
     s_dset_miss++;
+    if (memo) { m.set = set; m.dset_gen = s_dset_gen; m.valid = m.obj_gen == s_eobj_gen; }
     return set;
 }
 

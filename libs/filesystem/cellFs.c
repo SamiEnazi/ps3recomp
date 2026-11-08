@@ -497,7 +497,13 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
          * which made this look handled -- but the file contents were being read
          * to a raw guest address interpreted as a host one, so nothing the
          * title loaded ever landed in guest memory. */
+        /* Bracketed for the write tracker (ppu_loader.cpp g_vm_host_io_hook):
+         * the kernel writes these bytes, which no page fault reports. */
+        extern void (*g_vm_host_io_hook)(uint32_t ea, uint32_t len, int end);
+        void (*const io_hook)(uint32_t, uint32_t, int) = g_vm_host_io_hook;
+        if (io_hook) io_hook((uint32_t)buf, (uint32_t)nbytes, 0);
         bytes_read = (u64)fread(gptr(buf), 1, (size_t)nbytes, s_files[fd].host_fp);
+        if (io_hook) io_hook((uint32_t)buf, (uint32_t)nbytes, 1);
     }
 
     { static int _n = 0;
