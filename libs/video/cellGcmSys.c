@@ -1919,16 +1919,54 @@ void cellGcm_ref_on_poll(void)
      * loading's fence storms clear in seconds, not minutes). */
     static LARGE_INTEGER s_freq;
     static volatile LONGLONG s_last_pub;
-    if (!TryAcquireSRWLockExclusive(&s_ref_pub_lock))
-        return;
+    /* GCM_REF_SOLO=1 (default off -- GCM_REF_STATS in the city: > 99.9% of the
+     * reads find nothing queued, the RSX thread has not reached the fence, so
+     * the pacing is not what the main thread waits for): while ONE thread is the
+     * only one reading the ref -- no other thread read it for a whole pacing
+     * gap -- each of its reads may advance one queued fence. It reads every
+     * value it publishes (the read follows this call), and any other waiter
+     * would have read within the gap, which is what the pacing already
+     * assumes. inFAMOUS 2's hot waiter (func_0013ACE8: ref - target >= 0,
+     * usleep(5)) otherwise waited 200 us per queued fence: 13-15% of the PPU
+     * main thread in the city. Recorded before the TryAcquire, so a reader
+     * that loses the lock still counts as a second reader. */
+    static int s_solo_on = -1;
+    static volatile LONG s_rp_tid;
+    static volatile LONGLONG s_rp_multi;
+    if (s_solo_on < 0) { const char* e = getenv("GCM_REF_SOLO"); s_solo_on = e && e[0] == '1'; }
     if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const LONG tid = (LONG)GetCurrentThreadId();
+    if (s_solo_on && s_rp_tid != tid) { s_rp_multi = now.QuadPart; InterlockedExchange(&s_rp_tid, tid); }
+    if (!TryAcquireSRWLockExclusive(&s_ref_pub_lock))
+        return;
     LONGLONG min_gap = s_freq.QuadPart / 5000;          /* ~200us */
+    const int solo = s_solo_on && s_rp_tid == tid && now.QuadPart - s_rp_multi >= min_gap;
     int dry = 0;
-    if (now.QuadPart - s_last_pub >= min_gap) {
+    /* GCM_REF_STATS=1: every ~5 s, how the ref reads went -- nothing queued
+     * (the RSX thread has not reached the fence: RSX lag), held back by the
+     * pacing gap, or advanced (paced / by a sole reader). */
+    static int s_rs_on = -1;
+    static u64 s_rs_n, s_rs_dry, s_rs_held, s_rs_pub, s_rs_solo; static LONGLONG s_rs_t;
+    if (s_rs_on < 0) s_rs_on = getenv("GCM_REF_STATS") ? 1 : 0;
+    const int queued = s_ref_qhead != s_ref_qtail;
+    if (solo || now.QuadPart - s_last_pub >= min_gap) {
+        if (s_rs_on && queued) { s_rs_pub++; if (now.QuadPart - s_last_pub < min_gap) s_rs_solo++; }
         gcm_ref_publish_one();
         s_last_pub = now.QuadPart;
         dry = (s_ref_qhead == s_ref_qtail);
+    } else if (s_rs_on && queued) s_rs_held++;
+    if (s_rs_on) {
+        s_rs_n++; if (!queued) s_rs_dry++;
+        if (!s_rs_t) s_rs_t = now.QuadPart;
+        if (now.QuadPart - s_rs_t >= 5 * s_freq.QuadPart) {
+            const double sec = (double)(now.QuadPart - s_rs_t) / (double)s_freq.QuadPart;
+            fprintf(stderr, "[refstats] per s: %.0f ref reads, %.0f with nothing queued, %.0f held by pacing, "
+                            "%.0f advanced (%.0f by a sole reader); queue %u\n",
+                    s_rs_n / sec, s_rs_dry / sec, s_rs_held / sec, s_rs_pub / sec, s_rs_solo / sec,
+                    (unsigned)(s_ref_qtail - s_ref_qhead));
+            s_rs_n = s_rs_dry = s_rs_held = s_rs_pub = s_rs_solo = 0; s_rs_t = now.QuadPart;
+        }
     }
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
     if (dry && s_gcm_kick_ev)

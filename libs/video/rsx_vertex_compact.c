@@ -160,6 +160,51 @@ u32 rsx_vertex_inline_layout(
     return declared ? declared : packed;
 }
 
+/* rsx_vertex_fetch_plan_init for the layout's attributes only: every reader
+ * of a plan (prepare, fetch_one, fetch_all) walks layout.attrs, so the others
+ * are neither decoded nor cleared (the draw engine's per-draw plan; decoding
+ * all sixteen attributes and their defaults, and clearing the whole plan, was
+ * ~0.5 ms of the RSX thread a frame in the pier view). */
+void rsx_vertex_fetch_plan_init_layout(
+    rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
+    const rsx_vertex_layout_plan* layout,
+    rsx_vertex_guest_ptr_fn guest_ptr, void* guest_user)
+{
+    if (!plan || !rsx || !layout)
+        return;
+    plan->layout = *layout;
+    plan->base_offset = rsx_dsp_vertex_data_base_offset(rsx);
+    plan->divider_mask = rsx_dsp_reg(rsx, 0x1FC0);
+    plan->guest_ptr = guest_ptr;
+    plan->guest_user = guest_user;
+    plan->inline_data = NULL;
+    plan->inline_bytes = 0;
+    plan->inline_stride = 0;
+    memset(plan->inline_off, 0, sizeof plan->inline_off);
+    for (u32 slot = 0; slot < layout->count; slot++) {
+        const u32 attr = layout->attrs[slot];
+        if (attr >= RSX_DSP_NUM_VERTEX_ATTR)
+            continue;
+        rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+        memset(fetch, 0, sizeof *fetch);
+        rsx_dsp_get_vertex_attr(rsx, attr, &fetch->desc);
+        fetch->elem_size =
+            rsx_vertex_attrib_size(fetch->desc.type, fetch->desc.size);
+        fetch->stride =
+            fetch->desc.stride ? fetch->desc.stride : fetch->elem_size;
+        rsx_dsp_vertex_default(rsx, attr, fetch->default_value);
+        if (attr == 3 &&
+            fetch->default_value[0] == 0.0f &&
+            fetch->default_value[1] == 0.0f &&
+            fetch->default_value[2] == 0.0f &&
+            fetch->default_value[3] == 1.0f) {
+            fetch->default_value[0] = 1.0f;
+            fetch->default_value[1] = 1.0f;
+            fetch->default_value[2] = 1.0f;
+        }
+    }
+}
+
 void rsx_vertex_fetch_plan_set_inline(
     rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
     const u8* data, u32 bytes)

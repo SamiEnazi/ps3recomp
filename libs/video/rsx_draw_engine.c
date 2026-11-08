@@ -445,6 +445,10 @@ static struct {
     rsx_vertex_ref* refs;
     u32 n_refs, cap_refs, n_source_refs;
     int refs_remapped;
+    /* An index-cache hit leaves refs[1..n_refs) unwritten (they are span
+     * consecutive ids from refs[0], base lazy_base): dc_refs_fill() writes them
+     * for the one later reader (a non-indexed refetch). 0 = all written. */
+    u32 refs_lazy, lazy_base;
     rsx_vertex_remap ref_remap;
 
     u32* cuts;
@@ -795,6 +799,31 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
     return g.tex_staging;
 }
 
+/* A 1024-bit filter over the colour targets' (location, offset), rebuilt
+ * when a slot is (re)assigned (eng_surface_get is the only writer): 0 means no
+ * target is at that address, so a texture unit's search over every target can
+ * be skipped. A stale filter only errs towards 1. PS3RECOMP_ENG_SURF_FILTER=1 to
+ * use it (default off: no measured gain). */
+static u32 s_surf_gen, s_surf_filter_gen = ~0u;
+static u64 s_surf_filter[16];
+static u32 eng_surf_hash(u32 location, u32 offset) { return ((offset ^ (location << 30)) * 0x9E3779B1u) >> 22; }
+static int eng_surface_maybe(u32 location, u32 offset)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_SURF_FILTER"); on = e && e[0] == '1'; }
+    if (!on) return 1;
+    if (s_surf_filter_gen != s_surf_gen) {
+        memset(s_surf_filter, 0, sizeof s_surf_filter);
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            const u32 h = eng_surf_hash(g.surfaces[i].location, g.surfaces[i].offset);
+            s_surf_filter[h >> 6] |= 1ull << (h & 63u);
+        }
+        s_surf_filter_gen = s_surf_gen;
+    }
+    const u32 h = eng_surf_hash(location, offset);
+    return (int)((s_surf_filter[h >> 6] >> (h & 63u)) & 1u);
+}
+
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
  * rsx_live_draw.c's surface_get (2605-2690). */
@@ -849,6 +878,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
 
     eng_surface* s = &g.surfaces[slot];
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+    s_surf_gen++;                            /* eng_surface_maybe's filter */
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
     s->handle = handle;
@@ -2140,7 +2170,17 @@ static eng_vp_memo* s_vpgen_memo;
 static u32 s_vpgen_gen, s_vpgen_start;
 static int s_vpgen_on = -1;
 static void eng_vpgen_set(int id, int v) { (void)id; __atomic_store_n(&s_vpgen_on, v != 0, __ATOMIC_RELAXED); }
-static eng_fp_memo s_fp_memo[ENG_PROG_MEMO];
+/* PS3RECOMP_ENG_FP_MEMO (1..64, default 8 = the old size; 64 showed no gain): how many
+ * fragment programs are kept. A heavy frame runs far more than eight, so the
+ * old table missed and re-analysed (copy, structural hash, constants, three
+ * microcode walks) on many draws. The lookup scans compact key arrays, not the
+ * 32 KB entries. */
+#define ENG_FP_MEMO_MAX 64u
+static eng_fp_memo s_fp_memo[ENG_FP_MEMO_MAX];
+static u64 s_fp_key[ENG_FP_MEMO_MAX];           /* loc << 32 | off */
+static u32 s_fp_sz[ENG_FP_MEMO_MAX];            /* 0: unused */
+static u32 s_fp_use[ENG_FP_MEMO_MAX];           /* recency */
+static u32 s_fp_cap;
 static u32 s_memo_clock;
 static u64 ds_memo_hit[2], ds_memo_miss[2];     /* drawstats: vp, fp */
 
@@ -2218,12 +2258,18 @@ static const eng_fp_memo* eng_fp_current(void)
     if (!rsx_dsp_reg(&g.rsx, 0x08E4)) return NULL;
     u32 loc = 0;
     const u32 off = rsx_dsp_fragment_program(&g.rsx, &loc);
-    for (u32 i = 0; i < ENG_PROG_MEMO; i++) {
+    if (__builtin_expect(!s_fp_cap, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_FP_MEMO");
+        const long n = e ? strtol(e, NULL, 10) : 8L;
+        s_fp_cap = n < 1 ? 1u : n > (long)ENG_FP_MEMO_MAX ? ENG_FP_MEMO_MAX : (u32)n;
+    }
+    const u64 key = ((u64)loc << 32) | off;
+    for (u32 i = 0; i < s_fp_cap; i++) {
+        if (!s_fp_sz[i] || s_fp_key[i] != key) continue;
         eng_fp_memo* m = &s_fp_memo[i];
-        if (!m->size || m->loc != loc || m->off != off) continue;
         const u8* uc = eng_guest_ptr(NULL, loc, off, m->size);
         if (uc && !memcmp(m->bytes, uc, m->size)) {
-            m->used = ++s_memo_clock;
+            s_fp_use[i] = m->used = ++s_memo_clock;
             ds_memo_hit[1]++;
             return m;
         }
@@ -2235,8 +2281,8 @@ static const eng_fp_memo* eng_fp_current(void)
     if (!uc || !size) return NULL;
 
     u32 v = 0;
-    for (u32 i = 1; i < ENG_PROG_MEMO; i++)
-        if (s_fp_memo[i].used < s_fp_memo[v].used) v = i;
+    for (u32 i = 1; i < s_fp_cap; i++)
+        if (s_fp_use[i] < s_fp_use[v]) v = i;
     eng_fp_memo* m = &s_fp_memo[v];
     u8* copy = (u8*)realloc(m->bytes, size);
     if (!copy) return NULL;
@@ -2246,6 +2292,7 @@ static const eng_fp_memo* eng_fp_current(void)
     m->off = off;
     m->size = size;
     m->used = ++s_memo_clock;
+    s_fp_key[v] = key; s_fp_sz[v] = size; s_fp_use[v] = m->used;
     m->structural = rsx_fp_structural_hash(uc, size, 1469598103934665603ull);
     m->constants.count = 0;
     m->constants_ok = rsx_fp_collect_constants(uc, size, &m->constants) >= 0;
@@ -2296,21 +2343,23 @@ static u64 eng_current_fp_structural(void)
  * 0 = each decodes its own. */
 static int s_texreg_once = -1;
 static void eng_texreg_once_set(int id, int v) { (void)id; __atomic_store_n(&s_texreg_once, v != 0, __ATOMIC_RELAXED); }
-static void eng_draw_textures(rsx_dsp_texture tex[RSX_DSP_NUM_TEXTURES])
+/* Read-only: the decoded units themselves, not a copy (copying all sixteen
+ * twice a draw was ~0.17 ms of the RSX thread a frame in the pier view). */
+static const rsx_dsp_texture* eng_draw_textures(void)
 {
     static u32 serial;
     static rsx_dsp_texture c[RSX_DSP_NUM_TEXTURES];
     if (__builtin_expect(s_texreg_once < 0, 0)) ps3_toggle_watch(PS3T_ENG_TEXREG_ONCE, eng_texreg_once_set);
     if (!__atomic_load_n(&s_texreg_once, __ATOMIC_RELAXED)) {
-        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) rsx_dsp_get_texture(&g.rsx, u, &tex[u]);
+        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) rsx_dsp_get_texture(&g.rsx, u, &c[u]);
         serial = 0;
-        return;
+        return c;
     }
     if (serial != s_draw_serial) {
         for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) rsx_dsp_get_texture(&g.rsx, u, &c[u]);
         serial = s_draw_serial;
     }
-    memcpy(tex, c, sizeof c);
+    return c;
 }
 
 /* The layout the active vertex program actually reads. An uncertain analysis
@@ -2472,8 +2521,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                   rsx_dsp_reg(&g.rsx, 0x1FECu), rs->alpha_ref_format & 0x1Fu); } }
     /* Every unit decoded once for the masks below (they took five decodes
      * of all sixteen units and three microcode walks per draw). */
-    rsx_dsp_texture tex[RSX_DSP_NUM_TEXTURES];
-    eng_draw_textures(tex);
+    const rsx_dsp_texture* tex = eng_draw_textures();
     const u32 cube_mask = eng_cube_mask(tex);
     const u32 vol_mask = eng_volume_mask(tex);
     const u32 vtex_mask = eng_vtex_mask();
@@ -3466,9 +3514,27 @@ static void eng_ic_after_draw(eng_ic_entry* e, u64 content, u32 n_draw)
     e->content = content; e->seen = 1; e->seen_frame = g.frames; e->last_frame = g.frames;
 }
 
+/* The draw's fetch plan. PS3RECOMP_ENG_PLAN_LAYOUT=1 (default 0 = all
+ * sixteen attributes decoded and the plan cleared, as before): only the
+ * layout's attributes (rsx_vertex_fetch_plan_init_layout). */
+static void eng_plan_init(const rsx_vertex_layout_plan* layout)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_PLAN_LAYOUT"); on = e && e[0] == '1'; }
+    if (on) rsx_vertex_fetch_plan_init_layout(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    else    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+}
+/* Write the references an index-cache hit left out (dc.refs_lazy). */
+static void dc_refs_fill(void)
+{
+    if (!dc.refs_lazy) return;
+    const u32 lo = dc.refs[0].vertex_id;
+    for (u32 i = 1; i < dc.n_refs; i++) { dc.refs[i].vertex_id = lo + i; dc.refs[i].base_index = dc.lazy_base; }
+    dc.refs_lazy = 0;
+}
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
-    s_ic_cur = NULL; s_ic_hit = 0; s_ic_ranged = 0;
+    s_ic_cur = NULL; s_ic_hit = 0; s_ic_ranged = 0; dc.refs_lazy = 0;
     /* PS3RECOMP_ENG_ICACHE: an index-only draw whose rebuilt list is resident
      * and whose vertices the vertex cache holds skips the index work. */
     if (dc.n_idx && !dc.n_arr && !dc.inl && dc.fetch_ok && allow_remap && layout->stride &&
@@ -3485,11 +3551,25 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             dc_reserve_refs(e->span)) {
             /* The references the range remap would have left: span
              * consecutive vertex ids from lo. */
-            for (u32 i = 0; i < e->span; i++) { dc.refs[i].vertex_id = e->lo + i; dc.refs[i].base_index = base_index; }
             dc.n_refs = e->span; dc.n_source_refs = e->n_src; dc.refs_remapped = 1; dc.n_cuts = 0;
             dc.layout = *layout;
-            rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+            eng_plan_init(layout);
             rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, NULL, 0);
+            /* PS3RECOMP_ENG_LAZY_REFS=1 (default off: no measured gain): the plan below reads only
+             * refs[0] of a consecutive run unless an attribute has a frequency
+             * divider; a hit never reads the rest (writing them was ~0.3 ms of
+             * the RSX thread a frame in the pier view). */
+            static int lazy_on = -1;
+            if (lazy_on < 0) { const char* ev = getenv("PS3RECOMP_ENG_LAZY_REFS"); lazy_on = ev && ev[0] == '1'; }
+            /* ... and only while the run does not wrap the 20-bit element index
+             * (prepare walks every reference then). */
+            int lazy = lazy_on && e->span > 1 &&
+                       (u64)rsx_vertex_element_index(e->lo, base_index, 0, 0) + e->span - 1u <= 0x000FFFFFu;
+            for (u32 slot = 0; lazy && slot < dc.fetch_plan.layout.count; slot++)
+                if (dc.fetch_plan.attr[dc.fetch_plan.layout.attrs[slot]].desc.frequency > 1) lazy = 0;
+            const u32 nw = lazy ? 1u : e->span;
+            for (u32 i = 0; i < nw; i++) { dc.refs[i].vertex_id = e->lo + i; dc.refs[i].base_index = base_index; }
+            dc.refs_lazy = lazy; dc.lazy_base = base_index;
             rsx_vertex_fetch_plan_prepare_ex(&dc.fetch_plan, dc.refs, dc.n_refs, 1);
             u64 vc_content = 0;
             eng_vc_entry* ve = eng_vc_probe(layout, &vc_content);
@@ -3503,7 +3583,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                 return;
             }
             /* The vertices changed: the whole way, as if nothing were cached. */
-            dc.n_refs = dc.n_source_refs = 0; dc.refs_remapped = 0;
+            dc.n_refs = dc.n_source_refs = 0; dc.refs_remapped = 0; dc.refs_lazy = 0;
         }
         if (s_ic_cur) ds_ic_miss++;
     }
@@ -3608,7 +3688,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 
     if (dso) { t1 = eng_ds_now(); ds.ns_remap += t1 - t0; t0 = t1; }
     dc.layout = *layout;
-    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    eng_plan_init(layout);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare_ex(&dc.fetch_plan, dc.refs, dc.n_refs, consecutive);
     if (dso) { t1 = eng_ds_now(); ds.ns_plan += t1 - t0; t0 = t1; }
@@ -4129,8 +4209,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     u32 mask = 0;
     s_fbf.cand = 0; s_fbf.applied = 0;
     const u32 fp_reads = eng_bind_unread() ? 0xFFFFu : eng_fp_tex_mask();
-    rsx_dsp_texture units[RSX_DSP_NUM_TEXTURES];
-    eng_draw_textures(units);
+    const rsx_dsp_texture* units = eng_draw_textures();
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t = units[u];
         /* A unit left enabled by an earlier draw but not sampled by this
@@ -4247,6 +4326,9 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          * this draw writes -- reading a target a pass is writing is undefined
          * on every API, and an MRT set writes more than one of them. */
         int sampled = -1, own_hit = 0, own_slot = -1;
+        /* eng_surface_maybe: no target at this address at all -> the search
+         * below finds nothing (most units sample plain textures). */
+        if (eng_surface_maybe(t.location, t.offset))
         for (u32 i = 0; i < g.n_surfaces; i++) {
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
@@ -4490,6 +4572,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* The cache hands over a buffer of unique vertices for an indexed draw;
      * one that ended up non-indexed needs dc.verts after all. */
     if (dc.vbuf_hit && !indexed) {
+        dc_refs_fill();
         if (!dc_reserve_verts((u64)dc.n_refs * dc.layout.stride) ||
             !rsx_vertex_fetch_all(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts)) {
             eng_drop("fetch", prim); return; }
