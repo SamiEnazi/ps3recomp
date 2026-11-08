@@ -6643,7 +6643,7 @@ static struct {
     double t0, last, sec_start;
     float  dt[4096];
     u32    n;
-    u32    draws0;
+    double draw_sum;                    /* guest draws of the frames in dt[] */
     int    mark;
 } s_pl;
 static double vk_pl_now(void)
@@ -6679,14 +6679,19 @@ static void vk_playlog_frame(void)
     }
     if (s_pl.state != 1) return;
     const double now = vk_pl_now();
-    if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; s_pl.draws0 = rsx_vulkan_backend_guest_draws(); return; }
+    if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; return; }
     const double dt = now - s_pl.last;
     s_pl.last = now;
-    if (s_pl.n < sizeof s_pl.dt / sizeof s_pl.dt[0]) s_pl.dt[s_pl.n++] = (float)(dt * 1000.0);
+    if (s_pl.n < sizeof s_pl.dt / sizeof s_pl.dt[0]) {
+        s_pl.dt[s_pl.n++] = (float)(dt * 1000.0);
+        /* the draw engine's count is per frame (the last presented one), not a
+         * running total: sum it per frame. Differencing it as a total printed
+         * garbage (148102288 draws/frame) whenever a frame drew fewer. */
+        s_pl.draw_sum += (double)rsx_vulkan_backend_guest_draws();
+    }
     if (dt > 0.050) fprintf(s_pl.f, "HITCH	%.2f	%.1f\n", now - s_pl.t0, dt * 1000.0);
     if (s_pl.mark) { fprintf(s_pl.f, "MARK	%.2f\n", now - s_pl.t0); s_pl.mark = 0; }
     if (now - s_pl.sec_start < 1.0 || !s_pl.n) return;
-    const u32 draws = rsx_vulkan_backend_guest_draws();
     u32 c17 = 0, c25 = 0, c33 = 0, c50 = 0;
     for (u32 i = 0; i < s_pl.n; i++) {
         const float d = s_pl.dt[i];
@@ -6696,9 +6701,9 @@ static void vk_playlog_frame(void)
     const double span = now - s_pl.sec_start;
     fprintf(s_pl.f, "%.1f	%.1f	%.1f	%.1f	%.1f	%u	%u	%u	%u	%.0f\n",
             now - s_pl.t0, s_pl.n / span, s_pl.dt[s_pl.n / 2], s_pl.dt[(s_pl.n * 99) / 100],
-            s_pl.dt[s_pl.n - 1], c17, c25, c33, c50, (double)(draws >= s_pl.draws0 ? draws - s_pl.draws0 : 0u) / s_pl.n);
+            s_pl.dt[s_pl.n - 1], c17, c25, c33, c50, s_pl.draw_sum / s_pl.n);
     fflush(s_pl.f);
-    s_pl.draws0 = draws;
+    s_pl.draw_sum = 0.0;
     s_pl.n = 0;
     s_pl.sec_start = now;
 }
