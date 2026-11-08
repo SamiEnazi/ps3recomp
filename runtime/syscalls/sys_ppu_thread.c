@@ -27,6 +27,7 @@ static PPU_TLS int     s_exit_done = 0;
 #include "sys_ppu_thread.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include "../platform/host_qos.h"       /* PS3_QOS: guest threads at USER_INTERACTIVE */
+#include "../platform/host_place.h"     /* PS3_CPU_PLACE: guest threads on chosen cores */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
 #include <string.h>
 #include <stdio.h>
@@ -137,6 +138,7 @@ static void* ppu_host_thread_proc(void* param)
      * on the efficiency cores. Its low-priority background threads get
      * USER_INITIATED. */
     ps3_host_qos_self(info->priority < PS3_HOST_QOS_PPU_INTERACTIVE_BELOW);
+    ps3_host_place_self(PS3_PLACE_PPU);   /* PS3_CPU_PLACE (host_place.h) */
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
