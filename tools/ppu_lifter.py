@@ -4408,7 +4408,7 @@ class PPULifter:
             lines.append(f"/* {label} */")
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
-        if _mm_on() and any(("vm_read" in l or "vm_write" in l) for l in func.body_lines):
+        if _mm_on() and any(("vm_read" in l or "vm_write" in l or "PPU_RR" in l) for l in func.body_lines):
             lines.append("        PPU_MM_SNAP")
         nv = self._nv_needs() if _nv_on() else None
         nvmod = _nv_mod() if nv is not None else None
