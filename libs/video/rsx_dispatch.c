@@ -610,6 +610,15 @@ static void plain_init(void)
     s_plain_ready = 1;
 }
 
+/* (rsx3) rsx_dispatch_method, inlined into rsx_dispatch_burst, made the burst's
+ * every call save and restore eight GPRs and ten XMM registers (its vertex
+ * attribute float paths) -- ~3% of the RSX thread in the city, for headers of
+ * one or two plain words. Out of line it costs the rare word that needs it. */
+static __attribute__((noinline)) void dispatch_method_cold(rsx_dispatch* rsx, u32 method, u32 arg)
+{
+    rsx_dispatch_method(rsx, method, arg);
+}
+
 void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count)
 {
     if (!count) return;
@@ -621,7 +630,7 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
     const int fast = !s_ed_on && method + (incr ? (count - 1u) * 4u : 0u) < 0x2000u;
     if (!fast) {
         for (u32 i = 0; i < count; i++)
-            rsx_dispatch_method(rsx, incr ? method + i * 4u : method,
+            dispatch_method_cold(rsx, incr ? method + i * 4u : method,
                                 __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED)));
         return;
     }
@@ -663,7 +672,7 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
         }
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
         if (s_plain[m >> 2]) { rsx->seen[m >> 2]++; tex_gen_note(m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
-        else rsx_dispatch_method(rsx, m, arg);
+        else dispatch_method_cold(rsx, m, arg);
         i++;
     }
 }
