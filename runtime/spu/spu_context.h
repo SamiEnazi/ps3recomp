@@ -636,16 +636,34 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
  * each LS access paid a call (spu_ls_write128 alone was ~4% of SPU time in the
  * docks cutscene). The debug paths are cold calls, so the inlined body is a
  * mask, four loads and four byte swaps. */
+/* SPU_LS_FASTPATH (a lifted TU's -D, the lifter's SPU_LIFT_LS_FAST=1): the lifted code's own
+ * LS accessors drop the debug probes (SPU_LS_LOWREAD / LS watch / SMC watch / WWS probes keep
+ * working in the runtime and the interpreter, not inside these TUs) and address the local store
+ * as ctx->ls_store, the context's own array, so the compiler sees that an LS store cannot change
+ * ctx->gpr. Only for contexts whose ls is ls_store (every SPU thread / SPURS context; a raw SPU
+ * repoints ls at guest memory and spu_raw.c refuses such a build). */
+/* g_spu_lifted_flags: what the lifted TUs were compiled for, set by each one before main (bit 0
+ * SPU_LS_FASTPATH, bit 1 SPU_FLOAT_RZ_ONLY), read by the runtime paths those forms cannot serve
+ * (a raw SPU's LS, SPU_FLOAT_RZ=0). One merged definition per program. */
+SPU_GATE int g_spu_lifted_flags = 0;
+#if defined(SPU_LS_FASTPATH) && SPU_LS_FASTPATH
+#define SPU_LS_BASE(ctx) ((ctx)->ls_store)
+#define SPU_LS_DBG_ON 0
+static __attribute__((constructor, used)) void spu__lifted_flag_ls(void) { g_spu_lifted_flags |= 1; }
+#else
+#define SPU_LS_BASE(ctx) ((ctx)->ls)
+#define SPU_LS_DBG_ON (__builtin_expect(g_spu_ls_dbg != 0, 0))
+#endif
 static inline __attribute__((always_inline)) u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_dbg != 0, 0)) {
+    if (SPU_LS_DBG_ON) {
         spu_ls_read_probe(ctx, lsa);
         spu_ls_watch_hit2(ctx, lsa & (SPU_LS_MASK & ~0xFu), 0, &ctx->ls[lsa & (SPU_LS_MASK & ~0xFu)],
                           (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     }
     lsa &= SPU_LS_MASK & ~0xFu;
-    const uint8_t* p = &ctx->ls[lsa];
+    const uint8_t* p = &SPU_LS_BASE(ctx)[lsa];
 #if SPU_LS_VEC
     _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)p)));
 #elif SPU_LS_FAST
@@ -721,14 +739,14 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
 static inline __attribute__((always_inline)) void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
-    uint8_t* p = &ctx->ls[lsa];
+    uint8_t* p = &SPU_LS_BASE(ctx)[lsa];
     /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
      * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
      * that code-buffer LS address, dump the RunJob decision inputs so we can see
      * why it resolves to an empty buffer: the resolved address, the whole
      * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
      * command (commandNum==5) names the code buffer set. */
-    if (__builtin_expect(g_spu_ls_dbg != 0, 0) && lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
+    if (SPU_LS_DBG_ON && lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
         spu_ls_write_probe_pre(ctx, lsa, val);
 #if SPU_LS_VEC
     _mm_storeu_si128((__m128i*)p, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8)));
@@ -746,7 +764,7 @@ static inline __attribute__((always_inline)) void spu_ls_write128(spu_context* c
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    if (__builtin_expect(g_spu_ls_dbg != 0, 0)) {
+    if (SPU_LS_DBG_ON) {
         spu_ls_watch_hit2(ctx, lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                           ctx->gpr[0]._u32[0] & SPU_LS_MASK);
         if (g_spu_smc_watch) spu_ls_write_probe_smc(ctx, lsa, p);

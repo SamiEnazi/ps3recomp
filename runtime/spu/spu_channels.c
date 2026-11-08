@@ -378,6 +378,11 @@ static unsigned spu_float_mode_enter(void)
          * i.e. round-to-nearest SPU floats, the bug that made characters
          * invisible. Never for play. */
         if (e && e[0] == 'r' && e[1] == 'n') on = 2;
+        /* lifted code built with SPU_FLOAT_RZ_ONLY has no exact-emulation form: keep the mode */
+        if (!on && (g_spu_lifted_flags & 2)) {
+            fprintf(stderr, "[spu] SPU_FLOAT_RZ=0 ignored: the lifted SPU code was built with SPU_FLOAT_RZ_ONLY\n");
+            on = 1;
+        }
         if (on) __atomic_store_n(&g_spu_float_rz, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&s_on, on, __ATOMIC_RELEASE);
         fprintf(stderr, "[spu] single precision: %s (SPU_FLOAT_RZ)\n",

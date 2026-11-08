@@ -69,7 +69,17 @@ static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST
 #define SPU_X86_SIMD 1
 #include <immintrin.h>
 #define SPU__X_INLINE static inline __attribute__((always_inline))
+/* SPU_FLOAT_RZ_ONLY (a lifted TU's -D, with SPU_LS_FASTPATH): the slow-path fix-ups are pure
+ * functions of their operands, said so to the compiler so a cold call does not make it reload
+ * the register file; and the lean float ops are compiled in their SPU_FLOAT_RZ form only. */
+#if defined(SPU_FLOAT_RZ_ONLY) && SPU_FLOAT_RZ_ONLY
+#define SPU__X_SLOW   static inline __attribute__((noinline, cold, pure))
+#define SPU__RZ_ON    1
+static __attribute__((constructor, used)) void spu__lifted_flag_rz(void) { g_spu_lifted_flags |= 2; }
+#else
 #define SPU__X_SLOW   static inline __attribute__((noinline, cold))
+#define SPU__RZ_ON    g_spu_float_rz
+#endif
 SPU__X_INLINE __m128i spu__xl(u128 a) { return _mm_loadu_si128((const __m128i*)a._u8); }
 SPU__X_INLINE u128 spu__xs(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u8, v); return r; }
 SPU__X_INLINE __m128i spu__xiota(void) { return _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
@@ -440,7 +450,9 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     const __m128i lut = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                       (char)0xFF, (char)0xFF, (char)0x80, (char)0x80);
     const __m128i special = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 4), _mm_set1_epi8(0x0F)));
-    r = _mm_blendv_epi8(r, special, C);
+    /* A selector with bit 7 set has bit 7 set in idx too, so both pshufb gave 0 there, and
+     * special is 0 wherever bit 7 is clear: OR, not a second blend. */
+    r = _mm_or_si128(r, special);
     u128 out; memcpy(&out, &r, 16); return out;
 }
 #elif defined(__ARM_NEON)
@@ -1065,6 +1077,26 @@ SPU__X_SLOW u128 spu__xln_fm_slow(u128 a, u128 b) {
 SPU__X_SLOW u128 spu__xln_fma_slow(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
     u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__fma_lane(a._u32[i], b._u32[i], c._u32[i], negp, negc); return r;
 }
+/* The same fix-ups with the operands and the result in vector registers (__vectorcall): a u128
+ * returned from an out-of-line call comes back through memory, and the RZ forms' result then took
+ * a store and a reload on every op, slow path taken or not. */
+#if defined(_WIN32)
+#define SPU__X_VC __vectorcall
+#else
+#define SPU__X_VC
+#endif
+static __attribute__((noinline, cold, pure)) __m128i SPU__X_VC spu__xv_fa_slow(__m128i a, __m128i b, uint32_t negb) {
+    u128 x, y; _mm_storeu_si128((__m128i*)x._u8, a); _mm_storeu_si128((__m128i*)y._u8, b);
+    return spu__xl(spu__xln_fa_slow(x, y, negb));
+}
+static __attribute__((noinline, cold, pure)) __m128i SPU__X_VC spu__xv_fm_slow(__m128i a, __m128i b) {
+    u128 x, y; _mm_storeu_si128((__m128i*)x._u8, a); _mm_storeu_si128((__m128i*)y._u8, b);
+    return spu__xl(spu__xln_fm_slow(x, y));
+}
+static __attribute__((noinline, cold, pure)) __m128i SPU__X_VC spu__xv_fma_slow(__m128i a, __m128i b, __m128i c, uint32_t negp, uint32_t negc) {
+    u128 x, y, z; _mm_storeu_si128((__m128i*)x._u8, a); _mm_storeu_si128((__m128i*)y._u8, b); _mm_storeu_si128((__m128i*)z._u8, c);
+    return spu__xl(spu__xln_fma_slow(x, y, z, negp, negc));
+}
 SPU__X_INLINE u128 spu__xln_fa(u128 a, u128 b, uint32_t negb) {
     const __m128 x = _mm_castsi128_ps(spu__xflush(spu__xl(a)));
     const __m128 y = _mm_castsi128_ps(_mm_xor_si128(spu__xflush(spu__xl(b)), _mm_set1_epi32((int)negb)));
@@ -1144,16 +1176,16 @@ SPU__X_INLINE u128 spu__xrz_fa(u128 a, u128 b, uint32_t negb) {
     __m128 x = _mm_castsi128_ps(spu__xl(a));
     const __m128 y = _mm_castsi128_ps(_mm_xor_si128(spu__xl(b), _mm_set1_epi32((int)negb)));
     __asm__("" : "+x"(x));
-    int ok; const __m128i r = spu__xrz_out(_mm_castps_si128(_mm_add_ps(x, y)), &ok);
-    if (__builtin_expect(!ok, 0)) return spu__xln_fa_slow(a, b, negb);
+    int ok; __m128i r = spu__xrz_out(_mm_castps_si128(_mm_add_ps(x, y)), &ok);
+    if (__builtin_expect(!ok, 0)) r = spu__xv_fa_slow(spu__xl(a), spu__xl(b), negb);
     return SPU__XRZ_CHECK(spu__xs(r), 0, a, b, b, 0, negb);
 }
 SPU__X_INLINE u128 spu__xrz_fm(u128 a, u128 b) {
     __m128 x = _mm_castsi128_ps(spu__xl(a));
     const __m128 y = _mm_castsi128_ps(spu__xl(b));
     __asm__("" : "+x"(x));
-    int ok; const __m128i r = spu__xrz_out(_mm_castps_si128(_mm_mul_ps(x, y)), &ok);
-    if (__builtin_expect(!ok, 0)) return spu__xln_fm_slow(a, b);
+    int ok; __m128i r = spu__xrz_out(_mm_castps_si128(_mm_mul_ps(x, y)), &ok);
+    if (__builtin_expect(!ok, 0)) r = spu__xv_fm_slow(spu__xl(a), spu__xl(b));
     return SPU__XRZ_CHECK(spu__xs(r), 1, a, b, b, 0, 0);
 }
 SPU__X_INLINE u128 spu__xrz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
@@ -1161,20 +1193,20 @@ SPU__X_INLINE u128 spu__xrz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t 
     const __m128 y = _mm_castsi128_ps(spu__xl(b));
     const __m128 z = _mm_castsi128_ps(_mm_xor_si128(spu__xl(c), _mm_set1_epi32((int)negc)));
     __asm__("" : "+x"(x));
-    int ok; const __m128i r = spu__xrz_out(_mm_castps_si128(_mm_fmadd_ps(x, y, z)), &ok);
-    if (__builtin_expect(!ok, 0)) return spu__xln_fma_slow(a, b, c, negp, negc);
+    int ok; __m128i r = spu__xrz_out(_mm_castps_si128(_mm_fmadd_ps(x, y, z)), &ok);
+    if (__builtin_expect(!ok, 0)) r = spu__xv_fma_slow(spu__xl(a), spu__xl(b), spu__xl(c), negp, negc);
     return SPU__XRZ_CHECK(spu__xs(r), 2, a, b, c, negp, negc);
 }
-SPU__X_INLINE u128 spu_fa_lean(u128 a, u128 b) { return g_spu_float_rz ? spu__xrz_fa(a, b, 0) : spu__xln_fa(a, b, 0); }
+SPU__X_INLINE u128 spu_fa_lean(u128 a, u128 b) { return SPU__RZ_ON ? spu__xrz_fa(a, b, 0) : spu__xln_fa(a, b, 0); }
 SPU__X_INLINE u128 spu_fs_lean(u128 a, u128 b) {
-    return g_spu_float_rz ? spu__xrz_fa(a, b, 0x80000000u) : spu__xln_fa(a, b, 0x80000000u); }
-SPU__X_INLINE u128 spu_fm_lean(u128 a, u128 b) { return g_spu_float_rz ? spu__xrz_fm(a, b) : spu__xln_fm(a, b); }
+    return SPU__RZ_ON ? spu__xrz_fa(a, b, 0x80000000u) : spu__xln_fa(a, b, 0x80000000u); }
+SPU__X_INLINE u128 spu_fm_lean(u128 a, u128 b) { return SPU__RZ_ON ? spu__xrz_fm(a, b) : spu__xln_fm(a, b); }
 SPU__X_INLINE u128 spu_fma_lean(u128 a, u128 b, u128 c)  {
-    return g_spu_float_rz ? spu__xrz_fma(a, b, c, 0, 0) : spu__xln_fma(a, b, c, 0, 0); }
+    return SPU__RZ_ON ? spu__xrz_fma(a, b, c, 0, 0) : spu__xln_fma(a, b, c, 0, 0); }
 SPU__X_INLINE u128 spu_fms_lean(u128 a, u128 b, u128 c)  {
-    return g_spu_float_rz ? spu__xrz_fma(a, b, c, 0, 0x80000000u) : spu__xln_fma(a, b, c, 0, 0x80000000u); }
+    return SPU__RZ_ON ? spu__xrz_fma(a, b, c, 0, 0x80000000u) : spu__xln_fma(a, b, c, 0, 0x80000000u); }
 SPU__X_INLINE u128 spu_fnms_lean(u128 a, u128 b, u128 c) {
-    return g_spu_float_rz ? spu__xrz_fma(a, b, c, 0x80000000u, 0) : spu__xln_fma(a, b, c, 0x80000000u, 0); }
+    return SPU__RZ_ON ? spu__xrz_fma(a, b, c, 0x80000000u, 0) : spu__xln_fma(a, b, c, 0x80000000u, 0); }
 SPU__X_INLINE __m128i spu__xln_key(__m128i x) {
     const __m128i f = spu__xflush(x);
     return _mm_xor_si128(f, _mm_srli_epi32(_mm_srai_epi32(f, 31), 1));
@@ -2160,6 +2192,12 @@ static inline u128 spu_gbb(u128 a) { return spu_gbb_ref(a); }
 static inline u128 spu_fsm(u128 a) { return spu_fsm_ref(a); }
 static inline u128 spu_fsmh(u128 a) { return spu_fsmh_ref(a); }
 static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
+#endif
+
+/* x86: vector forms of the scalar integer ops (spu_helpers_x86int.h); SPU_X86_INT=0 keeps the
+ * scalar ones (A/B). */
+#if SPU_X86_SIMD && !(defined(SPU_X86_INT) && !SPU_X86_INT)
+#include "spu_helpers_x86int.h"
 #endif
 
 #endif /* SPU_HELPERS_H */
