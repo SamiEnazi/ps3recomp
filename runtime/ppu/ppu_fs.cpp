@@ -390,6 +390,7 @@ static void cellFsClose(ppu_context* ctx)
  * Touch each page read-then-write so the fault happens here, in user mode,
  * where the handler can commit it. Read-then-write rather than a plain store so
  * nothing already in the buffer is disturbed. */
+extern "C" { extern void (*g_vm_host_io_hook)(uint32_t ea, uint32_t len, int end); }   /* ppu_loader.cpp */
 static inline void fs_prefault(uint32_t buf, uint64_t len)
 {
     if (!vm_base || !len) return;
@@ -408,8 +409,11 @@ static void cellFsRead(ppu_context* ctx)
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(g_files[fd]);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
+    void (*const io_hook)(uint32_t, uint32_t, int) = g_vm_host_io_hook;
+    if (io_hook) io_hook(buf, (uint32_t)nbytes, 0);
     fs_prefault(buf, nbytes);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    if (io_hook) io_hook(buf, (uint32_t)nbytes, 1);
     if (fpos_before >= 0) lang_apply(fd, (uint64_t)fpos_before, vm_base + buf, n);
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
@@ -859,11 +863,14 @@ static void cellFsAioRead(ppu_context* ctx)
     int32_t err = CELL_FS_ENOENT;
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+        void (*const io_hook)(uint32_t, uint32_t, int) = g_vm_host_io_hook;
+        if (io_hook) io_hook(buf, (uint32_t)size, 0);
         fs_prefault(buf, size);
         /* AIO reads are absolute -- they do not disturb the fd's own file
          * position, and the guest interleaves them freely across threads. */
         if (HOST_FSEEK64(g_files[fd], offset) == 0)
             n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+        if (io_hook) io_hook(buf, (uint32_t)size, 1);
         lang_apply(fd, offset, vm_base + buf, n);
         err = CELL_OK;
     }
