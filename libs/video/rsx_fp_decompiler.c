@@ -1120,6 +1120,27 @@ static int rsx_fp_decompile_internal(
                      "(abs(%s) > 0.0 ? (%s) / sqrt(abs((%s).x)) : (float4)0.0)",
                      a, a, b);
             break;
+        /* Screen-space derivatives (RPCS3 FragmentProgramDecompiler DDX/DDY:
+         * dFdx/dFdy of src0). They were dropped as unhandled, which left the
+         * destination at whatever the register held -- 0 at the start. inFAMOUS
+         * 2's Beast distortion (FP d8160c63900ef8ce) soft-tests its fragments
+         * against the half-resolution depth with a slope allowance of
+         * |DDX z| + |DDY z|; with 0 there the Beast's own depth z-fought with
+         * the depth copy it is part of, so the distortion map came out as a
+         * torn mask and the Beast as shredded horizontal fragments. Per RSX
+         * pixel: under PS3_RES_SCALE a host pixel is 1/scale of one; DDY is
+         * along the RSX window y, which counts up from the bottom when
+         * SHADER_WINDOW says so (fp_alpha.y = -1, as for WPOS). */
+        case OP_DDX:
+            if (s_fp_wpos_sx != 1.0f)
+                snprintf(rhs, sizeof(rhs), "ddx(%s) * %.9g", a, (double)s_fp_wpos_sx);
+            else
+                snprintf(rhs, sizeof(rhs), "ddx(%s)", a);
+            break;
+        case OP_DDY:
+            snprintf(rhs, sizeof(rhs), "ddy(%s) * %s%.9g", a,
+                     buffered ? "fp_alpha.y * " : "", (double)s_fp_wpos_sy);
+            break;
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
         case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
         case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;

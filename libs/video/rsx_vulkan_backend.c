@@ -3193,6 +3193,76 @@ static void vk_frame_limit(void)
 #endif
 }
 
+#ifdef _WIN32
+/* PS3RECOMP_VK_RDOC_AT=<sec>[,<sec>...] (diagnostic): when RenderDoc is loaded --
+ * ENABLE_VULKAN_RENDERDOC_CAPTURE=1 switches on its implicit Vulkan layer (the
+ * installer registers it), or renderdoccmd capture -- ask it for a frame
+ * capture at each of these times, in seconds since the process started (the
+ * scripted runs' PAD_SCRIPT and screenshot clock); PS3RECOMP_VK_RDOC_TRIGGER
+ * and PS3RECOMP_VK_RDOC_FILE below. RenderDoc's in-application API
+ * (renderdoc_app.h, MIT): RENDERDOC_GetAPI from the loaded renderdoc.dll, API
+ * 1.0.0, whose 16th entry is TriggerCapture (the next frame, present to
+ * present). tools/combat_beast.ps1 -RdocAt / -RdocTrigger set all of it up,
+ * tools/rdoc_inspect.py reads the captures headless. Without RenderDoc loaded,
+ * or without the variables, nothing happens. */
+static void vk_rdoc_poll(void)
+{
+    static int state = -1, n = 0, next = 0;
+    static double at[16];
+    static void (*trigger)(void);
+    static ULONGLONG t_start;
+    static const char* tfile;   /* PS3RECOMP_VK_RDOC_TRIGGER */
+    static unsigned tick;
+    if (state < 0) {
+        state = 0;
+        const char* e = getenv("PS3RECOMP_VK_RDOC_AT");
+        tfile = getenv("PS3RECOMP_VK_RDOC_TRIGGER");
+        if (tfile && !*tfile) tfile = NULL;
+        HMODULE m = GetModuleHandleA("renderdoc.dll");
+        if ((!e || !*e) && !tfile) return;
+        if (!e) e = "";
+        if (!m) { VK_LOG("PS3RECOMP_VK_RDOC_AT: renderdoc.dll is not loaded (run under renderdoccmd capture)\n"); return; }
+        typedef int (*rdoc_get_api_fn)(int version, void** out);
+        rdoc_get_api_fn get_api = (rdoc_get_api_fn)(void*)GetProcAddress(m, "RENDERDOC_GetAPI");
+        void** api = NULL;
+        if (!get_api || !get_api(10000 /* eRENDERDOC_API_Version_1_0_0 */, (void**)&api) || !api) {
+            VK_LOG("PS3RECOMP_VK_RDOC_AT: RENDERDOC_GetAPI failed\n"); return;
+        }
+        trigger = (void (*)(void))api[15];
+        /* PS3RECOMP_VK_RDOC_FILE=<path template>: where the captures go (entry 12,
+         * SetCaptureFilePathTemplate); RenderDoc appends _frameN.rdc. */
+        const char* tmpl = getenv("PS3RECOMP_VK_RDOC_FILE");
+        if (tmpl && *tmpl) ((void (*)(const char*))api[11])(tmpl);
+        for (const char* p = e; *p && n < 16; ) {
+            char* q; const double t = strtod(p, &q);
+            if (q == p) break;
+            at[n++] = t; p = q; while (*p == ',' || *p == ' ') p++;
+        }
+        FILETIME c, x, k, u;
+        GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u);
+        t_start = ((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime;
+        state = trigger && (n > 0 || tfile);
+        VK_LOG("PS3RECOMP_VK_RDOC_AT: %d capture time(s) armed%s\n", n, tfile ? ", trigger file watched" : "");
+    }
+    if (!state) return;
+    /* PS3RECOMP_VK_RDOC_TRIGGER=<file>: a capture whenever that file appears (it is
+     * deleted again), for a driver that decides by looking at the screen. */
+    if (tfile && (++tick & 15u) == 0 && GetFileAttributesA(tfile) != INVALID_FILE_ATTRIBUTES) {
+        DeleteFileA(tfile);
+        trigger();
+        VK_LOG("RenderDoc capture triggered by %s\n", tfile);
+    }
+    if (next >= n) return;
+    FILETIME f; GetSystemTimeAsFileTime(&f);
+    const double now = (double)((((ULONGLONG)f.dwHighDateTime << 32) | f.dwLowDateTime) - t_start) / 1e7;
+    if (now >= at[next]) {
+        trigger();
+        VK_LOG("RenderDoc capture triggered at %.1f s (asked for %.1f s)\n", now, at[next]);
+        while (next < n && now >= at[next]) next++;
+    }
+}
+#endif
+
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window(void)
 {
@@ -3291,6 +3361,9 @@ static void vk_present_window(void)
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
     vk_frame_limit();
+#ifdef _WIN32
+    vk_rdoc_poll();
+#endif
     r = pvkQueuePresentKHR(s_vk.queue, &pi);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
@@ -3390,6 +3463,7 @@ typedef struct vk_eng_obj {
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u32      tag;                    /* E5: which cache made it, 0 = none   */
     u32      faces;                  /* TEXTURE: 6 = a cube (layers = faces) */
+    u32      depth;                  /* TEXTURE: > 1 = a volume (3D image)  */
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -3438,9 +3512,9 @@ static vk_eng_obj* vk_eng_get(u32 handle, int kind)
 }
 
 /* Copy `rows` rows of `w` texels from host memory into one level / layer of
- * an image that is in GENERAL. */
+ * an image that is in GENERAL (slice `z` of a 3D image's level). */
 static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
-                              size_t tight, u32 rows, const void* src, u32 row_bytes)
+                              size_t tight, u32 rows, const void* src, u32 row_bytes, u32 z)
 {
     if (tight > row_bytes) tight = row_bytes;
     if (vk_batch_on()) {
@@ -3457,6 +3531,7 @@ static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
         VkBufferImageCopy region = {
             .bufferOffset = (VkDeviceSize)so,
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+            .imageOffset = { 0, 0, (int32_t)z },
             .imageExtent = { w, h, 1 },
         };
         pvkCmdCopyBufferToImage(s_vk.cmd, s_batch.sarena.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
@@ -3472,6 +3547,7 @@ static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
         vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy region = {
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+            .imageOffset = { 0, 0, (int32_t)z },
             .imageExtent = { w, h, 1 },
         };
         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
@@ -3484,7 +3560,7 @@ static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
 static int vk_eng_upload(VkImage img, u32 layer, u32 mip, u32 w, u32 h, u32 bpp,
                          const void* src, u32 row_bytes)
 {
-    return vk_eng_upload_rows(img, layer, mip, w, h, (size_t)w * bpp, h, src, row_bytes);
+    return vk_eng_upload_rows(img, layer, mip, w, h, (size_t)w * bpp, h, src, row_bytes, 0);
 }
 
 /* NV4097 TEXTURE_CONTROL1 crossbar as a Vulkan component mapping: the shared
@@ -3969,7 +4045,69 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
     if (!o || !src || !row_bytes || !rows || face >= (o->faces ? o->faces : 1u)) return;
     /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
     const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
-    vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);   /* face = layer */
+    vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes, 0);   /* face = layer */
+}
+
+/* 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth): one 3D image
+ * of `depth` slices per level, uploaded a slice at a time, sampled through a
+ * 3D view (the pixel decompiler declares those units Texture3D, one binding
+ * each). Without these hooks a volume was its first slice sampled in 2D: for
+ * inFAMOUS 2's occlusion volumes (an 8x8x8 cone LUT) that darkened whole boxes
+ * round props, as it did on Metal before its own 3D textures. */
+static u32 vk_eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                    u32 depth, u32 mips, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    u32 bpp;
+    const VkFormat vf = vk_eng_format(fmt, &bpp);
+    const int bc = (fmt == RSX_BE_FMT_BC1 || fmt == RSX_BE_FMT_BC2 || fmt == RSX_BE_FMT_BC3);
+    if (vf == VK_FORMAT_UNDEFINED || bc || !w || !h || !depth || w > 2048u || h > 2048u || depth > 2048u)
+        return 0;
+    if (!mips) mips = 1;
+    const u32 hd = vk_eng_alloc();
+    if (!hd) return 0;
+    vk_eng_obj* o = &s_eobj[hd];
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_3D,
+        .format = vf, .extent = { w, h, depth }, .mipLevels = mips, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    VkMemoryRequirements req;
+    u32 type;
+    if (pvkCreateImage(s_vk.device, &ici, NULL, &o->im.img) != VK_SUCCESS) goto fail;
+    pvkGetImageMemoryRequirements(s_vk.device, o->im.img, &req);
+    if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
+        vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = req.size, .memoryTypeIndex = type };
+    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS ||
+        pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS) goto fail;
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = o->im.img,
+        .viewType = VK_IMAGE_VIEW_TYPE_3D, .format = vf, .components = vk_remap(remap, rsx_fmt),
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1 } };
+    if (pvkCreateImageView(s_vk.device, &vci, NULL, &o->im.view) != VK_SUCCESS) goto fail;
+    o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->faces = 1; o->depth = depth;
+    o->bpp = bpp; o->block = 0;
+    if (vk_begin()) goto fail;
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (!s_batch.recording && vk_submit_and_wait()) goto fail;
+    { static int said; if (!said++) VK_LOG("engine: 3D textures in use (first %ux%ux%u, %u level(s))\n", w, h, depth, mips); }
+    return hd;
+fail:
+    vk_destroy_image(&o->im);
+    memset(o, 0, sizeof *o);
+    return 0;
+}
+
+static void vk_eng_texture_upload_3d(void* user, u32 texture, u32 z, u32 mip, u32 w, u32 h,
+                                     const void* src, u32 row_bytes)
+{
+    (void)user;
+    vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
+    if (!o || o->depth < 2 || !src || !row_bytes) return;
+    vk_eng_upload_rows(o->im.img, 0, mip, w, h, (size_t)w * o->bpp, h, src, row_bytes, z);
 }
 
 /* A colour target sampled with a unit's crossbar: an extra view of the same
@@ -4179,6 +4317,12 @@ typedef struct vk_eng_pipe {
     /* Units the fragment program declares TextureCube / Texture3D: a sampled
      * image's view type has to match the declaration, bound or not. */
     u32                 cube_mask, vol_mask;
+    /* FUNC_ADD_SIGNED emulation (vk_eng_sblend_hlsl): lanes that blend signed
+     * (bit 0 RGB, bit 1 A), the fragment module of the negative half and its
+     * pipelines (REVERSE_SUBTRACT, drawn after the positive half). */
+    u32                 sblend;
+    VkShaderModule      fs_neg;
+    VkPipeline          variant_neg[VK_ENG_TOPOLOGIES][4];
 } vk_eng_pipe;
 
 /* Bit u set for each "<kind> rsx_tex<u>" declaration in the program text. */
@@ -4295,7 +4439,13 @@ static VkBlendOp vk_gcm_blend_op(u32 e)
     case 0x8008: return VK_BLEND_OP_MAX;
     case 0x800A: return VK_BLEND_OP_SUBTRACT;
     case 0x800B: return VK_BLEND_OP_REVERSE_SUBTRACT;
-    default:     return VK_BLEND_OP_ADD;                  /* FUNC_ADD 0x8006 */
+    case 0x8006: return VK_BLEND_OP_ADD;                  /* FUNC_ADD */
+    default: {
+        static u32 seen[8]; static u32 ns;
+        u32 k = 0; while (k < ns && seen[k] != e) k++;
+        if (k == ns && ns < 8) { seen[ns++] = e;
+            VK_LOG("blend equation 0x%04X not mapped: drawn as FUNC_ADD\n", e); }
+        return VK_BLEND_OP_ADD; }
     }
 }
 static VkCompareOp vk_gcm_compare(u32 f)
@@ -4345,6 +4495,69 @@ static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out)
     return rc;
 }
 
+/* NV4097_SET_BLEND_EQUATION FUNC_ADD_SIGNED (0xF006, per half: RGB [0:15],
+ * A [16:31]): the destination plus the source taken as a SIGNED byte -- the
+ * 8-bit value the fragment wrote, read as two's complement (128..255 are
+ * -128..-1). inFAMOUS 2's heat distortion is built on it: the map is cleared to
+ * 0x80 (no offset) and each distorting fragment (the Beast's FP
+ * d8160c63900ef8ce, fire, explosions) writes its offset as x for x >= 0 and
+ * 1 + x for x < 0, with ONE/ONE; the composite then reads the map back
+ * unsigned around 0.5. Drawn as FUNC_ADD (Vulkan has no signed blend; RPCS3
+ * does the same), every negative offset saturates the map at 1.0 instead --
+ * half of each distortion turns into a +0.5 shift, the Beast's body tears
+ * into horizontal strips. Vulkan clamps a UNORM source to [0,1] before
+ * blending, so the draw is split in two: the positive half as written with
+ * FUNC_ADD (dst x Fd + max(s, 0) x Fs), then the negative half again with
+ * REVERSE_SUBTRACT (dst x ONE - max(-s, 0) x Fs) and only the signed lanes
+ * enabled. Exact unless a lane saturates half-way; factors that read the
+ * split source itself keep FUNC_ADD (vk_eng_pipeline_create says which).
+ * The game sets 0xF006 for both halves (ONE/ONE; and SRC_ALPHA/ONE with
+ * alpha ZERO/ONE) -- the semantics are inferred from the encoding its
+ * programs write, which only adds up this way.
+ * PS3RECOMP_VK_SIGNED_BLEND=1 (default): the ONE/ONE case; =2: every
+ * factor combination the split can do; =0: FUNC_ADD, as before. */
+static int vk_sblend_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_SIGNED_BLEND"); on = e ? atoi(e) : 1; }
+    return on;
+}
+/* The fragment program with its single-target return wrapped: neg = 0 keeps
+ * the non-negative part of each signed lane, neg = 1 the magnitude of the
+ * negative part. NULL when the program's return is not one this knows. */
+static char* vk_eng_sblend_hlsl(const char* ps_hlsl, u32 lanes, int neg)
+{
+    static const char* const forms[2] = { "    return (_o == _o) ? _o : (float4)0;\n}",
+                                          "    return _rsx_out;\n}" };
+    const char* at = NULL; const char* form = NULL;
+    for (int i = 0; i < 2 && !at; i++) { at = strstr(ps_hlsl, forms[i]); form = forms[i]; }
+    const char* main_at = strstr(ps_hlsl, "float4 main(");
+    if (!at || !main_at || main_at > at || strstr(ps_hlsl, "struct PSOutput")) return NULL;
+    char fn[640];
+    snprintf(fn, sizeof fn,
+             "float4 _rsx_sblend(float4 v) {\n"
+             "    float4 b = round(saturate(v) * 255.0);\n"
+             "    float4 s = (b >= 128.0 ? b - 256.0 : b) / 255.0;   /* the byte, two's complement */\n"
+             "    float4 r = %s;\n"
+             "    return float4(%s, %s);\n"
+             "}\n",
+             neg ? "max(-s, (float4)0)" : "max(s, (float4)0)",
+             (lanes & 1u) ? "r.xyz" : "v.xyz", (lanes & 2u) ? "r.w" : "v.w");
+    const char* expr = form == forms[0] ? "(_o == _o) ? _o : (float4)0" : "_rsx_out";
+    char ret[128];
+    snprintf(ret, sizeof ret, "    return _rsx_sblend(%s);\n}", expr);
+    const size_t n = strlen(ps_hlsl) + strlen(fn) + strlen(ret) + 1;
+    char* out = (char*)malloc(n);
+    if (!out) return NULL;
+    size_t k = 0;
+    memcpy(out + k, ps_hlsl, (size_t)(main_at - ps_hlsl)); k += (size_t)(main_at - ps_hlsl);
+    memcpy(out + k, fn, strlen(fn)); k += strlen(fn);
+    memcpy(out + k, main_at, (size_t)(at - main_at)); k += (size_t)(at - main_at);
+    memcpy(out + k, ret, strlen(ret)); k += strlen(ret);
+    strcpy(out + k, at + strlen(form));
+    return out;
+}
+
 static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                   const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
                                   u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
@@ -4368,10 +4581,60 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     }
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
-    if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
-    if (vk_eng_translate(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs)) {
-        pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P); return 0;
+    /* FUNC_ADD_SIGNED lanes (see vk_eng_sblend_hlsl). A lane whose source
+     * factor is ZERO adds nothing and needs no split. The split changes the
+     * source the factors see, so it is refused (FUNC_ADD, said a few times)
+     * when a split RGB is its own factor (SRC_COLOR) or a split alpha feeds
+     * any factor (SRC_ALPHA...). inFAMOUS 2 uses ONE/ONE on both halves (the
+     * heat-distortion maps: checked against the game's look in the Beast
+     * fight) and SRC_ALPHA/ONE with alpha ZERO/ONE (some particles: whether
+     * those darken on hardware is not checked yet). PS3RECOMP_VK_SIGNED_BLEND:
+     * 1 (default) = the ONE/ONE case only, 2 = every case the split can do,
+     * 0 = none (FUNC_ADD everywhere, as before). */
+    u32 sbl = 0;
+    const int sbl_mode = vk_sblend_on();
+    if (rs->blend_enable && sbl_mode) {
+        int srgb = rs->eq_rgb == 0xF006u && rs->sf_rgb != 0u, sa = rs->eq_a == 0xF006u && rs->sf_a != 0u;
+        if (sbl_mode == 1 && ((srgb && (rs->sf_rgb != 1u || rs->df_rgb != 1u)) ||
+                              (sa && (rs->sf_a != 1u || rs->df_a != 1u)))) {
+            static int said;
+            if (said++ < 4) VK_LOG("engine: FUNC_ADD_SIGNED with factors 0x%X/0x%X 0x%X/0x%X: drawn as FUNC_ADD "
+                                   "(PS3RECOMP_VK_SIGNED_BLEND=2 splits it)\n", rs->sf_rgb, rs->df_rgb, rs->sf_a, rs->df_a);
+            srgb = sa = 0;
+        }
+        #define VK_SRC_COLOR_F(f) ((f) == 0x300u || (f) == 0x301u)
+        #define VK_SRC_ALPHA_F(f) ((f) == 0x302u || (f) == 0x303u || (f) == 0x308u)
+        const int bad = (srgb && (VK_SRC_COLOR_F(rs->sf_rgb) || VK_SRC_COLOR_F(rs->df_rgb))) ||
+                        (sa && (VK_SRC_ALPHA_F(rs->sf_rgb) || VK_SRC_ALPHA_F(rs->df_rgb) ||
+                                VK_SRC_ALPHA_F(rs->sf_a) || VK_SRC_ALPHA_F(rs->df_a) ||
+                                VK_SRC_COLOR_F(rs->sf_a) || VK_SRC_COLOR_F(rs->df_a)));
+        #undef VK_SRC_COLOR_F
+        #undef VK_SRC_ALPHA_F
+        if (bad) {
+            static int said;
+            if (said++ < 4) VK_LOG("engine: FUNC_ADD_SIGNED with factors 0x%X/0x%X 0x%X/0x%X: drawn as FUNC_ADD\n",
+                                   rs->sf_rgb, rs->df_rgb, rs->sf_a, rs->df_a);
+        } else {
+            sbl = (srgb ? 1u : 0u) | (sa ? 2u : 0u);
+        }
     }
+    char* ps_pos = sbl ? vk_eng_sblend_hlsl(ps_hlsl, sbl, 0) : NULL;
+    char* ps_neg = sbl ? vk_eng_sblend_hlsl(ps_hlsl, sbl, 1) : NULL;
+    if (sbl && (!ps_pos || !ps_neg)) {
+        static int said;
+        if (!said++) VK_LOG("engine: FUNC_ADD_SIGNED on a program whose output is not a single float4: drawn as FUNC_ADD\n");
+        free(ps_pos); free(ps_neg); ps_pos = ps_neg = NULL; sbl = 0;
+    }
+    if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) { free(ps_pos); free(ps_neg); return 0; }
+    if (vk_eng_translate(ps_pos ? ps_pos : ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, &P->fs) ||
+        (ps_neg && vk_eng_translate(ps_neg, RSX_SHADER_STAGE_FRAGMENT, &P->fs_neg))) {
+        if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
+        pvkDestroyShaderModule(s_vk.device, P->vs, NULL); memset(P, 0, sizeof *P);
+        free(ps_pos); free(ps_neg); return 0;
+    }
+    free(ps_pos); free(ps_neg);
+    P->sblend = sbl;
+    if (sbl) { static int said; if (!said++) VK_LOG("engine: FUNC_ADD_SIGNED blending emulated (lanes 0x%X)\n", sbl); }
     P->rs = *rs;
     P->nslots = layout->count;
     P->stride = vertex_stride;
@@ -4392,19 +4655,31 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
     for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
         for (u32 k = 0; k < 4; k++)
             if (P->variant[t][k]) pvkDestroyPipeline(s_vk.device, P->variant[t][k], NULL);
+    for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
+        for (u32 k = 0; k < 4; k++)
+            if (P->variant_neg[t][k]) pvkDestroyPipeline(s_vk.device, P->variant_neg[t][k], NULL);
     if (P->vs) pvkDestroyShaderModule(s_vk.device, P->vs, NULL);
     if (P->fs) pvkDestroyShaderModule(s_vk.device, P->fs, NULL);
+    if (P->fs_neg) pvkDestroyShaderModule(s_vk.device, P->fs_neg, NULL);
     memset(P, 0, sizeof *P);
     if (s_e2.pipeline == pipeline) s_e2.pipeline = 0;
 }
 
+static VkPipeline vk_eng_variant_ex(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx, int neg);
 static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx)
+{
+    return vk_eng_variant_ex(P, topo_idx, vk_idx, 0);
+}
+/* neg: the negative half of a FUNC_ADD_SIGNED draw (vk_eng_sblend_hlsl). */
+static VkPipeline vk_eng_variant_ex(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx, int neg)
 {
     static const VkPrimitiveTopology topo[VK_ENG_TOPOLOGIES] = {
         VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
         VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
         VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
-    if (P->variant[topo_idx][vk_idx]) return P->variant[topo_idx][vk_idx];
+    VkPipeline* slotp = neg ? &P->variant_neg[topo_idx][vk_idx] : &P->variant[topo_idx][vk_idx];
+    if (*slotp) return *slotp;
+    if (neg && !P->fs_neg) return VK_NULL_HANDLE;
     VkRenderPass rp = vk_eng_render_pass(P->rt_count);
     if (!rp || P->nslots > VK_GUEST_ATTRS) return VK_NULL_HANDLE;
     const rsx_be_render_state* rs = &P->rs;
@@ -4413,7 +4688,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx)
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
           .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = P->vs, .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = P->fs, .pName = "main" } };
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = neg ? P->fs_neg : P->fs, .pName = "main" } };
     VkVertexInputBindingDescription vb = { 0, P->stride, VK_VERTEX_INPUT_RATE_VERTEX };
     VkVertexInputAttributeDescription va[VK_GUEST_ATTRS];
     for (u32 s = 0; s < P->nslots; s++)
@@ -4493,11 +4768,24 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx)
             .blendEnable = tblend ? VK_TRUE : VK_FALSE,
             .srcColorBlendFactor = vk_gcm_blend_factor(rs->sf_rgb),
             .dstColorBlendFactor = vk_gcm_blend_factor(rs->df_rgb),
-            .colorBlendOp = vk_gcm_blend_op(rs->eq_rgb),
+            .colorBlendOp = (P->sblend & 1u) ? (neg ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD)
+                                             : vk_gcm_blend_op(rs->eq_rgb),
             .srcAlphaBlendFactor = vk_gcm_blend_factor(rs->sf_a),
             .dstAlphaBlendFactor = vk_gcm_blend_factor(rs->df_a),
-            .alphaBlendOp = vk_gcm_blend_op(rs->eq_a),
+            .alphaBlendOp = (P->sblend & 2u) ? (neg ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD)
+                                             : vk_gcm_blend_op(rs->eq_a),
             .colorWriteMask = twm };
+        /* The negative half writes only the signed lanes (the others were
+         * drawn, once, by the positive half), and subtracts from what the
+         * positive half left: dst x ONE - neg x Fs, so dst x Fd is applied
+         * once and the sum is dst x Fd + (pos - neg) x Fs. */
+        if (neg) {
+            cba[r].colorWriteMask &= ((P->sblend & 1u) ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                          VK_COLOR_COMPONENT_B_BIT) : 0u) |
+                                     ((P->sblend & 2u) ? VK_COLOR_COMPONENT_A_BIT : 0u);
+            if (P->sblend & 1u) cba[r].dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            if (P->sblend & 2u) cba[r].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        }
     }
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -4513,11 +4801,11 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx)
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = s_g.pipe_layout, .renderPass = rp, .subpass = 0 };
-    if (vk_sc_create_pipeline(&gci, &P->variant[topo_idx][vk_idx], 0) != VK_SUCCESS) {
+    if (vk_sc_create_pipeline(&gci, slotp, 0) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
-        P->variant[topo_idx][vk_idx] = VK_NULL_HANDLE;
+        *slotp = VK_NULL_HANDLE;
     }
-    return P->variant[topo_idx][vk_idx];
+    return *slotp;
 }
 
 static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pipeline = pipeline; }
@@ -4796,17 +5084,23 @@ static void vk_eng_image_infos(VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], VkDes
 {
     /* What the bound program declares per unit (vk_eng_decl_mask): the view
      * handed over must be of that type -- a cube for TextureCube (the bound
-     * cube, else the stand-in), the volume stand-in for Texture3D (no 3D
-     * textures yet), and never a cube where a 2D texture is read. */
+     * cube, else the stand-in), a volume for Texture3D (the bound one, else
+     * the stand-in), and never a cube or a volume where a 2D texture is read. */
     const vk_eng_pipe* EP = (s_e2.pipeline && s_e2.pipeline <= VK_ENG_MAX_PIPE) ? &s_epipe[s_e2.pipeline - 1] : NULL;
     const u32 cube_mask = EP ? EP->cube_mask : 0u, vol_mask = EP ? EP->vol_mask : 0u;
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
         const u32 h = ((s_e2.tex_mask >> u) & 1u) ? s_e2.tex[u] : 0u;
         VkImageView v = h ? vk_eng_sample_view(h) : VK_NULL_HANDLE;
         const int is_cube = h && h < VK_ENG_MAX_OBJ && s_eobj[h].kind == VK_ENG_TEXTURE && s_eobj[h].faces == 6;
+        const int is_vol  = h && h < VK_ENG_MAX_OBJ && s_eobj[h].kind == VK_ENG_TEXTURE && s_eobj[h].depth > 1;
         if ((cube_mask >> u) & 1u) { if (!v || !is_cube) v = vk_eng_dummy_view(0); }
-        else if ((vol_mask >> u) & 1u) v = vk_eng_dummy_view(1);
-        else if (is_cube) v = VK_NULL_HANDLE;           /* a cube where 2D is read: the 2D stand-in */
+        else if ((vol_mask >> u) & 1u) {
+            if (v && !is_vol) { static int said; if (said++ < 4)
+                VK_LOG("engine: unit %u reads a volume but a %ux%u 2D texture is bound (compressed volume?): black stand-in\n",
+                       u, s_eobj[h].w, s_eobj[h].h); }
+            if (!v || !is_vol) v = vk_eng_dummy_view(1);
+        }
+        else if (is_cube || is_vol) v = VK_NULL_HANDLE; /* a cube or volume where 2D is read: the 2D stand-in */
         VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
         ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, v ? v : s_vk.dummy.view, VK_IMAGE_LAYOUT_GENERAL };
         si[u] = (VkDescriptorImageInfo){ smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
@@ -5303,6 +5597,15 @@ static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer
         pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+    }
+    if (P->sblend) {                            /* FUNC_ADD_SIGNED: the negative half */
+        VkPipeline npipe = vk_eng_variant_ex(P, (u32)topology - 1u, vk_idx, 1);
+        if (npipe) {
+            pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, npipe);
+            s_ecs.pipe = npipe;
+            if (has_idx) pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
+            else         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+        }
     }
     if (batched) {
         s_batch.draws++;                        /* the pass stays open in the batch */
@@ -5997,6 +6300,8 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .submit_and_wait      = vk_eng_submit_and_wait,
     .texture_create       = vk_eng_texture_create,
     .texture_upload       = vk_eng_texture_upload,
+    .texture_create_3d    = vk_eng_texture_create_3d,
+    .texture_upload_3d    = vk_eng_texture_upload_3d,
     .texture_release      = vk_eng_release,
     .color_target_create  = vk_eng_color_target_create,
     .color_target_release = vk_eng_release,
@@ -6212,7 +6517,17 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
      * pipeline from the guest's programs, so without them it has nothing to
      * draw with, and the vtable's fixed-function path stays the default.
      * Either way PS3RECOMP_RSX_ENGINE=dispatch|vtable overrides. */
-    rsx_draw_engine_set_backend(&s_vk_engine_backend);
+    /* PS3RECOMP_VK_TEX3D=0 (A/B): no 3D textures -- a volume is its first
+     * slice sampled in 2D, as before vk_eng_texture_create_3d. */
+    { static rsx_draw_backend no3d;
+      const char* e = getenv("PS3RECOMP_VK_TEX3D");
+      if (e && e[0] == '0') {
+          no3d = s_vk_engine_backend; no3d.texture_create_3d = NULL; no3d.texture_upload_3d = NULL;
+          rsx_draw_engine_set_backend(&no3d);
+          VK_LOG("engine: 3D textures off (PS3RECOMP_VK_TEX3D=0)\n");
+      } else {
+          rsx_draw_engine_set_backend(&s_vk_engine_backend);
+      } }
     rsx_draw_engine_set_default(s_g.on ? 1 : 0);
     if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
         s_vk.eng_active = 1;
