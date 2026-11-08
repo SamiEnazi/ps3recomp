@@ -281,6 +281,117 @@ static inline void vm_write64_inl(uint64_t a, uint64_t v)
 #define vm_write64(a, v) vm_write64_inl(a, v)
 #endif
 
+/*@@PPU_MM@@*/
+/* The memory-model gates in a local (a lift with PPU_MM=1; after soyjxck/ps3recomp's
+ * ppu_mm, MIT). Every guest load and store above is an atomic access, which the
+ * compiler treats as touching all memory, and the build has no strict aliasing:
+ * after each one it loads vm_base, vm_inline_ok, ppu_vm_size, ppu_hle_inject_base
+ * and the coherence pointers again. A lifted function then opens with PPU_MM_SNAP
+ * (one copy of the gates that do not change while guest code runs) and its loads
+ * and stores use the copy: one compare for the range (one span from 0x10000 that
+ * stops before the raw SPU windows and the end of the mapping, 0 while a memory
+ * diagnostic is armed), the gcm ref-poll word only on 32-bit loads (the only
+ * width whose slow path treats it specially), and the stores keep the coherence
+ * protocol of vm_st_ok / vm_st_after exactly. The range is the old one or
+ * narrower, so anything the old checks sent to the out-of-line path still goes. */
+typedef struct ppu_mm { uint8_t* vb; int64_t span; uint32_t poll; int* armed; unsigned char* bits; } ppu_mm;
+static inline ppu_mm ppu_mm_take(void)
+{
+    const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
+    ppu_mm m;
+    m.vb = vm_base;
+    m.span = vm_inline_ok ? (int64_t)(hi - 0x10000u) : 0;
+    m.poll = ppu_hle_inject_base + 0x2008u;
+    m.armed = g_spu_coh_armed;
+    m.bits = g_spu_coh_bitmap;
+    return m;
+}
+/* [ea, ea + n) inside [0x10000, 0x10000 + span); below 0x10000 the 32-bit
+ * subtraction wraps past any span, and a span of 0 turns everything away. */
+static inline int vm_mm_in(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    return (int64_t)(uint32_t)(ea - 0x10000u) <= m->span - (int64_t)n;
+}
+static inline int vm_mm_resv(const ppu_mm* m, uint32_t ea)
+{
+    if (!__atomic_load_n(m->armed, __ATOMIC_ACQUIRE)) return 0;
+    const uint32_t line = ea >> 7;
+    return (__atomic_load_n(&m->bits[line >> 3], __ATOMIC_RELAXED) >> (line & 7)) & 1u;
+}
+static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    return __builtin_expect(vm_mm_in(m, ea, n), 1) && !vm_mm_resv(m, ea);
+}
+static inline void vm_mm_after(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    if (__builtin_expect(vm_mm_resv(m, ea), 0)) ppu_store_coh_notify(ea, n);
+}
+static inline uint8_t vm_read8_mm(const ppu_mm* m, uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_in(m, ea, 1), 1)) return __atomic_load_n(m->vb + ea, __ATOMIC_RELAXED);
+    return (vm_read8)(a);   /* the out-of-line accessor, not the macro */
+}
+static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_in(m, ea, 2), 1)) {   /* aligned: single-copy atomic, as on Cell */
+        uint16_t v;
+        if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 2);
+        return __builtin_bswap16(v); }
+    return (vm_read16)(a);   /* the out-of-line accessor, not the macro */
+}
+static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_in(m, ea, 4), 1) && __builtin_expect(ea != m->poll, 1)) {
+        uint32_t v;
+        if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 4);
+        return __builtin_bswap32(v); }
+    return (vm_read32)(a);   /* the out-of-line accessor, not the macro */
+}
+static inline uint64_t vm_read64_mm(const ppu_mm* m, uint64_t a)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_in(m, ea, 8), 1)) {
+        uint64_t v;
+        if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 8);
+        return __builtin_bswap64(v); }
+    return (vm_read64)(a);   /* the out-of-line accessor, not the macro */
+}
+#define VM_MM_ST(T, m, ea, val) do { uint8_t* _p = (m)->vb + (uint32_t)(ea); T _v = (val); \
+    if (!((uintptr_t)_p & (sizeof(T) - 1))) __atomic_store_n((T*)_p, _v, __ATOMIC_RELAXED); \
+    else memcpy(_p, &_v, sizeof(T)); } while (0)
+static inline void vm_write8_mm(const ppu_mm* m, uint64_t a, uint8_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_mm_st_ok(m, ea, 1)) { __atomic_store_n(m->vb + ea, v, __ATOMIC_RELAXED); vm_mm_after(m, ea, 1); return; }
+    (vm_write8)(a, v);
+}
+static inline void vm_write16_mm(const ppu_mm* m, uint64_t a, uint16_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_mm_st_ok(m, ea, 2)) { VM_MM_ST(uint16_t, m, ea, __builtin_bswap16(v)); vm_mm_after(m, ea, 2); return; }
+    (vm_write16)(a, v);
+}
+static inline void vm_write32_mm(const ppu_mm* m, uint64_t a, uint32_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_mm_st_ok(m, ea, 4)) { VM_MM_ST(uint32_t, m, ea, __builtin_bswap32(v)); vm_mm_after(m, ea, 4); return; }
+    (vm_write32)(a, v);
+}
+static inline void vm_write64_mm(const ppu_mm* m, uint64_t a, uint64_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (vm_mm_st_ok(m, ea, 8)) { VM_MM_ST(uint64_t, m, ea, __builtin_bswap64(v)); vm_mm_after(m, ea, 8); return; }
+    (vm_write64)(a, v);
+}
+/*@@PPU_MM_END@@*/
+
 /* Syscall handler */
 #ifdef __cplusplus
 extern "C"
@@ -947,6 +1058,68 @@ class LiftedFunction:
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)  # addresses of bl targets
     fallthrough_to: int = 0  # if it falls off the end, the continuation address
+    nv: object = None  # ppu_nv_dirty's liveness summary (PPU_NV_LOCALS=1 lifts)
+
+
+# Lift-time switches of the register-locals codegen (2026-11-08, after soyjxck/ps3recomp,
+# MIT; read in every lifting worker, which inherits the environment):
+#   PPU_NV_LOCALS=1   guest registers as C locals, written back only where they changed and
+#                     are read (ppu_nv_dirty.py; PPU_NV_LIVE=0: every changed one, PPU_NV_FLAGS=0:
+#                     CR/XER whole, PPU_NV_VERIFY=1: compare/poison instead of dropping)
+#   PPU_MM=1          the memory-model gates in a per-function local (ppu_recomp.h: ppu_mm)
+#   PPU_DRAIN_ELIDE=1 no trampoline drain after a direct call to a function that never
+#                     returns with the trampoline set
+# All off = the old lift, byte for byte.
+NV_STATS: dict = {}
+
+
+def _env_on(name: str) -> bool:
+    return os.environ.get(name, "0") not in ("0", "")
+
+
+def _so_zero() -> bool:
+    """PPU_SO_ZERO=1: compares and record forms leave CR's SO bit 0 instead of
+    copying XER[SO]. Only for a lift whose own code never sets SO (no o-form,
+    no mtxer: inFAMOUS 2's EBOOT) nor reads a CR SO bit (no bso/bns, no crX on
+    one): then the copy is a constant 0 the compiler could not see."""
+    return _env_on("PPU_SO_ZERO")
+
+
+def _so_bit() -> str:
+    return "" if _so_zero() else " | ((ctx->xer >> 31) & 1u)"
+
+
+def _so_rec() -> str:
+    return "" if _so_zero() else "_c |= (uint32_t)((ctx->xer >> 31) & 1u); "
+
+
+def _so_cr0() -> str:
+    return "" if _so_zero() else " | ((ctx->xer >> 31) << 28)"
+
+
+def _nv_on() -> bool:
+    return _env_on("PPU_NV_LOCALS")
+
+
+def _mm_on() -> bool:
+    return _env_on("PPU_MM")
+
+
+def _nv_verify() -> bool:
+    return _nv_on() and os.environ.get("PPU_NV_VERIFY") == "1"
+
+
+def _nv_mod():
+    # ppu_nv_dirty's frame-entry and access-run rewrites need soyjxck's ppu_vm_fast.h
+    # macros, which this runtime does not have: off unless asked for.
+    os.environ.setdefault("PPU_FRAME_ENTRY", "0")
+    os.environ.setdefault("PPU_VM_RUNS", "0")
+    import ppu_nv_dirty
+    return ppu_nv_dirty
+
+
+# `func_X(ctx); DRAIN_TRAMPOLINE(ctx);` -- the drain after a direct call (PPU_DRAIN_ELIDE).
+_RE_CALL_DRAIN = re.compile(r"((\w*func_[0-9A-Fa-f]{8})\(ctx\);) DRAIN_TRAMPOLINE\(ctx\);")
 
 
 # Max span (bytes) for a mid-function tail-entry / gap wrapper. A real interior
@@ -1090,6 +1263,8 @@ class PPULifter:
         if nid is not None:
             func.body_lines.append(
                 f"    ps3_hle_call(0x{nid:08X}u, ctx); return;  /* import stub */")
+            if _nv_on():
+                self._nv_pass(func)
             self.functions.append(func)
             return func
 
@@ -1337,8 +1512,29 @@ class PPULifter:
                        for _n, _off in sorted(_mem_snap.items()) if _n not in _reg_snap]
             func.body_lines = _decls + func.body_lines
 
+        if _nv_on():
+            self._nv_pass(func)
         self.functions.append(func)
         return func
+
+    def _nv_pass(self, func) -> None:
+        """PPU_NV_LOCALS=1: the guest registers as C locals (ppu_nv_dirty.py).
+
+        In the plain form every register is a field of *ctx, and the build has
+        no strict aliasing while every guest access is an atomic: the compiler
+        stores each register to the file and loads it back around every guest
+        load and store. As locals they stay in host registers; they are written
+        back where control leaves the function (a call, a syscall, a tail jump,
+        a return) and only those that changed and that the other side may read
+        (the whole-program liveness of ppu_nv_dirty.solve, applied at emit time
+        by expand). A body of a shape the pass does not follow keeps the plain
+        form (always correct) and is summarised as reading everything."""
+        nv = _nv_mod()
+        live = os.environ.get("PPU_NV_LIVE", "1") != "0"
+        new, func.nv = nv.rewrite_function(func.body_lines, func.start_addr, verify=_nv_verify(),
+                                           stats=NV_STATS, live=live)
+        if new is not None:
+            func.body_lines = new
 
     # ------------------------------------------------------------------ #
     # Per-instruction translation
@@ -1483,7 +1679,7 @@ class PPULifter:
             if m:
                 code += (f" {{ int64_t _r = (int64_t)ctx->gpr[{m.group(1)}]; "
                          f"uint32_t _c = (_r < 0) ? 8u : (_r > 0) ? 4u : 2u; "
-                         f"_c |= (uint32_t)((ctx->xer >> 31) & 1u); "
+                         f"{_so_rec()}"
                          f"ctx->cr = (ctx->cr & 0x0FFFFFFFu) | (_c << 28); }}")
         # FP record forms: CR1 = FPSCR[FX FEX VX OX] after the op.
         raw = insn.raw
@@ -1965,7 +2161,7 @@ class PPULifter:
             cast = "(int32_t)" if mn == "cmpwi" else "(int64_t)"
             shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = (int64_t){imm}; "
-                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); "
+                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2){_so_bit()}; "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmplwi", "cmpldi"):
@@ -1980,7 +2176,7 @@ class PPULifter:
             cast = "(uint32_t)" if mn == "cmplwi" else "(uint64_t)"
             shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = (uint64_t){imm}; "
-                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); "
+                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2){_so_bit()}; "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmpw", "cmpd"):
@@ -1995,7 +2191,7 @@ class PPULifter:
             cast = "(int32_t)" if mn == "cmpw" else "(int64_t)"
             shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = {cast}ctx->gpr[{rb_i}]; "
-                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); "
+                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2){_so_bit()}; "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         if mn in ("cmplw", "cmpld"):
@@ -2010,7 +2206,7 @@ class PPULifter:
             cast = "(uint32_t)" if mn == "cmplw" else "(uint64_t)"
             shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = {cast}ctx->gpr[{rb_i}]; "
-                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); "
+                    f"uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2){_so_bit()}; "
                     f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
 
         # ------- Branches -------
@@ -2674,7 +2870,7 @@ class PPULifter:
             return (f"{{ uint64_t ea = {ea}; "
                     f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
                     f"ppu_stwcx32(ea, (uint32_t)ctx->reserve_value, (uint32_t)ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "  # CR0 EQ = success
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u){_so_cr0()}; "  # CR0 EQ = success
                     f"ctx->reserve_addr = 0; }}")
 
         if mn == "ldarx":
@@ -2691,7 +2887,7 @@ class PPULifter:
             return (f"{{ uint64_t ea = {ea}; "
                     f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
                     f"ppu_stdcx64(ea, ctx->reserve_value, ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u){_so_cr0()}; "
                     f"ctx->reserve_addr = 0; }}")
 
         # ------- Data-stream hints: no architected effect -------
@@ -3925,6 +4121,13 @@ class PPULifter:
         preamble = (HEADER_PREAMBLE.replace("function_table",
                                             self.prefix + "function_table")
                     if self.prefix else HEADER_PREAMBLE)
+        # The ppu_mm accessors only in a PPU_MM lift (the default header stays as it was).
+        i, j = preamble.find("\n/*@@PPU_MM@@*/\n"), preamble.find("/*@@PPU_MM_END@@*/\n")
+        if i >= 0 and j > i:
+            if _mm_on():
+                preamble = preamble.replace("\n/*@@PPU_MM@@*/\n", "\n").replace("/*@@PPU_MM_END@@*/\n", "")
+            else:
+                preamble = preamble[:i] + preamble[j + len("/*@@PPU_MM_END@@*/\n"):]
         lines = [preamble]
         # Forward declarations
         for func in self.functions:
@@ -4031,6 +4234,43 @@ class PPULifter:
         lines.append("    return (sh >= 64) ? (rs >> 63) : (rs >> sh);")
         lines.append("}")
         lines.append("")
+        if _mm_on():
+            # PPU_MM=1: every lifted function below opens with PPU_MM_SNAP (the gates
+            # in a local, ppu_recomp.h's ppu_mm) and its loads and stores use it.
+            lines.append("/* PPU_MM lift: the guest accessors use the function's snapshot of the gates */")
+            lines.append("#define PPU_MM_SNAP const ppu_mm _mm = ppu_mm_take(); (void)_mm;")
+            lines.append("#ifndef PPU_NO_INLINE_LOADS")
+            for w in (8, 16, 32, 64):
+                lines.append(f"#undef vm_read{w}")
+                lines.append(f"#define vm_read{w}(a) vm_read{w}_mm(&_mm, a)")
+            lines.append("#ifndef PPU_NO_INLINE_STORES")
+            for w in (8, 16, 32, 64):
+                lines.append(f"#undef vm_write{w}")
+                lines.append(f"#define vm_write{w}(a, v) vm_write{w}_mm(&_mm, a, v)")
+            lines.append("#endif")
+            lines.append("#endif")
+            lines.append("")
+        if _nv_verify():
+            lines.append("/* PPU_NV_VERIFY lift (ppu_nv_dirty.py): a local taken as unchanged is compared")
+            lines.append(" * with the register file at each transfer; a dropped write-back stores poison. */")
+            lines.append("#ifndef PPU_UNLIKELY")
+            lines.append("#define PPU_UNLIKELY(x) __builtin_expect(!!(x), 0)")
+            lines.append("#endif")
+            lines.append("static void ppu_nv_differs(ppu_context* ctx, unsigned fn)")
+            lines.append("{")
+            lines.append("    static int said = 0;")
+            lines.append('    if (said < 60) { said++; fprintf(stderr, "[nv-verify] func_%08X (lr %08X): a local taken as '
+                         'unchanged differs from the register file\\n", fn, (unsigned)ctx->lr); fflush(stderr); }')
+            lines.append("}")
+            lines.append("static inline uint64_t ppu_nv_xf(const double* a, double b)")
+            lines.append("{ uint64_t x, y; memcpy(&x, a, 8); memcpy(&y, &b, 8); return x ^ y; }")
+            lines.append("#define PPU_NV_XF(n) ppu_nv_xf(&ctx->fpr[n], f##n)")
+            lines.append("#define PPU_NV_XV(n) ((uint64_t)(memcmp(&ctx->vr[n], &v##n, 16) != 0))")
+            lines.append("#define PPU_NV_POISON_G(n) (ctx->gpr[n] = 0xBAD0BAD0BAD00000ull + n)")
+            lines.append("#define PPU_NV_POISON_F(n) do { uint64_t _p = 0x7FF4BAD0BAD00000ull + n; memcpy(&ctx->fpr[n], &_p, 8); } while (0)")
+            lines.append("#define PPU_NV_POISON_S(n) (ctx->n = 0xBAD0C0DEu)")
+            lines.append("#define PPU_NV_POISON_V(n) memset(&ctx->vr[n], 0xBD, 16)")
+            lines.append("")
         return lines
 
     def _emit_functions(self) -> list["LiftedFunction"]:
@@ -4095,6 +4335,68 @@ class PPULifter:
             return False
         return not (self.code_lo <= tgt < self.code_hi)
 
+    def _drainless(self) -> set:
+        """PPU_DRAIN_ELIDE=1: the functions after a direct call to which the trampoline
+        drain is idle (after soyjxck/ps3recomp). Only lifted code sets g_trampoline_fn,
+        in a tail jump or where a body runs off its end, and every call inside a body
+        drains its own; so a body with neither, that is no import stub (its HLE handler
+        may run lifted firmware) and does no indirect jump (whose target runs inside
+        ps3_indirect_call), returns with it clear."""
+        cached = getattr(self, "_drainless_cache", None)
+        if cached is None:
+            cached = set()
+            if _env_on("PPU_DRAIN_ELIDE"):
+                for f in self._emit_functions():
+                    if f.fallthrough_to:
+                        continue
+                    if any(("g_trampoline_fn" in l or "ps3_hle_call" in l or "ps3_indirect_call" in l)
+                           for l in f.body_lines):
+                        continue
+                    cached.add(f.name)
+                print(f"  drain elision: {len(cached)} of {len(self._emit_functions())} functions "
+                      f"never return with the trampoline set", flush=True)
+            self._drainless_cache = cached
+        return cached
+
+    def _nv_needs(self):
+        """(need, verify) for ppu_nv_dirty.expand, or None: the scratch registers each
+        transfer has to write back, from the whole program's liveness (after
+        soyjxck/ps3recomp's lifter). Solved once, when the first function is emitted."""
+        cached = getattr(self, "_nv_need_cache", 0)
+        if cached == 0:
+            cached = None
+            funcs = self._emit_functions()
+            if any(f.nv is not None for f in funcs):
+                nvm = _nv_mod()
+                t0 = time.time()
+                summ = {f.start_addr: (f.nv if f.nv is not None else nvm.summarize_plain(f.body_lines))
+                        for f in funcs}
+                fall = {f.start_addr: f.fallthrough_to for f in funcs
+                        if f.fallthrough_to and f.fallthrough_to in summ}
+                # What a guest function pointer can name: the functions with a
+                # descriptor (--functions' "opd"); without that list, every function.
+                entries = getattr(self, "opd_entries", None) or set(summ)
+                ends = {f.start_addr: f.end_addr for f in funcs}
+                log = {}
+                need = nvm.solve(summ, entries, set(), fall, ends, log)
+                self._nv_counts = [0, 0]
+                self._nv_summ = summ
+                # r14-r31 are re-read after a direct call to a function that hands
+                # some back changed; v20-v31 after any call if some called function
+                # assigns one it does not save (a restore routine).
+                self._nv_nvout = {a: v["nvout"] for a, v in summ.items() if v.get("nvout")}
+                _called = set(self.call_targets) | set(entries)
+                _vc = [a for a, v in summ.items() if v.get("vclob") and a in _called]
+                self._nv_vr_reload = bool(_vc)
+                plain = sum(1 for v in summ.values() if v.get("plain"))
+                print(f"  register liveness: {len(summ)} functions ({plain} kept plain), {log['rounds']} rounds, "
+                      f"{time.time() - t0:.1f} s; an indirect call's target reads {nvm.names(log['any_in'])}; "
+                      f"after it the caller reads {nvm.names(log['ind_out'])}; "
+                      f"v20-v31 after a call: {'re-read' if _vc else 'kept'}", flush=True)
+                cached = (need, _nv_verify())
+            self._nv_need_cache = cached
+        return cached
+
     def _function_def_lines(self, func, func_by_addr, sorted_addrs,
                             addr_index) -> list[str]:
         """C lines for one lifted function (body + fallthrough trampoline)."""
@@ -4104,7 +4406,21 @@ class PPULifter:
             lines.append(f"/* {label} */")
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
-        for bline in _fuse_cr(func.body_lines):
+        if _mm_on() and any(("vm_read" in l or "vm_write" in l) for l in func.body_lines):
+            lines.append("        PPU_MM_SNAP")
+        nv = self._nv_needs() if _nv_on() else None
+        nvmod = _nv_mod() if nv is not None else None
+        drainless = self._drainless()
+        # PPU_NV_LOCALS: the CR fusion is the plain form's; the locals form leaves
+        # the compare-and-branch to the compiler, which now sees it.
+        body = func.body_lines if _nv_on() else _fuse_cr(func.body_lines)
+        for bline in body:
+            if nv is not None and "/*@NV" in bline:
+                bline = nvmod.expand(bline, self._nv_summ[func.start_addr], nv[0][func.start_addr], nv[1],
+                                     self._nv_counts, self._nv_vr_reload, self._nv_nvout)
+            if drainless and "DRAIN_TRAMPOLINE" in bline:
+                bline = _RE_CALL_DRAIN.sub(
+                    lambda m: m.group(1) if m.group(2) in drainless else m.group(0), bline)
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional
@@ -4733,6 +5049,17 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["jump_tables"] = jump_tables or {}
 
 
+def _nv_stats_add(st: dict) -> None:
+    """Fold a worker's ppu_nv_dirty counters into this process's."""
+    for k, v in st.items():
+        if isinstance(v, dict):
+            d = NV_STATS.setdefault(k, {})
+            for k2, v2 in v.items():
+                d[k2] = d.get(k2, 0) + v2
+        else:
+            NV_STATS[k] = NV_STATS.get(k, 0) + v
+
+
 def _worker_lift(task):
     idx0, bounds = task
     lifter = PPULifter(prefix=_WORKER_STATE.get("prefix", ""))
@@ -4756,8 +5083,10 @@ def _worker_lift(task):
         insns = disassemble_bytes(blob, start, _WORKER_STATE["be"]) if blob else []
         f = lifter.lift_function(insns, start, end)
         results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
-                        f.fallthrough_to))
-    return idx0, results, lifter.call_targets, lifter.branch_targets
+                        f.fallthrough_to, f.nv))
+    st = dict(NV_STATS)
+    NV_STATS.clear()
+    return idx0, results, lifter.call_targets, lifter.branch_targets, st
 
 
 def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
@@ -4782,8 +5111,9 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0)))
     try:
-        for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
+        for idx0, results, ct, bt, st in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
+            _nv_stats_add(st)
             lifter.call_targets |= ct
             lifter.branch_targets |= bt
             done += len(results)
@@ -4799,10 +5129,10 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
         raise
 
     for idx0 in sorted(results_by_idx):
-        for name, s, e, body, calls, ft in results_by_idx[idx0]:
+        for name, s, e, body, calls, ft, nv in results_by_idx[idx0]:
             lifter.functions.append(LiftedFunction(
                 name=name, start_addr=s, end_addr=e,
-                body_lines=body, calls=calls, fallthrough_to=ft))
+                body_lines=body, calls=calls, fallthrough_to=ft, nv=nv))
 
 
 def main() -> None:
@@ -4857,7 +5187,12 @@ def main() -> None:
                              "instead of its literal .lib.stub trampoline, and "
                              "split out as its own 0x20-byte function so direct "
                              "calls to it dispatch to the HLE handler.")
+    parser.add_argument("--nonvolatile-locals", action="store_true",
+                        help="guest registers as C locals with liveness-based write-backs "
+                             "(= PPU_NV_LOCALS=1; see PPULifter._nv_pass)")
     args = parser.parse_args()
+    if args.nonvolatile_locals:
+        os.environ["PPU_NV_LOCALS"] = "1"   # before the worker pool: the workers inherit it
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
     # and the lifter below.
@@ -4907,7 +5242,10 @@ def main() -> None:
         with open(args.functions) as f:
             func_list = json.load(f)
         func_bounds = [(int(str(e["start"]), 0), int(str(e["end"]), 0)) for e in func_list]
+        # the functions with a descriptor: what a guest function pointer can name
+        _opd_entries = {int(str(e["start"]), 0) for e in func_list if e.get("opd")}
     else:
+        _opd_entries = set()
         detected = detect_functions(all_insns)
         func_bounds = [(f["start"], f["end"]) for f in detected]
 
@@ -5312,6 +5650,7 @@ def main() -> None:
         lifter.code_hi = max(e for _, e in func_bounds)
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
+    lifter.opd_entries = _opd_entries
     lifter.jump_tables = jt_dispatchers
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
@@ -5394,6 +5733,15 @@ def main() -> None:
               f"{os.path.basename(paths[0])} .. {os.path.basename(paths[-1])}")
     print(f"  {len(lifter.functions)} functions lifted")
     print(f"  {len(lifter.call_targets)} unique call targets")
+    if _nv_on():
+        st = NV_STATS
+        print(f"  register locals: {st.get('done', 0)} functions rewritten, {st.get('bail', 0)} kept plain "
+              f"({', '.join(f'{k} {v}' for k, v in sorted(st.get('why', {}).items(), key=lambda x: -x[1])[:6])}); "
+              f"write-backs {st.get('stores', 0)} of {st.get('stores_all', 0)} at {st.get('points', 0)} transfers",
+              flush=True)
+        if getattr(lifter, "_nv_counts", None):
+            print(f"      of the scratch registers' write-backs {lifter._nv_counts[1]} are live "
+                  f"(of {lifter._nv_counts[0]})", flush=True)
 
 
 if __name__ == "__main__":
