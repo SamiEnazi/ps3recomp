@@ -146,9 +146,21 @@ static void mark_class(rsx_dispatch* rsx, u32 method, u32 count, u8 klass)
         rsx->klass[(method >> 2) + i] = klass;
 }
 
+/* (rsx3) Bumped whenever a write CHANGES a texture unit's register (SET_TEXTURE_*
+ * blocks and CONTROL3), on any rsx_dispatch: the draw engine decodes the sixteen
+ * units again only when it moved (PS3RECOMP_ENG_TEXGEN). Conservative by design:
+ * a bump without a real change only costs a decode. */
+u32 g_rsx_dsp_tex_gen = 1;
+static inline void tex_gen_note(u32 idx, u32 old, u32 arg)
+{
+    if (old != arg && ((idx - (M_TEX_SIZE1 >> 2)) < 16u || (idx - (M_TEX_OFFSET >> 2)) < RSX_DSP_NUM_TEXTURES * 8u))
+        g_rsx_dsp_tex_gen++;
+}
+
 void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
 {
     memset(rsx, 0, sizeof(*rsx));
+    g_rsx_dsp_tex_gen++;
     if (sink)
         rsx->sink = *sink;
 
@@ -244,6 +256,7 @@ void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)
     if (count > RSX_DSP_NUM_REGS)
         count = RSX_DSP_NUM_REGS;
     memcpy(rsx->regs, regs, count * sizeof(u32));
+    g_rsx_dsp_tex_gen++;
 }
 
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -433,6 +446,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         }
     }
     rsx->seen[idx]++;
+    tex_gen_note(idx, rsx->regs[idx], arg);
     rsx->regs[idx] = arg;
 
     /* Transform program upload window: word goes to instruction slot
@@ -648,7 +662,7 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
             continue;
         }
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
-        if (s_plain[m >> 2]) { rsx->seen[m >> 2]++; rsx->regs[m >> 2] = arg; }
+        if (s_plain[m >> 2]) { rsx->seen[m >> 2]++; tex_gen_note(m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
         else rsx_dispatch_method(rsx, m, arg);
         i++;
     }

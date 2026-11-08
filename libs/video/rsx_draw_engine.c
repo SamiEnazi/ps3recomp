@@ -50,11 +50,12 @@ static void eng_dbounds_set(int id, int v) { (void)id; __atomic_store_n(&s_dboun
 /* PS3RECOMP_ENG_SHADOW_CMP (live): the depth compare's operand order
  * (rsx_fp_set_shadow_rsx_order); the shadow descriptors are part of the
  * program key, so a change recompiles the comparing programs. */
-static void eng_shadow_cmp_set(int id, int v) { (void)id; rsx_fp_set_shadow_rsx_order(v != 0); }
+static int s_shadow_epoch;   /* (rsx3) PS3RECOMP_ENG_TEXGEN: the shadow switches changed */
+static void eng_shadow_cmp_set(int id, int v) { (void)id; rsx_fp_set_shadow_rsx_order(v != 0); __atomic_fetch_add(&s_shadow_epoch, 1, __ATOMIC_RELAXED); }
 /* PS3RECOMP_ENG_SHADOW_D24 (live, diagnostic): the depth compare's precision
  * and filter order (rsx_fp_set_shadow_d24); part of the shadow descriptor,
  * so a change recompiles the comparing programs too. */
-static void eng_shadow_d24_set(int id, int v) { (void)id; rsx_fp_set_shadow_d24(v); }
+static void eng_shadow_d24_set(int id, int v) { (void)id; rsx_fp_set_shadow_d24(v); __atomic_fetch_add(&s_shadow_epoch, 1, __ATOMIC_RELAXED); }
 /* PS3RECOMP_ENG_POLY_OFFSET (live): the polygon offset
  * (SET_POLY_OFFSET_FILL_ENABLE 0x0A68, SET_POLYGON_OFFSET_SCALE_FACTOR /
  * _BIAS 0x0A78 / 0x0A7C), which this engine used to ignore. inFAMOUS 2 draws
@@ -2342,6 +2343,8 @@ static u64 eng_current_fp_structural(void)
  * each decoded all of them, and nothing writes a register between the two.
  * 0 = each decodes its own. */
 static int s_texreg_once = -1;
+static int s_texgen_on = -1;   /* PS3RECOMP_ENG_TEXGEN, eng_draw_textures */
+static u32 s_tex_dec_gen;      /* the texture generation the decoded units are (0: not tracked) */
 static void eng_texreg_once_set(int id, int v) { (void)id; __atomic_store_n(&s_texreg_once, v != 0, __ATOMIC_RELAXED); }
 /* Read-only: the decoded units themselves, not a copy (copying all sixteen
  * twice a draw was ~0.17 ms of the RSX thread a frame in the pier view). */
@@ -2353,10 +2356,20 @@ static const rsx_dsp_texture* eng_draw_textures(void)
     if (!__atomic_load_n(&s_texreg_once, __ATOMIC_RELAXED)) {
         for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) rsx_dsp_get_texture(&g.rsx, u, &c[u]);
         serial = 0;
+        s_tex_dec_gen = 0;
         return c;
     }
     if (serial != s_draw_serial) {
-        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) rsx_dsp_get_texture(&g.rsx, u, &c[u]);
+        /* PS3RECOMP_ENG_TEXGEN (rsx3, default 1; 0 = decode every draw): only
+         * when a texture register changed since the last decode. */
+        static u32 gen;
+        if (__builtin_expect(s_texgen_on < 0, 0)) { const char* e = getenv("PS3RECOMP_ENG_TEXGEN"); s_texgen_on = !(e && e[0] == '0'); }
+        const u32 now = g_rsx_dsp_tex_gen;
+        if (!s_texgen_on || !gen || gen != now) {
+            for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) rsx_dsp_get_texture(&g.rsx, u, &c[u]);
+            gen = now;
+        }
+        s_tex_dec_gen = s_texgen_on ? gen : 0;
         serial = s_draw_serial;
     }
     return c;
@@ -2522,15 +2535,42 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     /* Every unit decoded once for the masks below (they took five decodes
      * of all sixteen units and three microcode walks per draw). */
     const rsx_dsp_texture* tex = eng_draw_textures();
-    const u32 cube_mask = eng_cube_mask(tex);
-    const u32 vol_mask = eng_volume_mask(tex);
     const u32 vtex_mask = eng_vtex_mask();
+    /* (rsx3) PS3RECOMP_ENG_TEXGEN: everything below is a function of the
+     * decoded units, the fragment program's analyses and the shadow switches
+     * alone -- reused while none of them changed (no texture register write
+     * since the decode, same program memo, same switch epoch). ~3% of the RSX
+     * thread a draw in the city. */
+    static struct {
+        int valid; u32 gen, epoch; const eng_fp_memo* fp; u64 fps; u32 gc, ec, su;
+        u32 cube, vol, gamma_units, expand_units, shadow_mask;
+        u8 gm[RSX_DSP_NUM_TEXTURES], em[RSX_DSP_NUM_TEXTURES];
+        rsx_fp_shadow_desc sh[RSX_DSP_NUM_TEXTURES];
+    } dm;
+    { static int watched; if (!watched) { watched = 1; ps3_toggle_watch(PS3T_ENG_SHADOW_CMP, eng_shadow_cmp_set);
+                                          ps3_toggle_watch(PS3T_ENG_SHADOW_D24, eng_shadow_d24_set); } }
+    const int dm_hit = s_texgen_on > 0 && s_tex_dec_gen && dm.valid && dm.gen == s_tex_dec_gen &&
+                       dm.epoch == __atomic_load_n(&s_shadow_epoch, __ATOMIC_RELAXED) && dm.fp == fp &&
+                       (fixed || (dm.fps == fp->structural && dm.gc == fp->gamma_cand &&
+                                  dm.ec == fp->expand_cand && dm.su == fp->sampled_units));
+    u32 cube_mask, vol_mask, gamma_units = 0, expand_units = 0, shadow_mask = 0;
+    u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
+    rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
+    if (dm_hit) {
+        cube_mask = dm.cube; vol_mask = dm.vol;
+        gamma_units = dm.gamma_units; expand_units = dm.expand_units; shadow_mask = dm.shadow_mask;
+        memcpy(gamma_masks, dm.gm, sizeof gamma_masks);
+        memcpy(expand_masks, dm.em, sizeof expand_masks);
+        memcpy(shadow, dm.sh, sizeof shadow);
+    } else {
+    const u32 dm_epoch = __atomic_load_n(&s_shadow_epoch, __ATOMIC_RELAXED);
+    cube_mask = eng_cube_mask(tex);
+    vol_mask = eng_volume_mask(tex);
     /* Texture input gamma (upstream PR #305, ported): TEXTURE_ADDRESS bits
      * 20..23 ask for sRGB-to-linear on the sampled lanes. Only units the
      * program actually fetches through count, so an idle unit's state does
      * not fork the pipeline. */
-    u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
-    u32 gamma_units = 0;
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
         const rsx_dsp_texture* t = &tex[u];
         if (t->enabled && (fp->gamma_cand & (1u << u)))
@@ -2543,8 +2583,6 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * asks that every fetch come back re-centred to -1..1 (EXP_TEX fetches
      * as x*2-1). inFAMOUS 2's deferred composite reads its normals G-buffer
      * that way. Same rule as gamma: only units the program samples count. */
-    u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
-    u32 expand_units = 0;
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
         const rsx_dsp_texture* t = &tex[u];
         if (t->enabled && (fp->expand_cand & (1u << u)))
@@ -2553,18 +2591,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     }
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
         if (!(expand_units & (1u << u))) expand_masks[u] = 0;
-    { static int said = 0;
-      if (expand_units && !said) { said = 1;
-          fprintf(stderr, "[rsx engine] texture sign expansion in use (units 0x%X)\n", expand_units); } }
-    { static int said = 0;
-      if (gamma_units && !said) { said = 1;
-          fprintf(stderr, "[rsx engine] texture gamma decode in use (units 0x%X)\n", gamma_units); } }
     /* Depth textures with comparison enabled return visibility, not raw
      * depth (upstream PR #302, adapted: this engine has no UN-unit scaling). */
-    rsx_fp_shadow_desc shadow[RSX_DSP_NUM_TEXTURES] = {{0}};
-    u32 shadow_mask = 0;
-    { static int watched; if (!watched) { watched = 1; ps3_toggle_watch(PS3T_ENG_SHADOW_CMP, eng_shadow_cmp_set);
-                                          ps3_toggle_watch(PS3T_ENG_SHADOW_D24, eng_shadow_d24_set); } }
     const u32 sampled_units = fixed ? 0 : fp->sampled_units;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!(sampled_units & (1u << u))) continue;
@@ -2573,6 +2601,22 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             t->cubemap, t->mipmaps, t->filter, t->wrap, t->control0);
         if (shadow[u].enabled) shadow_mask |= 1u << u;
     }
+    if (s_texgen_on > 0 && s_tex_dec_gen) {
+        dm.valid = 1; dm.gen = s_tex_dec_gen; dm.epoch = dm_epoch; dm.fp = fp;
+        dm.fps = fixed ? 0 : fp->structural; dm.gc = fixed ? 0 : fp->gamma_cand;
+        dm.ec = fixed ? 0 : fp->expand_cand; dm.su = fixed ? 0 : fp->sampled_units;
+        dm.cube = cube_mask; dm.vol = vol_mask; dm.gamma_units = gamma_units;
+        dm.expand_units = expand_units; dm.shadow_mask = shadow_mask;
+        memcpy(dm.gm, gamma_masks, sizeof dm.gm); memcpy(dm.em, expand_masks, sizeof dm.em);
+        memcpy(dm.sh, shadow, sizeof dm.sh);
+    }
+    }
+    { static int said = 0;
+      if (expand_units && !said) { said = 1;
+          fprintf(stderr, "[rsx engine] texture sign expansion in use (units 0x%X)\n", expand_units); } }
+    { static int said = 0;
+      if (gamma_units && !said) { said = 1;
+          fprintf(stderr, "[rsx engine] texture gamma decode in use (units 0x%X)\n", gamma_units); } }
 
     static const rsx_fp_constant_block no_constants;
     g.fp_constants = fixed ? &no_constants : &fp->constants;
