@@ -1344,12 +1344,23 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+/* PS3_SPU_WRCH_INLINE (spu_helpers.h, lifted TUs): -1 until the first spu_wrch,
+ * then 1 = the lifted code stores the MFC parameter channels inline. */
+int g_spu_wrch_inline = -1;
+static __attribute__((noinline, cold)) void spu_wrch_inline_init(void)
+{
+    const char* e = getenv("PS3_SPU_WRCH_INLINE");
+    const int on = !(e && e[0] == '0') && spu_ch_lean() && !getenv("SPU_CHHIST");
+    __atomic_store_n(&g_spu_wrch_inline, on, __ATOMIC_RELAXED);
+}
+
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* The job recorder (spu_jobrec.h) logs a recorded job's channel writes and
      * checks a replayed one's against its recording. Off: a load and a branch. */
     if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_wrch(ctx, channel, value._u32[0]))
         return;
+    if (__builtin_expect(g_spu_wrch_inline < 0, 0)) spu_wrch_inline_init();
     spu_dma_lean_init();
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
@@ -1546,6 +1557,10 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
+    /* PS3_FTRACE: stamp the first wake of a sleeping wait (PS3_FT_SPU_WAKE) */
+    if (__builtin_expect(__atomic_load_n(&g_ps3_ft.on, __ATOMIC_RELAXED) == 2, 0) &&
+        ctx->status == SPU_STATUS_WAITING_CHANNEL && !ctx->ft_wake_ns)
+        ctx->ft_wake_ns = ps3_ft_now();
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
 }
 
@@ -1618,8 +1633,10 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                 ctx->spu_id, ctx->pc & SPU_LS_MASK, op, channel,
                 spu_ev_get(ctx), ctx->event_mask); }
 
+    ctx->ft_wake_ns = 0;
     ctx->status = SPU_STATUS_WAITING_CHANNEL;
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
+    unsigned ft_sleeps = 0, ft_timeouts = 0;
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
         int spun = 0;
@@ -1638,9 +1655,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
              * the loop condition (and the stop request) above. */
             if (!spun) { spun = 1; if (spu_ch_spin(ctx, channel)) continue; }
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
-            if (!spu_ch_ready(ctx, channel))
-                SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-                                          (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
+            if (!spu_ch_ready(ctx, channel)) {
+                ft_sleeps++;
+                if (!SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                               (SRWLOCK*)&ctx->ch_wait_lock, 10, 0))
+                    ft_timeouts++;
+            }
             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             unsigned long long waited = GetTickCount64() - start;
             if (waited >= next_hb) {
@@ -1654,7 +1674,16 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
         }
     }
     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
-    if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);
+    if (ft_t0) {
+        /* PS3_FT_SPU_WAKE: producer wake -> this thread running again (the OS
+         * wake-up latency); b = 0: no producer woke it (a 10 ms re-poll did) */
+        if (ft_sleeps) {
+            const uint64_t now = ps3_ft_now(), w = ctx->ft_wake_ns;
+            ps3_ft_span(PS3_FT_SPU_WAKE, ctx->spu_id, channel | (ft_timeouts << 8), w ? 1u : 0u,
+                        w && w <= now ? w : now, now);
+        }
+        spu_ft_wait_span(ctx, channel, ft_t0);
+    }
     ctx->status = SPU_STATUS_RUNNING;
 }
 
@@ -2514,12 +2543,36 @@ static int      s_ovl_summary_n = -1;
  * page instead of one union range. */
 static uint64_t s_ovl_sig_bits[64];
 static uint64_t s_ovl_lift_pages[4];        /* 256 x 1 KB pages of LS */
+/* PS3_SPU_OVL_INDEX (default 1; 0 = the old walk): the sources a GET can hit,
+ * found through the same hashes as the summary instead of a walk of the whole
+ * table (~70 sources, every GET the summary lets through: 3% of SPU time in a
+ * city profile, 2026-11-08). An address source hits only on its exact EA, a
+ * signature source only when the GET's first word is its signature's, so each
+ * of those is reached through a chain per 12-bit hash; fixed-address lifts
+ * (a handful) are all tried. The candidates are tried in table order with the
+ * walk's own per-source code, so the first source that hits is the same one. */
+static int16_t s_ovl_ix_ea[4096], s_ovl_ix_sig[4096], s_ovl_ix_next[SPU_OVL_SRC_MAX];
+static int16_t s_ovl_ix_lift[SPU_OVL_SRC_MAX];
+static int     s_ovl_ix_nlift;
 static inline unsigned ovl_ea_hash(uint32_t ea) { return (ea * 2654435761u) >> 20; }
 static void ovl_summary_rebuild(int n)
 {
     memset(s_ovl_ea_bits, 0, sizeof s_ovl_ea_bits);
     memset(s_ovl_sig_bits, 0, sizeof s_ovl_sig_bits);
     memset(s_ovl_lift_pages, 0, sizeof s_ovl_lift_pages);
+    memset(s_ovl_ix_ea, 0xFF, sizeof s_ovl_ix_ea);     /* -1 = empty chain */
+    memset(s_ovl_ix_sig, 0xFF, sizeof s_ovl_ix_sig);
+    s_ovl_ix_nlift = 0;
+    for (int i = n - 1; i >= 0; i--) {                 /* chains in ascending table order */
+        const spu_ovl_src* o = &s_ovl_src[i];
+        if (o->lift_lsa) continue;
+        int16_t* head;
+        if (!o->has_sig) head = &s_ovl_ix_ea[ovl_ea_hash(o->src_ea)];
+        else { uint32_t w; memcpy(&w, o->sig, 4); head = &s_ovl_ix_sig[ovl_ea_hash(w)]; }
+        s_ovl_ix_next[i] = *head; *head = (int16_t)i;
+    }
+    for (int i = 0; i < n; i++)
+        if (s_ovl_src[i].lift_lsa) s_ovl_ix_lift[s_ovl_ix_nlift++] = (int16_t)i;
     uint32_t lo = 0xFFFFFFFFu, hi = 0;
     for (int i = 0; i < n; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
@@ -2597,6 +2650,80 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     spu_overlay_note_get_full(ctx, ea, ls, size);
 }
 
+static int s_ovl_index = -1;
+static __attribute__((noinline, cold)) int ovl_index_init(void)
+{
+    const char* e = getenv("PS3_SPU_OVL_INDEX");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_ovl_index, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int ovl_index_on(void)
+{
+    const int v = __atomic_load_n(&s_ovl_index, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : ovl_index_init();
+}
+
+/* One overlay source tried against a GET (the body of note_get's walk): 1 = it
+ * hit (the GET is handled, note_get returns), 0 = try the next source. ea and lsa
+ * are the GET's; a fixed-address lift that hits re-points them before it returns. */
+static int ovl_try_source(spu_context* ctx, const spu_ovl_src* o, uint32_t ea, uint32_t lsa,
+                          const uint8_t* ls, uint32_t size)
+{
+    int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
+                         : (o->src_ea == ea);
+    if (o->lift_lsa) {
+        /* Fixed-address lift: resident when its own bytes land at its address. */
+        const uint32_t lo = lsa > o->lift_lsa ? lsa : o->lift_lsa;
+        const uint32_t hi = (lsa + size) < (o->lift_lsa + o->span) ? (lsa + size) : (o->lift_lsa + o->span);
+        hit = lo < hi && (hi - lo >= 128 || hi - lo == size) &&
+              gm_equal(vm_base + o->src_ea + (lo - o->lift_lsa), ls + (lo - lsa), hi - lo);
+        if (hit) {   /* zeros match any cleared buffer: demand real content */
+            const uint8_t* q = ls + (lo - lsa); uint32_t k = 0;
+            while (k < hi - lo && !q[k]) k++;
+            hit = k < hi - lo;
+        }
+        if (!hit) return 0;
+        int have = 0;
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+            if (ctx->resident_code[slot].image_id == o->image_id &&
+                ctx->resident_code[slot].lsa == o->lift_lsa) have = 1;
+        if (have) return 0;
+        lsa = o->lift_lsa; ea = o->src_ea;
+    }
+    if (hit) {
+        if (o->span) {
+            if (lsa + o->span > SPU_LS_SIZE) return 1;
+            for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+                if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                    continue;
+                ctx->resident_code[slot].lsa = lsa;
+                ctx->resident_code[slot].size = o->span;
+                ctx->resident_code[slot].source_ea = ea;
+                ctx->resident_code[slot].image_id = o->image_id;
+                ctx->resident_code[slot].reloc = (uint32_t)o->reloc;
+                ctx->ib_gen++;
+                { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
+                    fprintf(stderr, "[spu-ovl] img=%d code span src=0x%08X -> LS 0x%05X+0x%X resident as image %d (slot %u)\n",
+                            ctx->image_id, ea, lsa, o->span, o->image_id, slot); }
+                return 1;
+            }
+            fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+            return 1;
+        }
+        if (ctx->resident_ovl != o->image_id) {
+            ctx->resident_ovl = o->image_id;
+            { static int _n = 0; if (PS3_LOG_FIRST(_n, 32))
+                fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
+                        "-> LS 0x%05X size=%u -> resident ovl image %d%s\n",
+                        ctx->image_id, ea, (uint32_t)(ls - ctx->ls), size,
+                        ctx->resident_ovl, o->has_sig ? " (sig match)" : ""); }
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static void spu_overlay_note_get_full(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
@@ -2643,60 +2770,25 @@ static void spu_overlay_note_get_full(spu_context* ctx, uint32_t ea, const uint8
         }
     }
     if (ovl_cannot_match(ea, ls, lsa, size)) return;
-    for (int i = 0; i < s_ovl_src_count; i++) {
-        const spu_ovl_src* o = &s_ovl_src[i];
-        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
-                             : (o->src_ea == ea);
-        if (o->lift_lsa) {
-            /* Fixed-address lift: resident when its own bytes land at its address. */
-            const uint32_t lo = lsa > o->lift_lsa ? lsa : o->lift_lsa;
-            const uint32_t hi = (lsa + size) < (o->lift_lsa + o->span) ? (lsa + size) : (o->lift_lsa + o->span);
-            hit = lo < hi && (hi - lo >= 128 || hi - lo == size) &&
-                  gm_equal(vm_base + o->src_ea + (lo - o->lift_lsa), ls + (lo - lsa), hi - lo);
-            if (hit) {   /* zeros match any cleared buffer: demand real content */
-                const uint8_t* q = ls + (lo - lsa); uint32_t k = 0;
-                while (k < hi - lo && !q[k]) k++;
-                hit = k < hi - lo;
-            }
-            if (!hit) continue;
-            int have = 0;
-            for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
-                if (ctx->resident_code[slot].image_id == o->image_id &&
-                    ctx->resident_code[slot].lsa == o->lift_lsa) have = 1;
-            if (have) continue;
-            lsa = o->lift_lsa; ea = o->src_ea;
+    if (ovl_index_on()) {      /* PS3_SPU_OVL_INDEX: only the sources the GET can hit */
+        int16_t cand[SPU_OVL_SRC_MAX]; int nc = 0;
+        for (int i = s_ovl_ix_ea[ovl_ea_hash(ea)]; i >= 0; i = s_ovl_ix_next[i]) cand[nc++] = (int16_t)i;
+        if (size >= 512) {
+            uint32_t w; memcpy(&w, ls, 4);
+            for (int i = s_ovl_ix_sig[ovl_ea_hash(w)]; i >= 0; i = s_ovl_ix_next[i]) cand[nc++] = (int16_t)i;
         }
-        if (hit) {
-            if (o->span) {
-                if (lsa + o->span > SPU_LS_SIZE) return;
-                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
-                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
-                        continue;
-                    ctx->resident_code[slot].lsa = lsa;
-                    ctx->resident_code[slot].size = o->span;
-                    ctx->resident_code[slot].source_ea = ea;
-                    ctx->resident_code[slot].image_id = o->image_id;
-                    ctx->resident_code[slot].reloc = (uint32_t)o->reloc;
-                    ctx->ib_gen++;
-                    { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
-                        fprintf(stderr, "[spu-ovl] img=%d code span src=0x%08X -> LS 0x%05X+0x%X resident as image %d (slot %u)\n",
-                                ctx->image_id, ea, lsa, o->span, o->image_id, slot); }
-                    return;
-                }
-                fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
-                return;
-            }
-            if (ctx->resident_ovl != o->image_id) {
-                ctx->resident_ovl = o->image_id;
-                { static int _n = 0; if (PS3_LOG_FIRST(_n, 32))
-                    fprintf(stderr, "[spu-ovl] img=%d streamed overlay src=0x%08X "
-                            "-> LS 0x%05X size=%u -> resident ovl image %d%s\n",
-                            ctx->image_id, ea, (uint32_t)(ls - ctx->ls), size,
-                            ctx->resident_ovl, o->has_sig ? " (sig match)" : ""); }
-            }
-            return;
+        for (int k = 0; k < s_ovl_ix_nlift; k++) cand[nc++] = s_ovl_ix_lift[k];
+        for (int a = 1; a < nc; a++) {          /* table order: the walk's first hit */
+            const int16_t v = cand[a]; int q = a;
+            while (q > 0 && cand[q - 1] > v) { cand[q] = cand[q - 1]; q--; }
+            cand[q] = v;
         }
+        for (int k = 0; k < nc; k++)
+            if (ovl_try_source(ctx, &s_ovl_src[cand[k]], ea, lsa, ls, size)) return;
+        return;
     }
+    for (int i = 0; i < s_ovl_src_count; i++)
+        if (ovl_try_source(ctx, &s_ovl_src[i], ea, lsa, ls, size)) return;
 }
 
 /* Match a 16-byte module header against the registered content signatures.

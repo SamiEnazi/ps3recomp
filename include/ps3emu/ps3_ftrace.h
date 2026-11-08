@@ -69,6 +69,13 @@ enum ps3_ft_kind {
                               * a = 1 built / 0 failed */
     PS3_FT_TEXUP       = 17, /* RSX thread decoded + uploaded a guest texture: a = source KB,
                               * b = 0 new, 1 content changed; | 2 when it evicted another */
+    PS3_FT_SPU_JOB     = 18, /* one WWS job-module call (needs PS3_JOBSTAT=1): who = SPU id,
+                              * a = job overlay id (jobstat's ovl), b = entry LS pc; spans
+                              * shorter than PS3_FTRACE_MIN_US are dropped */
+    PS3_FT_SPU_WAKE    = 19, /* an SPU channel wait that slept: t0 = first producer wake
+                              * (spu_ch_wake), t1 = the thread runs again; who = SPU id,
+                              * a = channel | 10 ms timeouts << 8, b = 1 woken by a producer,
+                              * 0 = only the re-poll (t0 = t1) */
 };
 
 #if defined(_MSC_VER)
