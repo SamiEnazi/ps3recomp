@@ -3487,6 +3487,16 @@ static void eng_ic_after_draw(eng_ic_entry* e, u64 content, u32 n_draw)
     e->content = content; e->seen = 1; e->seen_frame = g.frames; e->last_frame = g.frames;
 }
 
+/* The draw's fetch plan. PS3RECOMP_ENG_PLAN_LAYOUT (default 1; 0 = all
+ * sixteen attributes decoded and the plan cleared, as before): only the
+ * layout's attributes (rsx_vertex_fetch_plan_init_layout). */
+static void eng_plan_init(const rsx_vertex_layout_plan* layout)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_PLAN_LAYOUT"); on = !(e && e[0] == '0'); }
+    if (on) rsx_vertex_fetch_plan_init_layout(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    else    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+}
 /* Write the references an index-cache hit left out (dc.refs_lazy). */
 static void dc_refs_fill(void)
 {
@@ -3516,7 +3526,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
              * consecutive vertex ids from lo. */
             dc.n_refs = e->span; dc.n_source_refs = e->n_src; dc.refs_remapped = 1; dc.n_cuts = 0;
             dc.layout = *layout;
-            rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+            eng_plan_init(layout);
             rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, NULL, 0);
             /* PS3RECOMP_ENG_LAZY_REFS (default 1): the plan below reads only
              * refs[0] of a consecutive run unless an attribute has a frequency
@@ -3651,7 +3661,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 
     if (dso) { t1 = eng_ds_now(); ds.ns_remap += t1 - t0; t0 = t1; }
     dc.layout = *layout;
-    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    eng_plan_init(layout);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare_ex(&dc.fetch_plan, dc.refs, dc.n_refs, consecutive);
     if (dso) { t1 = eng_ds_now(); ds.ns_plan += t1 - t0; t0 = t1; }

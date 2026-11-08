@@ -109,6 +109,12 @@ void rsx_vertex_fetch_plan_init(
     rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
     const rsx_vertex_layout_plan* layout,
     rsx_vertex_guest_ptr_fn guest_ptr, void* guest_user);
+/* The same for the layout's attributes only (the others are left as they
+ * were: no reader looks at an attribute the layout does not list). */
+void rsx_vertex_fetch_plan_init_layout(
+    rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
+    const rsx_vertex_layout_plan* layout,
+    rsx_vertex_guest_ptr_fn guest_ptr, void* guest_user);
 
 /* Attempt one bounds-checked contiguous mapping per used attribute.  Any
  * attribute whose complete span is not contiguous safely falls back to the
