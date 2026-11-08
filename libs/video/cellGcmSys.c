@@ -1919,13 +1919,29 @@ void cellGcm_ref_on_poll(void)
      * loading's fence storms clear in seconds, not minutes). */
     static LARGE_INTEGER s_freq;
     static volatile LONGLONG s_last_pub;
-    if (!TryAcquireSRWLockExclusive(&s_ref_pub_lock))
-        return;
+    /* GCM_REF_SOLO (default 1; 0 = pace every value): while ONE thread is the
+     * only one reading the ref -- no other thread read it for a whole pacing
+     * gap -- each of its reads may advance one queued fence. It reads every
+     * value it publishes (the read follows this call), and any other waiter
+     * would have read within the gap, which is what the pacing already
+     * assumes. inFAMOUS 2's hot waiter (func_0013ACE8: ref - target >= 0,
+     * usleep(5)) otherwise waited 200 us per queued fence: 13-15% of the PPU
+     * main thread in the city. Recorded before the TryAcquire, so a reader
+     * that loses the lock still counts as a second reader. */
+    static int s_solo_on = -1;
+    static volatile LONG s_rp_tid;
+    static volatile LONGLONG s_rp_multi;
+    if (s_solo_on < 0) { const char* e = getenv("GCM_REF_SOLO"); s_solo_on = !(e && e[0] == '0'); }
     if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const LONG tid = (LONG)GetCurrentThreadId();
+    if (s_solo_on && s_rp_tid != tid) { s_rp_multi = now.QuadPart; InterlockedExchange(&s_rp_tid, tid); }
+    if (!TryAcquireSRWLockExclusive(&s_ref_pub_lock))
+        return;
     LONGLONG min_gap = s_freq.QuadPart / 5000;          /* ~200us */
+    const int solo = s_solo_on && s_rp_tid == tid && now.QuadPart - s_rp_multi >= min_gap;
     int dry = 0;
-    if (now.QuadPart - s_last_pub >= min_gap) {
+    if (solo || now.QuadPart - s_last_pub >= min_gap) {
         gcm_ref_publish_one();
         s_last_pub = now.QuadPart;
         dry = (s_ref_qhead == s_ref_qtail);
