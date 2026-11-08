@@ -104,10 +104,13 @@ static void eng_shade_backface_set(int id, int v) { (void)id; __atomic_store_n(&
  *   a = n * Q.a * c4.x                       (depth of field, first band)
  *   b = max(f * B.a * c5.x, tc0.z)           (second band, or the edge blur)
  *   out = lerp(lerp(S, Q, a), B, b)
- * tc0.z is vertex attribute 8 of the pass's 12-index screen mesh: 0 in the
- * middle, the EDGE_BLUR_LIMITS weight at the borders -- the soft, smeared
- * edges of the picture that read as motion blur when the camera turns.
- * c4.x/c5.x are the depth-of-field strength (0.55 in the docks).
+ * tc0.z is vertex attribute 8 of the pass's 12-index screen mesh (centre +
+ * 4 corners): 0 in the middle, an edge weight at the corners (the TOD
+ * EDGE_BLUR_LIMITS). c4.x/c5.x are the depth-of-field strength.
+ * Measured (PS3RECOMP_FX_LOG, tw-fxlog1: boot to the docks tutorial and its
+ * camera turns): edge weight 0 throughout; DOF strength 0.3-1.0 in the
+ * cutscenes, 0.55 in play -- the "motion blur" on distant things when the
+ * camera turns is this depth of field (the game has no motion blur pass).
  * Off = those terms replaced by 0 in that program's generated shader: a = 0
  * and b = 0 exactly, so the pass returns S, the sharp scene, bit for bit
  * (every input is a finite UNORM sample). Nothing else in the frame

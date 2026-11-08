@@ -1097,14 +1097,15 @@ static void tab_graphics(void)
          "game starts. A higher render scale costs GPU time (see the HUD).");
 
     section("Game effects");
-    if (ImGui::Checkbox("Edge blur", &s_ui.edge_blur)) apply_setting(V_EDGE_BLUR, s_ui.edge_blur ? "1" : "0");
-    live_mark(V_EDGE_BLUR);
-    hint("The game softens the borders of the picture; while the camera turns it reads as motion blur "
-         "(the game has no camera motion blur of its own). Off keeps the whole picture sharp.");
     if (ImGui::Checkbox("Depth of field", &s_ui.dof)) apply_setting(V_DOF, s_ui.dof ? "1" : "0");
     live_mark(V_DOF);
-    hint("The game blurs the scene by distance. Off shows it sharp. Neither costs frame rate: the game's "
-         "pass still runs and returns the sharp picture.");
+    hint("The game blurs the scene by distance, strongly in cutscenes. This is the softness you see on "
+         "distant things when the camera turns: inFAMOUS 2 has no camera motion blur. Off shows "
+         "everything sharp. No frame-rate cost.");
+    if (ImGui::Checkbox("Edge blur", &s_ui.edge_blur)) apply_setting(V_EDGE_BLUR, s_ui.edge_blur ? "1" : "0");
+    live_mark(V_EDGE_BLUR);
+    hint("The game can soften the borders of the picture where its lighting settings ask for it. Off "
+         "keeps the borders sharp. No frame-rate cost.");
 }
 
 static void tab_audio(void)
