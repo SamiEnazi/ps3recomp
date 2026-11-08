@@ -165,6 +165,19 @@ VMXS_INL void ppu_lvewx_sse(void* d, uint64_t ea) {
     const __m128i lane = _mm_cmpeq_epi32(_mm_setr_epi32(0, 4, 8, 12), _mm_set1_epi32((int)(ea & 12u)));
     _mm_storeu_si128((__m128i*)d, _mm_and_si128(_mm_set1_epi32((int)e), lane));
 }
+/* lvlx: bytes ea .. end of its aligned block, then zeros; lvrx: zeros, then the bytes of
+ * the block before ea (pshufb zeroes a lane whose index has bit 7 set). The aligned block
+ * is read whole: the same 16 bytes, so the same page. */
+VMXS_INL void ppu_lvlx_sse(void* d, uint64_t ea) {
+    const __m128i q = _mm_loadu_si128((const __m128i*)(vm_base + (uint32_t)(ea & ~0xFULL)));
+    const __m128i ix = _mm_add_epi8(_mm_set1_epi8((char)(ea & 0xF)), _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+    _mm_storeu_si128((__m128i*)d, _mm_shuffle_epi8(q, _mm_or_si128(ix, _mm_cmpgt_epi8(ix, _mm_set1_epi8(15)))));
+}
+VMXS_INL void ppu_lvrx_sse(void* d, uint64_t ea) {
+    const __m128i q = _mm_loadu_si128((const __m128i*)(vm_base + (uint32_t)(ea & ~0xFULL)));
+    const __m128i ix = _mm_add_epi8(_mm_set1_epi8((char)((int)(ea & 0xF) - 16)), _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+    _mm_storeu_si128((__m128i*)d, _mm_shuffle_epi8(q, ix));
+}
 /* vcmpequw: equal words (no swap needed for equality), CR6 [all, 0, none, 0] */
 VMXS_INL uint32_t vmx_vcmpequw_sse(VMX_D, VMX_A, VMX_B) {
     const __m128i c = _mm_cmpeq_epi32(_mm_loadu_si128((const __m128i*)a_), _mm_loadu_si128((const __m128i*)b_));

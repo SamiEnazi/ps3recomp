@@ -123,6 +123,13 @@ int main(int argc, char** argv) {
             ppu_vld16_sse(g, ea); check("lvx", ref, g, a, b, 0, ea);
             bytes(a); ppu_vst16_sse(ea, a); check("stvx", a, mem + ea, a, b, 0, ea);
         }
+        for (uint32_t ea = 0; ea + 16 <= 4096; ea++) {   /* lvlx / lvrx, the lifter's loops */
+            uint32_t sh = ea & 0xF; uint8_t* m = vm_base + (ea & ~0xFu);
+            for (int i = 0; i < 16; i++) w[i] = (sh + (uint32_t)i < 16) ? m[sh + i] : 0;
+            ppu_lvlx_sse(g, ea); check("lvlx", w, g, a, b, 0, ea);
+            for (int i = 0; i < 16; i++) w[i] = ((uint32_t)i >= 16u - sh) ? m[i - (int)(16u - sh)] : 0;
+            ppu_lvrx_sse(g, ea); check("lvrx", w, g, a, b, 0, ea);
+        }
         for (uint32_t ea = 0; ea + 16 <= 4096; ea += 4) {   /* lvewx, the lifter's text */
             memset(w, 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy(w + (ea & 15), &_e, 4); }
             memset(g, 0xEE, 16); ppu_lvewx_sse(g, ea); check("lvewx", w, g, a, b, 0, ea);

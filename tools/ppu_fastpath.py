@@ -223,6 +223,12 @@ _RE_LVSL = re.compile(r"\{ uint8_t b = (\(uint8_t\)\((?:[^;{}]*)\)); for \(int i
 # lvewx: zero the register, the aligned word at ea into its lane
 _RE_LVEWX = re.compile(r"\{ uint64_t ea = ([^;{}]+); ea &= ~3ULL; memset\(" + _OPND + r", 0, 16\); "
                        r"\{ uint32_t _e = VM_RAW_LD\(uint32_t, ea\); memcpy\(\(uint8_t\*\)\2 \+ \(ea & 15\), &_e, 4\); \} \}")
+# lvlx / lvrx: the bytes of ea's aligned block from / up to ea, zeros elsewhere
+_LVX_HEAD = (r"\{ uint64_t ea = ([^;{}]+); uint32_t sh = \(uint32_t\)\(ea & 0xF\); "
+             r"uint8_t\* m = vm_base \+ \(uint32_t\)\(ea & ~0xFULL\); uint8_t\* d = \(uint8_t\*\)" + _OPND + "; ")
+_RE_LVLX = re.compile(_LVX_HEAD + r"for \(int i = 0; i < 16; i\+\+\) d\[i\] = \(sh \+ \(uint32_t\)i < 16\) \? m\[sh \+ i\] : 0; \}")
+_RE_LVRX = re.compile(_LVX_HEAD + r"for \(int i = 0; i < 16; i\+\+\) d\[i\] = \(\(uint32_t\)i >= 16u - sh\) "
+                      r"\? m\[i - \(int\)\(16u - sh\)\] : 0; \}")
 STATS: dict = {}
 
 
@@ -254,6 +260,9 @@ def rewrite_body(lines: list) -> list:
             ln = _sub(ln, _RE_LVSL, r"{ uint8_t b = \1; PPU_LVSL_SSE(\2, b); }", "lvsl")
         if "ea &= ~3ULL; memset(" in ln:
             ln = _sub(ln, _RE_LVEWX, r"{ uint64_t ea = \1; ea &= ~3ULL; ppu_lvewx_sse(\2, ea); }", "lvewx")
+        if "uint8_t* m = vm_base" in ln:
+            ln = _sub(ln, _RE_LVLX, r"ppu_lvlx_sse(\2, \1);", "lvlx")
+            ln = _sub(ln, _RE_LVRX, r"ppu_lvrx_sse(\2, \1);", "lvrx")
         if "vm_raw_" in ln:
             ln = _sub(ln, re.compile(r"\bvm_raw_ld16\("), "ppu_vld16_sse(", "lvx")
             ln = _sub(ln, re.compile(r"\bvm_raw_st16\("), "ppu_vst16_sse(", "stvx")
