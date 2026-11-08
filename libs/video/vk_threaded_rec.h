@@ -18,7 +18,11 @@
  *    (s_tq.direct) until it returns.
  *  - Host-side object lifetimes are unchanged: the backend already keeps
  *    anything a recorded command names alive until its batch completed, which
- *    is after the submit, which is after the drain.
+ *    is after the submit, which is after the drain. Every vkDestroy* (and
+ *    vkResetDescriptorPool) drains first anyway, a no-op on an empty ring.
+ *  - vkUpdateDescriptorSets is queued too (a set is written once, before its
+ *    first bind; the ring keeps that order), so the driver's descriptor work
+ *    moves with the binds.
  *
  * Idea after Ryujinx's threaded renderer (MIT); own implementation, at the
  * vkCmd level rather than at the renderer interface.
@@ -36,7 +40,7 @@ enum {
     TQ_WRAP = 0, TQ_BARRIER, TQ_CLEARC, TQ_CLEARDS, TQ_CI2B, TQ_CB2I, TQ_BEGINRP, TQ_ENDRP,
     TQ_BINDPIPE, TQ_BINDVB, TQ_BINDDS, TQ_PUSHC, TQ_VIEWPORT, TQ_SCISSOR, TQ_DRAW, TQ_SREF,
     TQ_BINDIB, TQ_DRAWIDX, TQ_DBIAS, TQ_BLIT, TQ_COPYIMG, TQ_RESETQ, TQ_TIMESTAMP,
-    TQ_BEGINCB, TQ_ENDCB, TQ_RESETCB, TQ_NOPS
+    TQ_BEGINCB, TQ_ENDCB, TQ_RESETCB, TQ_UPDDS, TQ_NOPS
 };
 
 typedef struct { u32 op, size; VkCommandBuffer cb; } tq_hdr;   /* size: whole record, 8-aligned */
@@ -65,7 +69,7 @@ static volatile LONG s_tq_quit;
     X(vkCmdDraw) X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCmdSetDepthBias) X(vkCmdBlitImage) X(vkCmdCopyImage) X(vkCmdResetQueryPool) \
     X(vkCmdWriteTimestamp) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
-    X(vkResetCommandBuffer) X(vkQueueSubmit)
+    X(vkResetCommandBuffer) X(vkQueueSubmit) X(vkUpdateDescriptorSets)     X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyBuffer) X(vkFreeMemory)     X(vkDestroyFramebuffer) X(vkDestroySampler) X(vkDestroyPipeline) X(vkDestroyRenderPass)     X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkDestroyQueryPool)
 #define TQ_DECLARE(name) static PFN_##name r##name;
 TQ_FNS(TQ_DECLARE)
 #undef TQ_DECLARE
@@ -182,6 +186,18 @@ typedef struct { tq_hdr h; float c, cl, s; } tq_dbias;
 typedef struct { tq_hdr h; VkImage src; VkImageLayout sl; VkImage dst; VkImageLayout dl; u32 n; VkFilter f; } tq_imgcopy;
 typedef struct { tq_hdr h; VkQueryPool pool; u32 a, b; VkPipelineStageFlagBits st; } tq_query;
 typedef struct { tq_hdr h; VkCommandBufferBeginInfo bi; } tq_begincb;
+typedef struct { tq_hdr h; VkDevice dev; u32 nw; } tq_updds;   /* VkWriteDescriptorSet[nw], then each one's infos */
+static int tq_ds_image(VkDescriptorType t)
+{
+    return t == VK_DESCRIPTOR_TYPE_SAMPLER || t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+           t == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+           t == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+}
+static int tq_ds_buffer(VkDescriptorType t)
+{
+    return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+           t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+}
 
 static void tq_exec(const u8* p)
 {
@@ -247,6 +263,16 @@ static void tq_exec(const u8* p)
     case TQ_RESETCB: { const tq_draw* r = (const tq_draw*)p;
         VkResult e = rvkResetCommandBuffer(cb, r->a);
         if (e != VK_SUCCESS && s_tq.err == VK_SUCCESS) { s_tq.err = e; s_tq.err_op = h->op; }
+        break; }
+    case TQ_UPDDS: {                   /* the ring copy is the worker's now: point it at its own infos */
+        tq_updds* r = (tq_updds*)(void*)p;
+        VkWriteDescriptorSet* w = (VkWriteDescriptorSet*)(r + 1);
+        u8* q = (u8*)(w + r->nw);
+        for (u32 k = 0; k < r->nw; k++) {
+            if (tq_ds_image(w[k].descriptorType)) { w[k].pImageInfo = (const VkDescriptorImageInfo*)q; q += TQ_ARR(VkDescriptorImageInfo, w[k].descriptorCount); }
+            else { w[k].pBufferInfo = (const VkDescriptorBufferInfo*)q; q += TQ_ARR(VkDescriptorBufferInfo, w[k].descriptorCount); }
+        }
+        rvkUpdateDescriptorSets(r->dev, r->nw, w, 0, NULL);
         break; }
     default: break;
     }
@@ -464,6 +490,50 @@ static VkResult VKAPI_CALL tq_vkResetCommandBuffer(VkCommandBuffer cb, VkCommand
     tq_commit(p);
     return VK_SUCCESS;
 }
+/* Host-side, but ordered with the binds that follow it: a set is written once
+ * before its first bind, so writing it on the worker, ahead of that bind in the
+ * ring, is the same order. Texel buffers, pNext chains and copies: directly. */
+static void VKAPI_CALL tq_vkUpdateDescriptorSets(VkDevice dev, u32 nw, const VkWriteDescriptorSet* w,
+                                                 u32 nc, const VkCopyDescriptorSet* c)
+{
+    u32 bytes = sizeof(tq_updds) + TQ_ARR(VkWriteDescriptorSet, nw);
+    int ok = nc == 0;
+    for (u32 k = 0; k < nw && ok; k++) {
+        if (w[k].pNext) ok = 0;
+        else if (tq_ds_image(w[k].descriptorType) && w[k].pImageInfo) bytes += TQ_ARR(VkDescriptorImageInfo, w[k].descriptorCount);
+        else if (tq_ds_buffer(w[k].descriptorType) && w[k].pBufferInfo) bytes += TQ_ARR(VkDescriptorBufferInfo, w[k].descriptorCount);
+        else ok = 0;
+    }
+    u8* p = NULL;
+    if (ok) p = tq_alloc(TQ_UPDDS, bytes, VK_NULL_HANDLE);
+    else if (s_tq.running && !s_tq.direct) vk_tq_sync();   /* the worker must not be behind a direct write */
+    if (!p) { rvkUpdateDescriptorSets(dev, nw, w, nc, c); return; }
+    tq_updds* r = (tq_updds*)(void*)p;
+    r->dev = dev; r->nw = nw;
+    VkWriteDescriptorSet* o = (VkWriteDescriptorSet*)(r + 1);
+    memcpy(o, w, TQ_ARR(VkWriteDescriptorSet, nw));
+    u8* q = (u8*)(o + nw);
+    for (u32 k = 0; k < nw; k++) {
+        if (tq_ds_image(w[k].descriptorType)) { memcpy(q, w[k].pImageInfo, TQ_ARR(VkDescriptorImageInfo, w[k].descriptorCount)); q += TQ_ARR(VkDescriptorImageInfo, w[k].descriptorCount); }
+        else { memcpy(q, w[k].pBufferInfo, TQ_ARR(VkDescriptorBufferInfo, w[k].descriptorCount)); q += TQ_ARR(VkDescriptorBufferInfo, w[k].descriptorCount); }
+        o[k].pImageInfo = NULL; o[k].pBufferInfo = NULL;
+    }
+    tq_commit(p);
+}
+/* Destroying (or resetting) anything a queued call may still name drains the
+ * ring first; a no-op when it is empty, which is the steady state (dead objects
+ * are destroyed after the batch's submit). */
+static void VKAPI_CALL tq_vkDestroyImage(VkDevice d, VkImage o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkDestroyImage(d, o, a); }
+static void VKAPI_CALL tq_vkDestroyImageView(VkDevice d, VkImageView o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkDestroyImageView(d, o, a); }
+static void VKAPI_CALL tq_vkDestroyBuffer(VkDevice d, VkBuffer o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkDestroyBuffer(d, o, a); }
+static void VKAPI_CALL tq_vkFreeMemory(VkDevice d, VkDeviceMemory o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkFreeMemory(d, o, a); }
+static void VKAPI_CALL tq_vkDestroyFramebuffer(VkDevice d, VkFramebuffer o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkDestroyFramebuffer(d, o, a); }
+static void VKAPI_CALL tq_vkDestroySampler(VkDevice d, VkSampler o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkDestroySampler(d, o, a); }
+static void VKAPI_CALL tq_vkDestroyPipeline(VkDevice d, VkPipeline o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkDestroyPipeline(d, o, a); }
+static void VKAPI_CALL tq_vkDestroyRenderPass(VkDevice d, VkRenderPass o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkDestroyRenderPass(d, o, a); }
+static void VKAPI_CALL tq_vkDestroyDescriptorPool(VkDevice d, VkDescriptorPool o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkDestroyDescriptorPool(d, o, a); }
+static VkResult VKAPI_CALL tq_vkResetDescriptorPool(VkDevice d, VkDescriptorPool o, VkDescriptorPoolResetFlags f) { vk_tq_sync(); return rvkResetDescriptorPool(d, o, f); }
+static void VKAPI_CALL tq_vkDestroyQueryPool(VkDevice d, VkQueryPool o, const VkAllocationCallbacks* a) { vk_tq_sync(); rvkDestroyQueryPool(d, o, a); }
 static VkResult VKAPI_CALL tq_vkQueueSubmit(VkQueue q, u32 n, const VkSubmitInfo* si, VkFence f)
 {
     vk_tq_sync();                      /* the command buffers are complete before the driver sees them */
