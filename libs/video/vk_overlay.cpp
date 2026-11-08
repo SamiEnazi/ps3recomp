@@ -110,6 +110,7 @@ static bool env_on(const char* v)
 enum {
     V_FPS_CAP, V_PRESENT, V_FULLSCREEN,
     V_AA, V_SHARPEN, V_RENDER_SCALE, V_ANISO, V_UPSCALE,
+    V_DOF, V_EDGE_BLUR,
     V_VOLUME,
     V_INPUT_MODE, V_BUTTON_ICONS, V_RUMBLE, V_RUMBLE_STRENGTH,
     V_HUD, V_HUD_CORNER, V_HUD_OPACITY, V_HUD_GRAPH, V_HUD_CPU,
@@ -118,6 +119,7 @@ enum {
 static const char* const kVar[V_N] = {
     "PS3RECOMP_FPS_CAP", "PS3RECOMP_VK_PRESENT", "PS3RECOMP_VK_FULLSCREEN",
     "PS3RECOMP_AA", "PS3RECOMP_SHARPEN", "PS3RECOMP_RENDER_SCALE", "PS3RECOMP_ANISO", "PS3RECOMP_UPSCALE",
+    "PS3RECOMP_DOF", "PS3RECOMP_EDGE_BLUR",
     "PS3_AUDIO_VOLUME",
     "PS3_INPUT_MODE", "PS3_BUTTON_ICONS", "PS3_RUMBLE", "PS3_RUMBLE_STRENGTH",
     "PS3_OVERLAY_HUD", "PS3_OVERLAY_HUD_CORNER", "PS3_OVERLAY_HUD_OPACITY",
@@ -936,6 +938,7 @@ struct Ui {
     int present;
     bool fullscreen;
     int aa, scale, aniso, upscale; float sharpen;
+    bool dof, edge_blur;      /* the game's own effects (rsx_draw_engine.c ENG_DOF_BLEND_FP) */
     int volume;
     int input_mode, button_icons;
     bool rumble; int rumble_strength;
@@ -963,6 +966,8 @@ static void ui_load(void)
       s_ui.aa = a == VK_POSTFX_AA_SMAA ? 2 : a == VK_POSTFX_AA_FXAA ? 1 : 0; }
     s_ui.sharpen = vk_postfx_sharpen();
     s_ui.upscale = vk_postfx_upscale();
+    { const char* e = getenv(kVar[V_DOF]); s_ui.dof = !(e && !strcmp(e, "0")); }
+    { const char* e = getenv(kVar[V_EDGE_BLUR]); s_ui.edge_blur = !(e && !strcmp(e, "0")); }
     { const char* e = getenv(kVar[V_RENDER_SCALE]);
       const double v = e ? atof(e) : 1.0;
       s_ui.scale = v >= 1.75 ? 2 : v >= 1.25 ? 1 : 0; }
@@ -1090,6 +1095,17 @@ static void tab_graphics(void)
     live_mark(V_UPSCALE);
     hint("\"live\" settings change at once; \"on restart\" ones are saved now and used the next time the "
          "game starts. A higher render scale costs GPU time (see the HUD).");
+
+    section("Game effects");
+    if (ImGui::Checkbox("Depth of field", &s_ui.dof)) apply_setting(V_DOF, s_ui.dof ? "1" : "0");
+    live_mark(V_DOF);
+    hint("The game blurs the scene by distance, strongly in cutscenes. This is the softness you see on "
+         "distant things when the camera turns: inFAMOUS 2 has no camera motion blur. Off shows "
+         "everything sharp. No frame-rate cost.");
+    if (ImGui::Checkbox("Edge blur", &s_ui.edge_blur)) apply_setting(V_EDGE_BLUR, s_ui.edge_blur ? "1" : "0");
+    live_mark(V_EDGE_BLUR);
+    hint("The game can soften the borders of the picture where its lighting settings ask for it. Off "
+         "keeps the borders sharp. No frame-rate cost.");
 }
 
 static void tab_audio(void)

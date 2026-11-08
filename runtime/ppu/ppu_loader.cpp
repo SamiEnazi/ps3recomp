@@ -3248,6 +3248,7 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 
+extern "C" uint32_t sys_mem_user_mb(void);   /* sys_memory.c: PS3_USER_MEMORY_MB */
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
@@ -3345,8 +3346,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     case 352: {   /* sys_memory_get_user_memory_size(sys_memory_info_t* info)
                    * info = { u32 total_user_memory; u32 available_user_memory } */
         uint32_t info = (uint32_t)ctx->gpr[3];
-        if (info) { vm_write32(info + 0, 0x10000000u);   /* 256 MB total */
-                    vm_write32(info + 4, 0x0C000000u); } /* 192 MB available */
+        /* PS3_USER_MEMORY_MB (sys_memory.c): a development console's size. */
+        const uint32_t mb = sys_mem_user_mb();
+        if (info) { vm_write32(info + 0, mb ? mb << 20 : 0x10000000u);            /* 256 MB total */
+                    vm_write32(info + 4, mb ? (mb - 64u) << 20 : 0x0C000000u); } /* 192 MB available */
+        { static int said; if (mb && !said++) fprintf(stderr, "[sys_memory] user memory size: %u MB (PS3_USER_MEMORY_MB, a development console)\n", mb); }
         ctx->gpr[3] = 0;
         return;
     }
