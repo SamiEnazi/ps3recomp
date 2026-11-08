@@ -4033,6 +4033,8 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
 
 extern "C" uint32_t lv2_prx_boot_liblv2(void);   /* runtime/syscalls/lv2_prx.c */
 
+extern "C" int spu_jobreplay_main(void);   /* runtime/spu/spu_jobrec.c */
+
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
     /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
@@ -4040,6 +4042,16 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * the buffer for minutes and were LOST when the run was killed -- which
      * made "the log line is absent" unusable as evidence. */
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* PS3_JOBREPLAY=<dir>: the SPU job equivalence checker (runtime/spu/
+     * spu_jobrec.c) replays the job recordings in <dir> through this build's
+     * lifted SPU code instead of booting the game, and exits with 0 when every
+     * replay matched. Everything a job can see is set up by now (the lifted
+     * images registered, the ELF in guest memory for the overlay matchers). */
+    {
+        const int rc = spu_jobreplay_main();
+        if (rc >= 0) { fflush(stdout); fflush(stderr); ExitProcess((UINT)rc); }
+    }
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
 
