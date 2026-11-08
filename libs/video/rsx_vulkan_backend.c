@@ -3419,6 +3419,7 @@ typedef struct vk_eng_obj {
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u32      tag;                    /* E5: which cache made it, 0 = none   */
     u32      faces;                  /* TEXTURE: 6 = a cube (layers = faces) */
+    u32      depth;                  /* TEXTURE: > 1 = a volume (3D image)  */
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -3467,9 +3468,9 @@ static vk_eng_obj* vk_eng_get(u32 handle, int kind)
 }
 
 /* Copy `rows` rows of `w` texels from host memory into one level / layer of
- * an image that is in GENERAL. */
+ * an image that is in GENERAL (slice `z` of a 3D image's level). */
 static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
-                              size_t tight, u32 rows, const void* src, u32 row_bytes)
+                              size_t tight, u32 rows, const void* src, u32 row_bytes, u32 z)
 {
     if (tight > row_bytes) tight = row_bytes;
     if (vk_batch_on()) {
@@ -3486,6 +3487,7 @@ static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
         VkBufferImageCopy region = {
             .bufferOffset = (VkDeviceSize)so,
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+            .imageOffset = { 0, 0, (int32_t)z },
             .imageExtent = { w, h, 1 },
         };
         pvkCmdCopyBufferToImage(s_vk.cmd, s_batch.sarena.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
@@ -3501,6 +3503,7 @@ static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
         vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy region = {
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+            .imageOffset = { 0, 0, (int32_t)z },
             .imageExtent = { w, h, 1 },
         };
         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
@@ -3513,7 +3516,7 @@ static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
 static int vk_eng_upload(VkImage img, u32 layer, u32 mip, u32 w, u32 h, u32 bpp,
                          const void* src, u32 row_bytes)
 {
-    return vk_eng_upload_rows(img, layer, mip, w, h, (size_t)w * bpp, h, src, row_bytes);
+    return vk_eng_upload_rows(img, layer, mip, w, h, (size_t)w * bpp, h, src, row_bytes, 0);
 }
 
 /* NV4097 TEXTURE_CONTROL1 crossbar as a Vulkan component mapping: the shared
@@ -3998,7 +4001,69 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
     if (!o || !src || !row_bytes || !rows || face >= (o->faces ? o->faces : 1u)) return;
     /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
     const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
-    vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);   /* face = layer */
+    vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes, 0);   /* face = layer */
+}
+
+/* 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth): one 3D image
+ * of `depth` slices per level, uploaded a slice at a time, sampled through a
+ * 3D view (the pixel decompiler declares those units Texture3D, one binding
+ * each). Without these hooks a volume was its first slice sampled in 2D: for
+ * inFAMOUS 2's occlusion volumes (an 8x8x8 cone LUT) that darkened whole boxes
+ * round props, as it did on Metal before its own 3D textures. */
+static u32 vk_eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                    u32 depth, u32 mips, u32 remap, u32 rsx_fmt)
+{
+    (void)user;
+    u32 bpp;
+    const VkFormat vf = vk_eng_format(fmt, &bpp);
+    const int bc = (fmt == RSX_BE_FMT_BC1 || fmt == RSX_BE_FMT_BC2 || fmt == RSX_BE_FMT_BC3);
+    if (vf == VK_FORMAT_UNDEFINED || bc || !w || !h || !depth || w > 2048u || h > 2048u || depth > 2048u)
+        return 0;
+    if (!mips) mips = 1;
+    const u32 hd = vk_eng_alloc();
+    if (!hd) return 0;
+    vk_eng_obj* o = &s_eobj[hd];
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_3D,
+        .format = vf, .extent = { w, h, depth }, .mipLevels = mips, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    VkMemoryRequirements req;
+    u32 type;
+    if (pvkCreateImage(s_vk.device, &ici, NULL, &o->im.img) != VK_SUCCESS) goto fail;
+    pvkGetImageMemoryRequirements(s_vk.device, o->im.img, &req);
+    if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
+        vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = req.size, .memoryTypeIndex = type };
+    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS ||
+        pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS) goto fail;
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = o->im.img,
+        .viewType = VK_IMAGE_VIEW_TYPE_3D, .format = vf, .components = vk_remap(remap, rsx_fmt),
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1 } };
+    if (pvkCreateImageView(s_vk.device, &vci, NULL, &o->im.view) != VK_SUCCESS) goto fail;
+    o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->faces = 1; o->depth = depth;
+    o->bpp = bpp; o->block = 0;
+    if (vk_begin()) goto fail;
+    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (!s_batch.recording && vk_submit_and_wait()) goto fail;
+    { static int said; if (!said++) VK_LOG("engine: 3D textures in use (first %ux%ux%u, %u level(s))\n", w, h, depth, mips); }
+    return hd;
+fail:
+    vk_destroy_image(&o->im);
+    memset(o, 0, sizeof *o);
+    return 0;
+}
+
+static void vk_eng_texture_upload_3d(void* user, u32 texture, u32 z, u32 mip, u32 w, u32 h,
+                                     const void* src, u32 row_bytes)
+{
+    (void)user;
+    vk_eng_obj* o = vk_eng_get(texture, VK_ENG_TEXTURE);
+    if (!o || o->depth < 2 || !src || !row_bytes) return;
+    vk_eng_upload_rows(o->im.img, 0, mip, w, h, (size_t)w * o->bpp, h, src, row_bytes, z);
 }
 
 /* A colour target sampled with a unit's crossbar: an extra view of the same
@@ -4821,17 +4886,23 @@ static void vk_eng_image_infos(VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], VkDes
 {
     /* What the bound program declares per unit (vk_eng_decl_mask): the view
      * handed over must be of that type -- a cube for TextureCube (the bound
-     * cube, else the stand-in), the volume stand-in for Texture3D (no 3D
-     * textures yet), and never a cube where a 2D texture is read. */
+     * cube, else the stand-in), a volume for Texture3D (the bound one, else
+     * the stand-in), and never a cube or a volume where a 2D texture is read. */
     const vk_eng_pipe* EP = (s_e2.pipeline && s_e2.pipeline <= VK_ENG_MAX_PIPE) ? &s_epipe[s_e2.pipeline - 1] : NULL;
     const u32 cube_mask = EP ? EP->cube_mask : 0u, vol_mask = EP ? EP->vol_mask : 0u;
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
         const u32 h = ((s_e2.tex_mask >> u) & 1u) ? s_e2.tex[u] : 0u;
         VkImageView v = h ? vk_eng_sample_view(h) : VK_NULL_HANDLE;
         const int is_cube = h && h < VK_ENG_MAX_OBJ && s_eobj[h].kind == VK_ENG_TEXTURE && s_eobj[h].faces == 6;
+        const int is_vol  = h && h < VK_ENG_MAX_OBJ && s_eobj[h].kind == VK_ENG_TEXTURE && s_eobj[h].depth > 1;
         if ((cube_mask >> u) & 1u) { if (!v || !is_cube) v = vk_eng_dummy_view(0); }
-        else if ((vol_mask >> u) & 1u) v = vk_eng_dummy_view(1);
-        else if (is_cube) v = VK_NULL_HANDLE;           /* a cube where 2D is read: the 2D stand-in */
+        else if ((vol_mask >> u) & 1u) {
+            if (v && !is_vol) { static int said; if (said++ < 4)
+                VK_LOG("engine: unit %u reads a volume but a %ux%u 2D texture is bound (compressed volume?): black stand-in\n",
+                       u, s_eobj[h].w, s_eobj[h].h); }
+            if (!v || !is_vol) v = vk_eng_dummy_view(1);
+        }
+        else if (is_cube || is_vol) v = VK_NULL_HANDLE; /* a cube or volume where 2D is read: the 2D stand-in */
         VkSampler smp = v ? vk_eng_sampler(&s_e2.samp[u]) : s_vk.sampler;
         ii[u] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, v ? v : s_vk.dummy.view, VK_IMAGE_LAYOUT_GENERAL };
         si[u] = (VkDescriptorImageInfo){ smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
@@ -6022,6 +6093,8 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .submit_and_wait      = vk_eng_submit_and_wait,
     .texture_create       = vk_eng_texture_create,
     .texture_upload       = vk_eng_texture_upload,
+    .texture_create_3d    = vk_eng_texture_create_3d,
+    .texture_upload_3d    = vk_eng_texture_upload_3d,
     .texture_release      = vk_eng_release,
     .color_target_create  = vk_eng_color_target_create,
     .color_target_release = vk_eng_release,
@@ -6224,7 +6297,17 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
      * pipeline from the guest's programs, so without them it has nothing to
      * draw with, and the vtable's fixed-function path stays the default.
      * Either way PS3RECOMP_RSX_ENGINE=dispatch|vtable overrides. */
-    rsx_draw_engine_set_backend(&s_vk_engine_backend);
+    /* PS3RECOMP_VK_TEX3D=0 (A/B): no 3D textures -- a volume is its first
+     * slice sampled in 2D, as before vk_eng_texture_create_3d. */
+    { static rsx_draw_backend no3d;
+      const char* e = getenv("PS3RECOMP_VK_TEX3D");
+      if (e && e[0] == '0') {
+          no3d = s_vk_engine_backend; no3d.texture_create_3d = NULL; no3d.texture_upload_3d = NULL;
+          rsx_draw_engine_set_backend(&no3d);
+          VK_LOG("engine: 3D textures off (PS3RECOMP_VK_TEX3D=0)\n");
+      } else {
+          rsx_draw_engine_set_backend(&s_vk_engine_backend);
+      } }
     rsx_draw_engine_set_default(s_g.on ? 1 : 0);
     if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
         s_vk.eng_active = 1;
