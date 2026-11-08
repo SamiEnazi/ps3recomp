@@ -980,18 +980,19 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     fclose(fp);
 }
 
-/* When a save was last written: its PARAM.SFO is rewritten on every save,
- * while an NTFS directory's own time only moves when a file is added or
- * removed, so take the later of the two. 0 = no such directory. */
+/* When a save was last written: the time of its PARAM.SFO, which every save
+ * rewrites (and a copy keeps). Not the directory's own time: copying the
+ * saves folder (a backup restored, a test's -SaveFrom) stamps every directory
+ * with the copy time, and the save copied last then counted as the newest
+ * (pl-cont2 continued from the older manual save). The directory's time only
+ * when there is no PARAM.SFO. 0 = no such directory. */
 static s64 save_mtime(const char* save_path)
 {
     HOST_STAT_T st;
-    s64 t = 0;
     char sfo[1024];
-    if (HOST_STAT(save_path, &st) == 0) t = (s64)st.st_mtime;
     snprintf(sfo, sizeof sfo, "%s/PARAM.SFO", save_path);
-    if (HOST_STAT(sfo, &st) == 0 && (s64)st.st_mtime > t) t = (s64)st.st_mtime;
-    return t;
+    if (HOST_STAT(sfo, &st) == 0) return (s64)st.st_mtime;
+    return HOST_STAT(save_path, &st) == 0 ? (s64)st.st_mtime : 0;
 }
 
 /* The directory list the way the system utility hands it to a List/Fixed
