@@ -2565,7 +2565,19 @@ static int16_t s_ovl_ix_ea[4096], s_ovl_ix_sig[4096], s_ovl_ix_next[SPU_OVL_SRC_
 static int16_t s_ovl_ix_lift[SPU_OVL_SRC_MAX];
 static int     s_ovl_ix_nlift;
 static inline unsigned ovl_ea_hash(uint32_t ea) { return (ea * 2654435761u) >> 20; }
+/* One builder at a time: the first GETs arrive on every SPU thread at once, and two
+ * threads prepending the same source to a chain made it point at itself (a replay
+ * crashed in the walk, 2026-11-08). Readers use the chains only once s_ovl_summary_n
+ * (published last, with release) matches, and every walk is bounded. */
+static SRWLOCK s_ovl_ix_lock = SRWLOCK_INIT;
+static void ovl_summary_build(int n);
 static void ovl_summary_rebuild(int n)
+{
+    AcquireSRWLockExclusive(&s_ovl_ix_lock);
+    if (__atomic_load_n(&s_ovl_summary_n, __ATOMIC_ACQUIRE) != n) ovl_summary_build(n);
+    ReleaseSRWLockExclusive(&s_ovl_ix_lock);
+}
+static void ovl_summary_build(int n)
 {
     memset(s_ovl_ea_bits, 0, sizeof s_ovl_ea_bits);
     memset(s_ovl_sig_bits, 0, sizeof s_ovl_sig_bits);
@@ -2780,14 +2792,21 @@ static void spu_overlay_note_get_full(spu_context* ctx, uint32_t ea, const uint8
         }
     }
     if (ovl_cannot_match(ea, ls, lsa, size)) return;
-    if (ovl_index_on()) {      /* PS3_SPU_OVL_INDEX: only the sources the GET can hit */
+    const int n_now = s_ovl_src_count;
+    if (ovl_index_on() && __atomic_load_n(&s_ovl_summary_n, __ATOMIC_ACQUIRE) == n_now) {
+        /* PS3_SPU_OVL_INDEX: only the sources the GET can hit (an index being
+         * rebuilt -- a source registered late -- sends this GET to the walk) */
         int16_t cand[SPU_OVL_SRC_MAX]; int nc = 0;
-        for (int i = s_ovl_ix_ea[ovl_ea_hash(ea)]; i >= 0; i = s_ovl_ix_next[i]) cand[nc++] = (int16_t)i;
+        for (int i = s_ovl_ix_ea[ovl_ea_hash(ea)]; i >= 0 && i < n_now && nc < SPU_OVL_SRC_MAX; i = s_ovl_ix_next[i])
+            cand[nc++] = (int16_t)i;
         if (size >= 512) {
             uint32_t w; memcpy(&w, ls, 4);
-            for (int i = s_ovl_ix_sig[ovl_ea_hash(w)]; i >= 0; i = s_ovl_ix_next[i]) cand[nc++] = (int16_t)i;
+            for (int i = s_ovl_ix_sig[ovl_ea_hash(w)]; i >= 0 && i < n_now && nc < SPU_OVL_SRC_MAX; i = s_ovl_ix_next[i])
+                cand[nc++] = (int16_t)i;
         }
-        for (int k = 0; k < s_ovl_ix_nlift; k++) cand[nc++] = s_ovl_ix_lift[k];
+        for (int k = 0; k < s_ovl_ix_nlift && nc < SPU_OVL_SRC_MAX; k++) cand[nc++] = s_ovl_ix_lift[k];
+        if (nc >= SPU_OVL_SRC_MAX || __atomic_load_n(&s_ovl_summary_n, __ATOMIC_ACQUIRE) != n_now)
+            goto walk;                  /* changed under us: the walk is always right */
         for (int a = 1; a < nc; a++) {          /* table order: the walk's first hit */
             const int16_t v = cand[a]; int q = a;
             while (q > 0 && cand[q - 1] > v) { cand[q] = cand[q - 1]; q--; }
@@ -2797,6 +2816,7 @@ static void spu_overlay_note_get_full(spu_context* ctx, uint32_t ea, const uint8
             if (ovl_try_source(ctx, &s_ovl_src[cand[k]], ea, lsa, ls, size)) return;
         return;
     }
+walk:
     for (int i = 0; i < s_ovl_src_count; i++)
         if (ovl_try_source(ctx, &s_ovl_src[i], ea, lsa, ls, size)) return;
 }
