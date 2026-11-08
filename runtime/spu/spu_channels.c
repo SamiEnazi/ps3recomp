@@ -1690,8 +1690,18 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
+/* PS3_SPU_RDCH_INLINE (spu_helpers.h, lifted TUs): -1 until the first spu_rdch. */
+int g_spu_rdch_inline = -1;
+static __attribute__((noinline, cold)) void spu_rdch_inline_init(void)
+{
+    const char* e = getenv("PS3_SPU_RDCH_INLINE");
+    const int on = !(e && e[0] == '0') && spu_ch_lean() && !getenv("SPU_CHHIST") && !getenv("SPU_POLLTRACE");
+    __atomic_store_n(&g_spu_rdch_inline, on, __ATOMIC_RELAXED);
+}
+
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    if (__builtin_expect(g_spu_rdch_inline < 0, 0)) spu_rdch_inline_init();
     /* A recorded job's channel reads are logged; a replayed one's are served or
      * checked (spu_jobrec.h). */
     if (__builtin_expect(g_spu_jobrec_mode != 0, 0)) {

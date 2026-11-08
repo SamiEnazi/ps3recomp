@@ -2286,6 +2286,19 @@ static inline __attribute__((always_inline)) void spu_wrch_inl(spu_context* ctx,
     spu_wrch(ctx, ch, v);
 }
 #define spu_wrch(ctx, ch, v) spu_wrch_inl((ctx), (ch), (v))
+/* PS3_SPU_RDCH_INLINE (default 1): the same for the two MFC status reads of every DMA wait and
+ * atomic (MFC_RdTagStat, MFC_RdAtomicStat: context fields under PS3_SPU_CH_LEAN). Published by
+ * spu_rdch's first call (CH_LEAN on, SPU_CHHIST / SPU_POLLTRACE unset); recorder off only. */
+u128 spu_rdch(spu_context* ctx, uint32_t channel);
+extern int g_spu_rdch_inline;
+static inline __attribute__((always_inline)) u128 spu_rdch_inl(spu_context* ctx, uint32_t ch)
+{
+    if (__builtin_constant_p(ch) && (ch == MFC_RdTagStat || ch == MFC_RdAtomicStat) &&
+        __builtin_expect(g_spu_rdch_inline > 0 && !g_spu_jobrec_mode, 1))
+        return spu_make_preferred_u32(ch == MFC_RdTagStat ? ctx->mfc_tag_status : ctx->atomic_stat);
+    return spu_rdch(ctx, ch);
+}
+#define spu_rdch(ctx, ch) spu_rdch_inl((ctx), (ch))
 #endif
 
 /* PS3_SPU_DRAIN_INLINE (default 1; lifted TUs only, spu3 2026-11-08): the call drain after every
