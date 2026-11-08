@@ -5017,6 +5017,38 @@ static void sink_end(void* user, const rsx_dispatch* r)
                       float v4[4]; memcpy(v4, g.rsx.constants[c], sizeof v4);
                       fprintf(stderr, "[hudlog]   c[%u] = (%g %g %g %g)\n", c, v4[0], v4[1], v4[2], v4[3]); }
           } } }
+    /* PS3RECOMP_FX_LOG=1 (diagnostic): once a second, how strong the game's
+     * DOF/edge-blur pass is (ENG_DOF_BLEND_FP): the largest edge weight of its
+     * screen mesh (vertex attribute 8, the tc0.z the pass reads; "cached" =
+     * the vertices did not change since they were last read), and the depth
+     * of field strengths c4.x / c5.x. */
+    { static int on = -1; if (on < 0) on = getenv("PS3RECOMP_FX_LOG") ? 1 : 0;
+      const eng_fp_memo* xfm = NULL;
+      if (on && eng_guest_programs(NULL, &xfm) && xfm && xfm->structural == ENG_DOF_BLEND_FP) {
+          extern unsigned long long ps3_ms_now(void);
+          static unsigned long long t0, last; static float emax = -1.0f, dmax; static u32 draws, nread;
+          if (!t0) t0 = ps3_ms_now();
+          const s8 es = layout.slot_by_attr[8];
+          if (es >= 0 && dc.verts && !(dc.vbuf_hit && indexed)) {
+              float e = 0.0f;
+              for (u32 v = 0; v < uploaded_hud_n(dc.n_verts, n_draw, indexed); v++) {
+                  const float* q = (const float*)((const u8*)dc.verts + (size_t)v * layout.stride + (size_t)es * 16u);
+                  if (fabsf(q[0]) > e) e = fabsf(q[0]);
+              }
+              if (e > emax) emax = e;
+              nread++;
+          }
+          if (g.fp_constants->count > 5u) { const float* k = (const float*)g.fp_cb;
+              if (k[16] > dmax) dmax = k[16]; if (k[20] > dmax) dmax = k[20]; }
+          draws++;
+          const unsigned long long now = ps3_ms_now();
+          if (now - last >= 1000ull) {
+              if (emax >= 0.0f) fprintf(stderr, "[fxlog] t=%.0f s (clock %.1f) DOF pass x%u: edge weight max %.3f, dof strength max %.3f\n",
+                                        (double)(now - t0) / 1000.0, (double)now / 1000.0, draws, emax, dmax);
+              else fprintf(stderr, "[fxlog] t=%.0f s (clock %.1f) DOF pass x%u: edge weight cached, dof strength max %.3f\n",
+                           (double)(now - t0) / 1000.0, (double)now / 1000.0, draws, dmax);
+              last = now; emax = -1.0f; dmax = 0.0f; draws = nread = 0;
+          } } }
     /* PS3_ASPECT_HUD_AFTER=<fp hex>[,<fp hex>..]: the title's 2D overlay for
      * a backend rendering wide (PS3_ASPECT, set_hud). The listed fragment
      * programs are the title's last full-screen pass of a 3D frame (its
