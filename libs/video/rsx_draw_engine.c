@@ -799,6 +799,31 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
     return g.tex_staging;
 }
 
+/* A 1024-bit filter over the colour targets' (location, offset), rebuilt
+ * when a slot is (re)assigned (eng_surface_get is the only writer): 0 means no
+ * target is at that address, so a texture unit's search over every target can
+ * be skipped. A stale filter only errs towards 1. PS3RECOMP_ENG_SURF_FILTER=0:
+ * always search. */
+static u32 s_surf_gen, s_surf_filter_gen = ~0u;
+static u64 s_surf_filter[16];
+static u32 eng_surf_hash(u32 location, u32 offset) { return ((offset ^ (location << 30)) * 0x9E3779B1u) >> 22; }
+static int eng_surface_maybe(u32 location, u32 offset)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_SURF_FILTER"); on = !(e && e[0] == '0'); }
+    if (!on) return 1;
+    if (s_surf_filter_gen != s_surf_gen) {
+        memset(s_surf_filter, 0, sizeof s_surf_filter);
+        for (u32 i = 0; i < g.n_surfaces; i++) {
+            const u32 h = eng_surf_hash(g.surfaces[i].location, g.surfaces[i].offset);
+            s_surf_filter[h >> 6] |= 1ull << (h & 63u);
+        }
+        s_surf_filter_gen = s_surf_gen;
+    }
+    const u32 h = eng_surf_hash(location, offset);
+    return (int)((s_surf_filter[h >> 6] >> (h & 63u)) & 1u);
+}
+
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
  * rsx_live_draw.c's surface_get (2605-2690). */
@@ -853,6 +878,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
 
     eng_surface* s = &g.surfaces[slot];
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+    s_surf_gen++;                            /* eng_surface_maybe's filter */
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
     s->handle = handle;
@@ -4300,6 +4326,9 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          * this draw writes -- reading a target a pass is writing is undefined
          * on every API, and an MRT set writes more than one of them. */
         int sampled = -1, own_hit = 0, own_slot = -1;
+        /* eng_surface_maybe: no target at this address at all -> the search
+         * below finds nothing (most units sample plain textures). */
+        if (eng_surface_maybe(t.location, t.offset))
         for (u32 i = 0; i < g.n_surfaces; i++) {
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
