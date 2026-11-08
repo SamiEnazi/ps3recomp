@@ -1,5 +1,6 @@
 /*
- * ps3recomp - Vulkan command recording on a second thread (PS3RECOMP_VK_THREADED).
+ * ps3recomp - Vulkan command recording on a second thread (PS3RECOMP_VK_THREADED, default
+ * on; =0 records on the RSX thread as before).
  *
  * Included once by rsx_vulkan_backend.c, after its entry-point pointers. With
  * the switch on (and draw batching on, the default), every vkCmd* the backend
@@ -540,15 +541,15 @@ static VkResult VKAPI_CALL tq_vkQueueSubmit(VkQueue q, u32 n, const VkSubmitInfo
     return rvkQueueSubmit(q, n, si, f);
 }
 
-/* After the device entry points are loaded: PS3RECOMP_VK_THREADED=1 (=2: worker
- * pinned to the E-cores) swaps the
+/* After the device entry points are loaded: PS3RECOMP_VK_THREADED (default on;
+ * =0 off, =2 worker pinned to the E-cores) swaps the
  * thunks in and starts the worker. Needs draw batching (PS3RECOMP_VK_BATCH,
  * default on): unbatched, every operation is its own submit anyway. */
 static void vk_tq_install(void)
 {
     const char* e = getenv("PS3RECOMP_VK_THREADED");
     const char* b = getenv("PS3RECOMP_VK_BATCH");
-    if (!(e && (e[0] == '1' || e[0] == '2')) || (b && b[0] == '0')) return;
+    if ((e && e[0] == '0') || (b && b[0] == '0')) return;   /* default on (2026-11-08) */
     s_tq.ring = (u8*)VirtualAlloc(NULL, TQ_RING_BYTES + 4096u, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!s_tq.ring) return;
 #define TQ_SAVE(name) r##name = p##name;
@@ -558,7 +559,7 @@ static void vk_tq_install(void)
     s_tq.thread = CreateThread(NULL, 0, tq_worker, NULL, 0, NULL);
     if (!s_tq.thread) { VirtualFree(s_tq.ring, 0, MEM_RELEASE); s_tq.ring = NULL; return; }
     SetThreadPriority(s_tq.thread, GetThreadPriority(GetCurrentThread()));
-    if (atoi(e) == 2) {                /* =2: the worker on the E-cores (hybrid CPUs) */
+    if (e && atoi(e) == 2) {                /* =2: the worker on the E-cores (hybrid CPUs) */
         ULONG len = 0;
         GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
         u8* buf = len ? (u8*)malloc(len) : NULL;
@@ -587,7 +588,7 @@ static void vk_tq_install(void)
 #undef TQ_SWAP
     s_tq.running = 1;
     s_tq.on = 1;
-    fprintf(stderr, "[RSX vulkan] threaded command recording on (PS3RECOMP_VK_THREADED=1, %u MB ring)\n",
+    fprintf(stderr, "[RSX vulkan] threaded command recording on (PS3RECOMP_VK_THREADED=0 = off, %u MB ring)\n",
             TQ_RING_BYTES >> 20);
 }
 

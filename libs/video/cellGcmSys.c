@@ -1919,7 +1919,9 @@ void cellGcm_ref_on_poll(void)
      * loading's fence storms clear in seconds, not minutes). */
     static LARGE_INTEGER s_freq;
     static volatile LONGLONG s_last_pub;
-    /* GCM_REF_SOLO (default 1; 0 = pace every value): while ONE thread is the
+    /* GCM_REF_SOLO=1 (default off -- GCM_REF_STATS in the city: > 99.9% of the
+     * reads find nothing queued, the RSX thread has not reached the fence, so
+     * the pacing is not what the main thread waits for): while ONE thread is the
      * only one reading the ref -- no other thread read it for a whole pacing
      * gap -- each of its reads may advance one queued fence. It reads every
      * value it publishes (the read follows this call), and any other waiter
@@ -1931,7 +1933,7 @@ void cellGcm_ref_on_poll(void)
     static int s_solo_on = -1;
     static volatile LONG s_rp_tid;
     static volatile LONGLONG s_rp_multi;
-    if (s_solo_on < 0) { const char* e = getenv("GCM_REF_SOLO"); s_solo_on = !(e && e[0] == '0'); }
+    if (s_solo_on < 0) { const char* e = getenv("GCM_REF_SOLO"); s_solo_on = e && e[0] == '1'; }
     if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     const LONG tid = (LONG)GetCurrentThreadId();
