@@ -21,6 +21,7 @@
 #include "spu_lockstep.h"
 #include "spu_jobrec.h"     /* PS3_JOBREC / PS3_JOBREPLAY / PS3_JOBSTAT */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+#include "spu_fastjmp.h"   /* PS3_SPU_FASTJMP: SPU_SETJMP / SPU_LONGJMP without the SEH unwind */
 #include "ps3emu/ps3_ftrace.h"
 #include "ps3emu/ps3_toggles.h"   /* PS3_TOGGLE_FILE: live knobs */
 #include <stdint.h>
@@ -235,6 +236,106 @@ void spu_ls_watch_dump(const char* why)
 
 static SPU_TLS jmp_buf s_spu_halt_env;
 static SPU_TLS int     s_spu_halt_armed = 0;
+
+#if SPU_FASTJMP_AVAILABLE
+/* PS3_SPU_FASTJMP (spu_fastjmp.h). -1 until the first SPU_SETJMP / SPU_LONGJMP;
+ * every thread that races the first read computes the same value (the
+ * environment and the process mitigation policy do not change), so a buffer is
+ * never set by one form and taken by the other. */
+static int s_fastjmp = -1;
+static __attribute__((noinline, cold)) int spu_fastjmp_init(void)
+{
+    const char* e = getenv("PS3_SPU_FASTJMP");
+    int on = !(e && e[0] == '0');
+    if (on) {   /* hardware shadow stacks: only the UCRT's NtContinue path keeps them right */
+        PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY ssp;
+        memset(&ssp, 0, sizeof ssp);
+        if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessUserShadowStackPolicy, &ssp, sizeof ssp) &&
+            ssp.EnableUserShadowStack)
+            on = 0;
+    }
+    static int s_said;
+    if (!__atomic_exchange_n(&s_said, 1, __ATOMIC_ACQ_REL))
+        fprintf(stderr, "[spu] setjmp/longjmp: %s (PS3_SPU_FASTJMP)\n",
+                on ? "register restore, no SEH unwind" : "UCRT (SEH unwind + NtContinue)");
+    __atomic_store_n(&s_fastjmp, on, __ATOMIC_RELAXED);
+    return on;
+}
+int spu_fastjmp_on(void)
+{
+    const int v = __atomic_load_n(&s_fastjmp, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : spu_fastjmp_init();
+}
+/* The jmp_buf layout (0x100 of its 256 bytes): rbx rbp rsi rdi r12 r13 r14 r15
+ * at 0x00..0x38, rsp after the setjmp returns at 0x40, the return address at
+ * 0x48, MXCSR at 0x50, the x87 control word at 0x54, xmm6..xmm15 at 0x60..0xF0.
+ * spu_fast_setjmp is a leaf that never moves rsp, so it needs no unwind data;
+ * spu_fast_longjmp never returns and is never unwound through. */
+__asm__(
+    "  .att_syntax prefix\n"      /* clang-cl parses module asm as Intel by default */
+    "  .text\n"
+    "  .p2align 4\n"
+    "  .globl spu_fast_setjmp\n"
+    "  .def spu_fast_setjmp; .scl 2; .type 32; .endef\n"
+    "spu_fast_setjmp:\n"
+    "  movq %rbx, 0x00(%rcx)\n"
+    "  movq %rbp, 0x08(%rcx)\n"
+    "  movq %rsi, 0x10(%rcx)\n"
+    "  movq %rdi, 0x18(%rcx)\n"
+    "  movq %r12, 0x20(%rcx)\n"
+    "  movq %r13, 0x28(%rcx)\n"
+    "  movq %r14, 0x30(%rcx)\n"
+    "  movq %r15, 0x38(%rcx)\n"
+    "  leaq 8(%rsp), %rdx\n"
+    "  movq %rdx, 0x40(%rcx)\n"
+    "  movq (%rsp), %rdx\n"
+    "  movq %rdx, 0x48(%rcx)\n"
+    "  stmxcsr 0x50(%rcx)\n"
+    "  fnstcw 0x54(%rcx)\n"
+    "  movdqu %xmm6, 0x60(%rcx)\n"
+    "  movdqu %xmm7, 0x70(%rcx)\n"
+    "  movdqu %xmm8, 0x80(%rcx)\n"
+    "  movdqu %xmm9, 0x90(%rcx)\n"
+    "  movdqu %xmm10, 0xA0(%rcx)\n"
+    "  movdqu %xmm11, 0xB0(%rcx)\n"
+    "  movdqu %xmm12, 0xC0(%rcx)\n"
+    "  movdqu %xmm13, 0xD0(%rcx)\n"
+    "  movdqu %xmm14, 0xE0(%rcx)\n"
+    "  movdqu %xmm15, 0xF0(%rcx)\n"
+    "  xorl %eax, %eax\n"
+    "  ret\n"
+    "  .p2align 4\n"
+    "  .globl spu_fast_longjmp\n"
+    "  .def spu_fast_longjmp; .scl 2; .type 32; .endef\n"
+    "spu_fast_longjmp:\n"
+    "  movl %edx, %eax\n"
+    "  testl %eax, %eax\n"
+    "  jnz 1f\n"
+    "  movl $1, %eax\n"
+    "1:\n"
+    "  movq 0x00(%rcx), %rbx\n"
+    "  movq 0x08(%rcx), %rbp\n"
+    "  movq 0x10(%rcx), %rsi\n"
+    "  movq 0x18(%rcx), %rdi\n"
+    "  movq 0x20(%rcx), %r12\n"
+    "  movq 0x28(%rcx), %r13\n"
+    "  movq 0x30(%rcx), %r14\n"
+    "  movq 0x38(%rcx), %r15\n"
+    "  ldmxcsr 0x50(%rcx)\n"
+    "  fldcw 0x54(%rcx)\n"
+    "  movdqu 0x60(%rcx), %xmm6\n"
+    "  movdqu 0x70(%rcx), %xmm7\n"
+    "  movdqu 0x80(%rcx), %xmm8\n"
+    "  movdqu 0x90(%rcx), %xmm9\n"
+    "  movdqu 0xA0(%rcx), %xmm10\n"
+    "  movdqu 0xB0(%rcx), %xmm11\n"
+    "  movdqu 0xC0(%rcx), %xmm12\n"
+    "  movdqu 0xD0(%rcx), %xmm13\n"
+    "  movdqu 0xE0(%rcx), %xmm14\n"
+    "  movdqu 0xF0(%rcx), %xmm15\n"
+    "  movq 0x40(%rcx), %rsp\n"
+    "  jmpq *0x48(%rcx)\n");
+#endif
 
 /* A non-local return replaces the old host call chain without changing
  * any architectural registers, local store, or pending guest work. */
@@ -519,14 +620,37 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 #define SPU_MAX_CONTEXTS 128
 
 /* `ctx` is read with no lock by every lookup and written by claim/release:
- * atomic, release on publish so the initialised engine is seen with it. */
+ * atomic, release on publish so the initialised engine is seen with it.
+ *
+ * PS3_SPU_MFC_PAD (default 1): one slot per 64-byte line group. A slot is 528
+ * bytes, so packed, three slots in four began in the line that held the
+ * previous slot's tag_completed -- which that slot's SPU writes on every DMA --
+ * and every MFC channel access of the next slot's SPU (mfc_for reads `ctx` on
+ * each of them) missed on a line another core kept taking back. Layout only:
+ * what is stored in a slot is unchanged. 0 = packed as before. The stride is
+ * fixed at the first lookup, before any slot is claimed. */
 typedef struct {
     spu_context* ctx;
     mfc_engine   mfc;
 } spu_mfc_slot;
 
-static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
+#define SPU_MFC_SLOT_PADDED (((sizeof(spu_mfc_slot) + 63u) / 64u) * 64u)
+static _Alignas(64) uint8_t s_mfc_store[SPU_MAX_CONTEXTS * SPU_MFC_SLOT_PADDED];
+static size_t       s_mfc_stride;            /* 0 until the first lookup */
 static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
+static __attribute__((noinline, cold)) size_t spu_mfc_stride_init(void)
+{
+    const char* e = getenv("PS3_SPU_MFC_PAD");
+    const size_t s = (e && e[0] == '0') ? sizeof(spu_mfc_slot) : SPU_MFC_SLOT_PADDED;
+    __atomic_store_n(&s_mfc_stride, s, __ATOMIC_RELAXED);   /* every racer computes the same */
+    return s;
+}
+static inline spu_mfc_slot* mfc_slot(int i)
+{
+    size_t s = __atomic_load_n(&s_mfc_stride, __ATOMIC_RELAXED);
+    if (__builtin_expect(!s, 0)) s = spu_mfc_stride_init();
+    return (spu_mfc_slot*)(s_mfc_store + (size_t)i * s);
+}
 
 /* spu_dma.h: PS3_SPU_DMA_LEAN. 1 until the toggle is read (the first
  * spu_wrch reads it). */
@@ -549,13 +673,13 @@ static mfc_engine* mfc_for(spu_context* ctx)
     /* PS3_SPU_DMA_LEAN: the slot this context held last time, if it still
      * does -- the scan below walked up to 128 slots per channel write. */
     if (__builtin_expect(g_spu_dma_lean, 1) && ctx->mfc_hint) {
-        spu_mfc_slot* hs = &s_mfc_slots[ctx->mfc_hint - 1];
+        spu_mfc_slot* hs = mfc_slot((int)ctx->mfc_hint - 1);
         if (__atomic_load_n(&hs->ctx, __ATOMIC_ACQUIRE) == ctx) return &hs->mfc;
     }
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (__atomic_load_n(&s_mfc_slots[i].ctx, __ATOMIC_ACQUIRE) == ctx) {
+        if (__atomic_load_n(&mfc_slot(i)->ctx, __ATOMIC_ACQUIRE) == ctx) {
             ctx->mfc_hint = (uint32_t)i + 1;
-            return &s_mfc_slots[i].mfc;
+            return &mfc_slot(i)->mfc;
         }
 
     /* No slot yet: take one. The engine is initialized before the slot is
@@ -563,10 +687,11 @@ static mfc_engine* mfc_for(spu_context* ctx)
     mfc_engine* e = NULL;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (int i = 0; i < SPU_MAX_CONTEXTS && !e; i++) {
-        if (__atomic_load_n(&s_mfc_slots[i].ctx, __ATOMIC_RELAXED) != NULL) continue;
-        mfc_engine_init(&s_mfc_slots[i].mfc);
-        __atomic_store_n(&s_mfc_slots[i].ctx, ctx, __ATOMIC_RELEASE);
-        e = &s_mfc_slots[i].mfc;
+        spu_mfc_slot* sl = mfc_slot(i);
+        if (__atomic_load_n(&sl->ctx, __ATOMIC_RELAXED) != NULL) continue;
+        mfc_engine_init(&sl->mfc);
+        __atomic_store_n(&sl->ctx, ctx, __ATOMIC_RELEASE);
+        e = &sl->mfc;
         ctx->mfc_hint = (uint32_t)i + 1;
     }
     if (!e) {
@@ -605,8 +730,8 @@ void spu_mfc_release(spu_context* ctx)
     if (!ctx) return;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        if (__atomic_load_n(&s_mfc_slots[i].ctx, __ATOMIC_RELAXED) != ctx) continue;
-        __atomic_store_n(&s_mfc_slots[i].ctx, NULL, __ATOMIC_RELEASE);
+        if (__atomic_load_n(&mfc_slot(i)->ctx, __ATOMIC_RELAXED) != ctx) continue;
+        __atomic_store_n(&mfc_slot(i)->ctx, NULL, __ATOMIC_RELEASE);
         break;
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
@@ -1106,6 +1231,43 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
     }
 }
 
+/* PS3_SPU_FENCE_LEAN (default 1): every MFC_Cmd write came through
+ * spu_mfc_atomic below, so a plain GET/PUT paid two full fences around an
+ * atomic body that returns at once for it, and then mfc_submit's own two --
+ * four mfences per DMA, ~2.5 million DMAs a second in combat. The body touches
+ * no memory for a non-lock-line command (its first test returns 0), so its
+ * pair of fences orders nothing that mfc_submit's pair, run right after with
+ * only this SPU's private engine fields in between, does not already order:
+ * skipping them leaves the same fences between any two guest memory accesses.
+ * Lock-line commands keep theirs. 0 = the fences on every command as before. */
+static int s_fence_lean = -1;
+static __attribute__((noinline, cold)) int spu_fence_lean_init(void)
+{
+    const char* e = getenv("PS3_SPU_FENCE_LEAN");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_fence_lean, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int spu_fence_lean(void)
+{
+    const int v = __atomic_load_n(&s_fence_lean, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : spu_fence_lean_init();
+}
+
+static int s_ch_lean = -1;   /* PS3_SPU_CH_LEAN (spu_wrch) */
+static __attribute__((noinline, cold)) int spu_ch_lean_init(void)
+{
+    const char* e = getenv("PS3_SPU_CH_LEAN");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_ch_lean, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int spu_ch_lean(void)
+{
+    const int v = __atomic_load_n(&s_ch_lean, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : spu_ch_lean_init();
+}
+
 /* Lock-line commands are ordered like every MFC command (see mfc_submit). */
 static inline __attribute__((always_inline)) int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -1114,6 +1276,9 @@ static inline __attribute__((always_inline)) int spu_mfc_atomic(spu_context* ctx
         if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_atomic(ctx, cmd, &handled))
             return handled;
     }
+    if (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD && cmd != MFC_PUTLLUC_CMD &&
+        cmd != MFC_PUTQLLUC_CMD && spu_fence_lean())
+        return 0;   /* not a lock-line command: spu_mfc_atomic_body would return 0 untouched */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     int r = spu_mfc_atomic_body(ctx, cmd);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -1164,6 +1329,22 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
             return;
+        /* PS3_SPU_CH_LEAN (default 1): the parameter channels only latch a
+         * context field (mfc_channel_write's own cases, verbatim) -- five of
+         * the ~eight writes of every DMA, each of which looked up the MFC
+         * engine it never touches. The engine is still claimed at the first
+         * command or tag operation that uses it. 0 = every write looks it up. */
+        if (__builtin_expect(spu_ch_lean(), 1)) {
+            switch (channel) {
+            case MFC_LSA:       ctx->mfc_lsa = v; return;
+            case MFC_EAH:       ctx->mfc_eah = v; return;
+            case MFC_EAL:       ctx->mfc_eal = v; return;
+            case MFC_Size:      ctx->mfc_size = v; return;
+            case MFC_TagID:     ctx->mfc_tag = v & 0x1F; return;
+            case MFC_WrTagMask: ctx->mfc_tag_mask = v; return;
+            default: break;
+            }
+        }
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
         /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
          * DMA completes synchronously, so the instant the program arms tag
@@ -1349,6 +1530,43 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
     t_ft_busy0 = t1;
 }
 
+/* PS3_SPU_SPIN_US=<n> (default 0 = off): before an SPU thread sleeps on a
+ * channel, poll it for up to n microseconds. In combat each SPU thread blocks
+ * ~2000 times a second and most waits are short, so the job that ends one
+ * arrives while the thread is still going to sleep -- and then waits for the OS
+ * wake-up (an IPI, a context switch, a C-state exit) before it starts. The
+ * polls are the same readiness test the sleep loop makes; when the time runs
+ * out the thread sleeps exactly as before, so no wake-up can be lost. */
+static int s_spin_us = -1;
+static __attribute__((noinline, cold)) int spu_spin_us_init(void)
+{
+    const char* e = getenv("PS3_SPU_SPIN_US");
+    int v = e ? atoi(e) : 0;
+    if (v < 0) v = 0;
+    if (v > 1000) v = 1000;
+    __atomic_store_n(&s_spin_us, v, __ATOMIC_RELAXED);
+    return v;
+}
+static int spu_ch_ready(spu_context* ctx, uint32_t channel);
+/* 1 = the channel became ready (or a stop was requested) while polling. */
+static int spu_ch_spin(spu_context* ctx, uint32_t channel)
+{
+    int us = __atomic_load_n(&s_spin_us, __ATOMIC_RELAXED);
+    if (__builtin_expect(us < 0, 0)) us = spu_spin_us_init();
+    if (!us) return 0;
+    static LARGE_INTEGER s_qpf;
+    if (!s_qpf.QuadPart) QueryPerformanceFrequency(&s_qpf);
+    LARGE_INTEGER t0, t;
+    QueryPerformanceCounter(&t0);
+    const long long end = t0.QuadPart + s_qpf.QuadPart * us / 1000000;
+    do {
+        for (int k = 0; k < 8; k++) _mm_pause();
+        if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED) || spu_ch_ready(ctx, channel)) return 1;
+        QueryPerformanceCounter(&t);
+    } while (t.QuadPart < end);
+    return 0;
+}
+
 /* Block the calling SPU host thread until `channel` is readable. */
 static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 {
@@ -1365,6 +1583,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
+        int spun = 0;
         while (!spu_ch_ready(ctx, channel)) {
             if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED)) {
                 /* The group was terminated while this SPU waited: stop here.
@@ -1376,6 +1595,9 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                 spu_halt(ctx);
                 return;
             }
+            /* PS3_SPU_SPIN_US: poll before the first sleep; a hit re-tests
+             * the loop condition (and the stop request) above. */
+            if (!spun) { spun = 1; if (spu_ch_spin(ctx, channel)) continue; }
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             if (!spu_ch_ready(ctx, channel))
                 SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
@@ -1439,6 +1661,12 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             (unsigned long long)s_c[8],(unsigned long long)s_c[9]); } }
 
     if (channel_is_mfc(channel)) {
+        /* PS3_SPU_CH_LEAN: the two status reads of every DMA wait / atomic are
+         * context fields (mfc_channel_read's own cases); no engine lookup. */
+        if (__builtin_expect(spu_ch_lean(), 1)) {
+            if (channel == MFC_RdTagStat)    return spu_make_preferred_u32(ctx->mfc_tag_status);
+            if (channel == MFC_RdAtomicStat) return spu_make_preferred_u32(ctx->atomic_stat);
+        }
         v = mfc_channel_read(mfc_for(ctx), ctx, channel);
         return spu_make_preferred_u32(v);
     }
@@ -2291,7 +2519,46 @@ static inline int ovl_cannot_match(uint32_t ea, const uint8_t* ls, uint32_t lsa,
     return 1;
 }
 
+static void spu_overlay_note_get_full(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size);
+
+/* PS3_SPU_OVL_FAST (default 1): every DMA GET (~2 million a second in combat)
+ * comes here, and nearly all of them land on no resident code span and can
+ * match no overlay source -- for which the full function below does nothing,
+ * after a 0x2C8-byte frame with eight saved registers and a stack cookie and
+ * its diagnostics' checks. This small one makes exactly those two tests first
+ * (a GET that overlaps no resident span leaves the eviction loop with nothing
+ * to do; ovl_cannot_match is the full function's own early return) and hands
+ * every other GET, unchanged, to the full function. Off with SPU_GET_RANGE /
+ * SPU_DUMP_OVL (they log GETs the fast test would skip). 0 = always the full
+ * function. */
+static int s_ovl_fast = -1;
+static __attribute__((noinline, cold)) int spu_ovl_fast_init(void)
+{
+    const char* e = getenv("PS3_SPU_OVL_FAST");
+    const int on = !(e && e[0] == '0') && !getenv("SPU_GET_RANGE") && !getenv("SPU_DUMP_OVL");
+    __atomic_store_n(&s_ovl_fast, on, __ATOMIC_RELAXED);
+    return on;
+}
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
+{
+    int fast = __atomic_load_n(&s_ovl_fast, __ATOMIC_RELAXED);
+    if (__builtin_expect(fast < 0, 0)) fast = spu_ovl_fast_init();
+    if (fast) {
+        const uint32_t lsa = (uint32_t)(ls - ctx->ls);
+        int overlap = 0;
+        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+            if (!ctx->resident_code[slot].image_id) continue;
+            const uint32_t base = ctx->resident_code[slot].lsa;
+            const uint32_t end = base + ctx->resident_code[slot].size;
+            if (lsa < end && lsa + size > base) { overlap = 1; break; }
+        }
+        if (!overlap && ovl_cannot_match(ea, ls, lsa, size)) return;
+    }
+    spu_overlay_note_get_full(ctx, ea, ls, size);
+}
+
+static void spu_overlay_note_get_full(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     /* SPU_GET_RANGE=<lo>:<hi> (hex EAs): log each distinct GET (ea, LS, size) from
@@ -2595,6 +2862,20 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
  * the small instruction set such stubs use, and exit back into lifted code at
  * the first branch (trampoline re-dispatch). Returns 1 if it executed to a
  * branch, 0 on an unknown opcode (caller falls through to BRANCH-TO-0). */
+static int s_micro_qa = -1;
+static __attribute__((noinline, cold)) int spu_micro_qa_init(void)
+{
+    const char* e = getenv("PS3_SPU_MICRO_QA");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_micro_qa, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int spu_micro_qa_on(void)
+{
+    const int v = __atomic_load_n(&s_micro_qa, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : spu_micro_qa_init();
+}
+
 static int spu_smc_microstep(spu_context* ctx)
 {
     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
@@ -2607,7 +2888,26 @@ static int spu_smc_microstep(spu_context* ctx)
                     ctx->resident_code[k].lsa, ctx->resident_code[k].size);
         fprintf(stderr, " ovl=%d lookup10=%p lookup11=%p\n", ctx->resident_ovl,
                 (void*)spu_lookup(pc, 10), (void*)spu_lookup(pc, 11)); } }
-    for (int steps = 0; steps < 4096; steps++) {
+    int steps = 0;
+    /* PS3_SPU_MICRO_QA (default 1): the WWS interrupt handler's generated
+     * save / restore stubs are one long run of stqa / lqa (76 of them, then a
+     * `bi`), and each of those went through a dozen opcode tests below before
+     * reaching its own. Run such a run here first: the same instructions, the
+     * same order, the same step count -- the loop below takes over at the
+     * first word that is neither. 0 = the loop below decodes every word. */
+    if (__builtin_expect(spu_micro_qa_on(), 1)) {
+        for (; steps < 4096; steps++) {
+            const uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
+                               ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
+            const uint32_t op9 = w >> 23;
+            if (op9 != 0x041 && op9 != 0x061) break;
+            const uint32_t a = (((w >> 7) & 0xFFFF) << 2) & SPU_LS_MASK & ~15u;   /* as stqa / lqa below */
+            if (op9 == 0x041) spu_ls_write128(ctx, a, ctx->gpr[w & 0x7F]);
+            else              ctx->gpr[w & 0x7F] = spu_ls_read128(ctx, a);
+            pc += 4;
+        }
+    }
+    for (; steps < 4096; steps++) {
         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
                      ((uint32_t)ctx->ls[pc+2] << 8) | ctx->ls[pc+3];
         uint32_t op11 = w >> 21, op9 = w >> 23, op8 = w >> 24, op7 = w >> 25;

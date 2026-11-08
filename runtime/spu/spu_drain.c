@@ -11,6 +11,7 @@
 #include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "../../include/ps3emu/ps3_toggles.h" /* PS3_TOGGLE_FILE: live knobs */
 #include <setjmp.h>
+#include "spu_fastjmp.h"   /* PS3_SPU_FASTJMP: the interrupt-return jump without the SEH unwind */
 #include <pthread.h>   /* SPU_IRQSTAT counters */
 #include <time.h>
 
