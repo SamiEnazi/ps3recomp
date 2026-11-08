@@ -19,6 +19,9 @@
  *            there), the SPU threads the other performance cores, everything
  *            else the efficiency cores
  *   dedx     as ded, the SPU threads also on the efficiency cores
+ *   own      main and RSX own a performance core each (both hyperthreads);
+ *            every other thread may run anywhere else (nothing confined to
+ *            the E-cores: the guest's task kickers feed the SPUs)
  * On a CPU with one efficiency class only (no E-cores) p/pe do nothing.
  *
  * PS3_HIGHQOS=1: process power throttling off (Windows EcoQoS), so the

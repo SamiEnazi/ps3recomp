@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { PL_OFF = 0, PL_P, PL_PE, PL_DED, PL_DEDX };
+enum { PL_OFF = 0, PL_P, PL_PE, PL_DED, PL_DEDX, PL_OWN };
 enum { PL_MAXCPU = 256 };
 
 static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
@@ -55,7 +55,8 @@ static BOOL CALLBACK place_init(PINIT_ONCE once, PVOID p, PVOID* ctx)
     else if (!strcmp(e, "pe")) s_mode = PL_PE;
     else if (!strcmp(e, "ded")) s_mode = PL_DED;
     else if (!strcmp(e, "dedx")) s_mode = PL_DEDX;
-    else { fprintf(stderr, "[place] PS3_CPU_PLACE=%s: unknown mode (p|pe|ded|dedx)\n", e); return TRUE; }
+    else if (!strcmp(e, "own")) s_mode = PL_OWN;
+    else { fprintf(stderr, "[place] PS3_CPU_PLACE=%s: unknown mode (p|pe|ded|dedx|own)\n", e); return TRUE; }
 
     ULONG len = 0;
     GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
@@ -105,6 +106,12 @@ static BOOL CALLBACK place_init(PINIT_ONCE once, PVOID p, PVOID* ctx)
             if (isp) { add(PS3_PLACE_MAIN, id); add(PS3_PLACE_RSX, id); add(PS3_PLACE_SPU, id); }
             else     { add(PS3_PLACE_PPU, id); add(PS3_PLACE_OTHER, id); }
             break;
+        case PL_OWN:   /* main and RSX own a P-core each; nothing else is confined */
+            if (core_main < 0) break;
+            if (isp && cpu[i].core == core_main) add(PS3_PLACE_MAIN, id);
+            else if (isp && cpu[i].core == core_rsx) add(PS3_PLACE_RSX, id);
+            else { add(PS3_PLACE_SPU, id); add(PS3_PLACE_PPU, id); add(PS3_PLACE_OTHER, id); }
+            break;
         case PL_DED: case PL_DEDX:
             if (core_main < 0) break;
             if (isp && cpu[i].core == core_main) add(PS3_PLACE_MAIN, id);
@@ -119,7 +126,7 @@ static BOOL CALLBACK place_init(PINIT_ONCE once, PVOID p, PVOID* ctx)
             break;
         }
     }
-    if ((s_mode == PL_DED || s_mode == PL_DEDX) && core_main < 0) {
+    if ((s_mode == PL_DED || s_mode == PL_DEDX || s_mode == PL_OWN) && core_main < 0) {
         fprintf(stderr, "[place] PS3_CPU_PLACE=%s: fewer than 3 performance cores, placement off\n", e);
         s_mode = PL_OFF; return TRUE;
     }
