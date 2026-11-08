@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include "ppu_vmx.h"
 static uint8_t* vm_base;
+/* ppu_recomp.h's raw load, as the lifted code has it */
+#define VM_RAW_LD(T, ea) ({ const uint8_t* _p = vm_base + (uint32_t)(ea); T _v; memcpy(&_v, _p, sizeof(T)); _v; })
 #define PPU_VMX_SSE_NO_REDIRECT   /* call each side by its own name */
 #include "ppu_vmx_sse.h"
 
@@ -93,6 +95,17 @@ int main(int argc, char** argv) {
 #define SPW(U) { uint32_t* d = (uint32_t*)w; uint32_t val = ((uint32_t*)b)[U]; d[0] = d[1] = d[2] = d[3] = val; \
                  PPU_VSPLTW_SSE(g, b, U); check("vspltw " #U, w, g, a, b, 0, U); }
         SPW(0) SPW(1) SPW(2) SPW(3)
+        /* merges as the lifter writes them */
+        { uint32_t* d = (uint32_t*)w; uint32_t* x = (uint32_t*)a; uint32_t* y = (uint32_t*)b; uint32_t t[4];
+          t[0]=x[0]; t[1]=y[0]; t[2]=x[1]; t[3]=y[1]; memcpy(d, t, 16); PPU_VMRG_SSE(g, a, b, _mm_unpacklo_epi32); check("vmrghw", w, g, a, b, 0, 0);
+          t[0]=x[2]; t[1]=y[2]; t[2]=x[3]; t[3]=y[3]; memcpy(d, t, 16); PPU_VMRG_SSE(g, a, b, _mm_unpackhi_epi32); check("vmrglw", w, g, a, b, 0, 0); }
+        { uint16_t* d = (uint16_t*)w; uint16_t* x = (uint16_t*)a; uint16_t* y = (uint16_t*)b; uint16_t t[8];
+          for (int i = 0; i < 8; i++) t[i] = (i & 1) ? y[i / 2] : x[i / 2]; memcpy(d, t, 16); PPU_VMRG_SSE(g, a, b, _mm_unpacklo_epi16); check("vmrghh", w, g, a, b, 0, 0);
+          for (int i = 0; i < 8; i++) t[i] = (i & 1) ? y[4 + i / 2] : x[4 + i / 2]; memcpy(d, t, 16); PPU_VMRG_SSE(g, a, b, _mm_unpackhi_epi16); check("vmrglh", w, g, a, b, 0, 0); }
+        { uint8_t bb = (uint8_t)(rnd() % 17); for (int i = 0; i < 16; i++) w[i] = bb + i; PPU_LVSL_SSE(g, bb); check("lvsl", w, g, a, b, 0, bb); }
+        { uint32_t r1 = vmx_vcmpequw(w, a, b), r2 = vmx_vcmpequw_sse(g, a, b); check("vcmpequw", w, g, a, b, 0, 0);
+          if (r1 != r2) { fails++; printf("FAIL vcmpequw cr6 %u %u\n", r1, r2); } }
+        { bytes(c); vmx_vslw(w, a, c); vmx_vslw_sse(g, a, c); check("vslw", w, g, a, c, 0, 0); }
         /* the lifter's two-half logic ops */
         { uint64_t* d = (uint64_t*)w; uint64_t* x = (uint64_t*)a; uint64_t* y = (uint64_t*)b; uint64_t* z = (uint64_t*)c;
           d[0] = x[0] ^ y[0]; d[1] = x[1] ^ y[1]; PPU_VLOGIC_SSE(g, _mm_xor_si128, a, b); check("vxor", w, g, a, b, 0, 0);
@@ -109,6 +122,10 @@ int main(int argc, char** argv) {
             uint8_t ref[16]; memcpy(ref, mem + ea, 16);
             ppu_vld16_sse(g, ea); check("lvx", ref, g, a, b, 0, ea);
             bytes(a); ppu_vst16_sse(ea, a); check("stvx", a, mem + ea, a, b, 0, ea);
+        }
+        for (uint32_t ea = 0; ea + 16 <= 4096; ea += 4) {   /* lvewx, the lifter's text */
+            memset(w, 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy(w + (ea & 15), &_e, 4); }
+            memset(g, 0xEE, 16); ppu_lvewx_sse(g, ea); check("lvewx", w, g, a, b, 0, ea);
         }
     }
     printf("%ld cases: %ld failures\n", n, fails);

@@ -153,6 +153,30 @@ VMXS_INL void ppu_vst16_sse(uint64_t ea, const void* src) {
 #define PPU_VSPLTW_SSE(d, b, u) _mm_storeu_si128((__m128i*)(d), \
     _mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)(b)), (u) * 0x55))
 
+/* vmrgh{w,h} / vmrgl{w,h}: interleave the high / low halves (element order = memory order) */
+#define PPU_VMRG_SSE(d, a, b, op) _mm_storeu_si128((__m128i*)(d), \
+    op(_mm_loadu_si128((const __m128i*)(a)), _mm_loadu_si128((const __m128i*)(b))))
+/* lvsl / lvsr: byte i = b + i (b <= 16, so no byte wraps) */
+#define PPU_LVSL_SSE(d, b) _mm_storeu_si128((__m128i*)(d), _mm_add_epi8(_mm_set1_epi8((char)(b)), \
+    _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)))
+/* lvewx: the word at ea (4-aligned) in its own lane, zeros elsewhere */
+VMXS_INL void ppu_lvewx_sse(void* d, uint64_t ea) {
+    const uint32_t e = VM_RAW_LD(uint32_t, ea);
+    const __m128i lane = _mm_cmpeq_epi32(_mm_setr_epi32(0, 4, 8, 12), _mm_set1_epi32((int)(ea & 12u)));
+    _mm_storeu_si128((__m128i*)d, _mm_and_si128(_mm_set1_epi32((int)e), lane));
+}
+/* vcmpequw: equal words (no swap needed for equality), CR6 [all, 0, none, 0] */
+VMXS_INL uint32_t vmx_vcmpequw_sse(VMX_D, VMX_A, VMX_B) {
+    const __m128i c = _mm_cmpeq_epi32(_mm_loadu_si128((const __m128i*)a_), _mm_loadu_si128((const __m128i*)b_));
+    _mm_storeu_si128((__m128i*)d_, c);
+    const int m = _mm_movemask_ps(_mm_castsi128_ps(c));
+    return (uint32_t)((m == 15) << 3 | (m == 0) << 1);
+}
+/* vslw: each word shifted left by the low 5 bits of B's word */
+VMXS_INL void vmx_vslw_sse(VMX_D, VMX_A, VMX_B) {
+    vmxs_st(d_, _mm_sllv_epi32(vmxs_ld(a_), _mm_and_si128(vmxs_ld(b_), _mm_set1_epi32(31))));
+}
+
 /* vxor / vor / vand / vandc / vsel on the whole register at once */
 VMXS_INL __m128i ppu_vandc_sse(__m128i a, __m128i b) { return _mm_andnot_si128(b, a); }
 #define PPU_VLOGIC_SSE(d, op, a, b) _mm_storeu_si128((__m128i*)(d), \
@@ -182,6 +206,8 @@ VMXS_INL void ppu_vperm_sse(void* d_, const void* a_, const void* b_, const void
 #define vmx_vcmpgefp  vmx_vcmpgefp_sse
 #define vmx_vcmpgtfp  vmx_vcmpgtfp_sse
 #define vmx_vcfsx     vmx_vcfsx_sse
+#define vmx_vcmpequw  vmx_vcmpequw_sse
+#define vmx_vslw      vmx_vslw_sse
 #endif
 
 #ifdef __cplusplus

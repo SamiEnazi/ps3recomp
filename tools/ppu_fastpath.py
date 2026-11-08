@@ -200,6 +200,29 @@ _LOGIC = [
                 r"d\[0\]=\(a\[0\]&~c\[0\]\)\|\(b\[0\]&c\[0\]\); d\[1\]=\(a\[1\]&~c\[1\]\)\|\(b\[1\]&c\[1\]\); \}"),
      r"PPU_VSEL_SSE(\1, \2, \3, \4);", "vsel"),
 ]
+# vmrgh/vmrgl (words, halfwords): t = {a[s], b[s], a[s+1], b[s+1], ...} -> unpacklo/hi
+_RE_VMRG = re.compile(r"\{ uint(32|16)_t\* d=\(uint\1_t\*\)" + _OPND + r"; uint\1_t\* a=\(uint\1_t\*\)" + _OPND +
+                      r"; uint\1_t\* b=\(uint\1_t\*\)" + _OPND + r"; uint\1_t t\[(\d+)\]; ((?:t\[\d+\]=[ab]\[\d+\]; )+)"
+                      r"memcpy\(d, t, 16\); \}")
+
+
+def _vmrg(m):
+    bits, d, a, b, k, body = m.group(1), m.group(2), m.group(3), m.group(4), int(m.group(5)), m.group(6)
+    got = re.findall(r"t\[(\d+)\]=([ab])\[(\d+)\]; ", body)
+    for s, op in ((0, "unpacklo"), (k // 2, "unpackhi")):
+        want = [(str(i), "ab"[i & 1], str(s + i // 2)) for i in range(k)]
+        if k == 128 // int(bits) and got == want:
+            STATS["vmrg"] = STATS.get("vmrg", 0) + 1
+            return "PPU_VMRG_SSE(%s, %s, %s, _mm_%s_epi%s);" % (d, a, b, op, bits)
+    return m.group(0)
+
+
+# lvsl / lvsr: { uint8_t b = (uint8_t)(X); for (...) ((uint8_t*)D)[i] = b + i; }
+_RE_LVSL = re.compile(r"\{ uint8_t b = (\(uint8_t\)\((?:[^;{}]*)\)); for \(int i = 0; i < 16; i\+\+\) "
+                      r"\(\(uint8_t\*\)" + _OPND + r"\)\[i\] = b \+ i; \}")
+# lvewx: zero the register, the aligned word at ea into its lane
+_RE_LVEWX = re.compile(r"\{ uint64_t ea = ([^;{}]+); ea &= ~3ULL; memset\(" + _OPND + r", 0, 16\); "
+                       r"\{ uint32_t _e = VM_RAW_LD\(uint32_t, ea\); memcpy\(\(uint8_t\*\)\2 \+ \(ea & 15\), &_e, 4\); \} \}")
 STATS: dict = {}
 
 
@@ -225,6 +248,12 @@ def rewrite_body(lines: list) -> list:
         if "(uint64_t*)&" in ln:
             for rx, rep, key in _LOGIC:
                 ln = _sub(ln, rx, rep, key)
+        if "memcpy(d, t, 16)" in ln:
+            ln = _RE_VMRG.sub(_vmrg, ln)
+        if "] = b + i; }" in ln:
+            ln = _sub(ln, _RE_LVSL, r"{ uint8_t b = \1; PPU_LVSL_SSE(\2, b); }", "lvsl")
+        if "ea &= ~3ULL; memset(" in ln:
+            ln = _sub(ln, _RE_LVEWX, r"{ uint64_t ea = \1; ea &= ~3ULL; ppu_lvewx_sse(\2, ea); }", "lvewx")
         if "vm_raw_" in ln:
             ln = _sub(ln, re.compile(r"\bvm_raw_ld16\("), "ppu_vld16_sse(", "lvx")
             ln = _sub(ln, re.compile(r"\bvm_raw_st16\("), "ppu_vst16_sse(", "stvx")
