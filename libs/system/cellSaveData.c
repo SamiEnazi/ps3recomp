@@ -1049,6 +1049,22 @@ static u32 enumerate_save_dirs_sorted(u32 setList_ea, const char* prefix,
     return got;
 }
 
+/* A List save/load with nothing to pick: on the console the list shows
+ * "There is no saved data." and the player backs out, which returns
+ * CELL_SAVEDATA_RET_CANCEL (1) -- not an error. inFAMOUS 2's pause menu
+ * "Load Game" with no save got ERROR_NODATA instead, showed "There was an
+ * error while loading." and called ListLoad2 again ~200 times a second: the
+ * menu hung behind a dimmed screen. PS3_SAVEDATA_LEGACY=1: ERROR_NODATA. */
+#ifndef CELL_SAVEDATA_RET_CANCEL
+#define CELL_SAVEDATA_RET_CANCEL 1
+#endif
+static s32 savedata_list_nothing(const char* fn)
+{
+    if (savedata_legacy()) return CELL_SAVEDATA_ERROR_NODATA;
+    printf("[cellSaveData] %s: no saved data to pick -- returning CANCEL (the player backed out)\n", fn);
+    return CELL_SAVEDATA_RET_CANCEL;
+}
+
 /* Core save/load implementation shared by List/Fixed/Auto variants */
 /* Saves in flight, for a host-side quit (cellSysutil.c ps3_host_quit): it
  * waits for this to reach 0 so it never cuts a save file short. */
@@ -1277,7 +1293,7 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
         strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
     if (!selectedDir[0]) {
         free(dirList);
-        return CELL_SAVEDATA_ERROR_NODATA;
+        return savedata_list_nothing(__func__);
     }
 
     s32 result = savedata_execute(selectedDir, 1, setBuf, funcStat, funcFile, userdata);
@@ -1337,7 +1353,7 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
         strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
     if (!selectedDir[0]) {
         free(dirList);
-        return CELL_SAVEDATA_ERROR_NODATA;
+        return savedata_list_nothing(__func__);
     }
 
     s32 result = savedata_execute(selectedDir, 0, setBuf, funcStat, funcFile, userdata);
