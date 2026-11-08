@@ -1214,10 +1214,16 @@ static void nv3089_blit(void)
      * before the copies below read it. */
     { static int eng = -1;
       if (eng < 0) eng = rsx_draw_engine_enabled();
-      if (eng) rsx_draw_engine_write_back_to(s_nv3089.src_dma != 0xFEED0001u, s_nv3089.in_off, in_pitch,
-                                             s_gcm2d.dst_dma != 0xFEED0001u,
-                                             s_gcm2d.dst_offset + (s_nv3089.out_pt >> 16) * dst_pitch
-                                                                + (s_nv3089.out_pt & 0xFFFF) * 4u); }
+      if (eng) {
+          const int dl = s_gcm2d.dst_dma != 0xFEED0001u;
+          const u32 doff = s_gcm2d.dst_offset + (s_nv3089.out_pt >> 16) * dst_pitch
+                                              + (s_nv3089.out_pt & 0xFFFF) * 4u;
+          rsx_draw_engine_write_back_to(s_nv3089.src_dma != 0xFEED0001u, s_nv3089.in_off, in_pitch, dl, doff);
+          /* A copy into a GPU light input that nothing reads any more: the
+           * engine took its GPU snapshot above, the guest bytes are dead
+           * (PS3RECOMP_ENG_GPU_LIGHT_SKIPCOPY, rsx_draw_engine.c). */
+          if (rsx_draw_engine_gpu_light_dst_dead(dl, doff, in_pitch)) return;
+      } }
     /* NV3089_GATE=<file>: log every blit's geometry while <file> exists, so a
      * capture covers the scene of interest instead of the first N since boot. */
     { static const char* gate = (const char*)-1; static unsigned poll; static int open_gate;
@@ -1291,6 +1297,45 @@ static void nv3089_blit(void)
         { extern u8* vm_base;
           const u8* sbase = vm_base + src2;
           u8* dbase = vm_base + dst2;
+          /* NV309E_FAST (default 1): the swizzle is separable -- the x bits and
+           * the y bits of nv309e_swz never share a position, so
+           * swz(x,y) = swz(x,0) | swz(0,y) -- and each row's x part is the same
+           * table: one table lookup and one OR per pixel instead of a bit loop
+           * per pixel (the RSX thread's 4th-largest cost in the docks walk).
+           * Same words to the same places; NV309E_FAST=2 also runs the bit loop
+           * and logs any pixel whose offset differs. =0: the old loop. */
+          static int fast = -1;
+          if (fast < 0) { const char* e = getenv("NV309E_FAST"); fast = e ? atoi(e) : 1; }
+          static u32 s_xo[4096];
+          if (fast && out_w <= 4096u) {
+              for (u32 x = 0; x < out_w; x++) s_xo[x] = nv309e_swz(x, 0, l2w, l2h);
+              const u64 su0 = nv3089_origin(u0b);
+              const int unit = s_nv3089.ds_dx == 0x100000u;
+              for (u32 y = 0; y < out_h; y++) {
+                  const u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
+                  const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
+                  const u32 yo = nv309e_swz(0, y, l2w, l2h);
+                  if (unit) {
+                      const u8* s = srow + (u32)(su0 >> 20) * 4;
+                      for (u32 x = 0; x < out_w; x++) {
+                          u32 v; memcpy(&v, s + (u64)x * 4, 4);
+                          memcpy(dbase + (u64)(s_xo[x] | yo) * 4, &v, 4);
+                      }
+                  } else {
+                      for (u32 x = 0; x < out_w; x++) {
+                          const u64 su = su0 + (u64)x * s_nv3089.ds_dx;
+                          u32 v; memcpy(&v, srow + (u32)(su >> 20) * 4, 4);
+                          memcpy(dbase + (u64)(s_xo[x] | yo) * 4, &v, 4);
+                      }
+                  }
+                  if (fast == 2) {
+                      static int bad;
+                      for (u32 x = 0; x < out_w; x++)
+                          if ((s_xo[x] | yo) != nv309e_swz(x, y, l2w, l2h) && PS3_LOG_FIRST(bad, 8))
+                              fprintf(stderr, "[NV309E_FAST] offset mismatch x=%u y=%u l2w=%u l2h=%u\n", x, y, l2w, l2h);
+                  }
+              }
+          } else
           for (u32 y = 0; y < out_h; y++) {
               u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
               const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
@@ -1974,7 +2019,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      if (getenv("GCM_RATE")) {
+      /* each switch read once: a getenv per drain showed in the RSX thread's profile */
+      static int rate_on = -1; if (rate_on < 0) rate_on = getenv("GCM_RATE") != NULL;
+      if (rate_on) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -2015,7 +2062,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
      * its own, every field below moves with it and the FIFO the runtime walks
      * stops being the one the title fills. Reported on change, not per tick. */
-    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+    static int ctxdbg = -1; if (ctxdbg < 0) ctxdbg = getenv("GCM_CTXDBG") != NULL;
+    if (ctxdbg && s_gcm_ctx_out_ea) {
         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
@@ -2031,7 +2079,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     u32 start_off = s_fifo_getoff;
-    if (getenv("GCM_DRAINDBG")) {
+    static int draindbg = -1; if (draindbg < 0) draindbg = getenv("GCM_DRAINDBG") != NULL;
+    if (draindbg) {
         static int n = 0;
         if (n++ % 60 == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
@@ -2044,7 +2093,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
     { static int scanned = 0;
-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+      static int scan_on = -1; if (scan_on < 0) scan_on = getenv("GCM_SCANREF") != NULL;
+      if (!scanned && scan_on && put >= 0x19F0) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
@@ -2580,7 +2630,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * the drained EA. */
     s_drain_why = s_sema_live ? "sema-acquire" : why;
     gcm_flip_stats_tick();
-    if (getenv("GCM_DRAINDBG")) {
+    if (draindbg) {
         static int n2 = 0;
         if (n2++ % 60 == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
@@ -2712,7 +2762,8 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
 
-    if (getenv("CELLMARK_BLINKDBG"))
+    static int blinkdbg = -1; if (blinkdbg < 0) blinkdbg = getenv("CELLMARK_BLINKDBG") != NULL;
+    if (blinkdbg)
         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
 
     static int s_recdbg = -1;

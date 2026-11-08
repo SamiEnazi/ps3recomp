@@ -371,6 +371,10 @@ int rsx_draw_engine_write_back(int local, u32 offset, u32 pitch);
 /* Same, knowing where the blit lands (-1/0 when unknown): a blit into a buffer
  * the GPU light pass replaces needs no write-back (PS3RECOMP_ENG_GPU_LIGHT). */
 int rsx_draw_engine_write_back_to(int local, u32 offset, u32 pitch, int dst_local, u32 dst_offset);
+/* After rsx_draw_engine_write_back_to: 1 when that blit's destination is one of
+ * the GPU light pass's input buffers that nothing reads any more (both GPU
+ * passes on), so the guest copy can be skipped (PS3RECOMP_ENG_GPU_LIGHT_SKIPCOPY). */
+int rsx_draw_engine_gpu_light_dst_dead(int dst_local, u32 dst_offset, u32 pitch);
 /* PS3RECOMP_ENG_GPU_LIGHT: hand the engine the light job's frame block (its
  * 0x100 bytes, big-endian: matrix at +0x10, scale at +0x98) and light records
  * (0x30 bytes each), as the SPU job would read them this frame. Any thread. */
