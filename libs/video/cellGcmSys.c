@@ -1043,6 +1043,37 @@ static int gcm_lean_state(void)
     if (eng < 0) eng = rsx_draw_engine_enabled();
     return eng && !rsx_get_backend();
 }
+/* GCM_SUBCH1_2D=1: subchannel 1 goes to the 2D path (the old split). */
+static int gcm_subch1_2d(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_SUBCH1_2D"); v = e ? atoi(e) : 0; }
+    return v;
+}
+/* May this header's data words go to the draw engine in one call
+ * (rsx_draw_engine_burst)? Only when the per-word walk would do nothing with
+ * them but rsx_draw_engine_method: a 3D subchannel, lean state, no live
+ * engine, no per-word FIFO diagnostic or guest memory diagnostic, and none of
+ * the methods the walker acts on itself (SET_REFERENCE, GET_REPORT, the
+ * semaphore / label writes rsx_process_method keeps) in its range.
+ * GCM_FIFO_BURST=0: every word the per-word way, as before. */
+extern int vm_inline_ok;
+static int gcm_fifo_burst_ok(u32 subch, u32 method, u32 type, u32 count)
+{
+    static int on = -1, live = -1, eng = -1;
+    if (on < 0) { const char* e = getenv("GCM_FIFO_BURST"); on = !(e && *e == '0'); }
+    if (!on || gcm_fifo_dbg() || !vm_inline_ok) return 0;
+    if (!(subch == 0 || (subch == 1 && !gcm_subch1_2d()))) return 0;
+    if (live < 0) live = rsx_live_draw_enabled();
+    if (eng < 0) eng = rsx_draw_engine_enabled();
+    if (live || !eng || !gcm_lean_state()) return 0;
+    const u32 lo = method, hi = type == 0 ? method + (count - 1u) * 4u : method;
+    if (hi > 0x1FFCu) return 0;
+    if (lo <= 0x0050u && hi >= 0x0050u) return 0;
+    if (lo <= 0x1800u && hi >= 0x1800u) return 0;
+    if (lo <= 0x1D74u && hi >= 0x1D6Cu) return 0;
+    return 1;
+}
 /* Run time of one wait: restart it, then add each check's step. */
 typedef struct { unsigned long long last, run; } gcm_run_clock;
 static void gcm_run_clock_start(gcm_run_clock* c, unsigned long long now) { c->last = now; c->run = 0; }
@@ -2403,6 +2434,22 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
+            /* A header whose words all go to the draw engine and nothing else
+             * (gcm_fifo_burst_ok): handed over whole, read straight from its
+             * one IO page, instead of a translation, an out-of-line guest
+             * read and the per-word routing below for every word. */
+            if (count && gcm_fifo_burst_ok(subch, method, type, count)) {
+                const u32 io0 = s_fifo_getoff + 4u, io1 = s_fifo_getoff + count * 4u;
+                const u32 ea0 = gcm_io2ea(io0);
+                if (ea0 && (io0 >> 20) == (io1 >> 20)) {
+                    extern u8* vm_base;
+                    rsx_draw_engine_burst((subch << 13) | method, type == 0,
+                                          (const u32*)(vm_base + ea0), count);
+                    s_frame_bytes += 4 + count * 4; s_walk_bytes += 4 + count * 4;
+                    s_fifo_getoff += 4 + count * 4;
+                    continue;
+                }
+            }
             const int fifo_dbg = gcm_fifo_dbg();
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
@@ -2460,8 +2507,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * for every draw in the game. Treat the subchannels the 2D path
                  * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
                  */
-                static int s1_2d = -1;
-                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+                const int s1_2d = gcm_subch1_2d();
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
                 if (fifo_dbg) { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;

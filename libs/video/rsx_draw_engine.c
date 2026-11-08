@@ -1966,11 +1966,15 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
 
 static u32 eng_vtex_mask(void)
 {
+    /* The three fields rsx_dsp_get_vertex_texture would decode (enable =
+     * CONTROL0 bit 31, width/height = IMAGE_RECT) read directly: this runs
+     * twice a draw and the full decode (a memset and eleven fields per unit)
+     * showed in the RSX thread's profile. */
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
-        rsx_dsp_vertex_texture vt;
-        rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
-        if (vt.enabled && vt.width && vt.height) mask |= 1u << u;
+        const u32 base = 0x0900u + u * 0x20u;    /* NV4097_SET_VERTEX_TEXTURE_OFFSET + unit block */
+        const u32 ctl0 = rsx_dsp_reg(&g.rsx, base + 0x0Cu), rect = rsx_dsp_reg(&g.rsx, base + 0x18u);
+        if ((ctl0 >> 31) && (rect >> 16) && (rect & 0xFFFFu)) mask |= 1u << u;
     }
     return mask;
 }
@@ -5502,6 +5506,14 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
     rsx_dispatch_method(&g.rsx, m, arg);
+}
+
+/* rsx_draw_engine_method for a whole header (cellGcmSys's walker: only for
+ * methods whose mask leaves them unchanged over the burst, < 0x2000). */
+void rsx_draw_engine_burst(u32 method, int incr, const u32* be_words, u32 count)
+{
+    if (!g.ready) return;
+    rsx_dispatch_burst(&g.rsx, method & 0x1FFCu, incr, be_words, count);
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,

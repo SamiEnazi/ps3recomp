@@ -388,6 +388,17 @@ static void imm_flush_as_inline(rsx_dispatch* rsx)
 static u32 s_ed_flips, s_ed_n, s_ed_packets, s_ed_printed;
 static u32 s_ed_m[24], s_ed_a[24];
 static int s_ed_on = -1; static u32 s_ed_from;
+static void ed_init(void)
+{
+    const char* e = getenv("RSX_EMPTY_DRAW_LOG"); s_ed_on = e ? 1 : 0; s_ed_from = e ? (u32)atoi(e) : 0;
+}
+/* RSX_CONST_LOG (rsx_dispatch_method): file scope, the burst path reads it too. */
+static int s_clog_lo = -2, s_clog_hi, s_clog_n;
+static void clog_init(void)
+{
+    const char* e = getenv("RSX_CONST_LOG"); s_clog_lo = -1;
+    if (e) sscanf(e, "%d,%d", &s_clog_lo, &s_clog_hi);
+}
 
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
@@ -405,7 +416,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
                     method, arg);
         return;
     }
-    if (s_ed_on < 0) { const char* e = getenv("RSX_EMPTY_DRAW_LOG"); s_ed_on = e ? 1 : 0; s_ed_from = e ? (u32)atoi(e) : 0; }
+    if (s_ed_on < 0) ed_init();
     if (s_ed_on) {
         if (method == M_GCM_FLIP_HEAD_0 || method == M_GCM_FLIP_HEAD_1 || method == M_GCM_DRIVER_FLIP) s_ed_flips++;
         if (method == M_VERTEX_BEGIN_END && arg) { s_ed_n = 0; s_ed_packets = 0; }
@@ -450,10 +461,8 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->constants[slot][word & 3] = arg;
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
-        { static int lo = -2, hi = 0, n = 0;
-          if (lo == -2) { const char* e = getenv("RSX_CONST_LOG"); lo = -1;
-                          if (e) sscanf(e, "%d,%d", &lo, &hi); }
-          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 400) { n++;
+        { if (s_clog_lo == -2) clog_init();
+          if (s_clog_lo >= 0 && (int)slot >= s_clog_lo && (int)slot <= s_clog_hi && s_clog_n < 400) { s_clog_n++;
               fprintf(stderr, "[const-load] c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
                       "xyzw"[word & 3], arg, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); } }
         return;
@@ -562,6 +571,88 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     }
 }
 
+/* One FIFO method header's data words, straight from guest memory (big-endian):
+ * exactly the rsx_dispatch_method calls the per-word walk makes for them.
+ * A run of words inside the transform-constant upload window -- most of a
+ * world frame's command words, usually right behind the VP_UPLOAD_CONST_ID
+ * word of the same header -- goes in one tight loop: nothing in the window
+ * moves the slot base (VP_UPLOAD_CONST_ID is outside it), so it is read once
+ * per run, after the words before the run were applied. Program upload words
+ * get the same treatment; plain registers are just stored. */
+static u8 s_plain[0x2000 >> 2];
+static int s_plain_ready;
+static void plain_init(void)
+{
+    for (u32 m = 0; m < 0x2000u; m += 4u) {
+        int p = 1;
+        if (m >= M_VP_UPLOAD_INST && m < M_VP_UPLOAD_INST + 32u * 4u) p = 0;
+        if (m >= M_VP_UPLOAD_CONST && m < M_VP_UPLOAD_CONST + 32u * 4u) p = 0;
+        if ((m >= 0x1C00 && m < 0x1D00) || (m >= 0x1880 && m < 0x1A00) || (m >= 0x1500 && m < 0x15C0) ||
+            (m >= 0x1E40 && m < 0x1E80) || (m >= 0x0A80 && m < 0x0B00)) p = 0;   /* imm_method */
+        if (m == M_CLEAR_BUFFERS || m == M_VERTEX_BEGIN_END || m == M_INLINE_ARRAY ||
+            m == M_VB_VERTEX_BATCH || m == M_VB_INDEX_BATCH) p = 0;
+        s_plain[m >> 2] = (u8)p;
+    }
+    s_plain_ready = 1;
+}
+
+void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count)
+{
+    if (!count) return;
+    if (s_ed_on < 0) ed_init();
+    if (s_clog_lo == -2) clog_init();
+    if (!s_plain_ready) plain_init();
+    method &= 0xFFFFC;
+    /* The fast forms only below 0x2000 and with no per-word diagnostic. */
+    const int fast = !s_ed_on && method + (incr ? (count - 1u) * 4u : 0u) < 0x2000u;
+    if (!fast) {
+        for (u32 i = 0; i < count; i++)
+            rsx_dispatch_method(rsx, incr ? method + i * 4u : method,
+                                __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED)));
+        return;
+    }
+    u32 i = 0;
+    while (i < count) {
+        const u32 m = incr ? method + i * 4u : method;
+        if (incr && s_clog_lo < 0 && m >= M_VP_UPLOAD_CONST && m < M_VP_UPLOAD_CONST + 32u * 4u) {
+            u32 n = (M_VP_UPLOAD_CONST + 32u * 4u - m) >> 2;
+            if (n > count - i) n = count - i;
+            const u32 idx0 = m >> 2, w0 = (m - M_VP_UPLOAD_CONST) >> 2;
+            const u32 base = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+            for (u32 k = 0; k < n; k++) {
+                const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i + k], __ATOMIC_RELAXED));
+                rsx->seen[idx0 + k]++;
+                rsx->regs[idx0 + k] = arg;
+                const u32 word = w0 + k, slot = base + (word >> 2);
+                if (slot < RSX_DSP_NUM_CONSTANTS)
+                    rsx->constants[slot][word & 3] = arg;
+            }
+            i += n;
+            continue;
+        }
+        if (incr && m >= M_VP_UPLOAD_INST && m < M_VP_UPLOAD_INST + 32u * 4u) {
+            u32 n = (M_VP_UPLOAD_INST + 32u * 4u - m) >> 2;
+            if (n > count - i) n = count - i;
+            const u32 idx0 = m >> 2;
+            u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+            for (u32 k = 0; k < n; k++) {
+                const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i + k], __ATOMIC_RELAXED));
+                rsx->seen[idx0 + k]++;
+                rsx->regs[idx0 + k] = arg;
+                const u32 lane = (((m - M_VP_UPLOAD_INST) >> 2) + k) & 3u;
+                const u32 pos = *load * 4u + lane;
+                if (pos < RSX_DSP_VP_WORDS && rsx->vp[pos] != arg) { rsx->vp[pos] = arg; rsx->vp_gen++; }
+                if (lane == 3u) (*load)++;
+            }
+            i += n;
+            continue;
+        }
+        const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
+        if (s_plain[m >> 2]) { rsx->seen[m >> 2]++; rsx->regs[m >> 2] = arg; }
+        else rsx_dispatch_method(rsx, m, arg);
+        i++;
+    }
+}
 /* ---- getters ----------------------------------------------------------- */
 
 u32 rsx_dsp_clear_color(const rsx_dispatch* rsx)

@@ -348,6 +348,9 @@ void rsx_draw_engine_shutdown(void);
  * SPU-built command lists bind NV4097 to another subchannel would otherwise
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
+/* count words of one FIFO header (guest byte order): method + 4 i (incr) or
+ * method each time; method + 4 (count - 1) must stay below 0x2000. */
+void rsx_draw_engine_burst(u32 method, int incr, const u32* be_words, u32 count);
 
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */

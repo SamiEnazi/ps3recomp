@@ -170,6 +170,10 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
 
+/* A whole method header's data words (guest byte order, in memory): the same
+ * as count rsx_dispatch_method calls with method + 4 i (incr) or method. */
+void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count);
+
 /* ---- decoded state getters -------------------------------------------- */
 
 static inline u32 rsx_dsp_reg(const rsx_dispatch* rsx, u32 method)
