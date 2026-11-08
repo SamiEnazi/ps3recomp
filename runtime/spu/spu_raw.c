@@ -304,6 +304,12 @@ static void raw_spu_start(raw_spu* s)
     /* THE point of this whole file: local store is the guest window, not a copy.
      * The PPU keeps writing command buffers into it while the SPU runs. */
     s->ctx->ls       = vm_base + s->base;
+    if (g_spu_lifted_flags & 1) {   /* lifted code built with SPU_LS_FASTPATH reads ctx->ls_store */
+        fprintf(stderr, "[spu-raw] spu%u: this build's lifted SPU code was compiled with SPU_LS_FASTPATH "
+                        "(LS = ctx->ls_store), which a raw SPU's guest-memory LS cannot use; rebuild "
+                        "without it (PORT_SPU_ARCH)\n", n);
+        abort();
+    }
     s->ctx->image_id = s_pending_image_id;
     s->entry         = s_pending_entry;
     s->ctx->gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;      /* SPU ABI stack top */

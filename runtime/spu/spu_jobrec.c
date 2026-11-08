@@ -1145,13 +1145,23 @@ int spu_jobreplay_main(void)
     else snprintf(rp, sizeof rp, "%s\\replay_report.txt", s_dir);
     FILE* out = fopen(rp, "w");
     long np = 0, nf = 0, nbad = 0, ndet = 0, nskip = 0;
-    struct { long n, pass, fail; double us, rec_us; int first_fail; uint32_t entry; } mod[JR_MAX_OVL];
+    /* best = per recording the fastest of its repeats, averaged over the module's recordings:
+     * the speed metric that other load on the machine disturbs least */
+    struct { long n, pass, fail, nrec; double us, rec_us, best; int first_fail; uint32_t entry; } mod[JR_MAX_OVL];
     memset(mod, 0, sizeof mod);
     for (int i = 0; i < JR_MAX_OVL; i++) mod[i].first_fail = -1;
     for (int i = 0; i < n; i++) {
         const jr_result* r0 = &js.res[(size_t)i * repeat];
         for (int k = 1; k < repeat; k++)
             if (js.res[(size_t)i * repeat + k].hash != r0->hash || js.res[(size_t)i * repeat + k].pass != r0->pass) ndet++;
+        { double b = -1; int o = 0;
+          for (int k = 0; k < repeat; k++) {
+              const jr_result* r = &js.res[(size_t)i * repeat + k];
+              if (r->pass < 0) continue;
+              o = r->ovl >= 0 && r->ovl < JR_MAX_OVL ? r->ovl : 0;
+              if (b < 0 || r->us < b) b = r->us;
+          }
+          if (b >= 0) { mod[o].best += b; mod[o].nrec++; } }
         for (int k = 0; k < repeat; k++) {
             const jr_result* r = &js.res[(size_t)i * repeat + k];
             if (r->pass == -2) { nskip++; continue; }
@@ -1168,11 +1178,11 @@ int spu_jobreplay_main(void)
         if (!w) continue;
         fprintf(w, "== job replay: %d recording(s) x %d, %.1f s, %d thread(s)%s%s\n", n, repeat, secs, threads,
                 getenv("SPU_FLOAT_RZ") ? " [SPU_FLOAT_RZ set]" : "", s_interp ? " [SPU interpreter]" : "");
-        fprintf(w, "%-6s %-8s %6s %6s %6s %10s %10s\n", "ovl", "entry", "jobs", "pass", "FAIL", "rec_us", "replay_us");
+        fprintf(w, "%-6s %-8s %6s %6s %6s %10s %10s %10s\n", "ovl", "entry", "jobs", "pass", "FAIL", "rec_us", "replay_us", "best_us");
         for (int o = 0; o < JR_MAX_OVL; o++) {
             if (!mod[o].n) continue;
-            fprintf(w, "%-6d 0x%05X  %6ld %6ld %6ld %10.1f %10.1f\n", o, mod[o].entry, mod[o].n, mod[o].pass,
-                    mod[o].fail, mod[o].rec_us / mod[o].n, mod[o].us / mod[o].n);
+            fprintf(w, "%-6d 0x%05X  %6ld %6ld %6ld %10.1f %10.1f %10.1f\n", o, mod[o].entry, mod[o].n, mod[o].pass,
+                    mod[o].fail, mod[o].rec_us / mod[o].n, mod[o].us / mod[o].n, mod[o].nrec ? mod[o].best / mod[o].nrec : 0.0);
         }
         fprintf(w, "TOTAL: %ld passed, %ld FAILED, %ld unreadable, %ld nondeterministic (repeat differs), %ld skipped\n",
                 np, nf, nbad, ndet, nskip);
