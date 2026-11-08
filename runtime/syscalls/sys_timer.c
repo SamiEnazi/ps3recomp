@@ -336,6 +336,24 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        /* PS3_USLEEP_TIMER_US=<n> (A/B, off by default): a sleep of n us or more is
+         * slept on a high-resolution waitable timer, not spun. inFAMOUS 2's SPU task
+         * kickers poll with usleep(100/500/900) -- spun, that is most of two P-cores
+         * while the SPU worker threads that set the frame rate in the heavy view run
+         * partly on E-cores. The timer here wakes on ~0.5 ms ticks, so the sleep may
+         * end up to ~0.5 ms late; whatever is left of the request is still spun. */
+        { static int s_tus = -1;
+          if (s_tus < 0) { const char* e = getenv("PS3_USLEEP_TIMER_US"); s_tus = e ? atoi(e) : 0; if (s_tus < 0) s_tus = 0; }
+          if (s_tus > 0 && usec >= (uint64_t)s_tus) {
+              static __declspec(thread) HANDLE t_ht;
+              if (!t_ht) t_ht = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+              LARGE_INTEGER due; due.QuadPart = -((LONGLONG)usec * 10);
+              if (t_ht && SetWaitableTimer(t_ht, &due, 0, NULL, NULL, FALSE)) {
+                  WaitForSingleObject(t_ht, INFINITE);
+                  do { QueryPerformanceCounter(&qpc_now); } while (qpc_now.QuadPart < qpc_deadline);
+                  return CELL_OK;
+              }
+          } }
         if (s_wmode == 2) {
             static __declspec(thread) uint32_t t_lr;
             static __declspec(thread) int64_t t_run0, t_last;
