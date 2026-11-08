@@ -16,6 +16,12 @@ computes -- only the order and number of tests change.
                     float arithmetic, compares, vperm, vsldoi, vspltw, the logic
                     ops and lvx/stvx as single 16-byte accesses; each computes
                     what the scalar form computes (tools/test_vmx_sse.c).
+  PPU_VMX_FAST=1    (ppu3; needs PPU_VMX_SSE) the float ops' plain SSE result when no
+                    operand or result lane is a denormal and no result lane a NaN,
+                    else the exact form (ppu_vmx_sse.h; tools/test_vmx_sse.c).
+  PPU_ST_LEAN=1     (ppu3; needs PPU_MM) the store fast path's reservation test reads
+                    the bitmap only (not the armed flag first), as one aligned word:
+                    the same bit (see header_preamble).
   PPU_VM_RUNS_LOADS=1  ppu_nv_dirty's access runs for loads (see _RUNS_C);
                     PPU_VM_RUNS_VERIFY=1 = the check build of it.
 """
@@ -156,6 +162,43 @@ static inline uint32_t ppu_stfs_bits(double v)
 """
 
 
+# PPU_ST_LEAN (ppu3): the PPU_MM store fast path's reservation test. Bits of the
+# reservation bitmap are only ever SET (runtime/spu/spu_coherency.c coh_mark_line,
+# never cleared), and the armed flag is set right after the first one, so with the
+# flag still 0 every bit is 0 as well: reading the bit alone sends exactly the stores
+# the flag-then-bit test sends to the out-of-line path, plus any that land in the
+# moment between a line's first bit and the flag (which then take the careful path).
+# On x86 the acquire load of the flag orders nothing a plain load does not. The bit
+# is read as part of an aligned 32-bit word (the bitmap is a 4 MiB static array,
+# 16-byte aligned by the x86-64 large-array rule): line = ea >> 7, word = ea >> 12,
+# bit = line & 31 -- the same bit of the same byte (little-endian), in one shift
+# fewer, and the compiler makes the test a single bt.
+_RESV_OLD = """\
+static inline int vm_mm_resv(const ppu_mm* m, uint32_t ea)
+{
+    if (!__atomic_load_n(m->armed, __ATOMIC_ACQUIRE)) return 0;
+    const uint32_t line = ea >> 7;
+    return (__atomic_load_n(&m->bits[line >> 3], __ATOMIC_RELAXED) >> (line & 7)) & 1u;
+}
+"""
+_RESV_NEW = """\
+static inline int vm_mm_resv(const ppu_mm* m, uint32_t ea)
+{   /* PPU_ST_LEAN: the bit alone (bits are only ever set, the armed flag after the first one) */
+    const uint32_t w = __atomic_load_n((const uint32_t*)m->bits + (ea >> 12), __ATOMIC_RELAXED);
+    return (w >> ((ea >> 7) & 31u)) & 1u;
+}
+"""
+
+
+def header_preamble(text: str) -> str:
+    """The lifted code's header (ppu_recomp.h) with the switched-on rewrites."""
+    if _on("PPU_ST_LEAN"):
+        if _RESV_OLD not in text:
+            raise RuntimeError("PPU_ST_LEAN needs PPU_MM=1 (or the lifter's vm_mm_resv changed; update ppu_fastpath.py)")
+        text = text.replace(_RESV_OLD, _RESV_NEW)
+    return text
+
+
 def source_preamble(text: str) -> str:
     """The per-chunk source preamble with the switched-on helper rewrites."""
     if _on("PPU_FP_ONE_NAN"):
@@ -167,9 +210,17 @@ def source_preamble(text: str) -> str:
     if _on("PPU_VMX_SSE"):
         if _VMX_INC not in text:
             raise RuntimeError("PPU_VMX_SSE: the lifter's ppu_vmx.h include changed; update ppu_fastpath.py")
-        text = text.replace(_VMX_INC, _VMX_INC + '#include "ppu_vmx_sse.h"   /* PPU_VMX_SSE: same results, 4 lanes at once */\n')
+        fast = ('#define PPU_VMX_FAST 1   /* PPU_VMX_FAST (ppu3): the plain SSE result when no lane is special */\n'
+                if _on("PPU_VMX_FAST") else "")
+        text = text.replace(_VMX_INC, _VMX_INC + fast + '#include "ppu_vmx_sse.h"   /* PPU_VMX_SSE: same results, 4 lanes at once */\n')
+    elif _on("PPU_VMX_FAST"):
+        raise RuntimeError("PPU_VMX_FAST needs PPU_VMX_SSE=1")
     if _on("PPU_VM_RUNS_LOADS"):
         text += ("\n#define PPU_VM_RUNS_VERIFY 1\n" if _on("PPU_VM_RUNS_VERIFY") else "") + _RUNS_C
+    if _natives():
+        text += ("\n/* PPU_NATIVE_FILE (ppu3): native libc bodies, runtime/ppu/ppu_loader.cpp */\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+                 + "".join("int ppu_native_%s(ppu_context* ctx);\n" % k for k in _NATIVE_KINDS)
+                 + "#ifdef __cplusplus\n}\n#endif\n")
     return text
 
 
@@ -239,8 +290,56 @@ def _sub(ln, rx, rep, key):
     return ln
 
 
+# PPU_NATIVE_FILE=<file> (ppu3): lifted functions that are a libc routine get a native
+# body in front (runtime/ppu/ppu_loader.cpp ppu_native_*; it declines -> the lifted
+# body runs). The file -- title knowledge, kept with the title -- has one
+# "<hex guest address> <kind>" per line (# comments); kinds: memcpy, memset.
+_NATIVE_KINDS = ("memcpy", "memset")
+_native_map = None
+
+
+def _natives() -> dict:
+    global _native_map
+    if _native_map is None:
+        _native_map = {}
+        path = os.environ.get("PPU_NATIVE_FILE", "")
+        if path:
+            for ln in open(path, encoding="utf-8"):
+                ln = ln.split("#")[0].strip()
+                if not ln:
+                    continue
+                a, k = ln.split()
+                if k not in _NATIVE_KINDS:
+                    raise RuntimeError(f"PPU_NATIVE_FILE: unknown kind {k!r} (have {', '.join(_NATIVE_KINDS)})")
+                _native_map["func_%08X" % int(a, 16)] = k
+    return _native_map
+
+
+_RE_FUNC_HEAD = re.compile(r"^void (func_[0-9A-F]{8})\(ppu_context\* ctx\) \{$")
+
+
+def _native_wrap(lines: list) -> list:
+    nat = _natives()
+    out, cur = [], None
+    for ln in lines:
+        m = _RE_FUNC_HEAD.match(ln) if ln.startswith("void func_") else None
+        if m and m.group(1) in nat:
+            cur = m.group(1)
+            out.append("void %s_lifted(ppu_context* ctx) {" % cur)
+            STATS["native"] = STATS.get("native", 0) + 1
+            continue
+        out.append(ln)
+        if cur and ln == "}":
+            out.append("void %s(ppu_context* ctx) { if (ppu_native_%s(ctx)) return; %s_lifted(ctx); }"
+                       % (cur, nat[cur], cur))
+            cur = None
+    return out
+
+
 def rewrite_body(lines: list) -> list:
     """A chunk's function lines with the switched-on statement rewrites."""
+    if _natives():
+        lines = _native_wrap(lines)
     if not _on("PPU_VMX_SSE"):
         return lines
     out = []

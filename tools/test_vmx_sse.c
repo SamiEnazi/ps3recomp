@@ -15,6 +15,7 @@ static uint8_t* vm_base;
 /* ppu_recomp.h's raw load, as the lifted code has it */
 #define VM_RAW_LD(T, ea) ({ const uint8_t* _p = vm_base + (uint32_t)(ea); T _v; memcpy(&_v, _p, sizeof(T)); _v; })
 #define PPU_VMX_SSE_NO_REDIRECT   /* call each side by its own name */
+#define PPU_VMX_FAST 1            /* and the fast forms (ppu3) */
 #include "ppu_vmx_sse.h"
 
 static uint64_t s = 0x9E3779B97F4A7C15ull;
@@ -134,6 +135,69 @@ int main(int argc, char** argv) {
             memset(w, 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy(w + (ea & 15), &_e, 4); }
             memset(g, 0xEE, 16); ppu_lvewx_sse(g, ea); check("lvewx", w, g, a, b, 0, ea);
         }
+    }
+    /* PPU_VMX_FAST (ppu3): the fast forms against the scalar helpers, on the same mixed
+     * operands and on mostly-normal ones (where the plain-result path is the one taken):
+     * normal lanes over the whole exponent range, results that cancel to tiny or denormal
+     * values (a - a*(1+e), a*c close to -b), and an occasional zero / inf / NaN / denormal. */
+    {
+        long taken = 0, total = 0;
+        for (long it = 0; it < n; it++) {
+            const uint32_t vscr = (it & 1) ? VMX_NJ : 0;
+            const int mode = (int)(it % 3);   /* 0: mixed (lane()), 1: normal, 2: near-cancelling */
+            for (int i = 0; i < 4; i++) {
+                uint32_t x, y, z;
+                if (mode == 0) { x = lane(); y = lane(); z = lane(); }
+                else {
+                    const uint32_t e1 = 1 + rnd() % 254, e2 = 1 + rnd() % 254;
+                    x = (rnd() & 0x80000000u) | (e1 << 23) | (rnd() & 0x7FFFFFu);
+                    y = (rnd() & 0x80000000u) | (e2 << 23) | (rnd() & 0x7FFFFFu);
+                    z = (rnd() & 0x80000000u) | ((1 + rnd() % 254) << 23) | (rnd() & 0x7FFFFFu);
+                    if (mode == 2) {   /* y close to -x or x (small exponents too), z near 1 */
+                        const uint32_t ex = 1 + rnd() % 40;
+                        x = (x & 0x807FFFFFu) | (ex << 23);
+                        y = (x ^ ((rnd() & 1) ? 0x80000000u : 0)) + (rnd() % 5) - 2;
+                        z = 0x3F800000u + (rnd() % 9) - 4;
+                    }
+                    if (rnd() % 64 == 0) x = SPECIAL[rnd() % NSP];
+                    if (rnd() % 64 == 0) y = SPECIAL[rnd() % NSP];
+                }
+                a[4*i] = x >> 24; a[4*i+1] = x >> 16; a[4*i+2] = x >> 8; a[4*i+3] = x;
+                b[4*i] = y >> 24; b[4*i+1] = y >> 16; b[4*i+2] = y >> 8; b[4*i+3] = y;
+                c[4*i] = z >> 24; c[4*i+1] = z >> 16; c[4*i+2] = z >> 8; c[4*i+3] = z;
+            }
+            vmx_vaddfp(w, a, b, vscr);   vmx_vaddfp_fast(g, a, b, vscr);   check("vaddfp fast", w, g, a, b, 0, vscr);
+            vmx_vsubfp(w, a, b, vscr);   vmx_vsubfp_fast(g, a, b, vscr);   check("vsubfp fast", w, g, a, b, 0, vscr);
+            vmx_vmaddfp(w, a, b, c, vscr);  vmx_vmaddfp_fast(g, a, b, c, vscr);  check("vmaddfp fast", w, g, a, b, c, vscr);
+            vmx_vnmsubfp(w, a, b, c, vscr); vmx_vnmsubfp_fast(g, a, b, c, vscr); check("vnmsubfp fast", w, g, a, b, c, vscr);
+            /* the a*c + b cancellation: b = -(a*c) rounded, so the fused result is tiny */
+            { uint8_t bb[16];
+              for (int i = 0; i < 4; i++) { float fa, fc, fb; uint32_t ua = (uint32_t)a[4*i] << 24 | a[4*i+1] << 16 | a[4*i+2] << 8 | a[4*i+3];
+                uint32_t uc = (uint32_t)c[4*i] << 24 | c[4*i+1] << 16 | c[4*i+2] << 8 | c[4*i+3];
+                memcpy(&fa, &ua, 4); memcpy(&fc, &uc, 4); fb = -(fa * fc); uint32_t ub; memcpy(&ub, &fb, 4);
+                bb[4*i] = ub >> 24; bb[4*i+1] = ub >> 16; bb[4*i+2] = ub >> 8; bb[4*i+3] = ub; }
+              vmx_vmaddfp(w, a, bb, c, vscr);  vmx_vmaddfp_fast(g, a, bb, c, vscr);  check("vmaddfp fast cancel", w, g, a, bb, c, vscr);
+              vmx_vnmsubfp(w, a, bb, c, vscr); vmx_vnmsubfp_fast(g, a, bb, c, vscr); check("vnmsubfp fast cancel", w, g, a, bb, c, vscr); }
+            memcpy(w, a, 16); memcpy(g, a, 16);
+            vmx_vmaddfp(w, w, b, c, vscr);  vmx_vmaddfp_fast(g, g, b, c, vscr);  check("vmaddfp fast d=a", w, g, a, b, c, vscr);
+            memcpy(w, c, 16); memcpy(g, c, 16);
+            vmx_vaddfp(w, a, w, vscr);  vmx_vaddfp_fast(g, a, g, vscr);  check("vaddfp fast d=b", w, g, a, c, 0, vscr);
+            vmx_vmaxfp(w, a, b, vscr);   vmx_vmaxfp_fast(g, a, b, vscr);   check("vmaxfp fast", w, g, a, b, 0, vscr);
+            vmx_vminfp(w, a, b, vscr);   vmx_vminfp_fast(g, a, b, vscr);   check("vminfp fast", w, g, a, b, 0, vscr);
+            if ((it & 7) == 2) memcpy(b, a, 16);
+            { uint32_t r1 = vmx_vcmpeqfp(w, a, b, vscr), r2 = vmx_vcmpeqfp_fast(g, a, b, vscr); check("vcmpeqfp fast", w, g, a, b, 0, vscr);
+              if (r1 != r2) { fails++; printf("FAIL vcmpeqfp fast cr6 %u %u\n", r1, r2); } }
+            { uint32_t r1 = vmx_vcmpgefp(w, a, b, vscr), r2 = vmx_vcmpgefp_fast(g, a, b, vscr); check("vcmpgefp fast", w, g, a, b, 0, vscr);
+              if (r1 != r2) { fails++; printf("FAIL vcmpgefp fast cr6 %u %u\n", r1, r2); } }
+            { uint32_t r1 = vmx_vcmpgtfp(w, a, b, vscr), r2 = vmx_vcmpgtfp_fast(g, a, b, vscr); check("vcmpgtfp fast", w, g, a, b, 0, vscr);
+              if (r1 != r2) { fails++; printf("FAIL vcmpgtfp fast cr6 %u %u\n", r1, r2); } }
+            /* how often the plain path decides (vmaddfp, as a sample) */
+            { const __m128i x = vmxs_ld(a), y = vmxs_ld(b), cc = vmxs_ld(c);
+              const __m128i z = vmxs_f2i(_mm_fmadd_ps(vmxs_i2f(x), vmxs_i2f(cc), vmxs_i2f(y))), z1 = vmxs_dm1(z);
+              const __m128i m = _mm_min_epu32(_mm_min_epu32(vmxs_dm1(x), vmxs_dm1(y)), _mm_min_epu32(vmxs_dm1(cc), z1));
+              total++; taken += !vmxs_special(m, z1); }
+        }
+        printf("fast forms: %ld cases, plain path on %ld (%.0f%%)\n", n, taken, total ? 100.0 * taken / total : 0.0);
     }
     printf("%ld cases: %ld failures\n", n, fails);
     return fails != 0;

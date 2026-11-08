@@ -4129,7 +4129,8 @@ class PPULifter:
                 preamble = preamble.replace("\n/*@@PPU_MM@@*/\n", "\n").replace("/*@@PPU_MM_END@@*/\n", "")
             else:
                 preamble = preamble[:i] + preamble[j + len("/*@@PPU_MM_END@@*/\n"):]
-        lines = [preamble]
+        import ppu_fastpath   # header fast paths (ppu3): all switches off = unchanged text
+        lines = [ppu_fastpath.header_preamble(preamble)]
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")

@@ -206,18 +206,126 @@ VMXS_INL void ppu_vperm_sse(void* d_, const void* a_, const void* b_, const void
     _mm_storeu_si128((__m128i*)d_, _mm_blendv_epi8(ra, rb, _mm_slli_epi16(c, 3)));   /* bit 4 -> bit 7 */
 }
 
+/* PPU_VMX_FAST (ppu3 agent, 2026-11-08; a lift with PPU_VMX_FAST=1 defines it): the
+ * float ops above with the plain SSE result when no lane needs the special rules.
+ * The flushes only change a denormal (with NJ; a zero keeps its sign either way),
+ * and the NaN rules only change a NaN result -- and a NaN operand always gives a NaN
+ * result (IEEE add / sub / fma / div / sqrt). So when no operand and no result lane
+ * is a denormal and no result lane is a NaN, the exact form returns exactly the plain
+ * result (same IEEE operation, round to nearest, no flush); otherwise the exact form
+ * runs from the start (nothing has been stored yet, so d may alias any operand).
+ * The test is off the result's dependency chain: a chain of float ops runs at the
+ * latency of the SSE ops instead of ~4x it. tools/test_vmx_sse.c checks every one
+ * against ppu_vmx.h. */
+#ifdef PPU_VMX_FAST
+/* |v| - 1 per lane: a denormal is exactly a value below 0x7FFFFF (unsigned); zero wraps high */
+VMXS_INL __m128i vmxs_dm1(__m128i v) {
+    return _mm_sub_epi32(_mm_and_si128(v, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(1));
+}
+/* nonzero if any lane of the minimum m of some dm1 values is a denormal, or r1 = dm1(r) is a NaN
+ * (as signed: zero is -1, a NaN is above 0x7F7FFFFF = dm1(inf)) */
+VMXS_INL int vmxs_special(__m128i m, __m128i r1) {
+    const __m128i d = _mm_cmpeq_epi32(_mm_min_epu32(m, _mm_set1_epi32(0x007FFFFE)), m);
+    const __m128i n = _mm_cmpgt_epi32(r1, _mm_set1_epi32(0x7F7FFFFF));
+    const __m128i s = _mm_or_si128(d, n);
+    return !_mm_testz_si128(s, s);
+}
+VMXS_INL void vmx_vaddfp_fast(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const __m128i x = vmxs_ld(a_), y = vmxs_ld(b_);
+    const __m128i z = vmxs_f2i(_mm_add_ps(vmxs_i2f(x), vmxs_i2f(y))), z1 = vmxs_dm1(z);
+    if (__builtin_expect(vmxs_special(_mm_min_epu32(_mm_min_epu32(vmxs_dm1(x), vmxs_dm1(y)), z1), z1), 0)) {
+        vmx_vaddfp_sse(d_, a_, b_, vscr); return; }
+    vmxs_st(d_, z);
+}
+VMXS_INL void vmx_vsubfp_fast(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const __m128i x = vmxs_ld(a_), y = vmxs_ld(b_);
+    const __m128i z = vmxs_f2i(_mm_sub_ps(vmxs_i2f(x), vmxs_i2f(y))), z1 = vmxs_dm1(z);
+    if (__builtin_expect(vmxs_special(_mm_min_epu32(_mm_min_epu32(vmxs_dm1(x), vmxs_dm1(y)), z1), z1), 0)) {
+        vmx_vsubfp_sse(d_, a_, b_, vscr); return; }
+    vmxs_st(d_, z);
+}
+VMXS_INL void vmx_vmaddfp_fast(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const __m128i x = vmxs_ld(a_), y = vmxs_ld(b_), c = vmxs_ld(c_);
+    const __m128i z = vmxs_f2i(_mm_fmadd_ps(vmxs_i2f(x), vmxs_i2f(c), vmxs_i2f(y))), z1 = vmxs_dm1(z);
+    const __m128i m = _mm_min_epu32(_mm_min_epu32(vmxs_dm1(x), vmxs_dm1(y)), _mm_min_epu32(vmxs_dm1(c), z1));
+    if (__builtin_expect(vmxs_special(m, z1), 0)) { vmx_vmaddfp_sse(d_, a_, b_, c_, vscr); return; }
+    vmxs_st(d_, z);
+}
+/* -(a*c - b): flipping the sign of a non-NaN, non-denormal value keeps it so */
+VMXS_INL void vmx_vnmsubfp_fast(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const __m128i x = vmxs_ld(a_), y = vmxs_ld(b_), c = vmxs_ld(c_);
+    const __m128i z = vmxs_f2i(_mm_fmsub_ps(vmxs_i2f(x), vmxs_i2f(c), vmxs_i2f(y))), z1 = vmxs_dm1(z);
+    const __m128i m = _mm_min_epu32(_mm_min_epu32(vmxs_dm1(x), vmxs_dm1(y)), _mm_min_epu32(vmxs_dm1(c), z1));
+    if (__builtin_expect(vmxs_special(m, z1), 0)) { vmx_vnmsubfp_sse(d_, a_, b_, c_, vscr); return; }
+    vmxs_st(d_, _mm_xor_si128(z, _mm_set1_epi32((int)0x80000000u)));
+}
+/* vmaxfp / vminfp take no input flush: the plain result needs only no NaN operand
+ * (then the exact form's NaN rules do nothing) and no denormal result. The selection
+ * (AND / OR of two zeros, then the ordered compares) is the exact form's own. */
+VMXS_INL void vmx_vmaxfp_fast(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const __m128i x = vmxs_ld(a_), y = vmxs_ld(b_);
+    const __m128 xf = vmxs_i2f(x), yf = vmxs_i2f(y);
+    __m128i z = _mm_and_si128(x, y);
+    z = _mm_blendv_epi8(z, y, vmxs_f2i(_mm_cmp_ps(yf, xf, _CMP_GT_OQ)));
+    z = _mm_blendv_epi8(z, x, vmxs_f2i(_mm_cmp_ps(xf, yf, _CMP_GT_OQ)));
+    const __m128i n = vmxs_f2i(_mm_cmp_ps(xf, yf, _CMP_UNORD_Q)), z1 = vmxs_dm1(z);
+    const __m128i s = _mm_or_si128(n, _mm_cmpeq_epi32(_mm_min_epu32(z1, _mm_set1_epi32(0x007FFFFE)), z1));
+    if (__builtin_expect(!_mm_testz_si128(s, s), 0)) { vmx_vmaxfp_sse(d_, a_, b_, vscr); return; }
+    vmxs_st(d_, z);
+}
+VMXS_INL void vmx_vminfp_fast(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const __m128i x = vmxs_ld(a_), y = vmxs_ld(b_);
+    const __m128 xf = vmxs_i2f(x), yf = vmxs_i2f(y);
+    __m128i z = _mm_or_si128(x, y);
+    z = _mm_blendv_epi8(z, y, vmxs_f2i(_mm_cmp_ps(yf, xf, _CMP_LT_OQ)));
+    z = _mm_blendv_epi8(z, x, vmxs_f2i(_mm_cmp_ps(xf, yf, _CMP_LT_OQ)));
+    const __m128i n = vmxs_f2i(_mm_cmp_ps(xf, yf, _CMP_UNORD_Q)), z1 = vmxs_dm1(z);
+    const __m128i s = _mm_or_si128(n, _mm_cmpeq_epi32(_mm_min_epu32(z1, _mm_set1_epi32(0x007FFFFE)), z1));
+    if (__builtin_expect(!_mm_testz_si128(s, s), 0)) { vmx_vminfp_sse(d_, a_, b_, vscr); return; }
+    vmxs_st(d_, z);
+}
+/* compares: the flush changes only denormal operands; an ordered compare of the rest is the same */
+#define VMXS_CMPF_FAST(name, sse, pred) \
+VMXS_INL uint32_t name(VMX_D, VMX_A, VMX_B, uint32_t vscr) { \
+    const __m128i x = vmxs_ld(a_), y = vmxs_ld(b_); \
+    const __m128i m = _mm_min_epu32(vmxs_dm1(x), vmxs_dm1(y)); \
+    const __m128i s = _mm_cmpeq_epi32(_mm_min_epu32(m, _mm_set1_epi32(0x007FFFFE)), m); \
+    if (__builtin_expect(!_mm_testz_si128(s, s), 0)) return sse(d_, a_, b_, vscr); \
+    const __m128 c = _mm_cmp_ps(vmxs_i2f(x), vmxs_i2f(y), pred); \
+    _mm_storeu_si128((__m128i*)d_, vmxs_f2i(c)); \
+    const int k = _mm_movemask_ps(c); \
+    return (uint32_t)((k == 15) << 3 | (k == 0) << 1); }
+VMXS_CMPF_FAST(vmx_vcmpeqfp_fast, vmx_vcmpeqfp_sse, _CMP_EQ_OQ)
+VMXS_CMPF_FAST(vmx_vcmpgefp_fast, vmx_vcmpgefp_sse, _CMP_GE_OQ)
+VMXS_CMPF_FAST(vmx_vcmpgtfp_fast, vmx_vcmpgtfp_sse, _CMP_GT_OQ)
+#endif /* PPU_VMX_FAST */
+
 #ifndef PPU_VMX_SSE_NO_REDIRECT
+#ifdef PPU_VMX_FAST
+#define vmx_vaddfp    vmx_vaddfp_fast
+#define vmx_vsubfp    vmx_vsubfp_fast
+#define vmx_vmaddfp   vmx_vmaddfp_fast
+#define vmx_vnmsubfp  vmx_vnmsubfp_fast
+#define vmx_vmaxfp    vmx_vmaxfp_fast
+#define vmx_vminfp    vmx_vminfp_fast
+#define vmx_vcmpeqfp  vmx_vcmpeqfp_fast
+#define vmx_vcmpgefp  vmx_vcmpgefp_fast
+#define vmx_vcmpgtfp  vmx_vcmpgtfp_fast
+#else
 #define vmx_vaddfp    vmx_vaddfp_sse
 #define vmx_vsubfp    vmx_vsubfp_sse
 #define vmx_vmaddfp   vmx_vmaddfp_sse
 #define vmx_vnmsubfp  vmx_vnmsubfp_sse
-#define vmx_vrefp     vmx_vrefp_sse
-#define vmx_vrsqrtefp vmx_vrsqrtefp_sse
 #define vmx_vmaxfp    vmx_vmaxfp_sse
 #define vmx_vminfp    vmx_vminfp_sse
+#endif
+#define vmx_vrefp     vmx_vrefp_sse
+#define vmx_vrsqrtefp vmx_vrsqrtefp_sse
+#ifndef PPU_VMX_FAST
 #define vmx_vcmpeqfp  vmx_vcmpeqfp_sse
 #define vmx_vcmpgefp  vmx_vcmpgefp_sse
 #define vmx_vcmpgtfp  vmx_vcmpgtfp_sse
+#endif
 #define vmx_vcfsx     vmx_vcfsx_sse
 #define vmx_vcmpequw  vmx_vcmpequw_sse
 #define vmx_vslw      vmx_vslw_sse
