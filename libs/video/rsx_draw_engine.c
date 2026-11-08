@@ -36,6 +36,7 @@
 #include <string.h>
 #include "../../include/ps3emu/ps3_toggles.h"   /* PS3_TOGGLE_FILE: live knobs */
 #include "../../include/ps3emu/ps3_ftrace.h"    /* PS3_FTRACE: compile / texture spans */
+#include "../../include/ps3emu/ps3_settings.h"  /* the PC menu's live settings (PS3RECOMP_DOF, ...) */
 
 /* Knobs PS3_TOGGLE_FILE can change while the game runs (their watchers only
  * store; the RSX thread reads). */
@@ -87,6 +88,51 @@ static void eng_poly_offset_set(int id, int v) { (void)id; __atomic_store_n(&s_p
 static int s_shade_backface = -1;
 static void eng_shade_backface_set(int id, int v) { (void)id; __atomic_store_n(&s_shade_backface, v != 0, __ATOMIC_RELAXED); }
 #define ENG_SHADE_BACKFACE_FP 0xf384f111ad5956baull
+/* PS3RECOMP_DOF=0 / PS3RECOMP_EDGE_BLUR=0 (live, the PC menu's Graphics
+ * page): inFAMOUS 2's depth of field and its screen-edge blur turned off.
+ * Unset or 1 = the game's own picture.
+ *
+ * Both are ONE full-screen pass of the game, FX_DOF_BLEND (the post object
+ * built by func_002FD1E4 keeps it at +0xA0), FP 59313a119f622eb5 with
+ * VP dd2553b92143f18f, drawn into the scene target after the deferred
+ * composite (RenderDoc, rd-scout1 frame 47024, event 12578):
+ *   unit 0  the depth buffer as RGBA8 -> d; w = c1.x + c1.y * d
+ *   unit 1  the sharp scene (a copy)                              = S
+ *   unit 2  the scene at 1/4 x 1/4 (320x180), alpha a weight      = Q
+ *   unit 3  Q blurred again (320x180), alpha a weight             = B
+ *   n = saturate(c2.y / w + c3.x), f = saturate(c2.w / w + c3.z)
+ *   a = n * Q.a * c4.x                       (depth of field, first band)
+ *   b = max(f * B.a * c5.x, tc0.z)           (second band, or the edge blur)
+ *   out = lerp(lerp(S, Q, a), B, b)
+ * tc0.z is vertex attribute 8 of the pass's 12-index screen mesh: 0 in the
+ * middle, the EDGE_BLUR_LIMITS weight at the borders -- the soft, smeared
+ * edges of the picture that read as motion blur when the camera turns.
+ * c4.x/c5.x are the depth-of-field strength (0.55 in the docks).
+ * Off = those terms replaced by 0 in that program's generated shader: a = 0
+ * and b = 0 exactly, so the pass returns S, the sharp scene, bit for bit
+ * (every input is a finite UNORM sample). Nothing else in the frame
+ * changes (the game still makes the two quarter-size images; they are
+ * small). A change builds the other variant of this one pipeline (part of
+ * its key). */
+#define ENG_DOF_BLEND_FP 0x59313a119f622eb5ull
+static int s_fx_dof = -1, s_fx_edge = -1;   /* 1 on (the game's), 0 off, -1 not read yet */
+static int eng_fx_on(const char* v) { return !(v && v[0] == '0' && v[1] == 0); }
+static int eng_fx_dof_apply(const char* v) { __atomic_store_n(&s_fx_dof, eng_fx_on(v), __ATOMIC_RELAXED); return 1; }
+static int eng_fx_edge_apply(const char* v) { __atomic_store_n(&s_fx_edge, eng_fx_on(v), __ATOMIC_RELAXED); return 1; }
+/* Replace every `from` in `buf` with `to`; the count, or -1 when it would not fit. */
+static int eng_hlsl_replace(char* buf, size_t cap, const char* from, const char* to)
+{
+    const size_t fl = strlen(from), tl = strlen(to);
+    int hits = 0;
+    for (char* q = strstr(buf, from); q; q = strstr(q + tl, from)) {
+        const size_t len = strlen(buf);
+        if (len - fl + tl + 1 > cap) return -1;
+        memmove(q + tl, q + fl, len + 1 - (size_t)(q - buf) - fl);
+        memcpy(q, to, tl);
+        hits++;
+    }
+    return hits;
+}
 /* PS3RECOMP_ENG_DEPTH_CLAMP (live): NV4097_SET_ZMIN_MAX_CONTROL (0x1D78,
  * cellGcmSetZMinMaxControl: bits 0-3 cull at the near/far planes, 4-7 depth
  * clamp, 8-11 cull ignores W), which this engine used to ignore (always
@@ -2457,7 +2503,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         int valid, fixed;
         u64 vp_hash, fp_struct;
         u32 fp_ctrl_key, cube_mask, vol_mask, vtex_mask, layout_mask, layout_stride, rt_count;
-        u32 shadow_mask, srgb_output, gamma_units, expand_units, ucp, dbz, shade_bf;
+        u32 shadow_mask, srgb_output, gamma_units, expand_units, ucp, dbz, shade_bf, fx_off;
         u32 fbf_cand; u8 fbf_att[16]; u8 fbf_sel[16][4];
         u8 gamma_masks[RSX_DSP_NUM_TEXTURES];
         u8 expand_masks[RSX_DSP_NUM_TEXTURES];
@@ -2491,6 +2537,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     }
     const u32 shade_bf = (!fixed && in_fp == ENG_SHADE_BACKFACE_FP)
                        ? (u32)__atomic_load_n(&s_shade_backface, __ATOMIC_RELAXED) : 0u;
+    /* PS3RECOMP_DOF / PS3RECOMP_EDGE_BLUR: which terms of the game's
+     * DOF/edge-blur pass are off (bit 0 depth of field, bit 1 edge blur). */
+    if (__builtin_expect(__atomic_load_n(&s_fx_dof, __ATOMIC_RELAXED) < 0, 0)) {
+        __atomic_store_n(&s_fx_edge, eng_fx_on(getenv("PS3RECOMP_EDGE_BLUR")), __ATOMIC_RELAXED);
+        __atomic_store_n(&s_fx_dof, eng_fx_on(getenv("PS3RECOMP_DOF")), __ATOMIC_RELAXED);
+    }
+    const u32 fx_off = (!fixed && in_fp == ENG_DOF_BLEND_FP)
+                     ? (u32)(!__atomic_load_n(&s_fx_dof, __ATOMIC_RELAXED)) |
+                       (u32)(!__atomic_load_n(&s_fx_edge, __ATOMIC_RELAXED)) << 1 : 0u;
     u64 key;
     if (kmemo.valid && kmemo.fixed == fixed && kmemo.vp_hash == in_vp && kmemo.fp_struct == in_fp &&
         kmemo.fp_ctrl_key == fp_ctrl_key && kmemo.cube_mask == cube_mask && kmemo.vol_mask == vol_mask &&
@@ -2499,7 +2554,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         kmemo.rt_fmt == rt_fmt && !memcmp(&kmemo.rs, rs, sizeof *rs) &&
         kmemo.shadow_mask == shadow_mask && kmemo.srgb_output == srgb_output &&
         kmemo.gamma_units == gamma_units && kmemo.ucp == ucp && kmemo.dbz == dbz &&
-        kmemo.shade_bf == shade_bf &&
+        kmemo.shade_bf == shade_bf && kmemo.fx_off == fx_off &&
         (!gamma_units || !memcmp(kmemo.gamma_masks, gamma_masks, sizeof gamma_masks)) &&
         kmemo.expand_units == expand_units &&
         (!expand_units || !memcmp(kmemo.expand_masks, expand_masks, sizeof expand_masks)) &&
@@ -2536,6 +2591,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         }
         if (dbz) { const u32 tag = 0x5A424400u | dbz; key = eng_fnv1a(&tag, sizeof tag, key); }
         if (shade_bf) { const u32 tag = 0x53424631u; key = eng_fnv1a(&tag, sizeof tag, key); }   /* "SBF1" */
+        if (fx_off) { const u32 tag = 0x46584F00u | fx_off; key = eng_fnv1a(&tag, sizeof tag, key); }   /* "FXO" */
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -2551,7 +2607,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     kmemo.shadow_mask = shadow_mask; memcpy(kmemo.shadow, shadow, sizeof shadow);
     kmemo.srgb_output = srgb_output;
     kmemo.gamma_units = gamma_units; kmemo.expand_units = expand_units; kmemo.ucp = ucp; kmemo.dbz = dbz;
-    kmemo.shade_bf = shade_bf;
+    kmemo.shade_bf = shade_bf; kmemo.fx_off = fx_off;
     memcpy(kmemo.expand_masks, expand_masks, sizeof expand_masks); memcpy(kmemo.gamma_masks, gamma_masks, sizeof gamma_masks);
     kmemo.fbf_cand = s_fbf.cand; memcpy(kmemo.fbf_att, s_fbf.att, sizeof s_fbf.att); memcpy(kmemo.fbf_sel, s_fbf.sel, sizeof s_fbf.sel);
     kmemo.key = key;
@@ -2681,6 +2737,25 @@ key_done:;
             memcpy(at, fix, sizeof fix - 1);
             static u32 said; if (said++ < 2) fprintf(stderr, "[rsx engine] shade-backface: composite %016llx patched\n", (unsigned long long)in_fp);
         } else { static u32 said; if (said++ < 2) fprintf(stderr, "[rsx engine] shade-backface: composite %016llx NOT patched (unexpected text)\n", (unsigned long long)in_fp); }
+    }
+    /* PS3RECOMP_DOF=0 / PS3RECOMP_EDGE_BLUR=0: the DOF/edge-blur pass with
+     * those weights at 0 (see ENG_DOF_BLEND_FP). Each term must appear
+     * exactly once in the text the decompiler made, else it is left alone. */
+    if (fi > 0 && fx_off) {
+        static char tmp[sizeof s_ps_hlsl];
+        int ok_dof = 1, ok_edge = 1;
+        memcpy(tmp, s_ps_hlsl, strlen(s_ps_hlsl) + 1);
+        if (fx_off & 1u)
+            ok_dof = eng_hlsl_replace(tmp, sizeof tmp, "((fp_constants[4]).xxxx)", "((float4)0)") == 1 &&
+                     eng_hlsl_replace(tmp, sizeof tmp, "((fp_constants[5]).xxxx)", "((float4)0)") == 1;
+        if (ok_dof && (fx_off & 2u))
+            ok_edge = eng_hlsl_replace(tmp, sizeof tmp, "((input.tc0).zzzz)", "((float4)0)") == 1;
+        if (ok_dof && ok_edge) memcpy(s_ps_hlsl, tmp, strlen(tmp) + 1);
+        static u32 said;
+        if (said++ < 8)
+            fprintf(stderr, "[rsx engine] game post fx: depth of field %s, edge blur %s (fp %016llx)%s\n",
+                    (fx_off & 1u) ? "OFF" : "on", (fx_off & 2u) ? "OFF" : "on", (unsigned long long)in_fp,
+                    ok_dof && ok_edge ? "" : ": NOT applied (unexpected text)");
     }
     /* PS3RECOMP_ENG_FBFETCH: the units that read their own target. */
     u32 fbf_applied = 0;
@@ -5440,6 +5515,9 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     s_vpgen_memo = NULL;   /* PS3RECOMP_ENG_VP_GEN: vp_gen starts over */
+    /* The game's post effects the PC menu turns off (ENG_DOF_BLEND_FP). */
+    ps3_setting_register("PS3RECOMP_DOF", eng_fx_dof_apply);
+    ps3_setting_register("PS3RECOMP_EDGE_BLUR", eng_fx_edge_apply);
     g.ready = 1;
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
             g.width, g.height);
