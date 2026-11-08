@@ -60,6 +60,8 @@ static __declspec(align(64)) volatile u64  s_tq_w;     /* published write positi
 static __declspec(align(64)) volatile u64  s_tq_r;     /* consumed position (worker) */
 static __declspec(align(64)) volatile LONG s_tq_sleep; /* worker is (about to be) asleep */
 static volatile LONG s_tq_quit;
+static u64 s_tq_spin_ticks = 500000ull;   /* PS3RECOMP_VK_TQ_SPIN_US (vk_tq_install) */
+static u64 s_tq_wake_bytes;               /* PS3RECOMP_VK_TQ_WAKE_KB (vk_tq_install) */
 /* PS3RECOMP_VK_PRESENT_ASYNC (rsx3): the frame's present -- postfx, the overlay,
  * the submit and vkQueuePresentKHR -- is one more record in the ring, run by the
  * worker. The worker's own calls through the thunks go straight to the driver
@@ -106,11 +108,12 @@ static DWORD WINAPI tq_worker(LPVOID arg)
             continue;
         }
         if (s_tq_quit) break;
-        /* idle: spin ~150 us (the RSX thread's gaps between draws are a few us),
-         * then sleep until the producer publishes */
+        /* idle: spin a little (PS3RECOMP_VK_TQ_SPIN_US), then sleep until the
+         * producer wakes it -- which it does only once PS3RECOMP_VK_TQ_WAKE_KB of
+         * records are waiting, at a present, a drain or a full ring (tq_wake). */
         const u64 t0 = __rdtsc();
         int got = 0;
-        while (__rdtsc() - t0 < 500000ull) {
+        while (__rdtsc() - t0 < s_tq_spin_ticks) {
             for (int k = 0; k < 16; k++) _mm_pause();
             if (__atomic_load_n(&s_tq_w, __ATOMIC_ACQUIRE) != r || s_tq_quit) { got = 1; break; }
         }
@@ -124,8 +127,23 @@ static DWORD WINAPI tq_worker(LPVOID arg)
     return 0;
 }
 
+/* The producer's wake (rsx3, lead + spu3: the worker's ~150 us idle spin after
+ * every burst kept it spinning the whole frame -- ~0.9 of a core taken from the
+ * SPU workers and the main thread). A sleeping worker is woken only once
+ * s_tq_wake_bytes of records wait (it then runs them as one burst), at a present
+ * (tq_wake_force), a drain (vk_tq_sync) or a full ring; anything below the
+ * threshold is picked up by its 2 ms wait timeout at the latest -- nothing waits
+ * on it until the next submit, and a submit drains. PS3RECOMP_VK_TQ_WAKE_KB=0 and
+ * PS3RECOMP_VK_TQ_SPIN_US=143 = the old behaviour (wake on every record). */
 static void tq_wake(void)
 {
+    if (!s_tq_sleep) return;
+    if (s_tq_wake_bytes && s_tq.wlocal - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) < s_tq_wake_bytes) return;
+    s_tq.n_wakes++; WakeByAddressSingle((PVOID)&s_tq_w);
+}
+static void tq_wake_force(void)
+{
+    MemoryBarrier();                   /* the published position before the sleep flag is read */
     if (s_tq_sleep) { s_tq.n_wakes++; WakeByAddressSingle((PVOID)&s_tq_w); }
 }
 
@@ -586,6 +604,18 @@ static void vk_tq_install(void)
     TQ_FNS(TQ_SAVE)
 #undef TQ_SAVE
     s_tq_w = s_tq_r = 0; s_tq.wlocal = 0; s_tq_quit = 0; s_tq.err = VK_SUCCESS;
+    { /* rsx3: the worker's idle spin and the producer's wake threshold */
+      const char* sp = getenv("PS3RECOMP_VK_TQ_SPIN_US"); const char* wk = getenv("PS3RECOMP_VK_TQ_WAKE_KB");
+      const double spin_us = sp ? atof(sp) : 20.0;
+      const long wake_kb = wk ? atol(wk) : 64L;
+      LARGE_INTEGER f, a, b; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a);
+      const u64 c0 = __rdtsc();
+      do { QueryPerformanceCounter(&b); } while ((b.QuadPart - a.QuadPart) * 1000000 < f.QuadPart * 2000);   /* 2 ms */
+      const double ticks_per_us = (double)(__rdtsc() - c0) * (double)f.QuadPart / ((double)(b.QuadPart - a.QuadPart) * 1e6);
+      s_tq_spin_ticks = (u64)(spin_us * ticks_per_us);
+      s_tq_wake_bytes = wake_kb > 0 ? (u64)wake_kb << 10 : 0;
+      fprintf(stderr, "[RSX vulkan] recording worker: idle spin %.0f us, wake at %ld KB (PS3RECOMP_VK_TQ_SPIN_US / _WAKE_KB)\n",
+              spin_us, wake_kb > 0 ? wake_kb : 0L); }
     s_tq.thread = CreateThread(NULL, 0, tq_worker, NULL, 0, NULL);
     if (!s_tq.thread) { VirtualFree(s_tq.ring, 0, MEM_RELEASE); s_tq.ring = NULL; return; }
     SetThreadPriority(s_tq.thread, GetThreadPriority(GetCurrentThread()));
@@ -620,8 +650,8 @@ static void vk_tq_install(void)
 #undef TQ_SWAP
     s_tq.running = 1;
     s_tq.on = 1;
-    fprintf(stderr, "[RSX vulkan] threaded command recording on (PS3RECOMP_VK_THREADED=0 = off, %u MB ring)\n",
-            TQ_RING_BYTES >> 20);
+    fprintf(stderr, "[RSX vulkan] threaded command recording on (PS3RECOMP_VK_THREADED=0 = off, %u MB ring; worker hosttid=%lu, producer hosttid=%lu)\n",
+            TQ_RING_BYTES >> 20, (unsigned long)GetThreadId(s_tq.thread), (unsigned long)GetCurrentThreadId());
 }
 
 /* Drain, stop the worker and put the real entry points back. */

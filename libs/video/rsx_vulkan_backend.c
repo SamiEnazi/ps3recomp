@@ -3605,6 +3605,7 @@ static void vk_present_async(void)
         p->img = s_vk.color.img; p->view = s_vk.color.view; p->w = s_vk.width; p->ht = s_vk.height;
         p->seq = ++s_tq_pres_sent;
         tq_commit((const u8*)p);
+        tq_wake_force();                    /* the frame goes now, whatever the wake threshold */
     } else {
         vk_tq_sync();
         const int was = s_tq.direct;
