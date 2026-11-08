@@ -445,10 +445,12 @@ int spu_jobrec_job_call(spu_context* ctx)
     jr_tls* t = jr_tls_get();
     if (t->active) {
         if (t->ctx != ctx) { __atomic_add_fetch(&s_skipped_nested, 1, __ATOMIC_RELAXED); return 0; }
-        /* deeper than the open job's call: a branch inside that job */
-        if (ctx->host_depth > t->depth0) return 0;
-        /* the same context back at a job call at the open job's depth: that
-         * one was unwound without coming back (halt / restart) */
+        /* An indirect branch inside the open job (a job may branch through a
+         * register before it has changed r0) -- or the wrapper's own entry
+         * dispatch. Only a call below the open job's depth means that job was
+         * unwound without coming back (halts and restarts also say so through
+         * spu_jobrec_unwound). */
+        if (ctx->host_depth >= t->depth0) return 0;
         __atomic_add_fetch(&s_aborted, 1, __ATOMIC_RELAXED);
         t->active = 0;
     }
