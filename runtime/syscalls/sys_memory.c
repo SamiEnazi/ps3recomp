@@ -20,7 +20,31 @@ sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
 uint32_t g_sys_mem_bump_ptr = 0;
 
 /* Total user memory size (default 213 MB, after kernel reservation) */
-#define SYS_MEM_USER_TOTAL  (213 * 1024 * 1024)
+#define SYS_MEM_USER_TOTAL  (sys_mem_user_total())
+
+/* PS3_USER_MEMORY_MB=<n> (read once; unset = the retail console): the user
+ * memory a DEVELOPMENT console reports. A retail PS3 has 256 MB; a debug
+ * console / devkit in "debug memory" mode reports more, and some titles size
+ * their heaps from it. inFAMOUS 2 does (func_001EFC24 at 0x001EFC8C: total
+ * > 0x17FFFFFF sets the byte at 0x00A2C840; func_000DD8AC then allocates its
+ * main heap at 0xD400000 = 212 MB instead of 0x7900000 = 121 MB). The
+ * sys_memory window grows to match (it is guest address space: 0x40000000
+ * up, nothing else lives there). Values below 256 are ignored. */
+uint32_t sys_mem_user_mb(void)
+{
+    static _Atomic uint32_t s_mb = 0;
+    if (!s_mb) {
+        const char* e = getenv("PS3_USER_MEMORY_MB");
+        const unsigned long v = e ? strtoul(e, 0, 10) : 0;
+        s_mb = (v >= 256 && v <= 1024) ? (uint32_t)v : 1;   /* 1 = not set */
+    }
+    return s_mb == 1 ? 0 : s_mb;
+}
+static uint32_t sys_mem_user_total(void)
+{
+    const uint32_t mb = sys_mem_user_mb();
+    return mb ? (mb - 43u) << 20 : 213u * 1024u * 1024u;   /* the kernel's 43 MB, as on retail */
+}
 
 /* Guest window handed out by sys_memory_allocate / sys_mmapper.
  * 0x40000000+ matches where the real lv2 places these allocations (verified
@@ -40,7 +64,7 @@ static uint32_t sys_mem_alloc_base(void)
     return s_base;
 }
 #define SYS_MEM_ALLOC_BASE  (sys_mem_alloc_base())
-#define SYS_MEM_ALLOC_END   (sys_mem_alloc_base() + 0x10000000u)
+#define SYS_MEM_ALLOC_END   (sys_mem_alloc_base() + (sys_mem_user_mb() > 256u ? sys_mem_user_mb() << 20 : 0x10000000u))
 
 static uint32_t s_total_allocated = 0;
 
