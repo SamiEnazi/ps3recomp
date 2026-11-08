@@ -57,6 +57,8 @@ static int s_interp = 0;
 #define JR_VERSION 1u
 #define JR_MAX_OVL 512
 
+enum { JR_SKIP_RDCH = 1, JR_SKIP_RCHCNT = 2, JR_SKIP_WRCH = 4, JR_SKIP_ATOM = 8, JR_SKIP_STOP = 16 };
+
 enum { EV_RDCH = 1, EV_RCHCNT = 2, EV_WRCH = 3, EV_DMA = 4, EV_ATOM = 5, EV_STOP = 6, EV_IRQ = 7 };
 static const char* const s_ev_name[] = { "?", "rdch", "rchcnt", "wrch", "dma", "atomic", "stop", "irq" };
 
@@ -200,6 +202,7 @@ typedef struct jr_file {
 
 typedef struct jr_tls {
     int          active;      /* a job of `ctx` is being recorded / replayed / timed */
+    unsigned     skip;        /* JR_SKIP_*: the recorder's own call of a hooked operation, consumed by its hook */
     uint32_t     depth0;      /* ctx->host_depth at the job call */
     int          recording, replaying;
     spu_context* ctx;
@@ -235,6 +238,32 @@ static inline jr_tls* jr_on(spu_context* ctx)
 {
     jr_tls* t = t_jr;
     return (t && t->active && t->ctx == ctx && (t->recording || t->replaying)) ? t : NULL;
+}
+
+/* The operations themselves, with this thread's hooks bypassed: the hooked
+ * functions are the only copies, so the hooks cost one load + branch when off. */
+extern u128 spu_rdch(spu_context* ctx, uint32_t channel);
+extern uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
+extern void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+extern void spu_stop(spu_context* ctx);
+uint32_t spu_rdch_raw(spu_context* ctx, uint32_t ch)
+{
+    t_jr->skip |= JR_SKIP_RDCH; const u128 v = spu_rdch(ctx, ch);
+    return v._u32[0];
+}
+uint32_t spu_rchcnt_raw(spu_context* ctx, uint32_t ch)
+{
+    t_jr->skip |= JR_SKIP_RCHCNT; const uint32_t v = spu_rchcnt(ctx, ch);
+    return v;
+}
+void spu_wrch_raw(spu_context* ctx, uint32_t ch, uint32_t v)
+{
+    u128 x; memset(&x, 0, sizeof x); x._u32[0] = v;
+    t_jr->skip |= JR_SKIP_WRCH; spu_wrch(ctx, ch, x);
+}
+void spu_stop_raw(spu_context* ctx)
+{
+    t_jr->skip |= JR_SKIP_STOP; spu_stop(ctx);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -466,7 +495,7 @@ int spu_jobrec_job_call(spu_context* ctx)
             rec = 1;
         }
     }
-    t->active = 1; t->ctx = ctx; t->recording = rec; t->replaying = 0; t->depth0 = ctx->host_depth;
+    t->active = 1; t->ctx = ctx; t->recording = rec; t->replaying = 0; t->depth0 = ctx->host_depth; t->skip = 0;
     uint64_t r0 = 0, r1 = 0;
     if (rec) { r0 = jr_qpc(); jr_rec_begin(t, ctx); r1 = jr_qpc(); }
     const uint64_t q0 = jr_qpc();
@@ -494,6 +523,7 @@ void spu_jobrec_unwound(spu_context* ctx)
 {
     jr_tls* t = t_jr;
     if (t && t->active && t->ctx == ctx) {
+        t->skip = 0;   /* an unwind out of a bypassed call (a stop that exits) */
         if (t->recording) __atomic_add_fetch(&s_aborted, 1, __ATOMIC_RELAXED);
         if (!t->replaying) t->active = 0;
     }
@@ -559,6 +589,7 @@ int spu_jobrec_rdch(spu_context* ctx, uint32_t ch, uint32_t* out)
 {
     jr_tls* t = jr_on(ctx);
     if (!t) return 0;
+    if (t->skip & JR_SKIP_RDCH) { t->skip &= ~(unsigned)JR_SKIP_RDCH; return 0; }   /* the recorder's own call */
     if (t->recording) {
         const uint32_t v = spu_rdch_raw(ctx, ch);
         jr_ev* e = jr_push(t, EV_RDCH, ch, NULL, 0);
@@ -588,6 +619,7 @@ int spu_jobrec_rchcnt(spu_context* ctx, uint32_t ch, uint32_t* out)
 {
     jr_tls* t = jr_on(ctx);
     if (!t) return 0;
+    if (t->skip & JR_SKIP_RCHCNT) { t->skip &= ~(unsigned)JR_SKIP_RCHCNT; return 0; }   /* the recorder's own call */
     if (t->recording) {
         const uint32_t v = spu_rchcnt_raw(ctx, ch);
         jr_ev* e = jr_push(t, EV_RCHCNT, ch, NULL, 0);
@@ -617,6 +649,7 @@ int spu_jobrec_wrch(spu_context* ctx, uint32_t ch, uint32_t v)
 {
     jr_tls* t = jr_on(ctx);
     if (!t) return 0;
+    if (t->skip & JR_SKIP_WRCH) { t->skip &= ~(unsigned)JR_SKIP_WRCH; return 0; }   /* the recorder's own call */
     if (t->recording) {
         jr_ev* e = jr_push(t, EV_WRCH, ch, NULL, 0);
         if (e) e->a = v;
@@ -694,6 +727,7 @@ int spu_jobrec_atomic(spu_context* ctx, uint32_t cmd, int* handled)
 {
     jr_tls* t = jr_on(ctx);
     if (!t) return 0;
+    if (t->skip & JR_SKIP_ATOM) { t->skip &= ~(unsigned)JR_SKIP_ATOM; return 0; }   /* the recorder's own call */
     if (!jr_is_atomic(cmd)) { *handled = 0; return 1; }
     const uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK & ~127u;
     const uint32_t lin = ctx->mfc_lsa & SPU_LS_MASK;
@@ -702,7 +736,7 @@ int spu_jobrec_atomic(spu_context* ctx, uint32_t cmd, int* handled)
     if (t->recording) {
         uint8_t buf[392];
         memcpy(buf, ctx->ls + lin, 128);
-        *handled = spu_mfc_atomic_raw(ctx, cmd);
+        t->skip |= JR_SKIP_ATOM; *handled = spu_mfc_atomic_raw(ctx, cmd);
         memcpy(buf + 128, ctx->ls + lin, 128);
         memcpy(buf + 256, ctx->resv_line, 128);
         const uint64_t rw = SPU_RESV_LOAD(ctx);
@@ -735,6 +769,7 @@ int spu_jobrec_stop(spu_context* ctx)
 {
     jr_tls* t = jr_on(ctx);
     if (!t) return 0;
+    if (t->skip & JR_SKIP_STOP) { t->skip &= ~(unsigned)JR_SKIP_STOP; return 0; }   /* the recorder's own call */
     if (t->recording) {
         jr_ev* e = jr_push(t, EV_STOP, ctx->stop_code & 0xFFFF, NULL, 0);
         const uint32_t idx = e ? (uint32_t)(e - t->ev) : 0;
@@ -935,7 +970,7 @@ static void jr_replay_one(const jr_file* f, jr_result* r, uint8_t* rec_ls, jr_sl
     jr_restore(ctx, f->st0);
     memcpy(ctx->gpr, f->gpr0, sizeof ctx->gpr);
     memcpy(ctx->ls, f->ls0, SPU_LS_SIZE);
-    t->active = 1; t->ctx = ctx; t->recording = 0; t->replaying = 1;
+    t->active = 1; t->ctx = ctx; t->recording = 0; t->replaying = 1; t->skip = 0;
     t->f = f; t->cur[0] = t->cur[1] = 0; t->failed = 0; t->done = 0; t->why[0] = 0;
     AcquireSRWLockExclusive(&slot->lock); slot->ctx = ctx; slot->t0_ms = jr_ms_now(); ReleaseSRWLockExclusive(&slot->lock);
     const uint64_t q0 = jr_qpc();

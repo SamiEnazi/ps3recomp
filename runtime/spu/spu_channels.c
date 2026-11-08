@@ -332,8 +332,10 @@ void spu_stop_exit_check(spu_context* ctx)
     }
 }
 
-void spu_stop_raw(spu_context* ctx)
+void spu_stop(spu_context* ctx)
 {
+    /* A job being recorded or replayed (spu_jobrec.h) logs / is served its stops. */
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_stop(ctx)) return;
     /* A lifted `stop` sets status and RETURNS to its caller -- for a SPURS
      * policy this is stop-and-signal: it returns up into the kernel/policy
      * service loop, which continues (i.e. the SPU "resumes" past the stop). That
@@ -353,13 +355,6 @@ void spu_stop_raw(spu_context* ctx)
     }
     spu_stop_exit_check(ctx);
     if (s_halt) spu_halt(ctx);
-}
-
-/* A job being recorded or replayed (spu_jobrec.h) logs / is served its stops. */
-void spu_stop(spu_context* ctx)
-{
-    if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_stop(ctx)) return;
-    spu_stop_raw(ctx);
 }
 
 /* SPU_FLOAT_RZ (x86, spu_helpers.h): every SPU run executes with MXCSR at round toward zero +
@@ -1112,21 +1107,21 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
 }
 
 /* Lock-line commands are ordered like every MFC command (see mfc_submit). */
-int spu_mfc_atomic_raw(spu_context* ctx, uint32_t cmd)
+static inline __attribute__((always_inline)) int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
+    {   /* the job recorder (spu_jobrec.h); off: a load and a branch */
+        int handled;
+        if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_atomic(ctx, cmd, &handled))
+            return handled;
+    }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     int r = spu_mfc_atomic_body(ctx, cmd);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return r;
 }
 
-static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
-{
-    int handled;
-    if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_atomic(ctx, cmd, &handled))
-        return handled;
-    return spu_mfc_atomic_raw(ctx, cmd);
-}
+/* For the recorder, which calls it with its own hooks bypassed. */
+int spu_mfc_atomic_raw(spu_context* ctx, uint32_t cmd) { return spu_mfc_atomic(ctx, cmd); }
 
 static int channel_is_mfc(uint32_t ch)
 {
@@ -1145,22 +1140,12 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
-static void spu_wrch_body(spu_context* ctx, uint32_t channel, u128 value);
-/* The job recorder (spu_jobrec.h) logs a recorded job's channel writes and
- * checks a replayed one's against its recording. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    /* The job recorder (spu_jobrec.h) logs a recorded job's channel writes and
+     * checks a replayed one's against its recording. Off: a load and a branch. */
     if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_wrch(ctx, channel, value._u32[0]))
         return;
-    spu_wrch_body(ctx, channel, value);
-}
-void spu_wrch_raw(spu_context* ctx, uint32_t channel, uint32_t v)
-{
-    u128 x; memset(&x, 0, sizeof x); x._u32[0] = v;
-    spu_wrch_body(ctx, channel, x);
-}
-static void spu_wrch_body(spu_context* ctx, uint32_t channel, u128 value)
-{
     spu_dma_lean_init();
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
@@ -1415,20 +1400,14 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
-static u128 spu_rdch_body(spu_context* ctx, uint32_t channel);
-/* A recorded job's channel reads are logged; a replayed one's are served or
- * checked (spu_jobrec.h). */
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    /* A recorded job's channel reads are logged; a replayed one's are served or
+     * checked (spu_jobrec.h). */
     if (__builtin_expect(g_spu_jobrec_mode != 0, 0)) {
         uint32_t v;
         if (spu_jobrec_rdch(ctx, channel, &v)) return spu_make_preferred_u32(v);
     }
-    return spu_rdch_body(ctx, channel);
-}
-uint32_t spu_rdch_raw(spu_context* ctx, uint32_t channel) { return spu_rdch_body(ctx, channel)._u32[0]; }
-static u128 spu_rdch_body(spu_context* ctx, uint32_t channel)
-{
     { static _Atomic int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
           r[channel & 127]++;
@@ -1517,18 +1496,12 @@ static u128 spu_rdch_body(spu_context* ctx, uint32_t channel)
 /* ===========================================================================
  * Channel count (rchcnt) -- how many entries can be read/written right now
  * ===========================================================================*/
-static uint32_t spu_rchcnt_body(spu_context* ctx, uint32_t channel);
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
     if (__builtin_expect(g_spu_jobrec_mode != 0, 0)) {
         uint32_t v;
         if (spu_jobrec_rchcnt(ctx, channel, &v)) return v;
     }
-    return spu_rchcnt_body(ctx, channel);
-}
-uint32_t spu_rchcnt_raw(spu_context* ctx, uint32_t channel) { return spu_rchcnt_body(ctx, channel); }
-static uint32_t spu_rchcnt_body(spu_context* ctx, uint32_t channel)
-{
     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
      * with the pc each SPU is sitting at.
      *
