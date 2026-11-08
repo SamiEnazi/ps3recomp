@@ -110,6 +110,9 @@ typedef struct rsx_dispatch_sink {
     void (*flip)(void* user, const rsx_dispatch* rsx, u32 arg);
 } rsx_dispatch_sink;
 
+/* (rsx3) rsx_dispatch.c: bumped by every write that changes a texture unit register. */
+extern u32 g_rsx_dsp_tex_gen;
+
 struct rsx_dispatch {
     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */

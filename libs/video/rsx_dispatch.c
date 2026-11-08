@@ -146,9 +146,21 @@ static void mark_class(rsx_dispatch* rsx, u32 method, u32 count, u8 klass)
         rsx->klass[(method >> 2) + i] = klass;
 }
 
+/* (rsx3) Bumped whenever a write CHANGES a texture unit's register (SET_TEXTURE_*
+ * blocks and CONTROL3), on any rsx_dispatch: the draw engine decodes the sixteen
+ * units again only when it moved (PS3RECOMP_ENG_TEXGEN). Conservative by design:
+ * a bump without a real change only costs a decode. */
+u32 g_rsx_dsp_tex_gen = 1;
+static inline void tex_gen_note(u32 idx, u32 old, u32 arg)
+{
+    if (old != arg && ((idx - (M_TEX_SIZE1 >> 2)) < 16u || (idx - (M_TEX_OFFSET >> 2)) < RSX_DSP_NUM_TEXTURES * 8u))
+        g_rsx_dsp_tex_gen++;
+}
+
 void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
 {
     memset(rsx, 0, sizeof(*rsx));
+    g_rsx_dsp_tex_gen++;
     if (sink)
         rsx->sink = *sink;
 
@@ -244,6 +256,7 @@ void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)
     if (count > RSX_DSP_NUM_REGS)
         count = RSX_DSP_NUM_REGS;
     memcpy(rsx->regs, regs, count * sizeof(u32));
+    g_rsx_dsp_tex_gen++;
 }
 
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -433,6 +446,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         }
     }
     rsx->seen[idx]++;
+    tex_gen_note(idx, rsx->regs[idx], arg);
     rsx->regs[idx] = arg;
 
     /* Transform program upload window: word goes to instruction slot
@@ -596,19 +610,62 @@ static void plain_init(void)
     s_plain_ready = 1;
 }
 
-void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count)
+/* (rsx3) The burst's every call saved and restored eight GPRs and ten XMM
+ * registers (the vectorised constant/program window loops, and rsx_dispatch_method
+ * inlined) -- 4% of the RSX thread in the city, for headers of one or two plain
+ * register words. The heavy parts are out of line now; the burst itself is lean. */
+static __attribute__((noinline)) void dispatch_method_cold(rsx_dispatch* rsx, u32 method, u32 arg)
 {
-    if (!count) return;
+    rsx_dispatch_method(rsx, method, arg);
+}
+/* A run of words in the transform-constant upload window (n words from method m). */
+static __attribute__((noinline)) void burst_const_run(rsx_dispatch* rsx, u32 m, const u32* be_words, u32 n)
+{
+    const u32 idx0 = m >> 2, w0 = (m - M_VP_UPLOAD_CONST) >> 2;
+    const u32 base = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+    for (u32 k = 0; k < n; k++) {
+        const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[k], __ATOMIC_RELAXED));
+        rsx->seen[idx0 + k]++;
+        rsx->regs[idx0 + k] = arg;
+        const u32 word = w0 + k, slot = base + (word >> 2);
+        if (slot < RSX_DSP_NUM_CONSTANTS)
+            rsx->constants[slot][word & 3] = arg;
+    }
+}
+/* A run of words in the transform-program upload window. */
+static __attribute__((noinline)) void burst_inst_run(rsx_dispatch* rsx, u32 m, const u32* be_words, u32 n)
+{
+    const u32 idx0 = m >> 2;
+    u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+    for (u32 k = 0; k < n; k++) {
+        const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[k], __ATOMIC_RELAXED));
+        rsx->seen[idx0 + k]++;
+        rsx->regs[idx0 + k] = arg;
+        const u32 lane = (((m - M_VP_UPLOAD_INST) >> 2) + k) & 3u;
+        const u32 pos = *load * 4u + lane;
+        if (pos < RSX_DSP_VP_WORDS && rsx->vp[pos] != arg) { rsx->vp[pos] = arg; rsx->vp_gen++; }
+        if (lane == 3u) (*load)++;
+    }
+}
+static __attribute__((noinline)) void burst_slow(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count)
+{
     if (s_ed_on < 0) ed_init();
     if (s_clog_lo == -2) clog_init();
     if (!s_plain_ready) plain_init();
+    for (u32 i = 0; i < count; i++)
+        dispatch_method_cold(rsx, incr ? method + i * 4u : method,
+                             __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED)));
+}
+
+void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count)
+{
+    if (!count) return;
     method &= 0xFFFFC;
-    /* The fast forms only below 0x2000 and with no per-word diagnostic. */
-    const int fast = !s_ed_on && method + (incr ? (count - 1u) * 4u : 0u) < 0x2000u;
-    if (!fast) {
-        for (u32 i = 0; i < count; i++)
-            rsx_dispatch_method(rsx, incr ? method + i * 4u : method,
-                                __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED)));
+    /* The fast forms only below 0x2000, with no per-word diagnostic, and once the
+     * switches are read (the first call takes the slow form and reads them). */
+    if (__builtin_expect(s_ed_on != 0 || s_clog_lo == -2 || !s_plain_ready, 0) ||
+        method + (incr ? (count - 1u) * 4u : 0u) >= 0x2000u) {
+        burst_slow(rsx, method, incr, be_words, count);
         return;
     }
     u32 i = 0;
@@ -617,39 +674,20 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
         if (incr && s_clog_lo < 0 && m >= M_VP_UPLOAD_CONST && m < M_VP_UPLOAD_CONST + 32u * 4u) {
             u32 n = (M_VP_UPLOAD_CONST + 32u * 4u - m) >> 2;
             if (n > count - i) n = count - i;
-            const u32 idx0 = m >> 2, w0 = (m - M_VP_UPLOAD_CONST) >> 2;
-            const u32 base = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
-            for (u32 k = 0; k < n; k++) {
-                const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i + k], __ATOMIC_RELAXED));
-                rsx->seen[idx0 + k]++;
-                rsx->regs[idx0 + k] = arg;
-                const u32 word = w0 + k, slot = base + (word >> 2);
-                if (slot < RSX_DSP_NUM_CONSTANTS)
-                    rsx->constants[slot][word & 3] = arg;
-            }
+            burst_const_run(rsx, m, be_words + i, n);
             i += n;
             continue;
         }
         if (incr && m >= M_VP_UPLOAD_INST && m < M_VP_UPLOAD_INST + 32u * 4u) {
             u32 n = (M_VP_UPLOAD_INST + 32u * 4u - m) >> 2;
             if (n > count - i) n = count - i;
-            const u32 idx0 = m >> 2;
-            u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
-            for (u32 k = 0; k < n; k++) {
-                const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i + k], __ATOMIC_RELAXED));
-                rsx->seen[idx0 + k]++;
-                rsx->regs[idx0 + k] = arg;
-                const u32 lane = (((m - M_VP_UPLOAD_INST) >> 2) + k) & 3u;
-                const u32 pos = *load * 4u + lane;
-                if (pos < RSX_DSP_VP_WORDS && rsx->vp[pos] != arg) { rsx->vp[pos] = arg; rsx->vp_gen++; }
-                if (lane == 3u) (*load)++;
-            }
+            burst_inst_run(rsx, m, be_words + i, n);
             i += n;
             continue;
         }
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
-        if (s_plain[m >> 2]) { rsx->seen[m >> 2]++; rsx->regs[m >> 2] = arg; }
-        else rsx_dispatch_method(rsx, m, arg);
+        if (s_plain[m >> 2]) { rsx->seen[m >> 2]++; tex_gen_note(m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
+        else dispatch_method_cold(rsx, m, arg);
         i++;
     }
 }

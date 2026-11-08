@@ -96,6 +96,14 @@ void vk_overlay_notice(const char* text);
 /* Open the menu (Esc with the menu closed). 1 = opened, 0 = no overlay. */
 int  vk_overlay_open_menu(void);
 
+/* PS3RECOMP_VK_PRESENT_ASYNC (rsx3): the present -- and the HUD with it -- may
+ * run on the backend's recording thread. The menu (whose settings appliers may
+ * touch the window) is drawn only on the RSX thread: while it is open the
+ * backend presents there; set while the worker draws, vk_overlay_draw then
+ * skips a menu that opened meanwhile (one frame). ImGui itself is guarded. */
+int  vk_overlay_menu_open(void);
+extern volatile int g_vk_overlay_on_worker;
+
 /* Window teardown (device alive and idle): frees everything. */
 void vk_overlay_shutdown(void);
 
