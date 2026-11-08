@@ -19,6 +19,7 @@
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_slot_verify.h" /* resident code slot word check (dispatch) */
 #include "spu_lockstep.h"
+#include "spu_jobrec.h"     /* PS3_JOBREC / PS3_JOBREPLAY / PS3_JOBSTAT */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include "ps3emu/ps3_toggles.h"   /* PS3_TOGGLE_FILE: live knobs */
@@ -333,6 +334,8 @@ void spu_stop_exit_check(spu_context* ctx)
 
 void spu_stop(spu_context* ctx)
 {
+    /* A job being recorded or replayed (spu_jobrec.h) logs / is served its stops. */
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_stop(ctx)) return;
     /* A lifted `stop` sets status and RETURNS to its caller -- for a SPURS
      * policy this is stop-and-signal: it returns up into the kernel/policy
      * service loop, which continues (i.e. the SPU "resumes" past the stop). That
@@ -370,12 +373,18 @@ static unsigned spu_float_mode_enter(void)
     if (on < 0) {
         const char* e = getenv("SPU_FLOAT_RZ");
         on = !(e && e[0] == '0');
+        /* SPU_FLOAT_RZ=rn: a deliberately WRONG mode for testing the job replay
+         * checker (spu_jobrec.c) -- the native float ops WITHOUT the MXCSR switch,
+         * i.e. round-to-nearest SPU floats, the bug that made characters
+         * invisible. Never for play. */
+        if (e && e[0] == 'r' && e[1] == 'n') on = 2;
         if (on) __atomic_store_n(&g_spu_float_rz, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&s_on, on, __ATOMIC_RELEASE);
         fprintf(stderr, "[spu] single precision: %s (SPU_FLOAT_RZ)\n",
+                on == 2 ? "native ops WITHOUT round-toward-zero (SPU_FLOAT_RZ=rn: WRONG, checker test only)" :
                 on ? "native, MXCSR round-toward-zero + FTZ + DAZ" : "exact emulation, default MXCSR");
     }
-    if (!on) return ~0u;
+    if (on != 1) return ~0u;
     const unsigned v = _mm_getcsr();
     if ((v & SPU_MXCSR_RZFZ) == SPU_MXCSR_RZFZ) return ~0u;   /* nested run: the outer one restores */
     _mm_setcsr(v | SPU_MXCSR_RZFZ);
@@ -443,6 +452,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         halted = 1;
         g_spu_trampoline_fn = 0;
         ctx->irq_frame = 0;     /* the drain loops that held them are gone */
+        if (g_spu_jobrec_mode) spu_jobrec_unwound(ctx);   /* a recorded job's wrapper is gone too */
         break;
     case 2:
         /* A one-way guest stack reset invalidates every lifted host caller.
@@ -454,6 +464,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
         ctx->host_depth = 0;
         ctx->irq_frame = 0;
         g_spu_trampoline_fn = 0;
+        if (g_spu_jobrec_mode) spu_jobrec_unwound(ctx);
         spu_indirect_branch(ctx);
         SPU_DRAIN(ctx);
         break;
@@ -600,6 +611,9 @@ void spu_mfc_release(spu_context* ctx)
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }
+
+/* The job recorder saves and restores a context's engine (spu_jobrec.c). */
+void* spu_jobrec_mfc_engine(spu_context* ctx) { return mfc_for(ctx); }
 
 /* ===========================================================================
  * Atomic reservation (GETLLAR / PUTLLC / PUTLLUC) -- real lock-line semantics
@@ -1093,13 +1107,21 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
 }
 
 /* Lock-line commands are ordered like every MFC command (see mfc_submit). */
-static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+static inline __attribute__((always_inline)) int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
+    {   /* the job recorder (spu_jobrec.h); off: a load and a branch */
+        int handled;
+        if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_atomic(ctx, cmd, &handled))
+            return handled;
+    }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     int r = spu_mfc_atomic_body(ctx, cmd);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return r;
 }
+
+/* For the recorder, which calls it with its own hooks bypassed. */
+int spu_mfc_atomic_raw(spu_context* ctx, uint32_t cmd) { return spu_mfc_atomic(ctx, cmd); }
 
 static int channel_is_mfc(uint32_t ch)
 {
@@ -1120,6 +1142,10 @@ static int channel_is_mfc(uint32_t ch)
  * ===========================================================================*/
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    /* The job recorder (spu_jobrec.h) logs a recorded job's channel writes and
+     * checks a replayed one's against its recording. Off: a load and a branch. */
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_wrch(ctx, channel, value._u32[0]))
+        return;
     spu_dma_lean_init();
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
@@ -1376,6 +1402,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    /* A recorded job's channel reads are logged; a replayed one's are served or
+     * checked (spu_jobrec.h). */
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0)) {
+        uint32_t v;
+        if (spu_jobrec_rdch(ctx, channel, &v)) return spu_make_preferred_u32(v);
+    }
     { static _Atomic int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
           r[channel & 127]++;
@@ -1466,6 +1498,10 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
  * ===========================================================================*/
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0)) {
+        uint32_t v;
+        if (spu_jobrec_rchcnt(ctx, channel, &v)) return v;
+    }
     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
      * with the pc each SPU is sitting at.
      *
@@ -1911,6 +1947,8 @@ int spu_resident_slot_stale(spu_context* ctx, unsigned slot, uint32_t pc)
 
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_no_lifted(ctx))
+        return NULL;   /* PS3_JOBREPLAY_INTERP: the replay stays on the interpreter */
     /* Streamed code that is resident at this address owns it (same rule as
      * spu_indirect_branch): the interpreter hands back to its lift as soon as
      * it reaches a lifted entry, instead of interpreting the whole job. */
@@ -3596,6 +3634,10 @@ static __attribute__((noinline, cold)) int spu_ibcache_init(void)
 
 void spu_indirect_branch(spu_context* ctx)
 {
+    /* PS3_JOBREC / PS3_JOBSTAT: the job manager calling a job module is run
+     * inside the recorder's wrapper (spu_jobrec.c), which comes back here for
+     * the job's entry. */
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_job_call(ctx)) return;
     const uint32_t pc = ctx->pc & SPU_LS_MASK;
     if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED) || ctx->irq_saved ||
         pc == SPURS_TASKSET_PM_SYSCALL_LS || pc == 0xA00u ||

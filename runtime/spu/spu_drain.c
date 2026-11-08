@@ -7,6 +7,7 @@
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
 #include "spu_slot_verify.h"
+#include "spu_jobrec.h"
 #include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "../../include/ps3emu/ps3_toggles.h" /* PS3_TOGGLE_FILE: live knobs */
 #include <setjmp.h>
@@ -431,6 +432,8 @@ void (*spu_take_interrupt(spu_context* ctx,
                     spu_ev_get(ctx), ctx->event_mask, w);
         return tf;
     }
+    if (g_spu_jobrec_mode)           /* a recorded job notes the take (spu_jobrec.c) */
+        spu_jobrec_irq(ctx, spu_ev_get(ctx) & ctx->event_mask);
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */

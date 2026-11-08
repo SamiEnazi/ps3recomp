@@ -16,6 +16,7 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "spu_jobrec.h"
 #include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "../memory/guest_mem_atomic.h"
 #include <stdint.h>
@@ -181,7 +182,7 @@ static inline int spu_poison_dma_on(void)
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
  */
-static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+static inline int mfc_do_transfer_raw(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
@@ -819,6 +820,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     }
 
     return 0;
+}
+
+/* Every GET/PUT data transfer goes through here: with the job recorder on
+ * (spu_jobrec.h, PS3_JOBREC / PS3_JOBREPLAY) a job being recorded logs its
+ * transfers and one being replayed is served from its recording. Off, this is
+ * one load and a branch not taken. */
+static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                                  uint32_t size, uint32_t cmd)
+{
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0)) {
+        int rc;
+        if (spu_jobrec_dma(spu, lsa, ea, size, cmd, &rc)) return rc;
+    }
+    return mfc_do_transfer_raw(spu, lsa, ea, size, cmd);
 }
 
 /*
