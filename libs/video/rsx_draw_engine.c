@@ -805,7 +805,7 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
  * target is at that address, so a texture unit's search over every target can
  * be skipped. A stale filter only errs towards 1. PS3RECOMP_ENG_SURF_FILTER=1 to
  * use it (default off: no measured gain). rsx3 2026-11-08: default ON (=0 off) -- with
- * LAZY_REFS, FP_MEMO=64, PLAN_LAYOUT and the E-core worker, city heavy view +4.7%. */
+ * LAZY_REFS, PLAN_LAYOUT and the E-core worker (and FP_MEMO=64, since reverted), city heavy view +4.7%. */
 static u32 s_surf_gen, s_surf_filter_gen = ~0u;
 static u64 s_surf_filter[16];
 static u32 eng_surf_hash(u32 location, u32 offset) { return ((offset ^ (location << 30)) * 0x9E3779B1u) >> 22; }
@@ -2172,7 +2172,7 @@ static eng_vp_memo* s_vpgen_memo;
 static u32 s_vpgen_gen, s_vpgen_start;
 static int s_vpgen_on = -1;
 static void eng_vpgen_set(int id, int v) { (void)id; __atomic_store_n(&s_vpgen_on, v != 0, __ATOMIC_RELAXED); }
-/* PS3RECOMP_ENG_FP_MEMO (1..64, default 64 since rsx3; 8 = the old size): how many
+/* PS3RECOMP_ENG_FP_MEMO (1..64, default 8; rsx3 profile: 64 doubled eng_guest_programs): how many
  * fragment programs are kept. A heavy frame runs far more than eight, so the
  * old table missed and re-analysed (copy, structural hash, constants, three
  * microcode walks) on many draws. The lookup scans compact key arrays, not the
@@ -2262,7 +2262,7 @@ static const eng_fp_memo* eng_fp_current(void)
     const u32 off = rsx_dsp_fragment_program(&g.rsx, &loc);
     if (__builtin_expect(!s_fp_cap, 0)) {
         const char* e = getenv("PS3RECOMP_ENG_FP_MEMO");
-        const long n = e ? strtol(e, NULL, 10) : 64L;   /* rsx3: default 64 (=8 the old size) */
+        const long n = e ? strtol(e, NULL, 10) : 8L;   /* rsx3: 64 measured WORSE (same-address programs with patched constants pile up and are all compared) */
         s_fp_cap = n < 1 ? 1u : n > (long)ENG_FP_MEMO_MAX ? ENG_FP_MEMO_MAX : (u32)n;
     }
     const u64 key = ((u64)loc << 32) | off;
@@ -3164,7 +3164,9 @@ static void eng_ds_frame_end(u32 frame_draws)
  * geometry) is not hashed again for a while. PS3RECOMP_ENG_VCACHE=0 = off. */
 typedef struct {
     u64 key, content;
-    u32 vbuf, bytes, n, stride;
+    u32 vbuf, bytes, n;
+    u16 stride;
+    u16 next;                    /* PS3RECOMP_ENG_PREFETCH: the entry the next draw used, index + 1 (mod 64K) */
     u32 last_frame, seen_frame, skip_until;
     u8 seen, changes;
     u8 wt_ok;                    /* rsx_wtrack: spans armed, wt_content is their hash */
@@ -3182,26 +3184,30 @@ static u32 s_vc_cursor;
  * the probes of the 4 MB vertex and 1 MB index tables were cache misses, ~4.5%
  * of the RSX thread in the city. Only a hint: a wrong or stale successor (the
  * tables are rebuilt on a prune) costs one useless prefetch. */
-static u32 s_vc_next[ENG_VC_SIZE], s_vc_prev;
 static int s_prefetch_on = -1;
-static inline void eng_cache_predict(const void* table, size_t esz, u32* next, u32* prev, u32 idx)
+static int eng_prefetch_on(void)
 {
     if (__builtin_expect(s_prefetch_on < 0, 0)) {
         const char* e = getenv("PS3RECOMP_ENG_PREFETCH");
         s_prefetch_on = !(e && e[0] == '0');
     }
-    if (!s_prefetch_on) return;
-    const u32 me = idx + 1u;
-    if (*prev && *prev != me) next[*prev - 1u] = me;
-    *prev = me;
-    const u32 nx = next[idx];
-    if (nx) {
-        const char* p = (const char*)table + (size_t)(nx - 1u) * esz;
-        __builtin_prefetch(p, 0, 3);
-        __builtin_prefetch(p + esz - 1u, 0, 3);   /* an entry that straddles two lines */
-    }
+    return s_prefetch_on;
 }
-
+/* The successor link lives in the entry itself (the first version kept it in a
+ * parallel array, whose own misses cost what the prefetch saved): the previous
+ * draw's entry is still in cache when this draw's is linked to it. */
+#define ENG_CACHE_PREDICT(TABLE, PREV, E) do { \
+    if (eng_prefetch_on()) { \
+        const u16 me_ = (u16)((u32)((E) - (TABLE)) + 1u); \
+        if ((PREV) && (PREV) != (E)) (PREV)->next = me_; \
+        (PREV) = (E); \
+        if ((E)->next) { \
+            const char* p_ = (const char*)&(TABLE)[(u16)((E)->next - 1u)]; \
+            __builtin_prefetch(p_, 0, 3); \
+            __builtin_prefetch(p_ + sizeof *(E) - 1u, 0, 3); \
+        } \
+    } } while (0)
+static eng_vc_entry* s_vc_prev;
 /* PS3_TOGGLE_FILE can switch it live: the watcher only records the wish, and
  * the RSX thread (the cache's only user) acts on it at its next draw. Off
  * drops every persistent buffer (the backend retires them once the GPU is past
@@ -3355,7 +3361,7 @@ static eng_vc_entry* eng_vc_probe(const rsx_vertex_layout_plan* layout, u64* con
         }
     }
     if (!e) return NULL;
-    eng_cache_predict(s_vc, sizeof *e, s_vc_next, &s_vc_prev, (u32)(e - s_vc));
+    ENG_CACHE_PREDICT(s_vc, s_vc_prev, e);
     if (e->skip_until > g.frames) { ds_vc_skip++; return NULL; }
     /* Hash the union of the attribute spans: interleaved attributes share one. */
     for (u32 i = 1; i < nr; i++)            /* insertion sort by start */
@@ -3441,12 +3447,13 @@ typedef struct {
     u32 last_frame, seen_frame, skip_until;
     u8 seen, changes;
     u8 wt_ok;                    /* rsx_wtrack: runs armed, wt_content is their hash */
+    u16 next;                    /* PS3RECOMP_ENG_PREFETCH: the entry the next draw used, index + 1 */
     u64 wt_stamp, wt_content;
 } eng_ic_entry;
 #define ENG_IC_SIZE   16384u
 #define ENG_IC_BUDGET (128ull << 20)
 static eng_ic_entry s_ic[ENG_IC_SIZE];
-static u32 s_ic_next[ENG_IC_SIZE], s_ic_prev;   /* PS3RECOMP_ENG_PREFETCH (eng_cache_predict) */
+static eng_ic_entry* s_ic_prev;   /* PS3RECOMP_ENG_PREFETCH (ENG_CACHE_PREDICT) */
 static int s_ic_want = -1, s_ic_applied = -2;
 /* The current draw: the entry its key found (and the content it hashed to),
  * and whether the index work was skipped for it. */
@@ -3532,7 +3539,7 @@ static eng_ic_entry* eng_ic_probe(const rsx_dsp_index_array* ia, u32 ia_loc, int
         }
     }
     if (!e) return NULL;
-    eng_cache_predict(s_ic, sizeof *e, s_ic_next, &s_ic_prev, (u32)(e - s_ic));
+    ENG_CACHE_PREDICT(s_ic, s_ic_prev, e);
     /* The raw indices' hash -- or, rsx_wtrack, the one they had when their
      * pages were armed, while those stay unwritten. */
     const int wt = rsx_wt_mode();
