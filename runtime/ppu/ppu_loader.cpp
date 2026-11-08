@@ -4044,6 +4044,8 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
 
 extern "C" uint32_t lv2_prx_boot_liblv2(void);   /* runtime/syscalls/lv2_prx.c */
 
+extern "C" int spu_jobreplay_main(void);   /* runtime/spu/spu_jobrec.c */
+
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
     /* Decide the memory-diagnostics gate (vm_inline_ok) before any guest code
@@ -4056,6 +4058,16 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * the buffer for minutes and were LOST when the run was killed -- which
      * made "the log line is absent" unusable as evidence. */
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* PS3_JOBREPLAY=<dir>: the SPU job equivalence checker (runtime/spu/
+     * spu_jobrec.c) replays the job recordings in <dir> through this build's
+     * lifted SPU code instead of booting the game, and exits with 0 when every
+     * replay matched. Everything a job can see is set up by now (the lifted
+     * images registered, the ELF in guest memory for the overlay matchers). */
+    {
+        const int rc = spu_jobreplay_main();
+        if (rc >= 0) { fflush(stdout); fflush(stderr); ExitProcess((UINT)rc); }
+    }
 
     /* PS3_CPU_PLACE / PS3_HIGHQOS (host_place.h): this thread runs the guest's
      * main PPU thread, the frame's game logic. */
