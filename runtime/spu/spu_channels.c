@@ -3966,6 +3966,34 @@ static __attribute__((noinline, cold)) int spu_ibcache_init(void)
     return v < 0 ? 0 : v;
 }
 
+static int s_irq_fastib = -1;     /* PS3_SPU_IRQ_FASTIB (spu_indirect_branch) */
+static __attribute__((noinline, cold)) int spu_irq_fastib_init(void)
+{
+    const char* e = getenv("PS3_SPU_IRQ_FASTIB");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_irq_fastib, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int spu_irq_fastib_on(void)
+{
+    const int v = __atomic_load_n(&s_irq_fastib, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : spu_irq_fastib_init();
+}
+
+static int s_ibcache_slot = -1;   /* PS3_SPU_IBCACHE_SLOT (spu_indirect_branch) */
+static __attribute__((noinline, cold)) int spu_ibcache_slot_init(void)
+{
+    const char* e = getenv("PS3_SPU_IBCACHE_SLOT");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_ibcache_slot, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int spu_ibcache_slot_on(void)
+{
+    const int v = __atomic_load_n(&s_ibcache_slot, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : spu_ibcache_slot_init();
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* PS3_JOBREC / PS3_JOBSTAT: the job manager calling a job module is run
@@ -3973,7 +4001,15 @@ void spu_indirect_branch(spu_context* ctx)
      * the job's entry. */
     if (__builtin_expect(g_spu_jobrec_mode != 0, 0) && spu_jobrec_job_call(ctx)) return;
     const uint32_t pc = ctx->pc & SPU_LS_MASK;
-    if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED) || ctx->irq_saved ||
+    /* PS3_SPU_IRQ_FASTIB (default 1): while an interrupt's register save is
+     * armed, every branch went to the slow resolver for the one thing it does
+     * differently -- spu_irq_regs_maybe_restore, which acts only on an
+     * interrupts-enabled dispatch at the saved resume pc. Only that dispatch
+     * goes slow now; the handler's other branches resolve here, as they do
+     * outside an interrupt. 0 = every branch under a save goes slow. */
+    if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED) ||
+        (ctx->irq_saved && (!spu_irq_fastib_on() ||
+                            (ctx->int_enable && pc == (ctx->irq_resume_pc & SPU_LS_MASK)))) ||
         pc == SPURS_TASKSET_PM_SYSCALL_LS || pc == 0xA00u ||
         ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID ||
         (ctx->resident_ovl >= 200 && spu_job_slow_routing()) ||
@@ -4001,8 +4037,16 @@ void spu_indirect_branch(spu_context* ctx)
         const uint32_t reg_gen = __atomic_load_n(&g_spu_reg_gen, __ATOMIC_ACQUIRE);
         if (ib_on && !(pc >= SPU_TASKSET_TASK_LO && (s_task_elf_count || s_task_entry_count))) {
             ce = &ctx->ib_cache[(pc >> 2) & (SPU_IB_CACHE_SIZE - 1)];
+            /* PS3_SPU_IBCACHE_SLOT (default 1): an entry a resident code slot
+             * resolved (slot >= 0) came from that slot's image and the registry
+             * alone -- the resolver below never reads image_id, resident_ovl
+             * or the task once a slot owns pc -- so it stays valid across job
+             * overlay switches (every WWS job changes resident_ovl, and the
+             * job manager's own branches missed after each one). Slot changes
+             * still bump ib_gen; the slot's word is re-checked as before. */
             if (ce->fn && ce->pc == pc && ce->gen == ctx->ib_gen && ce->reg_gen == reg_gen &&
-                ce->img == ctx->image_id && ce->ovl == ctx->resident_ovl && ce->task == ctx->resident_task) {
+                ((ce->slot >= 0 && spu_ibcache_slot_on()) ||
+                 (ce->img == ctx->image_id && ce->ovl == ctx->resident_ovl && ce->task == ctx->resident_task))) {
                 const int cs = ce->slot;
                 if (cs < 0 || !spu_slot_word_stale(ctx, (unsigned)cs, pc)) {
                     if (cs >= 0 && ctx->resident_code[cs].reloc) ctx->code_base = ctx->resident_code[cs].lsa;
