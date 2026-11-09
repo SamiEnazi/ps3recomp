@@ -1795,6 +1795,11 @@ static void pad_poll_keys(int merge)
 volatile int      g_pad_overlay_open;
 volatile uint32_t g_pad_overlay_toggle;
 volatile uint32_t g_pad_overlay_nav, g_pad_overlay_nav2;
+/* g_pad_overlay_open == 2: a SYSTEM dialog holds the pad (the save-data list,
+ * libs/video/vk_overlay_saves.cpp). The scripted buttons (PAD_SCRIPT, PAD_FILE)
+ * then go to it -- as a player's would -- instead of the title: port 0's mask of
+ * them on its latest read, here. */
+volatile uint32_t g_pad_overlay_inject;
 static void pad_overlay_gate(void)
 {
     static int combo_on = -1, held;
@@ -2309,6 +2314,11 @@ skip_inject: ;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= 0x08;   /* START */
       } }
 
+    /* A system dialog holds the pad (g_pad_overlay_open == 2): the scripted
+     * presses below go to it (g_pad_overlay_inject), not to the title. */
+    const int sysdlg = g_pad_overlay_open == 2 && port_no == 0;
+    uint32_t sysdlg_inj = 0;
+
     /* PAD_SCRIPT="<sec>:<mask>,<sec>:<mask>,..." -- press a NAMED button at a
      * given wall-clock second, each held ~250 ms. PAD_AUTOPRESS only pulses
      * CROSS and START, which is enough to clear a "press start" screen but not
@@ -2377,7 +2387,8 @@ skip_inject: ;
               const int down = held[i] > 0 ||
                   (ev[i].hold > 0 && tn >= ev[i].t && tn < ev[i].t + ev[i].hold);
               if (held[i] > 0) held[i]--;
-              if (down) {
+              if (down && sysdlg) sysdlg_inj |= ev[i].mask & 0xFFFFu;   /* a system dialog holds the pad */
+              else if (down) {
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);
                   data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((ev[i].mask >> 8) & 0xFF);
                   if (ev[i].mask & 0xFF0000u) {
@@ -2438,7 +2449,8 @@ skip_inject: ;
            * stick): "0x10000 600" walks forward for 600 polls, so a driver can
            * steer a character by looking at screenshots between steps. */
           static int pf_stick;
-          if (held_n > 0) { held_n--;
+          if (held_n > 0 && sysdlg) { held_n--; sysdlg_inj |= held_mask & 0xFFFFu; }   /* to the system dialog */
+          else if (held_n > 0) { held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF);
               if (held_mask & 0xFF0000u) {
@@ -2449,6 +2461,7 @@ skip_inject: ;
                   pf_stick = 1; } }
           else if (pf_stick) { hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128; pf_stick = 0; }
       } }
+    if (port_no == 0) g_pad_overlay_inject = sysdlg_inj;
 
     /* Analog sticks */
     /* PAD_STICK="lx,ly,rx,ry" (0-255, 128 = centred): hold the analog sticks at

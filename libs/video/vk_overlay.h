@@ -14,6 +14,9 @@
  * switch pages.
  * While the menu is open the game reads neutral input (cellPad's
  * g_pad_overlay_open) and gets no keyboard or mouse events.
+ * The system's save-data list (cellSaveDataListSave2 / ListLoad2: pick, new
+ * save, overwrite, delete, back) takes the menu's window while it is up:
+ * vk_overlay_saves.cpp, include/ps3emu/ps3_savedlg.h; PS3_SAVEDATA_DIALOG=0 = none.
  *
  * Settings (environment variable names; menu changes apply at once where the
  * module supports it, see include/ps3emu/ps3_settings.h, and are saved):

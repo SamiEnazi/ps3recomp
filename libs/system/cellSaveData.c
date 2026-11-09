@@ -7,6 +7,7 @@
 
 #include "cellSaveData.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/ps3_savedlg.h"   /* the system's list dialog (vk_overlay_saves.cpp) */
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
 #include <stdio.h>
@@ -96,6 +97,9 @@ static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 
 static int savedata_legacy(void);
 static s64 save_mtime(const char* save_path);
+static int savedata_dialog_on(void);
+static int savedata_list_dialog(int is_save, uint32_t fixed, uint32_t fixed_n, uint32_t newd,
+                                uint32_t focus_pos, uint32_t focus_name, char selected[64]);
 
 /* The generic HLE adapter passes PPC register values raw, so string args
  * arrive as GUEST addresses (< 4GB). Translate to a host pointer once at
@@ -395,12 +399,19 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
  *
  * `selected` receives the chosen directory ("" when none): the first listed
  * entry, else the new-save name, else the focus name. For a save with nothing
- * listed the new-save name wins -- headless, there is no user to pick. */
+ * listed the new-save name wins -- headless, there is no user to pick.
+ *
+ * With a list dialog (ps3_savedlg.h: the overlay's, as the console's system
+ * draws it) the PLAYER picks from the list funcList set; `*cancelled` = 1 when
+ * they backed out (the caller returns CELL_SAVEDATA_RET_CANCEL, funcStat is
+ * not called). Without one, the automatic pick below, as before. */
 static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* dirList,
                                 uint32_t dirCount, uint32_t setBuf_ea, int is_save,
-                                uint32_t userdata_ea, const char* who, char selected[64])
+                                uint32_t userdata_ea, const char* who, char selected[64],
+                                int* cancelled)
 {
     selected[0] = '\0';
+    *cancelled = 0;
     if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
 
     scratch_reset();
@@ -431,6 +442,16 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
     const uint32_t fixed_n = vm_read32(set_ea + 8), fixed = vm_read32(set_ea + 12);
     const uint32_t newd = vm_read32(set_ea + 16), focus = vm_read32(set_ea + 4);
     const uint32_t new_name = newd ? vm_read32(newd + 4) : 0;
+    if (result == CELL_SAVEDATA_CBRESULT_OK_NEXT && savedata_dialog_on()) {
+        const int d = savedata_list_dialog(is_save, fixed, fixed_n, newd, vm_read32(set_ea + 0), focus, selected);
+        if (d) {
+            *cancelled = d == 2;
+            printf("[cellSaveData] %s returned cbResult.result=%d fixed=%u newData=%s focus=%u -> the player: %s%s%s%c",
+                   who, result, fixed_n, new_name ? "yes" : "no", vm_read32(set_ea + 0),
+                   d == 2 ? "backed out" : "'", d == 2 ? "" : selected, d == 2 ? "" : "'", 10);
+            return result;
+        }
+    }
     uint32_t pick = 0;
     /* Headless, nobody moves the cursor: take what the cursor starts on, the
      * title's focusPosition -- what a player pressing X at once would pick.
@@ -995,6 +1016,230 @@ static s64 save_mtime(const char* save_path)
     return HOST_STAT(save_path, &st) == 0 ? (s64)st.st_mtime : 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * The list dialog (ps3_savedlg.h)
+ *
+ * On a PS3 the system draws the ListSave/ListLoad list after funcList: the
+ * entries funcList put in fixedList (in its order), "New Save Data" from
+ * newData on a save (at the head, or the tail when iconPosition says so), the
+ * cursor where focusPosition says. The player picks one (saving over an
+ * existing one asks first), deletes one (Triangle, asked first; the list stays
+ * up), or backs out (Circle: CELL_SAVEDATA_RET_CANCEL, funcStat is not
+ * called). The overlay draws it (vk_overlay_saves.cpp) and blocks this guest
+ * thread meanwhile; inFAMOUS 2 saves on its own "Game State Thread", so the
+ * game keeps drawing its pause menu behind it, as on the console.
+ * PS3_SAVEDATA_DIALOG=0 (or PS3_SAVEDATA_LEGACY=1, or no window): the
+ * automatic pick in dispatch_func_select, as before.
+ * -----------------------------------------------------------------------*/
+#ifndef CELL_SAVEDATA_ICONPOS_HEAD
+#define CELL_SAVEDATA_ICONPOS_HEAD 0
+#define CELL_SAVEDATA_ICONPOS_TAIL 1
+#endif
+
+static int savedata_dialog_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3_SAVEDATA_DIALOG"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v && !savedata_legacy() && g_ps3_savedlg.show != NULL;
+}
+
+/* A guest NUL-terminated string, cut to n - 1 characters. */
+static void savedata_guest_str(uint32_t ea, char* out, size_t n)
+{
+    size_t i = 0;
+    for (; ea && i + 1 < n; i++) {
+        const char c = (char)vm_read8(ea + (uint32_t)i);
+        if (!c) break;
+        out[i] = c;
+    }
+    out[i] = '\0';
+}
+
+static int savedata_dirname_ok(const char* s)
+{
+    const size_t len = strnlen(s, CELL_SAVEDATA_DIRNAME_SIZE);
+    return len && len < CELL_SAVEDATA_DIRNAME_SIZE && !strchr(s, '/') && !strchr(s, '\\') &&
+           !strchr(s, ':') && strcmp(s, ".") != 0 && strcmp(s, "..") != 0;
+}
+
+/* A whole file as malloc'd bytes (at most `cap`), NULL when missing or bigger. */
+static unsigned char* savedata_slurp(const char* path, long cap, unsigned* size)
+{
+    *size = 0;
+    FILE* fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    unsigned char* b = NULL;
+    long n = -1;
+    if (fseek(fp, 0, SEEK_END) == 0) n = ftell(fp);
+    if (n > 0 && n <= cap && fseek(fp, 0, SEEK_SET) == 0 && (b = (unsigned char*)malloc((size_t)n)) != NULL) {
+        if (fread(b, 1, (size_t)n, fp) == (size_t)n) *size = (unsigned)n;
+        else { free(b); b = NULL; }
+    }
+    fclose(fp);
+    return b;
+}
+
+/* Delete a save: its files, then its directory (a save holds no folders).
+ * 1 = the directory is gone. */
+static int savedata_delete_dir(const char* dirName)
+{
+    if (!savedata_dirname_ok(dirName)) return 0;
+    char path[1024];
+    build_save_path(path, sizeof path, dirName);
+    if (dir_exists(path)) {
+#ifdef _WIN32
+        char search[1100];
+        snprintf(search, sizeof search, "%s\\*", path);
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(search, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                char f[1400];
+                snprintf(f, sizeof f, "%s\\%s", path, fd.cFileName);
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY) SetFileAttributesA(f, FILE_ATTRIBUTE_NORMAL);
+                DeleteFileA(f);
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+        RemoveDirectoryA(path);
+#else
+        DIR* dp = opendir(path);
+        if (dp) {
+            struct dirent* de;
+            while ((de = readdir(dp)) != NULL) {
+                if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+                char f[1400];
+                snprintf(f, sizeof f, "%s/%s", path, de->d_name);
+                remove(f);
+            }
+            closedir(dp);
+        }
+        rmdir(path);
+#endif
+    }
+    const int gone = !dir_exists(path);
+    printf("[cellSaveData] list dialog: delete '%s' -> %s\n", dirName, gone ? "deleted" : "FAILED");
+    return gone;
+}
+
+/* 1 = the player picked (`selected` = its directory), 2 = they backed out,
+ * 0 = no dialog could be shown (the caller picks by itself). `fixed`/`newd`
+ * are the guest CellSaveDataListSet's fixedList / newData, `focus_name` its
+ * focusDirName. */
+static int savedata_list_dialog(int is_save, uint32_t fixed, uint32_t fixed_n, uint32_t newd,
+                                uint32_t focus_pos, uint32_t focus_name, char selected[64])
+{
+    if (!fixed) fixed_n = 0;
+    if (fixed_n > CELL_SAVEDATA_DIRLIST_MAX) fixed_n = CELL_SAVEDATA_DIRLIST_MAX;
+    char new_dir[CELL_SAVEDATA_DIRNAME_SIZE] = "";
+    if (is_save && newd) savedata_guest_str(vm_read32(newd + 4), new_dir, sizeof new_dir);
+    const int has_new = new_dir[0] && savedata_dirname_ok(new_dir);
+    const int new_tail = has_new && vm_read32(newd + 0) == CELL_SAVEDATA_ICONPOS_TAIL;
+    ps3_savedlg_entry* e = (ps3_savedlg_entry*)calloc(fixed_n + 1, sizeof *e);
+    if (!e) return 0;
+    int n = (has_new && !new_tail) ? 1 : 0;   /* slot 0 = the new entry, filled below */
+    for (uint32_t i = 0; i < fixed_n; i++) {
+        ps3_savedlg_entry* x = &e[n];
+        savedata_guest_str(fixed + i * 48u, x->dir, sizeof x->dir);
+        if (!savedata_dirname_ok(x->dir)) { memset(x, 0, sizeof *x); continue; }
+        char path[1024], f[1100];
+        CellSaveDataSystemFileParam sp;
+        build_save_path(path, sizeof path, x->dir);
+        read_param_sfo(path, &sp);
+        snprintf(x->title, sizeof x->title, "%s", sp.title);
+        snprintf(x->subtitle, sizeof x->subtitle, "%s", sp.subTitle);
+        snprintf(x->detail, sizeof x->detail, "%s", sp.detail);
+        x->mtime = (long long)save_mtime(path);
+        snprintf(f, sizeof f, "%s/ICON0.PNG", path);
+        x->icon = savedata_slurp(f, 4L << 20, &x->icon_size);
+        n++;
+    }
+    int new_at = -1;
+    if (has_new) {
+        new_at = new_tail ? n++ : 0;
+        ps3_savedlg_entry* x = &e[new_at];
+        x->is_new = 1;
+        snprintf(x->dir, sizeof x->dir, "%s", new_dir);
+        const uint32_t icon = vm_read32(newd + 8);   /* CellSaveDataNewDataIcon { title*, iconBufSize, iconBuf* } */
+        if (icon) {
+            savedata_guest_str(vm_read32(icon + 0), x->title, sizeof x->title);
+            const uint32_t sz = vm_read32(icon + 4), buf = vm_read32(icon + 8);
+            unsigned char* b = (buf && sz && sz <= (4u << 20)) ? (unsigned char*)malloc(sz) : NULL;
+            if (b) {
+                for (uint32_t k = 0; k < sz; k++) b[k] = vm_read8(buf + k);
+                x->icon = b; x->icon_size = sz;
+            }
+        }
+    }
+    /* Where the cursor starts (CELL_SAVEDATA_FOCUSPOS_*). LISTHEAD = the top of
+     * the list as shown, which is "New Save Data" when it is first: inFAMOUS 2's
+     * save list asks for LISTHEAD, and the old automatic pick took the first
+     * SAVE there -- the manual save overwritten on every save. */
+    int cur = 0;
+    switch (focus_pos) {
+    case CELL_SAVEDATA_FOCUSPOS_NEWDATA:  cur = new_at >= 0 ? new_at : 0; break;
+    case CELL_SAVEDATA_FOCUSPOS_LISTTAIL: cur = n - 1; break;
+    case CELL_SAVEDATA_FOCUSPOS_DIRNAME: {
+        char want[CELL_SAVEDATA_DIRNAME_SIZE];
+        savedata_guest_str(focus_name, want, sizeof want);
+        for (int i = 0; want[0] && i < n; i++) if (!strcmp(e[i].dir, want)) { cur = i; break; }
+        break; }
+    case CELL_SAVEDATA_FOCUSPOS_LATEST:
+    case CELL_SAVEDATA_FOCUSPOS_OLDEST: {
+        int best = -1;
+        for (int i = 0; i < n; i++)
+            if (!e[i].is_new && (best < 0 || (focus_pos == CELL_SAVEDATA_FOCUSPOS_LATEST
+                                              ? e[i].mtime > e[best].mtime : e[i].mtime < e[best].mtime)))
+                best = i;
+        cur = best >= 0 ? best : (new_at >= 0 ? new_at : 0);
+        break; }
+    default: break;   /* LISTHEAD */
+    }
+    printf("[cellSaveData] list dialog: %s, %d entr%s (%u listed by the title%s), focusPosition %u -> cursor on %d\n",
+           is_save ? "save" : "load", n, n == 1 ? "y" : "ies", fixed_n,
+           has_new ? (new_tail ? " + New Save Data last" : " + New Save Data first") : "", focus_pos, cur);
+
+    int r = 0, shown = 0, up = 0;   /* up: the dialog is still showing (after a DELETE) */
+    const char* msg = NULL;
+    for (;;) {
+        ps3_savedlg_request rq;
+        rq.is_save = is_save; rq.n = n; rq.entries = e; rq.message = msg;
+        rq.focus = cur < 0 ? 0 : (cur >= n ? (n ? n - 1 : 0) : cur);
+        int action = PS3_SAVEDLG_CANCEL, idx = -1;
+        if (!g_ps3_savedlg.show || !g_ps3_savedlg.show(&rq, &action, &idx)) {
+            r = shown ? 2 : 0;    /* gone after a delete: backed out, never an automatic pick */
+            break;
+        }
+        shown = 1; up = 0; msg = NULL;
+        if (action == PS3_SAVEDLG_PICK && idx >= 0 && idx < n) {
+            snprintf(selected, 64, "%s", e[idx].dir);
+            r = 1;
+            break;
+        }
+        if (action == PS3_SAVEDLG_DELETE) {
+            up = 1;
+            if (idx < 0 || idx >= n || e[idx].is_new) { r = 2; break; }
+            cur = idx;
+            if (savedata_delete_dir(e[idx].dir)) {
+                free((void*)e[idx].icon);
+                memmove(&e[idx], &e[idx + 1], (size_t)(n - idx - 1) * sizeof *e);
+                n--;
+                if (new_at > idx) new_at--;
+            } else {
+                msg = "This save data could not be deleted.";
+            }
+            continue;
+        }
+        r = 2;   /* CANCEL (or anything unknown): backed out */
+        break;
+    }
+    if (up && g_ps3_savedlg.close) g_ps3_savedlg.close();
+    for (int i = 0; i < n; i++) free((void*)e[i].icon);
+    free(e);
+    return r;
+}
+
 /* The directory list the way the system utility hands it to a List/Fixed
  * callback: sorted by the title's CellSaveDataSetList (sortType at +0:
  * modified time or subtitle; sortOrder at +4: descending or ascending) and
@@ -1281,14 +1526,21 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
     memset(&listSet, 0, sizeof(listSet));
 
     char selectedDir[64];
+    int cancelled = 0;
     cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
                                           listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 1,
-                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir,
+                                          &cancelled);
     (void)listSet;
 
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
+    }
+    if (cancelled) {   /* the player backed out of the list (Circle): no funcStat */
+        free(dirList);
+        printf("[cellSaveData] %s: the player backed out -- CELL_SAVEDATA_RET_CANCEL%c", __func__, 10);
+        return CELL_SAVEDATA_RET_CANCEL;
     }
     if (!selectedDir[0] && dirCount > 0)
         strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
@@ -1341,14 +1593,21 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
     memset(&listSet, 0, sizeof(listSet));
 
     char selectedDir[64];
+    int cancelled = 0;
     cbResult.result = dispatch_func_select((uint32_t)(uintptr_t)funcList, dirList,
                                           listGet.dirListNum, (uint32_t)(uintptr_t)setBuf, 0,
-                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir);
+                                          (uint32_t)(uintptr_t)userdata, "funcList", selectedDir,
+                                          &cancelled);
     (void)listSet;
 
     if (cbResult.result < 0) {
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
+    }
+    if (cancelled) {   /* the player backed out of the list (Circle): no funcStat */
+        free(dirList);
+        printf("[cellSaveData] %s: the player backed out -- CELL_SAVEDATA_RET_CANCEL%c", __func__, 10);
+        return CELL_SAVEDATA_RET_CANCEL;
     }
     if (!selectedDir[0] && dirCount > 0)
         strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
