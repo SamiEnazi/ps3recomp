@@ -17,6 +17,8 @@
  * The system's save-data list (cellSaveDataListSave2 / ListLoad2: pick, new
  * save, overwrite, delete, back) takes the menu's window while it is up:
  * vk_overlay_saves.cpp, include/ps3emu/ps3_savedlg.h; PS3_SAVEDATA_DIALOG=0 = none.
+ * So does the system's message dialog (cellMsgDialogOpen2 Yes/No and OK: the
+ * player answers; include/ps3emu/ps3_msgdlg.h; PS3_MSGDIALOG=0 = answered by itself).
  *
  * Settings (environment variable names; menu changes apply at once where the
  * module supports it, see include/ps3emu/ps3_settings.h, and are saved):

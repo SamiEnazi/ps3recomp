@@ -15,6 +15,7 @@
 #include <ctype.h>   /* tolower: the yes/no auto-answer heuristic */
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX too */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
+#include "ps3emu/ps3_msgdlg.h"   /* the player answers Yes/No and OK dialogs (vk_overlay_saves.cpp) */
 
 /* Pointer parameters here are GUEST addresses, and the dialog callback is a
  * guest OPD -- the HLE ABI adapter passes both straight through as guest
@@ -46,6 +47,52 @@ static int                   s_dialog_open = 0;
 static CellMsgDialogCallback s_callback    = NULL;
 static void*                 s_userdata    = NULL;
 static CellMsgDialogType     s_type        = 0;
+
+/* The dialog the player is answering (ps3_msgdlg.h). The state above is now
+ * also touched by the overlay's thread (the answer), so it changes under one
+ * small lock; the provider is never called while it is held. s_id names each
+ * Open; s_ui is set while the provider shows it. */
+static unsigned     s_id, s_next_id;
+static int          s_ui;
+static volatile int s_msg_lock;
+static void msg_lock(void)   { while (__atomic_exchange_n(&s_msg_lock, 1, __ATOMIC_ACQUIRE)) { } }
+static void msg_unlock(void) { __atomic_store_n(&s_msg_lock, 0, __ATOMIC_RELEASE); }
+
+/* Close the open dialog (only dialog `id` when non-zero) and queue the title's
+ * callback with `result`, delivered on its next cellSysutilCheckCallback.
+ * CELL_OK and nothing queued when it is not open (any more). */
+static s32 dialog_finish(unsigned id, s32 result)
+{
+    msg_lock();
+    if (!s_dialog_open || (id && s_id != id)) { msg_unlock(); return CELL_OK; }
+    CellMsgDialogCallback cb = s_callback;
+    void* ud = s_userdata;
+    s_dialog_open = 0;
+    s_ui = 0;
+    s_callback = NULL;
+    msg_unlock();
+    return cb ? queue_dialog_callback(cb, result, ud) : CELL_OK;
+}
+
+static void dialog_answered(unsigned id, int button)   /* the provider: the player chose */
+{
+    printf("[cellMsgDialog] the player answered %s%c",
+           button == CELL_MSGDIALOG_BUTTON_YES ? "YES/OK" : button == CELL_MSGDIALOG_BUTTON_NO ? "NO"
+           : button == CELL_MSGDIALOG_BUTTON_ESCAPE ? "ESCAPE (Circle)" : "?", 10);
+    dialog_finish(id, button);
+}
+
+/* PS3_MSGDIALOG=0 or MSGDIALOG_ANSWER set: Yes/No and OK are answered by
+ * themselves (the knob a headless run or a title's workaround already uses). */
+static int dialog_ui_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("PS3_MSGDIALOG");
+        v = !(e && e[0] == '0') && !getenv("MSGDIALOG_ANSWER");
+    }
+    return v && g_ps3_msgdlg.open != NULL;
+}
 
 /* Deadline for auto-dismissing a no-button dialog; 0 = not armed.
  *
@@ -120,10 +167,16 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         printf("[cellMsgDialog] WARNING: dialog already open, closing previous\n");
     }
 
+    msg_lock();
+    const unsigned old_ui = (s_dialog_open && s_ui) ? s_id : 0;
     s_dialog_open = 1;
     s_callback    = callback;
     s_userdata    = userdata;
     s_type        = type;
+    s_ui          = 0;
+    const unsigned id = s_id = ++s_next_id ? s_next_id : ++s_next_id;
+    msg_unlock();
+    if (old_ui && g_ps3_msgdlg.close) g_ps3_msgdlg.close(old_ui);   /* replaced: off the screen */
     memset(s_progress, 0, sizeof(s_progress));
 
     /* Print the message so developers can see it */
@@ -136,6 +189,30 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     /* Determine button type and auto-respond */
     u32 button_type = type & 0x00000030;
     int has_progress = (type & 0x0000F000) != 0;
+
+    /* Yes/No and OK: the PLAYER answers, as on the console (ps3_msgdlg.h; the
+     * overlay draws it). Open2 returns now and the button reaches the title's
+     * callback on a later sysutil poll, where hardware delivers it. The cursor
+     * starts where the type says (DEFAULT_CURSOR_NO), Circle answers ESCAPE
+     * unless DISABLE_CANCEL_ON. inFAMOUS 2's "Do you want to save before
+     * loading?" (0x117) used to be answered YES: Load always went through a
+     * save first, and backing out of that save cancelled the load. */
+    if (!has_progress && (button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO ||
+                          button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK) && dialog_ui_on() &&
+        g_ps3_msgdlg.open(id, msgString ? guest_str(msgString) : "",
+                          button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO ? PS3_MSGDLG_YESNO : PS3_MSGDLG_OK,
+                          (type & CELL_MSGDIALOG_TYPE_DEFAULT_CURSOR_NO) != 0,
+                          (type & CELL_MSGDIALOG_TYPE_DISABLE_CANCEL_ON) == 0,
+                          (type & CELL_MSGDIALOG_TYPE_SE_TYPE_NORMAL) == 0, dialog_answered)) {
+        msg_lock();
+        if (s_dialog_open && s_id == id) s_ui = 1;
+        msg_unlock();
+        printf("[cellMsgDialog] shown: waiting for the player%c", 10);
+        return CELL_OK;
+    }
+    if (!has_progress && button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_NONE && msgString &&
+        dialog_ui_on() && g_ps3_msgdlg.notice)
+        g_ps3_msgdlg.notice(guest_str(msgString));   /* a no-button notice: its text on screen for a while */
 
     /* A BUTTON_TYPE_NONE dialog is an informational notice with no buttons: on
      * hardware it stays on screen until the TITLE takes it down with
@@ -234,12 +311,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         }
 
         /* Close and queue the callback; never enter guest code here. */
-        s_dialog_open = 0;
-        if (s_callback) {
-            CellMsgDialogCallback cb = s_callback;
-            s_callback = NULL;
-            return queue_dialog_callback(cb, result, s_userdata);
-        }
+        return dialog_finish(id, result);
     } else {
         printf("[cellMsgDialog] %s dialog opened (waits for Close/Abort)\n",
                has_progress ? "Progress bar" : "No-button");
@@ -266,40 +338,34 @@ s32 cellMsgDialogClose(float delayMs)
 {
     printf("[cellMsgDialog] Close(delay=%.1f ms)\n", delayMs);
 
+    msg_lock();
     if (!s_dialog_open) {
+        msg_unlock();
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
     }
-
-    s_dialog_open = 0;
+    const unsigned id = s_id;
+    const int ui = s_ui;
     s_nobutton_deadline = 0;
-
-    if (s_callback) {
-        CellMsgDialogCallback cb = s_callback;
-        s_callback = NULL;
-        return queue_dialog_callback(cb, CELL_MSGDIALOG_BUTTON_NONE, s_userdata);
-    }
-
-    return CELL_OK;
+    msg_unlock();
+    if (ui && g_ps3_msgdlg.close) g_ps3_msgdlg.close(id);   /* the title took it down: off the screen */
+    return dialog_finish(id, CELL_MSGDIALOG_BUTTON_NONE);
 }
 
 s32 cellMsgDialogAbort(void)
 {
     printf("[cellMsgDialog] Abort()\n");
 
+    msg_lock();
     if (!s_dialog_open) {
+        msg_unlock();
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
     }
-
-    s_dialog_open = 0;
+    const unsigned id = s_id;
+    const int ui = s_ui;
     s_nobutton_deadline = 0;
-
-    if (s_callback) {
-        CellMsgDialogCallback cb = s_callback;
-        s_callback = NULL;
-        return queue_dialog_callback(cb, CELL_MSGDIALOG_BUTTON_ESCAPE, s_userdata);
-    }
-
-    return CELL_OK;
+    msg_unlock();
+    if (ui && g_ps3_msgdlg.close) g_ps3_msgdlg.close(id);
+    return dialog_finish(id, CELL_MSGDIALOG_BUTTON_ESCAPE);
 }
 
 s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString)
@@ -361,12 +427,7 @@ void cellMsgDialog_tick(void)
     if (!s_dialog_open || !s_nobutton_deadline) return;
     if (GetTickCount64() < s_nobutton_deadline) return;
     s_nobutton_deadline = 0;
-    s_dialog_open = 0;
     printf("[cellMsgDialog] no-button dialog auto-dismissed after %u ms\n",
            nobutton_grace_ms());
-    if (s_callback) {
-        CellMsgDialogCallback cb = s_callback;
-        s_callback = NULL;
-        queue_dialog_callback(cb, CELL_MSGDIALOG_BUTTON_NONE, s_userdata);
-    }
+    dialog_finish(0, CELL_MSGDIALOG_BUTTON_NONE);
 }

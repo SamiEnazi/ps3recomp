@@ -23,11 +23,22 @@
  * (tests wait on them). PS3_SAVEDATA_DIALOG=0: no dialog (the List calls pick
  * by themselves, as before). A dialog that is never drawn for 20 s (window
  * gone or hidden) backs out, so a save is never made blind.
+ *
+ * The system's message dialog lives here too (include/ps3emu/ps3_msgdlg.h,
+ * libs/system/cellMsgDialog.c): a Yes/No or OK question the title asks with
+ * cellMsgDialogOpen2. Nothing waits on it (Open2 returned at once); the
+ * player's button goes back to cellMsgDialog, which queues the title's
+ * callback. Left/Right choose, Cross/Enter confirm, Circle/Esc = ESCAPE unless
+ * the title disabled cancel; the cursor starts where the title says. It is
+ * drawn over the save list if both are ever up, and takes the input first.
+ * "[msgdlg] ..." lines on stderr. PS3_MSGDIALOG=0: answered by themselves.
+ * A no-button notice's text is shown in a corner for 4 s.
  */
 #include "imgui.h"
 #include "imgui_internal.h"   /* ImGui::RegisterUserTexture: a texture the Vulkan renderer uploads (1.92) */
 
 #include "../../include/ps3emu/ps3_savedlg.h"
+#include "../../include/ps3emu/ps3_msgdlg.h"
 #include "rsx_image_io.h"
 
 #include <atomic>
@@ -45,6 +56,10 @@
 #include <time.h>
 
 extern "C" int vk_overlay_can_show(void);   /* vk_overlay.cpp */
+extern "C" void vk_overlay_notice_for(const char* text, double secs);
+
+/* CELL_MSGDIALOG_BUTTON_* (libs/system/cellMsgDialog.h) */
+enum { MD_BTN_YES = 1, MD_BTN_NO = 2, MD_BTN_OK = 1, MD_BTN_ESCAPE = 3 };
 
 /* CELL_PAD_CTRL_* (libs/input/cellPad.h), as vk_overlay.cpp passes them */
 enum {
@@ -138,6 +153,17 @@ static double s_open_t;         /* when the dialog came up */
 static std::mutex s_show_lock;  /* one guest caller at a time */
 static std::atomic<int> s_back(0);   /* Esc, from the event pump */
 static double s_answer_t;       /* when the player acted */
+
+/* the message dialog (ps3_msgdlg.h), under s_m */
+enum { MD_IDLE, MD_WANT_OPEN, MD_SHOWING, MD_WANT_CLOSE };
+static std::atomic<int> s_md(MD_IDLE);
+static unsigned    s_md_id;
+static std::string s_md_text;
+static int         s_md_buttons;            /* PS3_MSGDLG_YESNO / _OK */
+static bool        s_md_cancel, s_md_error, s_md_yes;   /* Circle allowed, SE_TYPE_ERROR, the cursor on Yes */
+static ps3_msgdlg_answer_fn s_md_answer;    /* NULL once answered or closed */
+static double      s_md_open_t;
+static bool        s_win;                   /* the overlay's window is open for a system dialog (the pump's thread) */
 
 /* render thread only */
 static int      s_confirm;      /* 0 none, 1 "Overwrite?", 2 "Delete?" */
@@ -244,25 +270,64 @@ static void sd_close(void)
     phase_down();
 }
 
-/* ---- vk_overlay.cpp's side ---------------------------------------------------- */
-extern "C" int vk_overlay_saves_active(void) { return s_phase.load() != PH_IDLE; }
+/* ---- the message dialog's provider (any guest thread) -------------------------- */
+static int md_open(unsigned id, const char* text, int buttons, int default_no, int can_cancel,
+                   int is_error, ps3_msgdlg_answer_fn answer)
+{
+    std::lock_guard<std::mutex> g(s_m);
+    if (s_shutdown || !answer || (buttons != PS3_MSGDLG_YESNO && buttons != PS3_MSGDLG_OK) || !vk_overlay_can_show())
+        return 0;
+    s_md_id = id;
+    s_md_text = text ? text : "";
+    s_md_buttons = buttons;
+    s_md_cancel = can_cancel != 0;
+    s_md_error = is_error != 0;
+    s_md_yes = buttons == PS3_MSGDLG_OK || !default_no;
+    s_md_answer = answer;
+    const int st = s_md.load();
+    if (st == MD_IDLE || st == MD_WANT_OPEN) s_md = MD_WANT_OPEN;
+    else { s_md = MD_SHOWING; s_md_open_t = sd_now(); }   /* replaced one that is still on screen */
+    fprintf(stderr, "[msgdlg] open %u: \"%s\" (%s, cursor on %s%s)\n", id, s_md_text.c_str(),
+            buttons == PS3_MSGDLG_YESNO ? "yes/no" : "ok", s_md_yes ? (buttons == PS3_MSGDLG_OK ? "OK" : "Yes") : "No",
+            s_md_cancel ? ", Circle = escape" : "");
+    return 1;
+}
 
-/* The event pump (the thread that draws): 1 = open the window for the dialog, 2 = close it. */
+static void md_close(unsigned id)
+{
+    std::lock_guard<std::mutex> g(s_m);
+    const int st = s_md.load();
+    if (st == MD_IDLE || s_md_id != id) return;
+    s_md = st == MD_WANT_OPEN ? MD_IDLE : MD_WANT_CLOSE;
+    if (s_md_answer) fprintf(stderr, "[msgdlg] %u closed by the title\n", id);
+    s_md_answer = NULL;
+}
+
+static void md_notice(const char* text) { if (text && *text) vk_overlay_notice_for(text, 4.0); }
+
+/* ---- vk_overlay.cpp's side ---------------------------------------------------- */
+extern "C" int vk_overlay_saves_active(void)
+{
+    return s_win || s_phase.load() != PH_IDLE || s_md.load() != MD_IDLE;
+}
+
+/* The event pump (the thread that draws): 1 = open the window for a system
+ * dialog, 2 = close it (both the save list and the message dialog done). */
 extern "C" int vk_overlay_saves_poll(void)
 {
-    const int p = s_phase.load();
-    if (p != PH_WANT_OPEN && p != PH_WANT_CLOSE) return 0;
+    if (!s_win && s_phase.load() == PH_IDLE && s_md.load() == MD_IDLE) return 0;
     std::lock_guard<std::mutex> g(s_m);
-    if (s_phase.load() == PH_WANT_OPEN) { s_phase = PH_SHOWING; s_open_t = sd_now(); s_scroll = true; return 1; }
-    if (s_phase.load() == PH_WANT_CLOSE) {
-        /* Not while the button or key that chose is still down: the title read a
-         * neutral pad all along and would take it as a new press (up to 1.5 s). */
-        if (((s_pad_prev & (SD_CROSS | SD_CIRCLE | SD_TRIANGLE)) || s_keys_held) && sd_now() - s_answer_t < 1.5)
-            return 0;
-        s_phase = PH_IDLE;
-        s_rows.clear();
-        return 2;
-    }
+    const double now = sd_now();
+    /* Not while the button or key that chose is still down: the title read a
+     * neutral pad all along and would take it as a new press (up to 1.5 s). */
+    const bool held = ((s_pad_prev & (SD_CROSS | SD_CIRCLE | SD_TRIANGLE)) || s_keys_held) && now - s_answer_t < 1.5;
+    if (s_phase.load() == PH_WANT_OPEN) { s_phase = PH_SHOWING; s_open_t = now; s_scroll = true; }
+    else if (s_phase.load() == PH_WANT_CLOSE && !held) { s_phase = PH_IDLE; s_rows.clear(); }
+    if (s_md.load() == MD_WANT_OPEN) { s_md = MD_SHOWING; s_md_open_t = now; }
+    else if (s_md.load() == MD_WANT_CLOSE && !held) s_md = MD_IDLE;
+    const bool want = s_phase.load() != PH_IDLE || s_md.load() != MD_IDLE;
+    if (want && !s_win) { s_win = true; return 1; }
+    if (!want && s_win) { s_win = false; return 2; }
     return 0;
 }
 
@@ -280,8 +345,11 @@ extern "C" void vk_overlay_saves_pad(uint32_t b, int lx, int ly)
     s_pad_prev = cur;
     const double now = sd_now();
     double opened;
-    { std::lock_guard<std::mutex> g(s_m); opened = s_open_t; }
-    if (s_phase.load() != PH_SHOWING || now - opened < kGrace) { s_rep_dir = 0; return; }   /* held from before: no press */
+    { std::lock_guard<std::mutex> g(s_m); opened = s_md.load() == MD_SHOWING ? s_md_open_t : s_open_t; }
+    if ((s_phase.load() != PH_SHOWING && s_md.load() != MD_SHOWING) || now - opened < kGrace) {
+        s_rep_dir = 0;   /* held from before it opened: no press */
+        return;
+    }
     if (pressed & SD_CROSS) s_act |= A_OK;
     if (pressed & SD_CIRCLE) s_act |= A_BACK;
     if (pressed & SD_TRIANGLE) s_act |= A_DEL;
@@ -293,14 +361,22 @@ extern "C" void vk_overlay_saves_pad(uint32_t b, int lx, int ly)
 
 extern "C" void vk_overlay_saves_attach(void)
 {
+    { std::lock_guard<std::mutex> g(s_m); s_shutdown = false; }
     const char* e = getenv("PS3_SAVEDATA_DIALOG");
     if (e && e[0] == '0') {
         fprintf(stderr, "[savedlg] PS3_SAVEDATA_DIALOG=0: save and load lists pick by themselves\n");
-        return;
+    } else {
+        g_ps3_savedlg.close = sd_close;
+        g_ps3_savedlg.show = sd_show;
     }
-    { std::lock_guard<std::mutex> g(s_m); s_shutdown = false; }
-    g_ps3_savedlg.close = sd_close;
-    g_ps3_savedlg.show = sd_show;
+    e = getenv("PS3_MSGDIALOG");
+    if (e && e[0] == '0') {
+        fprintf(stderr, "[msgdlg] PS3_MSGDIALOG=0: message dialogs are answered by themselves\n");
+    } else {
+        g_ps3_msgdlg.close = md_close;
+        g_ps3_msgdlg.notice = md_notice;
+        g_ps3_msgdlg.open = md_open;
+    }
 }
 
 /* After the ImGui context is gone (vk_overlay_shutdown). */
@@ -308,11 +384,25 @@ extern "C" void vk_overlay_saves_shutdown(void)
 {
     g_ps3_savedlg.show = NULL;
     g_ps3_savedlg.close = NULL;
+    g_ps3_msgdlg.open = NULL;
+    g_ps3_msgdlg.close = NULL;
+    g_ps3_msgdlg.notice = NULL;
+    ps3_msgdlg_answer_fn fire = NULL;
+    unsigned fire_id = 0;
     {
         std::lock_guard<std::mutex> g(s_m);
         s_shutdown = true;
         s_phase = PH_IDLE;
         s_cv.notify_all();
+        /* a question still up: answered as it was before there was a window */
+        fire = s_md_answer; fire_id = s_md_id;
+        s_md_answer = NULL;
+        s_md = MD_IDLE;
+        s_win = false;
+    }
+    if (fire) {
+        fprintf(stderr, "[msgdlg] %u: the window went away, answered %s\n", fire_id, s_md_buttons == PS3_MSGDLG_OK ? "OK" : "YES");
+        fire(fire_id, s_md_buttons == PS3_MSGDLG_OK ? MD_BTN_OK : MD_BTN_YES);
     }
     std::lock_guard<std::mutex> g(s_icon_lock);
     for (int i = 0; i < s_n_icon; i++) delete s_icon[i].tex;
@@ -487,32 +577,15 @@ static void draw_confirm(float k, unsigned* act)
     ImGui::PopStyleColor(2);
 }
 
-extern "C" void vk_overlay_saves_draw(float k)
+/* The save list (s_m held). `blocked`: a message dialog is over it and has the input. */
+static void draw_list(float k, unsigned act, double now, bool blocked)
 {
-    std::unique_lock<std::mutex> lk(s_m);
-    const double now = sd_now();
     if (s_seen_gen != s_gen) { s_seen_gen = s_gen; s_confirm = 0; s_scroll = true; }
     s_drawn = true;
     const ImGuiIO& io = ImGui::GetIO();
-    const bool live = s_waiting && !s_answered && s_phase.load() == PH_SHOWING;
+    const bool live = s_waiting && !s_answered && s_phase.load() == PH_SHOWING && !blocked;
     const int n = (int)s_rows.size();
     if (s_cur >= n) s_cur = n ? n - 1 : 0;
-
-    /* what the player did: the controller (since the last frame), keys, Esc */
-    unsigned act = s_act;
-    s_act = 0;
-    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) act |= A_UP;
-    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) act |= A_DOWN;
-    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) || ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) ||
-        ImGui::IsKeyPressed(ImGuiKey_Tab, false)) act |= A_SIDE;
-    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
-        ImGui::IsKeyPressed(ImGuiKey_Space, false)) act |= A_OK;
-    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) act |= A_DEL;
-    if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) act |= A_BACK;
-    if (s_back.exchange(0)) act |= A_BACK;
-    s_keys_held = ImGui::IsKeyDown(ImGuiKey_Enter) || ImGui::IsKeyDown(ImGuiKey_KeypadEnter) ||
-                  ImGui::IsKeyDown(ImGuiKey_Space) || ImGui::IsKeyDown(ImGuiKey_Delete) ||
-                  ImGui::IsKeyDown(ImGuiKey_Backspace);
 
     /* the game dimmed behind it */
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 150));
@@ -593,4 +666,101 @@ extern "C" void vk_overlay_saves_draw(float k)
         s_confirm = 2; s_yes = false;
         fprintf(stderr, "[savedlg] delete? asked for %d '%s'\n", s_cur, s_rows[s_cur].dir.c_str());
     }
+}
+
+/* The message dialog (s_m held): the title's sentence and Yes/No or OK. The
+ * button chosen is handed back in *fire_* so the caller reports it after
+ * letting go of s_m (cellMsgDialog takes its own lock). */
+static void draw_msg(float k, unsigned act, double now, ps3_msgdlg_answer_fn* fire, unsigned* fire_id, int* fire_btn)
+{
+    const ImGuiIO& io = ImGui::GetIO();
+    const bool live = s_md.load() == MD_SHOWING && s_md_answer != NULL;
+    const bool yesno = s_md_buttons == PS3_MSGDLG_YESNO;
+    const float w = 620.0f * k < io.DisplaySize.x - 20.0f ? 620.0f * k : io.DisplaySize.x - 20.0f;
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowFocus();
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.07f, 0.09f, 0.12f, 0.98f));
+    ImGui::PushStyleColor(ImGuiCol_Border, s_md_error ? ImVec4(1.0f, 0.45f, 0.30f, 0.9f) : ImVec4(0.20f, 0.80f, 0.95f, 0.8f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(26.0f * k, 22.0f * k));
+    if (ImGui::Begin("##msgdlg", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) {
+        ImGui::PushFont(NULL, ImGui::GetStyle().FontSizeBase * 1.15f);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(s_md_text.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopFont();
+        ImGui::Dummy(ImVec2(1.0f, 12.0f * k));
+        /* the buttons, centred; the highlighted one is where the pad is */
+        const float bw = 150.0f * k, gap = ImGui::GetStyle().ItemSpacing.x;
+        const float total = yesno ? bw * 2.0f + gap : bw;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - total) * 0.5f);
+        for (int b = 0; b < (yesno ? 2 : 1); b++) {
+            const bool hl = !yesno || ((b == 0) == s_md_yes);
+            ImGui::PushStyleColor(ImGuiCol_Button, hl ? ImVec4(0.12f, 0.45f, 0.55f, 1.0f) : ImVec4(0.12f, 0.16f, 0.20f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Border, hl ? ImVec4(0.20f, 0.80f, 0.95f, 1.0f) : ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 2.0f * k);
+            if (b) ImGui::SameLine();
+            if (ImGui::Button(!yesno ? "OK" : b == 0 ? "Yes" : "No", ImVec2(bw, 0.0f)) && live)
+                act |= (!yesno || b == 0) ? A_YES : A_NO;
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(2);
+        }
+        ImGui::Dummy(ImVec2(1.0f, 6.0f * k));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.72f, 1.0f));
+        ImGui::TextUnformatted(yesno ? (s_md_cancel ? "Left / Right: choose    Cross / Enter: confirm    Circle / Esc: back"
+                                                    : "Left / Right: choose    Cross / Enter: confirm")
+                                     : (s_md_cancel ? "Cross / Enter: OK    Circle / Esc: back" : "Cross / Enter: OK"));
+        ImGui::PopStyleColor();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+
+    if (!live) return;
+    if (now - s_md_open_t < kGrace) return;   /* a press still held from before it opened */
+    int btn = 0;
+    if (act & A_YES) btn = yesno ? MD_BTN_YES : MD_BTN_OK;
+    else if (act & A_NO) btn = MD_BTN_NO;
+    else if (act & A_BACK) { if (s_md_cancel) btn = MD_BTN_ESCAPE; }
+    else if (act & A_OK) btn = !yesno ? MD_BTN_OK : s_md_yes ? MD_BTN_YES : MD_BTN_NO;
+    else if (yesno && (act & (A_UP | A_DOWN | A_SIDE))) s_md_yes = !s_md_yes;
+    if (!btn) return;
+    fprintf(stderr, "[msgdlg] %u answered %s\n", s_md_id,
+            btn == MD_BTN_ESCAPE ? "ESCAPE (back)" : !yesno ? "OK" : btn == MD_BTN_YES ? "YES" : "NO");
+    *fire = s_md_answer; *fire_id = s_md_id; *fire_btn = btn;
+    s_md_answer = NULL;
+    s_md = MD_WANT_CLOSE;
+    s_answer_t = now;
+}
+
+extern "C" void vk_overlay_saves_draw(float k)
+{
+    ps3_msgdlg_answer_fn fire = NULL;
+    unsigned fire_id = 0;
+    int fire_btn = 0;
+    {
+        std::unique_lock<std::mutex> lk(s_m);
+        const double now = sd_now();
+        /* what the player did: the controller (since the last frame), keys, Esc */
+        unsigned act = s_act;
+        s_act = 0;
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) act |= A_UP;
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) act |= A_DOWN;
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) || ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_Tab, false)) act |= A_SIDE;
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_Space, false)) act |= A_OK;
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) act |= A_DEL;
+        if (ImGui::IsKeyPressed(ImGuiKey_Backspace, false)) act |= A_BACK;
+        if (s_back.exchange(0)) act |= A_BACK;
+        s_keys_held = ImGui::IsKeyDown(ImGuiKey_Enter) || ImGui::IsKeyDown(ImGuiKey_KeypadEnter) ||
+                      ImGui::IsKeyDown(ImGuiKey_Space) || ImGui::IsKeyDown(ImGuiKey_Delete) ||
+                      ImGui::IsKeyDown(ImGuiKey_Backspace);
+        const bool md = s_md.load() != MD_IDLE;
+        if (s_phase.load() != PH_IDLE) draw_list(k, md ? 0u : act, now, md);
+        else ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), ImGui::GetIO().DisplaySize, IM_COL32(0, 0, 0, 110));
+        if (md) draw_msg(k, act, now, &fire, &fire_id, &fire_btn);
+    }
+    if (fire) fire(fire_id, fire_btn);   /* cellMsgDialog queues the title's callback */
 }
