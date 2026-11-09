@@ -42,7 +42,7 @@
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
-#include "ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 /* VSCR at thread start: NJ = 1 like the PS3 (see ppu_vscr_default in
  * runtime/ppu/ppu_context.h, which this TU cannot include: ppu_recomp.h

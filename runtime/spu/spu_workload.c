@@ -5,7 +5,7 @@
  * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
-#include "ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 #include "../memory/guest_mem_atomic.h"
 #include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "spu_workload.h"

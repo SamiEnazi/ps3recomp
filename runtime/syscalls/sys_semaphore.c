@@ -14,7 +14,7 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_semaphore_info g_sys_semaphores[SYS_SEMAPHORE_MAX];
-#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 static ps3_lim s_lim_sem = PS3_LIM_INIT("semaphore", SYS_SEMAPHORE_MAX);
 
 #ifdef _WIN32

@@ -1,25 +1,27 @@
-/* ps3_limits.h -- runtime limits telemetry (limits agent, 2026-11-09).
+/* ps3_limits.h -- the runtime's side of PS3RECOMP_LIMITS (limits agent, 2026-11-09).
  *
  * A PS3 title is tuned to the console's limits, and the runtime under it has
  * fixed tables of its own. When one of ours fills where the console's would
  * not, the game slows down or breaks with nothing said (the 1024-entry texture
- * cache that turned the city seen from above into a 4-10 fps slideshow). Each
- * fixed table, pool and queue that can fill in play has a ps3_lim gauge:
+ * cache that turned the city seen from above into a 4-10 fps slideshow). The
+ * renderer's structures are in rsx_draw_engine.h (rsx_lim, rsx5); every fixed
+ * table, pool and queue of the runtime proper (threads, sync objects, guest
+ * memory, SPU tables, file descriptors, ...) has a ps3_lim gauge here:
  *
  *   static ps3_lim L = PS3_LIM_INIT("name", capacity);
  *   ps3_lim_set(&L, in_use);         current use (peak kept)
  *   ps3_lim_add(&L, +1 / -1);        the same as a running count
  *   ps3_lim_full(&L, "fmt", ...);    the table was full / a request failed
  *
- * Every ps3_lim_full is counted, logged to stderr (the first few times and
- * then every 1000th) and handed to the play log (PS3RECOMP_PLAYLOG): the next
- * HITCH line gets rtlim=<name>[,<name>...], or an RTLIMIT line if no
- * frame was slow. PS3_LIMITS=1: one summary line every PS3_LIMITS_S seconds
- * (default 5) with the process's private memory, handles, threads and every
- * gauge in use. Always: one summary line at a normal exit, and one every
- * 10 minutes, so a killed session still has a record.
+ * Both halves report through the renderer's mechanism: every ps3_lim_full is
+ * counted and logged ("[limits] <name> FULL #n: ..." -- the first 3, then each
+ * power of two), names its structure on the next HITCH line of the play log
+ * (lim=name:count, rsx_lim_take_frame) and puts out the second's LIMIT line;
+ * the PS3RECOMP_LIMITS=1 summary (every PS3RECOMP_LIMITS_S s, default 5) and
+ * the one at exit carry the gauges (name=peak/cap, !n = times full) and the
+ * process's private MB, handles and threads (sampled on a thread of its own).
  *
- * Cost: an uncontended atomic add per create/destroy, nothing on hot paths. */
+ * Cost: an atomic add or a store per create/destroy, nothing on hot paths. */
 #ifndef PS3EMU_PS3_LIMITS_H
 #define PS3EMU_PS3_LIMITS_H
 
@@ -35,7 +37,7 @@ typedef struct ps3_lim {
     volatile long    cur;
     volatile long    peak;
     volatile long    full;       /* exhaustion events */
-    long             full_seen;  /* the play log's copy (its thread only) */
+    long             full_seen;  /* the play log's copy (one reader thread) */
     volatile long    reg;        /* 0 new, 1 being linked, 2 linked */
     struct ps3_lim*  next;
 } ps3_lim;
@@ -55,14 +57,15 @@ void ps3_lim_full(ps3_lim* l, const char* fmt, ...);
         ps3_lim_set(&(lim), lim_c_);                                          \
     } while (0)
 
-/* Starts the PS3_LIMITS reporter and the exit summary (lv2_init_syscalls). */
+/* lv2_init_syscalls: starts the process sampler under PS3RECOMP_LIMITS=1. */
 void ps3_limits_init(void);
-/* One summary line to stderr now ("why" names the occasion). */
-void ps3_limits_report(const char* why);
-/* The play log's hook: the names of the limits hit since the last call,
- * comma separated, into buf; returns the length (0 = none). One caller. */
-int  ps3_limits_take_events(char* buf, size_t size);
-/* Cheap check for the play log: anything hit since the last take? */
+/* For rsx_lim_summary: " proc=<MB>MB/<handles>h/<threads>t name=peak/cap!full ..."
+ * appended to buf at buf[len]; returns the new length. */
+int  ps3_limits_format(char* buf, int len, int size);
+/* For rsx_lim_take_frame: ",name:count" per gauge hit since the last call
+ * appended at buf[len] (no leading comma when len == 0); returns the new length. */
+int  ps3_limits_take_frame(char* buf, int len, int size);
+/* Anything hit since the last take (cheap). */
 int  ps3_limits_pending(void);
 
 #ifdef __cplusplus

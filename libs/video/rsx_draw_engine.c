@@ -339,6 +339,7 @@ static u64 s_upload_hash;
 static int s_upload_hash_ok;
 rsx_hattr g_rsx_hattr;
 
+#include "ps3emu/ps3_limits.h"   /* (limits) the runtime's gauges in the same lines */
 /* ---- PS3RECOMP_LIMITS (rsx_draw_engine.h) ---------------------------------- */
 rsx_lim g_rsx_lim[RSX_LIM_COUNT] = {
     [RSX_LIM_TEXCACHE] = { "texcache" },           [RSX_LIM_TEXEVICT_RECENT] = { "tex_evict_recent" },
@@ -380,9 +381,10 @@ const char* rsx_lim_take_frame(char* buf, unsigned n)
 {
     if (!n) return "";
     buf[0] = 0;
+    /* (limits) the runtime's gauges (ps3_limits.h) hit since the last call come first */
+    unsigned p = ps3_limits_pending() ? (unsigned)ps3_limits_take_frame(buf, 0, (int)n) : 0u;
     if (!s_lim_any) return buf;
     s_lim_any = 0;
-    unsigned p = 0;
     for (int i = 0; i < RSX_LIM_COUNT; i++) {
         if (!g_rsx_lim[i].frame_ev) continue;
         const int w = snprintf(buf + p, n - p, "%s%s:%llu", p ? "," : "", g_rsx_lim[i].name, g_rsx_lim[i].frame_ev);
@@ -405,6 +407,8 @@ void rsx_lim_summary(FILE* f, const char* why)
         if (l->full)  p += snprintf(line + p, sizeof line - (size_t)p, "!%llu", l->full);
         if (l->evict) p += snprintf(line + p, sizeof line - (size_t)p, "~%llu", l->evict);
     }
+    if (p > 0 && p < (int)sizeof line)   /* (limits) the runtime's half: process + ps3_lim gauges */
+        p = ps3_limits_format(line, p, (int)sizeof line);
     fprintf(f, "%s\n", line);
     fflush(f);
 }
@@ -424,9 +428,13 @@ void rsx_lim_frame(void)
     if (!on) return;
     const unsigned long long now = ps3_ms_now();
     if (!last) { last = now; return; }
-    if (now - last < 5000u) return;
+    static unsigned long long period = 0;   /* (limits) PS3RECOMP_LIMITS_S=<s>, default 5 */
+    if (!period) { const char* e = getenv("PS3RECOMP_LIMITS_S"); const double v = e ? atof(e) : 0.0;
+                   period = v >= 1.0 ? (unsigned long long)(v * 1000.0) : 5000u; }
+    if (now - last < period) return;
     last = now;
-    rsx_lim_summary(stderr, "5s (peak/cap, !full ~live evictions)");
+    rsx_lim_summary(stderr, period == 5000u ? "5s (peak/cap, !full ~live evictions)"
+                                            : "periodic (peak/cap, !full ~live evictions)");
 }
 /* Non-zero: eng_texture_upload refills this 2D texture in place instead of
  * creating one (the atlas redraw when the backend has no object to spare). */

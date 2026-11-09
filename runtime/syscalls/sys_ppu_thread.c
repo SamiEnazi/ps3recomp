@@ -29,7 +29,7 @@ static PPU_TLS int     s_exit_done = 0;
 #include "../platform/host_qos.h"       /* PS3_QOS: guest threads at USER_INTERACTIVE */
 #include "../platform/host_place.h"     /* PS3_CPU_PLACE: guest threads on chosen cores */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
-#include "ps3emu/ps3_limits.h"           /* PS3_LIMITS telemetry */
+#include "ps3emu/ps3_limits.h"           /* PS3RECOMP_LIMITS: runtime gauges */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */

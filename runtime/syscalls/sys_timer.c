@@ -16,7 +16,7 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
-#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 static ps3_lim s_lim_timer = PS3_LIM_INIT("timer", SYS_TIMER_MAX);
 
 #ifdef _WIN32

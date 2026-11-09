@@ -13,7 +13,7 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
-#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 static ps3_lim s_lim_mutex = PS3_LIM_INIT("mutex", SYS_MUTEX_MAX);
 
 #ifdef _WIN32

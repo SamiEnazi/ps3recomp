@@ -62,7 +62,7 @@ typedef struct {
 } lwcond;
 
 #define LW_MAX 1024
-#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 static lwmutex s_mtx[LW_MAX];
 static lwcond  s_cnd[LW_MAX];
 static ps3_lim s_lim_lwm = PS3_LIM_INIT("lwmutex", LW_MAX);

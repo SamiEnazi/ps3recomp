@@ -13,7 +13,7 @@
 #include <stdlib.h>
 #include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "spu_coherency.h"
-#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 #ifndef _WIN32
 #include <execinfo.h>
 #include <dlfcn.h>

@@ -5,7 +5,7 @@
  */
 
 #include "sys_memory.h"
-#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 #include <stdio.h>
 #include <string.h>
 

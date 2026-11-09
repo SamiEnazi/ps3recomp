@@ -24,7 +24,7 @@
 #include "spu_fastjmp.h"   /* PS3_SPU_FASTJMP: SPU_SETJMP / SPU_LONGJMP without the SEH unwind */
 #include "ps3emu/ps3_ftrace.h"
 #include "ps3emu/ps3_toggles.h"   /* PS3_TOGGLE_FILE: live knobs */
-#include "ps3emu/ps3_limits.h"    /* PS3_LIMITS telemetry */
+#include "ps3emu/ps3_limits.h"    /* PS3RECOMP_LIMITS: runtime gauges */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

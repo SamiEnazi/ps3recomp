@@ -23,7 +23,7 @@ void (*g_spurs_kernel_hook)(uint32_t) = 0;
 sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 sys_event_port_info  g_sys_event_ports[SYS_EVENT_PORT_MAX];
 sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
-#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 static ps3_lim s_lim_evq = PS3_LIM_INIT("event_queue", SYS_EVENT_QUEUE_MAX);
 static ps3_lim s_lim_port = PS3_LIM_INIT("event_port", SYS_EVENT_PORT_MAX);
 static ps3_lim s_lim_flag = PS3_LIM_INIT("event_flag", SYS_EVENT_FLAG_MAX);

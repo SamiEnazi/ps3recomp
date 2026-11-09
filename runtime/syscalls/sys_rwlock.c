@@ -10,7 +10,7 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_rwlock_info g_sys_rwlocks[SYS_RWLOCK_MAX];
-#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 static ps3_lim s_lim_rw = PS3_LIM_INIT("rwlock", SYS_RWLOCK_MAX);
 
 #ifndef _WIN32

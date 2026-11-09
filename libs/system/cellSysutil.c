@@ -58,7 +58,7 @@ typedef struct {
     uint32_t param;
 } SysutilEvent;
 
-#include "ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 #define SYSUTIL_EVENT_QUEUE_SIZE 32
 static SysutilEvent s_event_queue[SYSUTIL_EVENT_QUEUE_SIZE];
 static int          s_event_head = 0;  /* next read */

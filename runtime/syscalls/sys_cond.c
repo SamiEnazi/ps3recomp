@@ -18,7 +18,7 @@ struct sys_cond_waiter {
 
 sys_cond_info g_sys_conds[SYS_COND_MAX];
 uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
-#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
 static ps3_lim s_lim_cond = PS3_LIM_INIT("cond", SYS_COND_MAX);
 
 #ifdef _WIN32
