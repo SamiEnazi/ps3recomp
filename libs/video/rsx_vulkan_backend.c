@@ -186,6 +186,7 @@ typedef struct vk_image {
     u32                w, h, levels;
     VkImageUsageFlags  usage;
     VkImageAspectFlags aspect;
+    u32                sub;     /* non-zero: `mem` is a texture block, this its slot (vk_ts_alloc) */
 } vk_image;
 
 #define VK_SAMPLER_CACHE 32
@@ -284,6 +285,11 @@ static VkImageAspectFlags s_vk_ds_aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
  * PS3RECOMP_VK_BATCH=0 restores the synchronous path (A/B). */
 #define VK_BATCH_SETS 16384u   /* per-draw sets a frame can hold before a mid-frame flush: the Empire City wide shots draw 5-8k (4096 cost a submit-and-wait each such frame) */
 #define VK_BATCH_DEAD_FB 256u
+/* (perf) Released images waiting for their batch: 256 -> 1024. Past the limit
+ * every further release flushed the batch and waited for the GPU, and a frame
+ * that brings in hundreds of textures evicts as many. PS3RECOMP_VK_DEAD_IMG=<n>
+ * (16..1024) runs with fewer (256 = the old size). */
+#define VK_BATCH_DEAD_IMG 1024u
 static struct {
     int          on;                     /* -1 unread, 0 off, 1 on            */
     int          recording;              /* s_vk.cmd holds batched work       */
@@ -294,7 +300,7 @@ static struct {
     VkDeviceSize vcur, icur, ucur, ualign, scur, gcur;
     VkFramebuffer dead_fb[VK_BATCH_DEAD_FB]; /* destroyed once the batch is done */
     u32          n_dead_fb;
-    vk_image     dead_img[256];          /* likewise images (and their views) */
+    vk_image     dead_img[VK_BATCH_DEAD_IMG]; /* likewise images (and their views) */
     u32          n_dead_img;
     u32*         dead_vb;                /* likewise persistent vertex/index buffers (handles) */
     u32          n_dead_vb, cap_dead_vb;
@@ -347,7 +353,7 @@ static struct {
     u32              dsets;
     VkFramebuffer    dead_fb[VK_BATCH_DEAD_FB];
     u32              n_dead_fb;
-    vk_image         dead_img[256];
+    vk_image         dead_img[VK_BATCH_DEAD_IMG];
     u32              n_dead_img;
     u32*             dead_vb;
     u32              n_dead_vb, cap_dead_vb;
@@ -372,6 +378,10 @@ static int vk_fif_busy(void)
 #endif
     return s_fif_pending[o] && pvkGetFenceStatus(s_vk.device, s_fif_fence[o]) != VK_SUCCESS;
 }
+/* Hitch attribution (PS3RECOMP_PLAYLOG): the submit-and-waits in the middle of
+ * a frame (a batch flush, a readback) and the waits for the other frame in
+ * flight, since the last present; the source line of the longest flush. */
+static struct { unsigned long long flush_n, flush_ns, flush_max, fif_ns; int flush_line; } s_ha;
 /* wait for the other slot's frame (its cleanup stays for its turn) */
 static void vk_fif_wait_other(void)
 {
@@ -380,7 +390,11 @@ static void vk_fif_wait_other(void)
 #ifndef VK_TQ_NO_ASYNC_PRESENT
     if (s_fif_pending[o]) vk_tq_present_wait(s_tq_pres_sent);   /* submitted before it is waited for */
 #endif
-    if (s_fif_pending[o]) pvkWaitForFences(s_vk.device, 1, &s_fif_fence[o], VK_TRUE, UINT64_MAX);
+    if (s_fif_pending[o]) {
+        const uint64_t t0 = ps3_ft_now();
+        pvkWaitForFences(s_vk.device, 1, &s_fif_fence[o], VK_TRUE, UINT64_MAX);
+        s_ha.fif_ns += ps3_ft_now() - t0;
+    }
 }
 
 static int vk_batch_on(void)
@@ -575,6 +589,7 @@ static int vk_find_memory_type(u32 type_bits, VkMemoryPropertyFlags want, u32* o
  * takes it back; contents are undefined, as a fresh image's are (every first
  * use transitions from UNDEFINED, which any layout satisfies). Oldest out. */
 #define VK_IMG_POOL 24u
+static unsigned long long s_alloc_n;           /* vkAllocateMemory calls for images (hitch attribution) */
 static vk_image s_imgpool[VK_IMG_POOL];
 static u32 s_imgpool_n;
 static void vk_destroy_image_real(vk_image* im);
@@ -617,6 +632,7 @@ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 
     }
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                  .allocationSize = req.size, .memoryTypeIndex = type };
+    s_alloc_n++;
     VK_CHECK(pvkAllocateMemory(s_vk.device, &mai, NULL, &im->mem), "vkAllocateMemory(image)");
     VK_CHECK(pvkBindImageMemory(s_vk.device, im->img, im->mem, 0), "vkBindImageMemory");
     VkImageViewCreateInfo vci = {
@@ -641,6 +657,16 @@ static void vk_destroy_image_now(vk_image* im);
 /* Bumped whenever an image (and with it a view) goes away or an engine object
  * is released: the descriptor memo (vk_eng_batch_set) holds views by handle. */
 static u32 s_eobj_gen = 1;
+static u32 vk_dead_img_cap(void)
+{
+    static u32 cap;
+    if (__builtin_expect(!cap, 0)) {
+        const char* e = getenv("PS3RECOMP_VK_DEAD_IMG");
+        long v = (e && *e) ? atol(e) : (long)VK_BATCH_DEAD_IMG;
+        cap = (u32)(v < 16 ? 16 : v > (long)VK_BATCH_DEAD_IMG ? (long)VK_BATCH_DEAD_IMG : v);
+    }
+    return cap;
+}
 static void vk_destroy_image(vk_image* im)
 {
     s_eobj_gen++;
@@ -648,12 +674,12 @@ static void vk_destroy_image(vk_image* im)
      * flight, the other slot's frame: destroy it when the batch has completed
      * (or finish the batch now if the list is full). */
     if ((s_batch.recording || vk_fif_busy()) && (im->view || im->img)) {
-        if (s_batch.n_dead_img >= sizeof s_batch.dead_img / sizeof s_batch.dead_img[0]) {
+        if (s_batch.n_dead_img >= vk_dead_img_cap()) {
             if (s_batch.recording) vk_batch_flush();
             else vk_fif_wait_other();
         }
         if ((s_batch.recording || vk_fif_busy()) &&
-            s_batch.n_dead_img < sizeof s_batch.dead_img / sizeof s_batch.dead_img[0]) {
+            s_batch.n_dead_img < vk_dead_img_cap()) {
             s_batch.dead_img[s_batch.n_dead_img++] = *im;
             memset(im, 0, sizeof *im);
             return;
@@ -676,11 +702,13 @@ static void vk_destroy_image_now(vk_image* im)
     }
     vk_destroy_image_real(im);
 }
+static void vk_ts_free(u32 sub);
 static void vk_destroy_image_real(vk_image* im)
 {
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
-    if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+    if (im->sub)       vk_ts_free(im->sub);      /* a slot of a shared block: never freed itself */
+    else if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
     memset(im, 0, sizeof *im);
 }
 
@@ -906,6 +934,7 @@ static int vk_submit_and_wait_at(int line)
     vk_batch_end_pass();
     vk_gprof_stamp(GP_END, 0, 0);
     s_batch.recording = 0;                  /* even on failure: never append to a dead buffer */
+    const uint64_t hs0 = ps3_ft_now();
     VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
@@ -913,6 +942,9 @@ static int vk_submit_and_wait_at(int line)
     VK_CHECK(pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence), "vkQueueSubmit");
     const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    { const uint64_t d = ps3_ft_now() - hs0;
+      s_ha.flush_n++; s_ha.flush_ns += d;
+      if (d > s_ha.flush_max) { s_ha.flush_max = d; s_ha.flush_line = line; } }
     if (ft0) ps3_ft_span(PS3_FT_GPU_WAIT, 0, was_batch ? 3u : 0u, s_batch.draws, ft0, ps3_ft_now());
     if (was_batch) vk_batch_completed();
     return 0;
@@ -972,6 +1004,32 @@ static void vk_batch_flush_at(int line)
 }
 
 /* (Re)create one batch arena with room for at least `need`; only while idle. */
+/* (perf) An arena that fills up in the middle of a batch costs that batch a
+ * submit-and-wait (vk_batch_flush) -- every frame, when it is the frame's own
+ * draws that fill it (the city seen from above: ~12k draws). It used to grow
+ * only for a single request larger than the whole arena; now an arena that ran
+ * out is doubled right after that flush (the batch is complete, the arena
+ * idle), up to `cap`, so the next frame fits. ThiagoFraga761/infamous2-pc
+ * (MIT) does the same with its rings. PS3RECOMP_VK_ARENA_GROW=0: the old way. */
+static int s_arena_grow_off;                   /* a growth was refused: sizes stay from then on */
+static int vk_arena_grow_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_ARENA_GROW"); on = (e && e[0] == '0') ? 0 : 1; }
+    return on && !s_arena_grow_off;
+}
+static VkDeviceSize vk_arena_need(const vk_buffer* b, VkDeviceSize request, int overflowed,
+                                  VkDeviceSize cap, const char* what)
+{
+    if (overflowed && b->buf && b->size < cap && vk_arena_grow_on()) {
+        static int said;
+        if (said++ < 16)
+            VK_LOG("batching: the %s arena filled up mid-frame -- %llu -> %llu MB\n", what,
+                   (unsigned long long)(b->size >> 20), (unsigned long long)((b->size * 2) >> 20));
+        return b->size * 2 > request ? b->size * 2 : request;
+    }
+    return request;
+}
 static int vk_batch_arena(vk_buffer* b, VkDeviceSize need, VkDeviceSize floor_size,
                           VkBufferUsageFlags usage)
 {
@@ -985,6 +1043,19 @@ static int vk_batch_arena(vk_buffer* b, VkDeviceSize need, VkDeviceSize floor_si
         return -1;
     }
     return 0;
+}
+/* vk_batch_arena with the growth above: `request` is what the caller needs now;
+ * a growth the driver refuses falls back to the old size and turns growth off. */
+static int vk_batch_arena_grow(vk_buffer* b, VkDeviceSize request, int overflowed, VkDeviceSize cap,
+                               VkDeviceSize floor_size, VkBufferUsageFlags usage, const char* what)
+{
+    const VkDeviceSize old = b->buf ? b->size : 0;
+    const VkDeviceSize need = vk_arena_need(b, request, overflowed, cap, what);
+    if (!vk_batch_arena(b, need, floor_size, usage)) return 0;
+    if (need == request || !old) return -1;
+    s_arena_grow_off = 1;
+    VK_LOG("batching: the %s arena could not grow; it stays at %llu MB\n", what, (unsigned long long)(old >> 20));
+    return vk_batch_arena(b, old > request ? old : request, floor_size, usage);
 }
 
 /* `bytes` of transfer staging that lives until the batch completes: the
@@ -1000,9 +1071,10 @@ static int64_t vk_batch_stage(VkDeviceSize bytes)
             return (int64_t)o;
         }
         if (pass) break;
+        const int was_recording = s_batch.recording;   /* a full arena mid-batch, not a first use */
         vk_batch_flush();
-        if (vk_batch_arena(&s_batch.sarena, bytes, 64u << 20,
-                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+        if (vk_batch_arena_grow(&s_batch.sarena, bytes, was_recording, 1024ull << 20, 64u << 20,
+                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, "staging"))
             return -1;
     }
     return -1;
@@ -1019,15 +1091,25 @@ static int64_t vk_batch_gstage(VkDeviceSize bytes)
             return (int64_t)o;
         }
         if (pass) break;
+        const int was_recording = s_batch.recording;
         vk_batch_flush();
-        if (s_batch.garena.buf && s_batch.garena.size >= bytes) continue;
+        const VkDeviceSize old = s_batch.garena.buf ? s_batch.garena.size : 0;
+        const VkDeviceSize need = vk_arena_need(&s_batch.garena, bytes, was_recording, 512ull << 20, "GPU bounce");
+        if (s_batch.garena.buf && s_batch.garena.size >= need) continue;
         VkDeviceSize size = s_batch.garena.size ? s_batch.garena.size * 2 : (64u << 20);
-        while (size < bytes) size *= 2;
+        while (size < need) size *= 2;
         vk_destroy_buffer(&s_batch.garena);
         if (vk_create_device_buffer(&s_batch.garena, size,
                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
             vk_destroy_buffer(&s_batch.garena);
-            return -1;
+            /* a refused growth: back to the old size, no more growing */
+            if (need == bytes || !old || old < bytes) return -1;
+            s_arena_grow_off = 1;
+            if (vk_create_device_buffer(&s_batch.garena, old,
+                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+                vk_destroy_buffer(&s_batch.garena);
+                return -1;
+            }
         }
     }
     return -1;
@@ -3828,7 +3910,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
  * Pipelines, draws and textures are the next stages; until then
  * pipeline_create reports 0, which the engine caches as "cannot build".
  * -------------------------------------------------------------------------*/
-#define VK_ENG_MAX_OBJ 2048          /* the engine's texture cache is 1024 */
+#define VK_ENG_MAX_OBJ 8192          /* the engine's texture cache is up to 4096, plus targets and views */
 
 enum { VK_ENG_FREE = 0, VK_ENG_COLOR, VK_ENG_DEPTH, VK_ENG_TEXTURE, VK_ENG_VIEW };
 
@@ -3875,11 +3957,19 @@ static VkFormat vk_eng_format(rsx_be_format f, u32* bpp)
     }
 }
 
+/* (perf) From a rotating cursor: with thousands of live textures a scan from 1
+ * walked past every one of them for each new object. A freed handle is reused
+ * only after the cursor has gone round, which also keeps a stale handle from
+ * naming a new object straight away. */
 static u32 vk_eng_alloc(void)
 {
-    for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+    static u32 cur = 1;
+    for (u32 n = 1; n < VK_ENG_MAX_OBJ; n++) {
+        const u32 i = cur;
+        cur = cur + 1 < VK_ENG_MAX_OBJ ? cur + 1 : 1u;
         if (s_eobj[i].kind == VK_ENG_FREE) return i;
-    VK_LOG("engine: object table full (%d)\n", VK_ENG_MAX_OBJ);
+    }
+    { static int said; if (!said++) VK_LOG("engine: object table full (%d)\n", VK_ENG_MAX_OBJ); }
     return 0;
 }
 
@@ -4384,6 +4474,97 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
  * becomes the image view's component mapping. Cube maps are not handled yet:
  * the pixel decompiler declares cube units as separate bindings, which the
  * shared set layout does not have, so faces == 6 reports 0 (placeholder). */
+/* ---- texture memory blocks (perf, 2026-11-09) ------------------------------
+ * Every texture used to get its own vkAllocateMemory: a kernel call for each of
+ * the hundreds of textures a new area brings in one frame, and with the engine
+ * keeping up to 4096 textures the device's allocation count would come into
+ * reach (maxMemoryAllocationCount is 4096 on NVIDIA's Windows driver). A texture
+ * whose image needs at most 1 MB now takes a slot in a 16 MB block: power-of-two
+ * size classes from 4 KB, one class per block, so a slot's offset is a multiple
+ * of its size and meets any alignment up to it (alignments are powers of two).
+ * Only optimal-tiling images live in the blocks (no buffer-image granularity to
+ * keep). A freed slot -- after the batches that used the image completed, as
+ * before -- goes on its class's free list; blocks are kept for the session.
+ * PS3RECOMP_VK_TEXSUB_MB=<n>: the blocks' total (default 1024); 0 = every
+ * texture its own allocation, the old way. The idea is from
+ * ThiagoFraga761/infamous2-pc's PS3RECOMP_VK_TEXSUB_MB (MIT); own code. */
+#define VK_TS_BLOCK      (16ull << 20)
+#define VK_TS_MIN_SHIFT  12u
+#define VK_TS_MAX_SHIFT  20u
+#define VK_TS_CLASSES    (VK_TS_MAX_SHIFT - VK_TS_MIN_SHIFT + 1u)
+#define VK_TS_MAX_BLOCKS 4096u                 /* slot id = block << 12 | slot (<= 4096 slots a block) */
+typedef struct { u32 cur, bump; int has; u32* fl; u32 nfl, capfl; } vk_ts_class;
+static struct {
+    long           cap_mb;                     /* -1 unread */
+    VkDeviceMemory mem[VK_TS_MAX_BLOCKS];
+    u8             btype[VK_TS_MAX_BLOCKS], bcls[VK_TS_MAX_BLOCKS];
+    u32            nblocks;
+    vk_ts_class    cls[32][VK_TS_CLASSES];     /* by memory type, size class */
+    u32            live;
+} s_ts = { .cap_mb = -1 };
+
+/* A slot for an image with these requirements in memory type `type`: its id
+ * (> 0), with the block and offset to bind; 0 = no slot (allocate on its own). */
+static u32 vk_ts_alloc(const VkMemoryRequirements* req, u32 type, VkDeviceMemory* mem, VkDeviceSize* off)
+{
+    if (__builtin_expect(s_ts.cap_mb < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_VK_TEXSUB_MB");
+        s_ts.cap_mb = (e && *e) ? atol(e) : 1024;
+        if (s_ts.cap_mb < 0) s_ts.cap_mb = 0;
+        VK_LOG("texture memory blocks: %ld MB of 16 MB blocks (PS3RECOMP_VK_TEXSUB_MB)\n", s_ts.cap_mb);
+    }
+    if (!s_ts.cap_mb || type >= 32u) return 0;
+    const VkDeviceSize need = req->size > req->alignment ? req->size : req->alignment;
+    if (!need || need > (1ull << VK_TS_MAX_SHIFT)) return 0;
+    u32 c = 0;
+    while ((1ull << (VK_TS_MIN_SHIFT + c)) < need) c++;
+    vk_ts_class* k = &s_ts.cls[type][c];
+    u32 id;
+    if (k->nfl) {
+        id = k->fl[--k->nfl];
+    } else {
+        const u32 per = (u32)(VK_TS_BLOCK >> (VK_TS_MIN_SHIFT + c));
+        if (!k->has || k->bump >= per) {
+            if (s_ts.nblocks >= VK_TS_MAX_BLOCKS ||
+                (unsigned long long)(s_ts.nblocks + 1u) * VK_TS_BLOCK > ((unsigned long long)s_ts.cap_mb << 20))
+                return 0;
+            VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                         .allocationSize = VK_TS_BLOCK, .memoryTypeIndex = type };
+            VkDeviceMemory m = VK_NULL_HANDLE;
+            s_alloc_n++;
+            if (pvkAllocateMemory(s_vk.device, &mai, NULL, &m) != VK_SUCCESS) {
+                static int said; if (!said++) VK_LOG("texture memory blocks: a 16 MB block was refused; textures allocate on their own\n");
+                s_ts.cap_mb = 0;
+                return 0;
+            }
+            s_ts.mem[s_ts.nblocks] = m;
+            s_ts.btype[s_ts.nblocks] = (u8)type;
+            s_ts.bcls[s_ts.nblocks] = (u8)c;
+            k->cur = s_ts.nblocks++;
+            k->bump = 0; k->has = 1;
+        }
+        id = (k->cur << 12) | k->bump++;
+    }
+    *mem = s_ts.mem[id >> 12];
+    *off = (VkDeviceSize)(id & 0xFFFu) << (VK_TS_MIN_SHIFT + c);
+    s_ts.live++;
+    return id + 1u;
+}
+static void vk_ts_free(u32 sub)
+{
+    const u32 id = sub - 1u, b = id >> 12;
+    if (b >= s_ts.nblocks) return;
+    vk_ts_class* k = &s_ts.cls[s_ts.btype[b]][s_ts.bcls[b]];
+    if (k->nfl == k->capfl) {
+        const u32 nc = k->capfl ? k->capfl * 2u : 256u;
+        u32* n = (u32*)realloc(k->fl, nc * sizeof *n);
+        if (!n) return;                        /* the slot is lost, nothing worse */
+        k->fl = n; k->capfl = nc;
+    }
+    k->fl[k->nfl++] = id;
+    s_ts.live--;
+}
+
 static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                                  u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
 {
@@ -4416,14 +4597,19 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
     VkMemoryRequirements req;
     u32 type;
+    VkDeviceSize moff = 0;
     if (pvkCreateImage(s_vk.device, &ici, NULL, &o->im.img) != VK_SUCCESS) goto fail;
     pvkGetImageMemoryRequirements(s_vk.device, o->im.img, &req);
     if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type) &&
         vk_find_memory_type(req.memoryTypeBits, 0, &type)) goto fail;
-    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                 .allocationSize = req.size, .memoryTypeIndex = type };
-    if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS ||
-        pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, 0) != VK_SUCCESS ||
+    o->im.sub = vk_ts_alloc(&req, type, &o->im.mem, &moff);
+    if (!o->im.sub) {
+        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                     .allocationSize = req.size, .memoryTypeIndex = type };
+        s_alloc_n++;
+        if (pvkAllocateMemory(s_vk.device, &mai, NULL, &o->im.mem) != VK_SUCCESS) goto fail;
+    }
+    if (pvkBindImageMemory(s_vk.device, o->im.img, o->im.mem, moff) != VK_SUCCESS ||
         vk_eng_make_view(o->im.img, vf, mips, faces, vk_remap(remap, rsx_fmt), &o->im.view))
         goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->faces = faces;
@@ -5674,10 +5860,18 @@ static int vk_batch_reserve(VkDeviceSize vb, VkDeviceSize ib, VkDeviceSize ub,
             return 0;
         }
         if (pass) break;
+        /* which arena ran out (the descriptor-set limit flushes too, growing none) */
+        const int rec = s_batch.recording;
+        const int ov_v = rec && s_batch.varena.buf && v + vb > s_batch.varena.size;
+        const int ov_i = rec && s_batch.iarena.buf && i + (ib ? ib : 4u) > s_batch.iarena.size;
+        const int ov_u = rec && s_batch.uarena.buf && u + ub > s_batch.uarena.size;
         vk_batch_flush();                       /* idle from here: arenas may grow */
-        if (vk_batch_arena(&s_batch.varena, vb, 32u << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) ||
-            vk_batch_arena(&s_batch.iarena, ib ? ib : 4u, 8u << 20, VK_BUFFER_USAGE_INDEX_BUFFER_BIT) ||
-            vk_batch_arena(&s_batch.uarena, ub, 64u << 20, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT))
+        if (vk_batch_arena_grow(&s_batch.varena, vb, ov_v, 512ull << 20, 32u << 20,
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, "vertex") ||
+            vk_batch_arena_grow(&s_batch.iarena, ib ? ib : 4u, ov_i, 256ull << 20, 8u << 20,
+                                VK_BUFFER_USAGE_INDEX_BUFFER_BIT, "index") ||
+            vk_batch_arena_grow(&s_batch.uarena, ub, ov_u, 1024ull << 20, 64u << 20,
+                                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, "uniform"))
             return -1;
     }
     VK_LOG("batching: a single draw does not fit the arenas\n");
@@ -6425,8 +6619,9 @@ static void vk_fif_advance(void)
 #undef FIF_SW
     memcpy(s_fif_bs[out].dead_fb, s_batch.dead_fb, sizeof s_batch.dead_fb);
     memcpy(s_batch.dead_fb, s_fif_bs[in].dead_fb, sizeof s_batch.dead_fb);
-    memcpy(s_fif_bs[out].dead_img, s_batch.dead_img, sizeof s_batch.dead_img);
-    memcpy(s_batch.dead_img, s_fif_bs[in].dead_img, sizeof s_batch.dead_img);
+    /* the counts are swapped already: only the entries in use move (the lists are 48 KB each) */
+    memcpy(s_fif_bs[out].dead_img, s_batch.dead_img, s_fif_bs[out].n_dead_img * sizeof s_batch.dead_img[0]);
+    memcpy(s_batch.dead_img, s_fif_bs[in].dead_img, s_batch.n_dead_img * sizeof s_batch.dead_img[0]);
     vk_lp_swap(out, in);
     s_dset_gen++;                              /* the cached sets are the parked pool's */
     s_fif_cur = in;
@@ -6434,9 +6629,11 @@ static void vk_fif_advance(void)
     s_vk.fence = s_fif_fence[in];
     if (s_fif_acq[in]) s_vk.sem_acquire = s_fif_acq[in];
     if (s_fif_pending[in]) {
-        const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        const uint64_t ft0 = ps3_ft_now();
         pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
-        if (ft0) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 1u, 0, ft0, ps3_ft_now());
+        const uint64_t ft1 = ps3_ft_now();
+        s_ha.fif_ns += ft1 - ft0;
+        if (PS3_FT_ON()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 1u, 0, ft0, ft1);
         s_fif_pending[in] = 0;
         vk_batch_completed();                  /* its arenas, sets, dead objects */
     }
@@ -7202,6 +7399,7 @@ static struct {
     u32    n;
     double draw_sum;                    /* guest draws of the frames in dt[] */
     int    mark;
+    double hitch_s;                     /* PS3RECOMP_PLAYLOG_HITCH_MS (default 50) */
 } s_pl;
 static double vk_pl_now(void)
 {
@@ -7222,6 +7420,47 @@ static int vk_pl_cmp(const void* a, const void* b)
     return (x > y) - (x < y);
 }
 u32 rsx_vulkan_backend_guest_draws(void);
+void cellGcm_hattr_take(unsigned long long* drain_ns, unsigned long long* sema_ns, unsigned long long* gaveup);
+/* (perf, 2026-11-09) What the RSX thread spent the frame on, for the HITCH line
+ * of a frame over 50 ms (PS3RECOMP_PLAYLOG_HITCH_MS): taken -- and cleared --
+ * at every present, so a line holds its own frame only. Fields (ms unless said):
+ *   draws    guest draws presented                 drain  time inside FIFO drains
+ *   sema     the walker parked on a semaphore acquire (n = acquires given up)
+ *   flush    mid-frame submit-and-waits: count/ms, @ the longest one's source line
+ *   fif      waiting for the previous frame on the GPU
+ *   tex      new textures + changed ones re-uploaded / evictions, MB, decode+upload ms
+ *   hash     full hashes of new textures   mod  texture-pack images read (n/ms)
+ *   texc     textures cached               pipe pipelines built (n/ms)
+ *   spv      shader translations (n/ms)    alloc vkAllocateMemory calls
+ * The rest of the frame is the RSX thread waiting for commands: the guest's
+ * PPU/SPU side was behind. */
+static void vk_playlog_attr(FILE* f, double ms)
+{
+    static unsigned long long l_pipes, l_pipe_ns, l_spv_n, l_spv_ns, l_alloc;
+    unsigned long long drain = 0, sema = 0, gaveup = 0;
+    cellGcm_hattr_take(&drain, &sema, &gaveup);
+    const rsx_hattr h = g_rsx_hattr;
+    const unsigned long long cached = g_rsx_hattr.tex_cached;
+    memset(&g_rsx_hattr, 0, sizeof g_rsx_hattr);
+    g_rsx_hattr.tex_cached = cached;
+    const unsigned long long pipes = s_sc.pipes - l_pipes, pipe_ns = s_sc.pipe_ns - l_pipe_ns;
+    const unsigned long long spv_n = s_sc.misses - l_spv_n, spv_ns = s_sc.spv_ns - l_spv_ns;
+    const unsigned long long alloc = s_alloc_n - l_alloc;
+    l_pipes = s_sc.pipes; l_pipe_ns = s_sc.pipe_ns; l_spv_n = s_sc.misses; l_spv_ns = s_sc.spv_ns; l_alloc = s_alloc_n;
+    const unsigned long long fl_n = s_ha.flush_n, fl_ns = s_ha.flush_ns, fif = s_ha.fif_ns;
+    const int fl_line = s_ha.flush_line;
+    memset(&s_ha, 0, sizeof s_ha);
+    if (!f) return;
+    fprintf(f, "\tdraws=%u\tdrain=%.1f\tsema=%.1f/%llu\tflush=%llu/%.1f@%d\tfif=%.1f"
+               "\ttex=%llu+%llu/%llu,%.1fMB,%.1f\thash=%.1f\tmod=%llu/%.1f\ttexc=%llu"
+               "\tpipe=%llu/%.1f\tspv=%llu/%.1f\talloc=%llu",
+            rsx_vulkan_backend_guest_draws(), drain / 1e6, sema / 1e6, gaveup,
+            fl_n, fl_ns / 1e6, fl_line, fif / 1e6,
+            h.tex_new, h.tex_reup, h.tex_evict, h.tex_bytes / 1048576.0, h.tex_ns / 1e6,
+            h.hash_ns / 1e6, h.mod_n, h.mod_ns / 1e6, cached,
+            pipes, pipe_ns / 1e6, spv_n, spv_ns / 1e6, alloc);
+    (void)ms;
+}
 static void vk_playlog_frame(void)
 {
     if (s_pl.state == 0) {
@@ -7230,13 +7469,15 @@ static void vk_playlog_frame(void)
         if (path && *path && (s_pl.f = fopen(path, "w")) != NULL) {
             s_pl.state = 1;
             s_pl.t0 = vk_pl_now();
+            const char* hm = getenv("PS3RECOMP_PLAYLOG_HITCH_MS");
+            s_pl.hitch_s = (hm && atof(hm) > 0.0) ? atof(hm) / 1000.0 : 0.050;
             fprintf(s_pl.f, "#t_s	fps	p50_ms	p99_ms	max_ms	n17	n25	n33	n50	draws_per_frame\n");
             fflush(s_pl.f);
         }
     }
     if (s_pl.state != 1) return;
     const double now = vk_pl_now();
-    if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; return; }
+    if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; vk_playlog_attr(NULL, 0.0); return; }
     const double dt = now - s_pl.last;
     s_pl.last = now;
     if (s_pl.n < sizeof s_pl.dt / sizeof s_pl.dt[0]) {
@@ -7246,7 +7487,15 @@ static void vk_playlog_frame(void)
          * garbage (148102288 draws/frame) whenever a frame drew fewer. */
         s_pl.draw_sum += (double)rsx_vulkan_backend_guest_draws();
     }
-    if (dt > 0.050) fprintf(s_pl.f, "HITCH	%.2f	%.1f\n", now - s_pl.t0, dt * 1000.0);
+    /* HITCH <t> <ms>, then what the frame was spent on (vk_playlog_attr: extra
+     * tab-separated name=value fields; tools/playlog_report.py reads the first 3) */
+    if (dt > s_pl.hitch_s) {
+        fprintf(s_pl.f, "HITCH	%.2f	%.1f", now - s_pl.t0, dt * 1000.0);
+        vk_playlog_attr(s_pl.f, dt * 1000.0);
+        fputc('\n', s_pl.f);
+    } else {
+        vk_playlog_attr(NULL, 0.0);
+    }
     if (s_pl.mark) { fprintf(s_pl.f, "MARK	%.2f\n", now - s_pl.t0); s_pl.mark = 0; }
     if (now - s_pl.sec_start < 1.0 || !s_pl.n) return;
     u32 c17 = 0, c25 = 0, c33 = 0, c50 = 0;

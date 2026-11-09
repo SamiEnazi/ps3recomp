@@ -113,8 +113,30 @@ typedef struct rsx_be_render_state {
 
 /* How many distinct guest textures the engine keeps before it evicts the
  * least recently used one. Public so the eviction test can be exact about
- * where the boundary is rather than assuming a number. */
-#define RSX_DRAW_ENGINE_TEXTURE_CACHE 1024
+ * where the boundary is rather than assuming a number.
+ * (perf, 2026-11-09) 1024 -> 4096: inFAMOUS 2's city seen from above binds more
+ * than 1024 distinct textures a frame, and an LRU smaller than the working set
+ * misses on every bind -- every frame re-hashed, re-decoded, re-uploaded and
+ * re-created every texture (Sami's 55 s at 4-5 fps). The same wall was found
+ * and fixed this way in ThiagoFraga761/infamous2-pc (MIT). This is the maximum;
+ * PS3RECOMP_ENG_TEXCACHE=<n> runs with fewer (1024 = the old size). */
+#define RSX_DRAW_ENGINE_TEXTURE_CACHE 4096
+
+/* Per-frame attribution of slow frames (PS3RECOMP_PLAYLOG's HITCH lines):
+ * counters the RSX thread adds to between two presents; the Vulkan backend's
+ * play log takes them (and clears the counts) at every present. */
+typedef struct rsx_hattr {
+    unsigned long long tex_new;     /* cache misses that created a texture       */
+    unsigned long long tex_evict;   /* of those, evictions of a cached one       */
+    unsigned long long tex_reup;    /* cached textures whose guest bytes changed  */
+    unsigned long long tex_bytes;   /* guest bytes those decoded and uploaded     */
+    unsigned long long tex_ns;      /* time in the decode + upload of both        */
+    unsigned long long hash_ns;     /* full content hashes of new textures        */
+    unsigned long long mod_n;       /* texture-pack replacements read from disk   */
+    unsigned long long mod_ns;
+    unsigned long long tex_cached;  /* gauge: entries in the cache at the present */
+} rsx_hattr;
+extern rsx_hattr g_rsx_hattr;
 
 /* ---- the backend interface ---------------------------------------------- */
 

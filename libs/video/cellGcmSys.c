@@ -2036,6 +2036,25 @@ void cellGcm_ref_on_poll(void)
     }
 }
 
+/* Hitch attribution (PS3RECOMP_PLAYLOG, perf 2026-11-09): time the RSX thread
+ * spent inside FIFO drains (walking, drawing, uploading, waiting on the GPU in
+ * a flush) and time the walker stood on a semaphore acquire (the SPU light
+ * label), since the last present; cellGcm_hattr_take hands them over at the
+ * present, which runs inside a drain (the part of that drain so far is
+ * counted, and the drain goes on counting from there). Written and taken under
+ * s_gcm_fifo_lock or by the draining thread; numbers only. */
+static unsigned long long s_ha_drain_ns, s_ha_drain_t0, s_ha_sema_ns, s_ha_sema_t0, s_ha_sema_gaveup;
+void cellGcm_hattr_take(unsigned long long* drain_ns, unsigned long long* sema_ns, unsigned long long* gaveup)
+{
+    const unsigned long long now = ps3_ft_now();
+    unsigned long long d = s_ha_drain_ns;
+    if (s_ha_drain_t0) { d += now - s_ha_drain_t0; s_ha_drain_t0 = now; }
+    unsigned long long s = s_ha_sema_ns;
+    if (s_ha_sema_t0) { s += now - s_ha_sema_t0; s_ha_sema_t0 = now; }
+    *drain_ns = d; *sema_ns = s; *gaveup = s_ha_sema_gaveup;
+    s_ha_drain_ns = s_ha_sema_ns = s_ha_sema_gaveup = 0;
+}
+
 void cellGcm_rsx_process_fifo(void)
 {
     /* The host's frame clock thread drains the FIFO and encodes the draws:
@@ -2054,7 +2073,10 @@ void cellGcm_rsx_process_fifo(void)
     if (long_dbg) clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
 #endif
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    s_ha_drain_t0 = ps3_ft_now();
     gcm_rsx_process_fifo_unlocked();
+    s_ha_drain_ns += ps3_ft_now() - s_ha_drain_t0;   /* (the present inside may have taken a part) */
+    s_ha_drain_t0 = 0;
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
     s_drain_end_ms = ps3_ms_now();
 #if !defined(_WIN32)
@@ -2487,6 +2509,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
                         s_ft_sema_t0 = 0;
                     }
+                    if (m == 0x68u && s_ha_sema_t0 && vm_read32(la) == v) {   /* hitch attribution */
+                        s_ha_sema_ns += ps3_ft_now() - s_ha_sema_t0;
+                        s_ha_sema_t0 = 0;
+                    }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) vm_write32(la, v);
                     else if (m == 0x68u && vm_read32(la) != v) {
@@ -2512,12 +2538,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                                                       gcm_run_clock_start(&b_run, now); }
                 if (!blk_ms || gcm_run_clock_ms(&b_run, now) < blk_ms) {
                     if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+                    if (!s_ha_sema_t0) s_ha_sema_t0 = ps3_ft_now();
                     sem_blocked = 1; break;
                 }
                 if (s_ft_sema_t0) {
                     ps3_ft_span(PS3_FT_SEMA_GAVEUP, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
                     s_ft_sema_t0 = 0;
                 }
+                if (s_ha_sema_t0) { s_ha_sema_ns += ps3_ft_now() - s_ha_sema_t0; s_ha_sema_t0 = 0; }
+                s_ha_sema_gaveup++;
                 { static int tn; if (PS3_LOG_FIRST(tn, 12))
                     fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
                             s_sema_offset, v, blk_ms, vm_read32(la)); }
