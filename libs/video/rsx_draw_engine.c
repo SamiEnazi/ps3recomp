@@ -2868,7 +2868,10 @@ static void eng_vpgen_set(int id, int v) { (void)id; __atomic_store_n(&s_vpgen_o
  * old table missed and re-analysed (copy, structural hash, constants, three
  * microcode walks) on many draws. The lookup scans compact key arrays, not the
  * 32 KB entries. */
-/* (rsx5) PS3RECOMP_ENG_FP_KPATCH (default 1; 0 = the memo as before):
+/* (rsx5) PS3RECOMP_ENG_FP_KPATCH=1 (default 0 = the memo as before; MEASURED
+ * NO GAIN in the city: only ~15 of its ~170 misses a frame are such patches --
+ * the rest are programs uploaded anew -- and the extra lookup passes and scans
+ * cost more, RSX drain 7.86 -> 8.04 ms/frame; kept for other scenes):
  * inFAMOUS 2 patches the inline constants of a fragment program in place
  * between draws (same address, same microcode, other constant values). Such a
  * draw missed the memo and re-ran the whole analysis -- a 32 KB clear in
@@ -3039,7 +3042,7 @@ static const eng_fp_memo* eng_fp_current(void)
     const u32 off = rsx_dsp_fragment_program(&g.rsx, &loc);
     if (__builtin_expect(!s_fp_cap, 0)) {
         const char* k = getenv("PS3RECOMP_ENG_FP_KPATCH");
-        s_fp_kpatch = !(k && *k == '0');
+        s_fp_kpatch = k && *k == '1';   /* default off: measured no gain (see above) */
         const char* e = getenv("PS3RECOMP_ENG_FP_MEMO");
         /* rsx3: 64 measured WORSE without kpatch (same-address programs with
          * patched constants piled up and were all compared). rsx5: 128 with
