@@ -348,6 +348,7 @@ static float s_hud_opacity = 0.55f;
 static bool  s_hud_graph = true;
 static bool  s_hud_cpu = true;
 static int   s_tab, s_tab_want = -1;     /* the menu's page; one to switch to */
+static int   s_ntabs = 5;                /* pages in draw_menu's list (L1/R1 wrap round it) */
 static volatile int  s_quit_ask;         /* 1 open the confirmation, 2 showing */
 static volatile bool s_quit_cancel;
 static double s_t_attach;
@@ -463,10 +464,10 @@ static void toggle_fullscreen(void)
     s_ui_stale = true;
 }
 
-enum { MENU_TABS = 6 };   /* [light] + Lighting */
+enum { MENU_TABS = 7 };   /* [light] + Lighting, [fx] + Effects */
 static int tab_from_name(const char* e)
 {
-    static const char* const names[MENU_TABS] = { "display", "graphics", "audio", "controls", "hud", "lighting" };
+    static const char* const names[MENU_TABS] = { "display", "graphics", "audio", "controls", "hud", "lighting", "effects" };
     if (!e || !*e) return -1;
     if (e[0] >= '0' && e[0] <= '9') { const int t = atoi(e); return t >= 0 && t < MENU_TABS ? t : 0; }
     for (int i = 0; i < MENU_TABS; i++) if (!SDL_strcasecmp(e, names[i])) return i;
@@ -1373,6 +1374,119 @@ static void tab_hud(void)
          "The faint line in the graph is the frame-rate cap's frame time.");
 }
 
+/* ---- Effects page (fx): effects resolution and texture packs --------------
+ * A page of its own. Its settings are not in the V_ table: fx_set applies
+ * one live (ps3_setting_apply: rsx_draw_engine.c registers the appliers) and
+ * keeps it as one of the file's other lines, which preload() exports at the
+ * next start like any other. */
+extern "C" const char* rsx_texpack_dir(void);
+extern "C" void rsx_texpack_status(unsigned* packs, unsigned* files, unsigned* applied, int* dumping);
+
+static void fx_set(const char* name, const char* value)
+{
+    ps3_setting_apply(name, value);
+    std::lock_guard<std::mutex> g(s_set_lock);
+    int i = 0;
+    while (i < s_n_extra && strcmp(s_extra[i][0], name)) i++;
+    if (i == s_n_extra) {
+        if (s_n_extra >= EXTRA_N) return;
+        snprintf(s_extra[i][0], sizeof s_extra[i][0], "%s", name);
+        s_n_extra++;
+    }
+    snprintf(s_extra[i][1], sizeof s_extra[i][1], "%s", value ? value : "");
+    s_dirty = true;
+    s_dirty_t = now_s();
+}
+
+static void fx_live(const char* name)
+{
+    ImGui::SameLine();
+    if (ps3_setting_applier(name)) ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f), "live");
+    else ImGui::TextColored(kGrey, "on restart");
+}
+
+/* The pack folders inside the packs folder ("_dump" and other "_" names are not packs). */
+static int fx_pack_list(char names[][64], int max)
+{
+    const char* dir = rsx_texpack_dir();
+    int n = 0;
+    if (!dir || !*dir) return 0;
+#ifdef _WIN32
+    char pat[700];
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.' || fd.cFileName[0] == '_') continue;
+        if (n < max) snprintf(names[n++], 64, "%s", fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#endif
+    return n;
+}
+
+static void tab_effects(void)
+{
+    section("Fire, smoke and particles");
+    {   /* PS3RECOMP_FX_RES: 1 (the game's), 2, full (2.5 at 720p) */
+        static const char* const kVal[] = { "1", "2", "full" };
+        static const char* const kName[] = { "As the game (512 x 288)", "High (1024 x 576)", "Full (1280 x 720)" };
+        const char* e = getenv("PS3RECOMP_FX_RES");
+        int cur = 0;
+        if (e && (!strcmp(e, "full") || atof(e) >= 2.5)) cur = 2;
+        else if (e && atof(e) > 1.0) cur = 1;
+        ImGui::SetNextItemWidth(combo_w());
+        if (ImGui::Combo("Effects resolution", &cur, kName, 3)) fx_set("PS3RECOMP_FX_RES", kVal[cur]);
+        fx_live("PS3RECOMP_FX_RES");
+        hint("The game draws fire, smoke, sparks, debris and the Beast into a small picture (512 x 288) and "
+             "stretches it over the frame: that is the blocky edge round flames and smoke. High and Full draw "
+             "them at a higher resolution, same art, sharper. Costs some GPU time where there is a lot of smoke "
+             "(see the HUD).");
+    }
+
+    section("Texture packs");
+    {
+        static char packs[16][64];
+        static int npacks = -1;
+        static double listed;
+        const double now = now_s();
+        if (npacks < 0 || now - listed > 2.0) { npacks = fx_pack_list(packs, 16); listed = now; }
+        const char* e = getenv("PS3_MODS");
+        int cur = 0;   /* 0 = off, k = packs[k - 1] */
+        for (int i = 0; i < npacks; i++) if (e && !SDL_strcasecmp(e, packs[i])) cur = i + 1;
+        char preview[80];
+        snprintf(preview, sizeof preview, "%s", cur ? packs[cur - 1] : (e && *e ? e : "Off"));
+        ImGui::SetNextItemWidth(combo_w());
+        if (ImGui::BeginCombo("Texture pack", preview)) {
+            if (ImGui::Selectable("Off", cur == 0)) fx_set("PS3_MODS", "");
+            for (int i = 0; i < npacks; i++)
+                if (ImGui::Selectable(packs[i], cur == i + 1)) fx_set("PS3_MODS", packs[i]);
+            ImGui::EndCombo();
+        }
+        fx_live("PS3_MODS");
+        if (ImGui::Button("Reload pack files")) fx_set("PS3_MODS", e ? e : "");
+        unsigned np = 0, nf = 0, na = 0; int dumping = 0;
+        rsx_texpack_status(&np, &nf, &na, &dumping);
+        ImGui::SameLine();
+        if (np) ImGui::Text("%u replacement file(s) in use, %u upload(s) replaced", nf, na);
+        else ImGui::TextColored(kGrey, "no pack in use");
+        const char* dir = rsx_texpack_dir();
+        if (dir && *dir) { char b[720]; snprintf(b, sizeof b, "Packs folder: %s", dir); hint(b); }
+        else hint("No packs folder: make a \"texpacks\" folder (work\\texpacks), or set PS3_MODS_DIR.");
+        hint("A pack is a folder of PNG (or DDS) files named by the texture they replace (the dump's names). "
+             "Larger pictures are fine: a higher-resolution pack. The game's own textures come back when "
+             "the pack is Off. \"Reload pack files\" picks up files you changed or added.");
+
+        bool d = dumping != 0;
+        if (ImGui::Checkbox("Dump textures (to make a pack)", &d)) ps3_setting_apply("PS3_MODS_DUMP", d ? "1" : "0");
+        fx_live("PS3_MODS_DUMP");
+        hint("Writes each texture the game shows, once, as <name>.png into the packs folder's _dump; "
+             "fx_textures.txt there lists the ones fire, smoke and sparks use. Slows the game while on; "
+             "not saved (off at the next start).");
+    }
+}
+
 static void quit_confirm(void)
 {
     if (s_quit_ask == 1) { ImGui::OpenPopup("###quitask"); s_quit_ask = 2; }
@@ -1417,7 +1531,8 @@ static void draw_menu(double now)
                                                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
         ImGui::End(); return;
     }
-    static const char* const names[MENU_TABS] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Lighting" };
+    static const char* const names[MENU_TABS] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Lighting", "Effects" };
+    s_ntabs = MENU_TABS;
     if (ImGui::BeginTabBar("tabs")) {
         for (int i = 0; i < MENU_TABS; i++) {
             const ImGuiTabItemFlags f = (s_tab_want == i) ? ImGuiTabItemFlags_SetSelected : 0;
@@ -1425,8 +1540,8 @@ static void draw_menu(double now)
                 s_tab = i;
                 ImGui::BeginChild("page", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() * 1.4f));
                 switch (i) { case 0: tab_display(); break; case 1: tab_graphics(); break; case 2: tab_audio(); break;
-                             case 3: tab_controls(now); break; case 5: tab_lighting(); break;
-                             default: tab_hud(); break; }
+                             case 3: tab_controls(now); break; case 4: tab_hud(); break;
+                             case 5: tab_lighting(); break; case 6: tab_effects(); break; default: break; }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }

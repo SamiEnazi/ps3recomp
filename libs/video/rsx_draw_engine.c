@@ -247,6 +247,7 @@ typedef struct {
     u32 handle;
     u32 stamp;           /* last time it was bound as a target (LRU, newest-wins) */
     u32 wb_stamp;        /* stamp at the last write-back into guest memory */
+    u8  kq;              /* PS3RECOMP_FX_RES: the backend image is w*kq/4 x h*kq/4 (0 or 4: w x h) */
 } eng_surface;
 static u32 s_surf_clock;
 
@@ -293,6 +294,7 @@ typedef struct {
     u32 stamp;             /* last depth write (s_surf_clock)             */
     u32 wb_stamp;          /* stamp at the last write-back into guest memory */
     u64 writer_fp;         /* structural hash of the last depth-writing FP (RESOLVE_LOG) */
+    u8  kq;                /* PS3RECOMP_FX_RES: scale of the last depth write (0 or 4: none) */
 } eng_zdepth;
 
 typedef struct {
@@ -309,12 +311,18 @@ typedef struct {
     u32 icon_gen;               /* the glyph set it was drawn with */
     u8 wt_ok;                   /* rsx_wtrack: the span was armed and the upload matches it */
     u64 wt_stamp;               /* ... the page versions it was armed with */
+    u8 modded;                  /* PS3_MODS: the upload was a pack's replacement */
 } eng_texture;
 
 /* rsx_button_icons: the glyph set of this frame, and whether the upload
  * that just ran was the prompt atlas. */
 static u32 s_icon_gen;
 static int s_upload_atlas;
+/* PS3_MODS: the upload that just ran was a pack's replacement; the content
+ * hash of the texture the last eng_texture_slot returned (its pack key is
+ * eng_texmod_key of it: the effects-texture list of the dump). */
+static int s_upload_modded;
+static u64 s_slot_hash;
 /* Non-zero: eng_texture_upload refills this 2D texture in place instead of
  * creating one (the atlas redraw when the backend has no object to spare). */
 static u32 s_upload_into;
@@ -841,14 +849,137 @@ static int eng_surface_maybe(u32 location, u32 offset)
     return (int)((s_surf_filter[h >> 6] >> (h & 63u)) & 1u);
 }
 
+/* ---- effects resolution (PS3RECOMP_FX_RES) -------------------------------
+ * Many PS3 titles draw their particles into a small offscreen target and
+ * blend it over the frame afterwards. inFAMOUS 2 draws fire, smoke, sparks,
+ * debris and the Beast's burning body into 512x288 (0.4 of the 1280x720
+ * frame, colour target 0x00B9E000), tested against a 512x288 depth it makes
+ * by depth export with a dummy colour target at 0x0F770000; the composite
+ * stretches that 2.5x, which is where the blocky edges round fire and smoke
+ * and the stair-stepped Beast silhouette come from.
+ *
+ *   PS3RECOMP_FX_RES=<k> (live)  render the listed targets k times larger:
+ *                                1 = as the game (default), 2, 2.5, ...
+ *                                (quarter steps, at most 4), "full" = the
+ *                                display's size (2.5 for 512x288 at 720p).
+ *   PS3RECOMP_FX_RES_TARGETS=<list>  which colour targets: "WxH" (any
+ *                                target that size) or "0xOFFSET:WxH"; comma
+ *                                separated. Default "512x288" (both of the
+ *                                game's particle targets, nothing else).
+ *
+ * Only the backend image grows: the engine keeps the guest's size for every
+ * decision, scales the viewport and scissor of draws into such a target,
+ * makes their depth attachment large enough, and scales the top-left crop a
+ * later reader of that depth takes (z->kq records the scale of the last
+ * depth write, so a zeta shared with an unscaled pass, the water
+ * reflection's 256x256, still crops right). Textures that sample the target
+ * use normalised coordinates and see the larger image as is. A target the
+ * guest reads back through memory (a write-back) is put back to its own
+ * size for good, and one the engine would seed from guest memory starts
+ * cleared instead. Fragment programs that read WPOS as a screen position
+ * would see scaled pixels: in the 1499 programs of the Beast-fight shader
+ * dump none does except through the depth-bounds emulation (its own pixel of
+ * a depth copy at the same scale, so it stays right); the particle programs
+ * reach the soft-particle depth through projective texcoords.
+ * Off (1) costs one load per target lookup. */
+#define ENG_FXRES_MAX 8
+static volatile int s_fxres_q = -1;   /* quarter steps; 4 = off, -2 = "full", -1 not read yet */
+static struct { u32 off, w, h; } s_fxres_t[ENG_FXRES_MAX];
+static u32 s_fxres_n;
+static u32 s_fxres_block[ENG_FXRES_MAX];   /* (offset ^ location << 31) + 1 of targets put back for good */
+static u32 s_fxres_nblock;
+
+static int eng_fxres_parse(const char* v)
+{
+    if (!v || !*v) return 4;
+    if (!strcmp(v, "full") || !strcmp(v, "FULL")) return -2;
+    const double k = atof(v);
+    if (!(k > 1.0)) return 4;
+    int q = (int)(k * 4.0 + 0.5);
+    return q > 16 ? 16 : q < 4 ? 4 : q;
+}
+static int eng_fxres_apply(const char* v)
+{
+    const int q = eng_fxres_parse(v);
+    const int was = __atomic_load_n(&s_fxres_q, __ATOMIC_RELAXED);
+    if (q != was && !(was == -1 && q == 4))
+        fprintf(stderr, "[fxres] effects resolution %s (targets:%s%s)\n", q == 4 ? "as the game" : v,
+                s_fxres_n ? "" : " none", s_fxres_n ? (getenv("PS3RECOMP_FX_RES_TARGETS") ? getenv("PS3RECOMP_FX_RES_TARGETS") : " 512x288") : "");
+    __atomic_store_n(&s_fxres_q, q, __ATOMIC_RELAXED);
+    return 1;
+}
+static void eng_fxres_init(void)
+{
+    const char* t = getenv("PS3RECOMP_FX_RES_TARGETS");
+    if (!t) t = "512x288";
+    s_fxres_n = 0;
+    while (*t && s_fxres_n < ENG_FXRES_MAX) {
+        while (*t == ',' || *t == ' ') t++;
+        if (!*t) break;
+        char* e;
+        u32 off = ~0u, w, h;
+        const unsigned long a = strtoul(t, &e, 0);
+        if (*e == ':') { off = (u32)a; t = e + 1; w = (u32)strtoul(t, &e, 10); }
+        else w = (u32)a;
+        if (*e != 'x' && *e != 'X') break;
+        h = (u32)strtoul(e + 1, &e, 10);
+        if (w && h) { s_fxres_t[s_fxres_n].off = off; s_fxres_t[s_fxres_n].w = w; s_fxres_t[s_fxres_n].h = h; s_fxres_n++; }
+        t = e;
+    }
+    eng_fxres_apply(getenv("PS3RECOMP_FX_RES"));
+}
+
+/* The scale (quarter steps, 4 = none) the target at this address and guest
+ * size gets now. */
+static u32 eng_fxres_kq(u32 location, u32 offset, u32 w, u32 h)
+{
+    int q = __atomic_load_n(&s_fxres_q, __ATOMIC_RELAXED);
+    if (__builtin_expect(q == 4, 1)) return 4u;
+    if (q == -1) { eng_fxres_init(); q = __atomic_load_n(&s_fxres_q, __ATOMIC_RELAXED); if (q == 4) return 4u; }
+    u32 i = 0;
+    for (; i < s_fxres_n; i++)
+        if (s_fxres_t[i].w == w && s_fxres_t[i].h == h && (s_fxres_t[i].off == ~0u || s_fxres_t[i].off == offset)) break;
+    if (i == s_fxres_n) return 4u;
+    const u32 id = (offset ^ (location << 31)) + 1u;
+    for (u32 b = 0; b < s_fxres_nblock; b++) if (s_fxres_block[b] == id) return 4u;
+    if (q == -2) q = (int)((4u * g.width + w / 2u) / w);   /* "full": the display's width */
+    if (q > 16) q = 16;
+    if (q < 4) q = 4;
+    while (q > 4 && ((u32)q * w / 4u > ENG_MAX_SURFACE_DIM || (u32)q * h / 4u > ENG_MAX_SURFACE_DIM)) q--;
+    return (u32)q;
+}
+static inline u32 eng_fxres_px(u32 v, u32 kq) { return kq > 4u ? (v * kq + 3u) / 4u : v; }
+/* Whether a target is on the list, whatever the scale (the dump's
+ * effects-texture list, PS3_MODS_DUMP). */
+static int eng_fxres_listed(u32 offset, u32 w, u32 h)
+{
+    for (u32 i = 0; i < s_fxres_n; i++)
+        if (s_fxres_t[i].w == w && s_fxres_t[i].h == h && (s_fxres_t[i].off == ~0u || s_fxres_t[i].off == offset)) return 1;
+    return 0;
+}
+
+/* A scaled target the guest reads back through memory: back to its own size
+ * for good (the backend cannot hand back the guest's pixels of a larger
+ * image). The next lookup recreates it. */
+static void eng_fxres_block(eng_surface* s)
+{
+    const u32 id = (s->offset ^ (s->location << 31)) + 1u;
+    if (s_fxres_nblock < ENG_FXRES_MAX) s_fxres_block[s_fxres_nblock++] = id;
+    fprintf(stderr, "[fxres] target %u:0x%08X %ux%u is read back by the guest: kept at its own size from now on\n",
+            s->location, s->offset, s->w, s->h);
+}
+
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
- * rsx_live_draw.c's surface_get (2605-2690). */
-static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
-                          rsx_be_format want_fmt)
+ * rsx_live_draw.c's surface_get (2605-2690). force_kq: the effects scale
+ * (PS3RECOMP_FX_RES) to use, or 0 for this target's own. */
+static u32 eng_surface_get_kq(u32 location, u32 offset, u32 want_w, u32 want_h,
+                              rsx_be_format want_fmt, u32 force_kq)
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
+    const u32 want_kq = force_kq ? force_kq : eng_fxres_kq(location, offset, want_w, want_h);
+    u32 reuse = ENG_INVALID;
 
     /* One target per (address, size, format). Reallocating the address's
      * target whenever a pass declared a different clip (a 1280x180 strip, a
@@ -858,6 +989,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         if (g.surfaces[i].handle && g.surfaces[i].location == location &&
             g.surfaces[i].offset == offset && g.surfaces[i].w == want_w &&
             g.surfaces[i].h == want_h && g.surfaces[i].fmt == want_fmt) {
+            if ((g.surfaces[i].kq ? g.surfaces[i].kq : 4u) != want_kq) { reuse = i; break; }   /* PS3RECOMP_FX_RES changed */
             g.surfaces[i].stamp = ++s_surf_clock;
             return i;
         }
@@ -877,9 +1009,11 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                     best != ENG_INVALID ? "existing" : "absent");
         return best;
     }
-    /* A free slot, else the least recently bound target. */
-    u32 slot = g.n_surfaces;
-    for (u32 i = 0; i < g.n_surfaces; i++) if (!g.surfaces[i].handle) { slot = i; break; }
+    /* A free slot, else the least recently bound target (or the one whose
+     * effects scale changed: replaced in place). */
+    u32 slot = reuse != ENG_INVALID ? reuse : g.n_surfaces;
+    if (reuse == ENG_INVALID)
+        for (u32 i = 0; i < g.n_surfaces; i++) if (!g.surfaces[i].handle) { slot = i; break; }
     if (slot >= ENG_MAX_SURFACES) {
         slot = 0;
         for (u32 i = 1; i < g.n_surfaces; i++)
@@ -887,27 +1021,40 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     }
 
     u32 seed_row = 0;
-    const void* seed = eng_surface_seed(location, offset, want_w, want_h,
-                                        want_fmt, &seed_row);
+    /* A scaled target (PS3RECOMP_FX_RES) starts cleared: the guest's bytes
+     * are its own size. */
+    const void* seed = want_kq > 4u ? NULL
+                     : eng_surface_seed(location, offset, want_w, want_h, want_fmt, &seed_row);
     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
-                                                 want_w, want_h, seed, seed_row);
-    if (!handle) return ENG_INVALID;
+                                                 eng_fxres_px(want_w, want_kq), eng_fxres_px(want_h, want_kq),
+                                                 seed, seed_row);
+    if (!handle) return reuse != ENG_INVALID ? reuse : ENG_INVALID;   /* the old size rather than nothing */
 
     eng_surface* s = &g.surfaces[slot];
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
     s_surf_gen++;                            /* eng_surface_maybe's filter */
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
+    s->kq = (u8)want_kq;
     s->handle = handle;
     s->stamp = ++s_surf_clock;
+    s->wb_stamp = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0, cap = 0;
       if (!cap) cap = getenv("PS3RECOMP_ENG_TEXLOG") ? 256u : 16u;   /* TEXLOG: the whole set */
-      if (__atomic_fetch_add(&logs, 1, __ATOMIC_RELAXED) < cap)
+      if (want_kq > 4u || reuse != ENG_INVALID)
+        fprintf(stderr, "[fxres] target %u:0x%08X %ux%u drawn at %ux%u -> h%u\n", location, offset,
+                want_w, want_h, eng_fxres_px(want_w, want_kq), eng_fxres_px(want_h, want_kq), handle);
+      else if (__atomic_fetch_add(&logs, 1, __ATOMIC_RELAXED) < cap)
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s -> h%u\n",
                 location, offset, want_w, want_h, (int)want_fmt,
                 seed ? " (seeded from guest memory)" : "", handle); }
     return slot;
+}
+static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+                          rsx_be_format want_fmt)
+{
+    return eng_surface_get_kq(location, offset, want_w, want_h, want_fmt, 0);
 }
 
 /* The colour targets SET_SURFACE_COLOR_TARGET names, as slots into
@@ -936,9 +1083,12 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
     };
     for (u32 i = 0; i < 3; i++) {
         if (sf.color_target < mrt_from[i]) break;
-        const u32 slot = eng_surface_get(sf.color_location[i + 1],
-                                         sf.color_offset[i + 1],
-                                         sf.clip_w, sf.clip_h, fmt);
+        /* Every member at A's effects scale (PS3RECOMP_FX_RES): attachments of
+         * one pass share one size. */
+        const u32 slot = eng_surface_get_kq(sf.color_location[i + 1],
+                                            sf.color_offset[i + 1],
+                                            sf.clip_w, sf.clip_h, fmt,
+                                            g.surfaces[first].kq ? g.surfaces[first].kq : 4u);
         if (slot == ENG_INVALID) break;
         /* A set naming one buffer twice would attach the same target twice,
          * which no host API allows. */
@@ -1101,6 +1251,7 @@ static u32 eng_zdepth_snapshot_rgba8_sized(u32 slot, u32 w, u32 h)
 {
     static int on = -1; if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_DEPTH_CROP"); on = e ? atoi(e) : 1; }
     eng_zdepth* z = &g.zdepths[slot];
+    if (z->kq > 4u) { w = eng_fxres_px(w, z->kq); h = eng_fxres_px(h, z->kq); }   /* PS3RECOMP_FX_RES */
     if (!on || !w || !h || (w >= z->w && h >= z->h)) return eng_zdepth_snapshot_rgba8(slot);
     if (w > z->w) w = z->w;
     if (h > z->h) h = z->h;
@@ -1132,6 +1283,7 @@ static u32 eng_zdepth_snapshot_sized(u32 slot, u32 w, u32 h)
     if (__builtin_expect(__atomic_load_n(&s_ztex_crop, __ATOMIC_RELAXED) < 0, 0))
         ps3_toggle_watch(PS3T_ENG_ZTEX_CROP, eng_ztex_crop_set);
     eng_zdepth* z = &g.zdepths[slot];
+    if (z->kq > 4u) { w = eng_fxres_px(w, z->kq); h = eng_fxres_px(h, z->kq); }   /* PS3RECOMP_FX_RES */
     if (!__atomic_load_n(&s_ztex_crop, __ATOMIC_RELAXED) || !w || !h || (w >= z->w && h >= z->h))
         return eng_zdepth_snapshot(slot);
     if (w > z->w) w = z->w;
@@ -1377,8 +1529,10 @@ static u64 eng_mod_name_key(const char* name)
     }
     if (eng_hexval((unsigned char)name[16]) >= 0) return 0;
     const size_t n = strlen(name);
-    if (n < 20 || name[n - 4] != '.' || (name[n - 3] | 32) != 'p' || (name[n - 2] | 32) != 'n' ||
-        (name[n - 1] | 32) != 'g') return 0;
+    if (n < 20 || name[n - 4] != '.') return 0;
+    const int png = (name[n - 3] | 32) == 'p' && (name[n - 2] | 32) == 'n' && (name[n - 1] | 32) == 'g';
+    const int dds = (name[n - 3] | 32) == 'd' && (name[n - 2] | 32) == 'd' && (name[n - 1] | 32) == 's';
+    if (!png && !dds) return 0;
     return k ? k : 1u;
 }
 
@@ -1461,7 +1615,25 @@ static void eng_mod_scan(const char* dir, u32 pack, int depth, u32* files, u32* 
     }
     closedir(d);
 #else
-    (void)dir; (void)pack; (void)depth; (void)files; (void)shadowed;
+    /* The CRT's find API (io.h, already in the force-included win32 shim). */
+    char pat[1040];
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    struct __finddata64_t fd;
+    const intptr_t h = _findfirst64(pat, &fd);
+    if (h == -1) return;
+    do {
+        if (fd.name[0] == '.') continue;
+        char path[1024];
+        snprintf(path, sizeof path, "%s\\%s", dir, fd.name);
+        if (fd.attrib & _A_SUBDIR) {
+            if (depth < 6) eng_mod_scan(path, pack, depth + 1, files, shadowed);
+            continue;
+        }
+        const u64 key = eng_mod_name_key(fd.name);
+        if (!key) continue;
+        if (eng_mod_add(key, path, pack)) (*files)++; else (*shadowed)++;
+    } while (_findnext64(h, &fd) == 0);
+    _findclose(h);
 #endif
 }
 
@@ -1469,29 +1641,64 @@ static void eng_mkdirs(const char* dir)
 {
     char b[512];
     snprintf(b, sizeof b, "%s", dir);
-    for (char* q = b + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(b, 0755); *q = '/'; }
+    for (char* q = b + 1; *q; q++)
+        if ((*q == '/' || *q == '\\') && q[-1] != ':') { const char c = *q; *q = 0; mkdir(b, 0755); *q = c; }
     mkdir(b, 0755);
 }
 
-/* Read the knobs and index the packs, once (on the first upload). */
+static int eng_path_absolute(const char* p)
+{
+    return p[0] == '/' || p[0] == '\\' || (p[0] && p[1] == ':');
+}
+
+/* PS3_MODS_DIR, or when it is unset the "texpacks" folder beside the
+ * executable, else two folders up from it (a build folder under work\port\
+ * finds work\texpacks). "" when there is none. */
+static const char* eng_mods_dir(void)
+{
+    static char dir[600];
+    const char* e = getenv("PS3_MODS_DIR");
+    if (e && *e) { snprintf(dir, sizeof dir, "%s", e); return dir; }
+    dir[0] = 0;
+#if defined(_WIN32)
+    char exe[520] = "";
+    { char* p = NULL; if (_get_pgmptr(&p) == 0 && p) snprintf(exe, sizeof exe, "%s", p); }
+    char* slash = strrchr(exe, '\\');
+    if (!slash) return dir;
+    *slash = 0;
+    const char* const up[] = { "%s\\texpacks", "%s\\..\\..\\texpacks" };
+    for (int i = 0; i < 2; i++) {
+        char p[600]; snprintf(p, sizeof p, up[i], exe);
+        struct stat st;
+        if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (!_fullpath(dir, p, sizeof dir)) snprintf(dir, sizeof dir, "%s", p);   /* without the ..\.. */
+            break;
+        }
+    }
+#endif
+    return dir;
+}
+
+/* Read the knobs and index the packs, once (on the first upload, and again
+ * when the PC menu changes PS3_MODS / PS3_MODS_DUMP: eng_mods_reload). */
 static void eng_mods_init(void)
 {
     if (s_mods.init) return;
     s_mods.init = 1;
+    const char* dir = eng_mods_dir();
     const char* dump = getenv("PS3_MODS_DUMP");
-    if (dump && *dump) {
+    if (dump && *dump && strcmp(dump, "0")) {
+        char dd[512];
+        /* "1": the packs folder's _dump */
+        if (!strcmp(dump, "1")) snprintf(dd, sizeof dd, "%s%s_dump", dir, *dir ? "/" : "");
+        else snprintf(dd, sizeof dd, "%s", dump);
         if (!g.be->image_save) fprintf(stderr, "[mods] PS3_MODS_DUMP: this backend cannot write images; no dump\n");
-        else { snprintf(s_mods.dump_dir, sizeof s_mods.dump_dir, "%s", dump); eng_mkdirs(dump);
-               fprintf(stderr, "[mods] dumping colour textures to %s (<key>.png, textures.txt)\n", dump); }
+        else { snprintf(s_mods.dump_dir, sizeof s_mods.dump_dir, "%s", dd); eng_mkdirs(dd);
+               fprintf(stderr, "[mods] dumping colour textures to %s (<key>.png, textures.txt, fx_textures.txt)\n", dd); }
     }
     const char* list = getenv("PS3_MODS");
     if (!list || !*list) return;
     if (!g.be->image_load) { fprintf(stderr, "[mods] PS3_MODS: this backend cannot read images; no texture packs\n"); return; }
-#if defined(_WIN32)
-    fprintf(stderr, "[mods] PS3_MODS: texture packs are not supported on this platform\n");
-    return;
-#endif
-    const char* dir = getenv("PS3_MODS_DIR");
     const char* q = list;
     while (*q && s_mods.npacks < 16) {
         while (*q == ',' || *q == ' ') q++;
@@ -1502,8 +1709,8 @@ static void eng_mods_init(void)
         if (t > q) {
             char name[160];
             snprintf(name, sizeof name, "%.*s", (int)(t - q), q);
-            char path[600];
-            if (name[0] == '/') snprintf(path, sizeof path, "%s", name);
+            char path[800];
+            if (eng_path_absolute(name)) snprintf(path, sizeof path, "%s", name);
             else if (dir && *dir) snprintf(path, sizeof path, "%s/%s", dir, name);
             else { fprintf(stderr, "[mods] pack \"%s\": PS3_MODS_DIR is not set; skipped\n", name); q = e; continue; }
             struct stat st;
@@ -1530,6 +1737,123 @@ static int eng_mods_wanted(void)
     return s_mods.on || s_mods.dump_dir[0] || eng_texdump_on();
 }
 
+/* ---- texture packs switched while the game runs (the PC menu) -------------
+ * PS3_MODS and PS3_MODS_DUMP have appliers (eng_texpack_register): they only
+ * set s_mods_dirty; the RSX thread re-reads both at the next present
+ * (eng_mods_poll) and makes the texture cache take the change at each
+ * texture's next use: a cached texture the new packs replace (its pack key
+ * is eng_texmod_key of the content hash the cache already holds, so nothing
+ * is hashed again to find them), every replaced one when packs go away,
+ * every colour texture when a dump starts (so what is in view is written).
+ * Such an entry is marked changed (hashes flipped, write-tracking dropped):
+ * its next bind re-hashes it in full and uploads it again, through the
+ * packs. Without the menu touching them nothing here runs. */
+static volatile int s_mods_dirty;
+static int eng_texpack_apply(const char* v) { (void)v; __atomic_store_n(&s_mods_dirty, 1, __ATOMIC_RELAXED); return 1; }
+static void eng_texpack_register(void)
+{
+    ps3_setting_register("PS3_MODS", eng_texpack_apply);
+    ps3_setting_register("PS3_MODS_DUMP", eng_texpack_apply);
+}
+static void eng_tex_mark_changed(eng_texture* e)
+{
+    e->content_hash ^= 0x5A5A5A5A5A5A5A5Aull;
+    e->sparse_hash ^= 0xA5A5A5A5A5A5A5A5ull;
+    e->wt_ok = 0;
+    e->last_hash_frame = g.frames - 1u;
+    e->last_full_frame = g.frames - 8u;
+}
+static void eng_mods_reload(void)
+{
+    const int was_on = s_mods.on, was_dump = s_mods.dump_dir[0] != 0;
+    s_mods.init = s_mods.on = 0;
+    s_mods.n = s_mods.npacks = s_mods.pool_used = 0;
+    if (s_mods.idx) memset(s_mods.idx, 0, s_mods.idx_size * sizeof *s_mods.idx);
+    s_mods.dump_dir[0] = 0;
+    eng_mods_init();
+    u32 marked = 0;
+    for (u32 i = 0; i < g.n_textures; i++) {
+        eng_texture* e = &g.textures[i];
+        if (!e->handle || e->cubemap || e->depth > 1) continue;
+        int mark = e->modded;                                   /* back to the original, or a new file */
+        if (!mark && s_mods.on && eng_mod_find(eng_texmod_key(e->content_hash, e->format, e->width, e->height)))
+            mark = 1;                                           /* a pack replaces it now */
+        if (!mark && s_mods.dump_dir[0] && !was_dump) mark = 1;  /* a dump started: write what is in view */
+        if (mark) { eng_tex_mark_changed(e); marked++; }
+    }
+    fprintf(stderr, "[mods] packs %s -> %s (%u texture(s) from %u pack(s)), dump %s; %u cached texture(s) re-upload at next use\n",
+            was_on ? "on" : "off", s_mods.on ? "on" : "off", s_mods.n, s_mods.npacks,
+            s_mods.dump_dir[0] ? "on" : "off", marked);
+}
+/* For the PC menu's Effects page (vk_overlay.cpp). Reads only: a value a
+ * frame old is fine there. */
+const char* rsx_texpack_dir(void) { return eng_mods_dir(); }
+void rsx_texpack_status(unsigned* packs, unsigned* files, unsigned* applied, int* dumping)
+{
+    if (packs) *packs = s_mods.on ? s_mods.npacks : 0u;
+    if (files) *files = s_mods.on ? s_mods.n : 0u;
+    if (applied) *applied = s_mods.applied;
+    if (dumping) *dumping = s_mods.dump_dir[0] != 0;
+}
+/* Scripted A/B in one run (tests only: nothing without PS3_TOGGLE_FILE). The
+ * toggle file may name, with numbers as it takes them:
+ *   PS3RECOMP_FX_RES_Q=<quarter steps>   effects resolution (4 = the game's, 10 = 2.5x)
+ *   PS3_MODS_ON=0|1                      the packs PS3_MODS named at start, off / on
+ *   PS3_MODS_DUMP_ON=0|1                 the dump (into PS3_MODS_DUMP_TO, else the packs folder's _dump)
+ * each applied as the PC menu would, at the next present after it changes. */
+static void eng_fx_toggle_poll(void)
+{
+    static int file = -1;
+    static int last_q = -1, last_m = -1, last_d = -1;
+    static char mods0[256];
+    if (__builtin_expect(file == 0, 1)) return;
+    if (file < 0) {
+        file = getenv("PS3_TOGGLE_FILE") ? 1 : 0;
+        const char* m = getenv("PS3_MODS");
+        snprintf(mods0, sizeof mods0, "%s", m ? m : "");
+        if (!file) return;
+    }
+    const int q = ps3_toggle_get("PS3RECOMP_FX_RES_Q", -1);
+    if (q != last_q && q >= 4) { char b[16]; snprintf(b, sizeof b, "%.2f", q / 4.0); eng_fxres_apply(b); }
+    last_q = q;
+    const int m = ps3_toggle_get("PS3_MODS_ON", -1);
+    if (m != last_m && m >= 0) { ps3_setting_setenv("PS3_MODS", m ? mods0 : ""); __atomic_store_n(&s_mods_dirty, 1, __ATOMIC_RELAXED); }
+    last_m = m;
+    const int d = ps3_toggle_get("PS3_MODS_DUMP_ON", -1);
+    if (d != last_d && d >= 0) {
+        const char* to = getenv("PS3_MODS_DUMP_TO");
+        ps3_setting_setenv("PS3_MODS_DUMP", d ? (to && *to ? to : "1") : "0");
+        __atomic_store_n(&s_mods_dirty, 1, __ATOMIC_RELAXED);
+    }
+    last_d = d;
+}
+
+static void eng_mods_poll(void)
+{
+    eng_fx_toggle_poll();
+    if (__builtin_expect(!__atomic_load_n(&s_mods_dirty, __ATOMIC_RELAXED), 1)) return;
+    __atomic_store_n(&s_mods_dirty, 0, __ATOMIC_RELAXED);
+    eng_mods_reload();
+}
+
+/* PS3_MODS_DUMP: <dir>/fx_textures.txt names, once each, the textures the
+ * draws into the effects targets (PS3RECOMP_FX_RES_TARGETS: the particles)
+ * sample -- the fire, smoke, sparks and debris sheets -- so a pack for them
+ * starts from the right files. */
+static void eng_mods_fx_note(u64 content_hash, u32 fmt, u32 w, u32 h)
+{
+    static u64 seen[1024]; static u32 ns;
+    const u64 key = eng_texmod_key(content_hash, fmt, w, h);
+    for (u32 i = 0; i < ns; i++) if (seen[i] == key) return;
+    if (ns < 1024) seen[ns++] = key;
+    char path[600];
+    snprintf(path, sizeof path, "%s/fx_textures.txt", s_mods.dump_dir);
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    fprintf(f, "%016llx %ux%u fmt 0x%02X frame %u\n", (unsigned long long)key, w, h, fmt, g.frames);
+    fclose(f);
+}
+
 /* Halve an RGBA8 image (box filter; an odd edge repeats its last texel). */
 static void eng_rgba_half(const u8* src, u32 w, u32 h, u8* dst, u32 nw, u32 nh)
 {
@@ -1544,6 +1868,75 @@ static void eng_rgba_half(const u8* src, u32 w, u32 h, u8* dst, u32 nw, u32 nh)
         }
 }
 
+static void eng_bc_decode(const u8* blocks, u32 row_bytes, u32 w, u32 h, rsx_texfmt f, u8* rgba);
+
+/* A pack file in DDS: level 0 of an uncompressed 32-bit image (any channel
+ * masks) or of DXT1/DXT3/DXT5 (legacy FourCC or the DX10 header's BC1-3 /
+ * R8G8B8A8 / B8G8R8A8), as tightly packed straight R,G,B,A rows (what the
+ * backend's image_load gives for a PNG). 1 = done; the caller frees *out. */
+static int eng_dds_load(const char* path, u8** out, u32* ow, u32* oh)
+{
+    *out = NULL; *ow = *oh = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    u8 hd[148];
+    const size_t got = fread(hd, 1, sizeof hd, f);
+    #define RD32(o) ((u32)hd[o] | ((u32)hd[(o) + 1] << 8) | ((u32)hd[(o) + 2] << 16) | ((u32)hd[(o) + 3] << 24))
+    if (got < 128 || memcmp(hd, "DDS ", 4) || RD32(4) != 124u) { fclose(f); return 0; }
+    const u32 h = RD32(12), w = RD32(16), pf_flags = RD32(80), fourcc = RD32(84), bits = RD32(88);
+    const u32 mask[4] = { RD32(92), RD32(96), RD32(100), RD32(104) };
+    long data = 128;
+    int bc = 0;                                       /* 1..3 = BC1..3 */
+    int rgba32 = 0, bgra32 = 0;
+    if (pf_flags & 4u) {                              /* DDPF_FOURCC */
+        if (fourcc == 0x31545844u) bc = 1;            /* "DXT1" */
+        else if (fourcc == 0x33545844u) bc = 2;       /* "DXT3" */
+        else if (fourcc == 0x35545844u) bc = 3;       /* "DXT5" */
+        else if (fourcc == 0x30315844u && got >= 148) {   /* "DX10" */
+            const u32 dxgi = RD32(128);
+            data = 148;
+            if (dxgi == 71u || dxgi == 72u) bc = 1;
+            else if (dxgi == 74u || dxgi == 75u) bc = 2;
+            else if (dxgi == 77u || dxgi == 78u) bc = 3;
+            else if (dxgi == 28u || dxgi == 29u) rgba32 = 1;
+            else if (dxgi == 87u || dxgi == 91u) bgra32 = 1;
+        }
+    } else if ((pf_flags & 0x40u) && bits == 32u) {   /* DDPF_RGB, 32 bits: by the masks */
+        rgba32 = 2;
+    }
+    #undef RD32
+    if (!w || !h || w > 8192u || h > 8192u || (!bc && !rgba32 && !bgra32)) {
+        fprintf(stderr, "[mods] %s: a DDS this loader does not read (uncompressed 32-bit or DXT1/3/5 only)\n", path);
+        fclose(f); return 0;
+    }
+    const size_t bytes = bc ? (size_t)((w + 3) / 4) * ((h + 3) / 4) * (bc == 1 ? 8u : 16u) : (size_t)w * h * 4u;
+    u8* src = (u8*)malloc(bytes);
+    u8* px = (u8*)malloc((size_t)w * h * 4u);
+    int ok = src && px && fseek(f, data, SEEK_SET) == 0 && fread(src, 1, bytes, f) == bytes;
+    fclose(f);
+    if (ok && bc) {
+        eng_bc_decode(src, ((w + 3) / 4) * (bc == 1 ? 8u : 16u), w, h,
+                      bc == 1 ? RSX_TEXFMT_BC1 : bc == 2 ? RSX_TEXFMT_BC2 : RSX_TEXFMT_BC3, px);
+    } else if (ok) {
+        int sh[4] = { 0, 8, 16, 24 };   /* byte position of R, G, B, A in a little-endian texel */
+        if (bgra32) { sh[0] = 16; sh[2] = 0; }
+        if (rgba32 == 2)
+            for (int c = 0; c < 4; c++) {
+                if (!mask[c]) { sh[c] = -1; continue; }
+                int s = 0; while (!((mask[c] >> s) & 1u)) s++;
+                sh[c] = s;
+            }
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            const u32 v = (u32)src[i * 4] | ((u32)src[i * 4 + 1] << 8) | ((u32)src[i * 4 + 2] << 16) | ((u32)src[i * 4 + 3] << 24);
+            for (int c = 0; c < 4; c++) px[i * 4 + c] = sh[c] < 0 ? 255u : (u8)(v >> sh[c]);
+        }
+    }
+    free(src);
+    if (!ok) { free(px); return 0; }
+    *out = px; *ow = w; *oh = h;
+    return 1;
+}
+
 /* The pack's replacement for `key` as a backend texture, or 0 (none, or it
  * cannot be used: then the original is uploaded as always). */
 static u32 eng_texmod_apply(u64 key, u32 fmt, u32 w, u32 h, u32 nlv, u32 remap)
@@ -1552,7 +1945,10 @@ static u32 eng_texmod_apply(u64 key, u32 fmt, u32 w, u32 h, u32 nlv, u32 remap)
     if (!m || m->bad) return 0;
     const char* path = s_mods.pool + m->path;
     u8* px = NULL; u32 pw = 0, ph = 0;
-    if (!g.be->image_load(g.be->user, path, &px, &pw, &ph) || !px || !pw || !ph) {
+    const size_t plen = strlen(path);
+    const int dds = plen > 4 && (path[plen - 1] | 32) == 's' && (path[plen - 2] | 32) == 'd';
+    if (!(dds ? eng_dds_load(path, &px, &pw, &ph)
+              : g.be->image_load(g.be->user, path, &px, &pw, &ph)) || !px || !pw || !ph) {
         fprintf(stderr, "[mods] %s: cannot read the image; the original is used\n", path);
         free(px); m->bad = 1; return 0;
     }
@@ -1696,6 +2092,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     s_upload_atlas = 0;
+    s_upload_modded = 0;
     if (!nlv || !lv[0].tl.face_bytes) return 0;
     /* A volume: every slice of every level decoded and uploaded on its own.
      * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
@@ -1756,6 +2153,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         if (mod_key && s_mods.on) {
             const u32 hnd = eng_texmod_apply(mod_key, fmt, w, h, nlv, remap);
             if (hnd) {
+                s_upload_modded = 1;
                 if (s_mods.dump_dir[0] && eng_staging_reserve(lv[0].tl.dst_row_bytes * lv[0].tl.rows)) {
                     rsx_texture_decode(g.tex_staging, lv[0].tl.dst_row_bytes, src + lv[0].offset,
                                        lv[0].w, lv[0].h, &lv[0].tl, rsx_texture_argb_is_rgba());
@@ -1960,6 +2358,7 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
                     e->content_hash = hash;
                     e->icon_atlas = (u8)s_upload_atlas;
                     e->icon_gen = s_icon_gen;
+                    e->modded = (u8)s_upload_modded;
                 }
             }
             if (wt_clean) {                     /* shadow mode: was the tracker right? */
@@ -1992,6 +2391,7 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
                               old, fresh, fresh == old ? " in place" : "", location, offset, s_icon_gen, s_upload_atlas); }
         }
         e->last_use_serial = ++g.texture_use_serial;
+        s_slot_hash = e->content_hash;
         return e->handle;
     }
 
@@ -2036,6 +2436,8 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     e.wt_stamp = new_st;
     e.icon_atlas = (u8)s_upload_atlas;
     e.icon_gen = s_icon_gen;
+    e.modded = (u8)s_upload_modded;
+    s_slot_hash = e.content_hash;
     if (ft_u0) ps3_ft_span(PS3_FT_TEXUP, 0, span >> 10, evicted ? 2u : 0u, ft_u0, ps3_ft_now());
     /* PS3RECOMP_ENG_TEXLOG=1: one line per texture the engine creates (guest
      * location/offset, format byte, size, levels, pitch, cube, crossbar) and
@@ -4537,6 +4939,11 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                        t.width, t.height, t.mipmaps, t.pitch,
                                        (int)t.cubemap, t.remap & 0x1FFFFu,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+        /* PS3_MODS_DUMP: the effects draws' textures (fx_textures.txt). */
+        if (__builtin_expect(s_mods.dump_dir[0] != 0, 0) && textures[u] && n_targets &&
+            eng_fxres_listed(g.surfaces[target_slots[0]].offset, g.surfaces[target_slots[0]].w,
+                             g.surfaces[target_slots[0]].h))
+            eng_mods_fx_note(s_slot_hash, t.format, t.width, t.height);
         /* PS3RECOMP_ENG_RES_LOG=1: guest-memory textures of a screen-buffer
          * size (the display's, half, quarter) -- under PS3_RES_SCALE these
          * stay at the guest's resolution while the targets are scaled. Once
@@ -4688,8 +5095,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_dsp_viewport vp;
     rsx_dsp_get_surface(&g.rsx, &sf);
     rsx_dsp_get_viewport(&g.rsx, &vp);
+    /* PS3RECOMP_FX_RES: a scaled target's depth attachment is that much larger. */
+    const u32 tkq = g.surfaces[target].kq > 4u ? g.surfaces[target].kq : 4u;
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
-                                     sf.clip_w, sf.clip_h);
+                                     eng_fxres_px(sf.clip_w, tkq), eng_fxres_px(sf.clip_h, tkq));
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */
@@ -5352,7 +5761,9 @@ static void sink_end(void* user, const rsx_dispatch* r)
         }
         g.be->set_hud(g.be->user, hud ? 1 : (s_hud_n && display ? 2 : 0), g.surfaces[target].w);
     }
-    g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
+    /* PS3RECOMP_FX_RES: the same picture over the scaled target's pixels. */
+    const float fxk = tkq > 4u ? (float)tkq * 0.25f : 1.0f;
+    g.be->set_viewport(g.be->user, 0.0f, 0.0f, W * fxk, H * fxk);
 
     /* The guest scissor intersected with the surface. The nv40 reset is a
      * full 4096x4096 window and a never-written register reads 0 here, which
@@ -5373,6 +5784,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
             if (gy + gh < bottom) bottom = gy + gh;
             sw = right > sx ? right - sx : 0;
             sh = bottom > sy ? bottom - sy : 0;
+        }
+        if (tkq > 4u) {   /* PS3RECOMP_FX_RES: edges on the scaled grid (left/top down, right/bottom up) */
+            const u32 r = eng_fxres_px(sx + sw, tkq), b = eng_fxres_px(sy + sh, tkq);
+            sx = sx * tkq / 4u; sy = sy * tkq / 4u; sw = r - sx; sh = b - sy;
         }
         g.be->set_scissor(g.be->user, sx, sy, sw, sh);
     }
@@ -5411,6 +5826,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
         g.zdepths[zslot].had_write = 1;
         g.zdepths[zslot].stamp = ++s_surf_clock;
+        g.zdepths[zslot].kq = (u8)tkq;   /* PS3RECOMP_FX_RES: readers crop at this scale */
         /* A published depth image is only good until the next depth write:
          * a reader later in the stream resolves again. Kept across writes,
          * inFAMOUS 2's occlusion volumes (drawn after the G-buffer) sampled a
@@ -5618,6 +6034,7 @@ static void eng_present(u32 buffer_id)
                       ps3_lightfx_get(PS3_LFX_SSAO_STRENGTH), ps3_lightfx_get(PS3_LFX_LIGHT_DITHER),
                       ps3_lightfx_get(PS3_LFX_TONE_SHADOWS), ps3_lightfx_get(PS3_LFX_TONE_MIDTONES),
                       ps3_lightfx_get(PS3_LFX_TONE_HIGHLIGHTS), ps3_lightfx_get(PS3_LFX_CLARITY)); }
+    eng_mods_poll();   /* the PC menu switched texture packs or their dump (and the tests' toggle file) */
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
@@ -5856,6 +6273,10 @@ int rsx_draw_engine_init(u32 width, u32 height)
     ps3_setting_register("PS3RECOMP_DOF", eng_fx_dof_apply);
     ps3_setting_register("PS3RECOMP_EDGE_BLUR", eng_fx_edge_apply);
     ps3_setting_register("PS3RECOMP_SOFT_SHADOWS", eng_soft_shadows_apply);   /* Lighting page */
+    /* The PC menu's Effects page: effects resolution and texture packs. */
+    eng_fxres_init();
+    ps3_setting_register("PS3RECOMP_FX_RES", eng_fxres_apply);
+    eng_texpack_register();
     g.ready = 1;
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
             g.width, g.height);
@@ -5975,6 +6396,12 @@ int rsx_draw_engine_write_back_to(int local, u32 offset, u32 pitch, int dst_loca
         if (offset < sf->offset || offset >= sf->offset + row) continue;
         if (best == ENG_INVALID || sf->stamp > g.surfaces[best].stamp) best = i;
     }
+    if ((on & 1) && best != ENG_INVALID && g.surfaces[best].kq > 4u) {
+        /* PS3RECOMP_FX_RES: the guest wants this target's pixels; it goes back
+         * to its own size (this read gets what memory holds). */
+        eng_fxres_block(&g.surfaces[best]);
+        g.surfaces[best].wb_stamp = g.surfaces[best].stamp;
+    }
     if ((on & 1) && best != ENG_INVALID && g.surfaces[best].wb_stamp != g.surfaces[best].stamp) {
         eng_surface* sf = &g.surfaces[best];
         const u32 row = pitch ? pitch : sf->w * 4u;
@@ -5998,6 +6425,13 @@ int rsx_draw_engine_write_back_to(int local, u32 offset, u32 pitch, int dst_loca
         const u32 row = pitch ? pitch : z->w * 4u;
         if (offset < z->offset || offset >= z->offset + row) continue;
         if (z->wb_stamp == z->stamp) break;
+        if (z->kq > 4u) {   /* PS3RECOMP_FX_RES: written at a scale the guest's layout does not have */
+            static int said; if (!said++)
+                fprintf(stderr, "[fxres] depth %u:0x%08X written at effects scale is read back by the guest: skipped\n",
+                        location, z->offset);
+            z->wb_stamp = z->stamp;
+            break;
+        }
         z->snapshot_rgba_valid = 0; z->crop_valid = 0;   /* the decode must follow the latest depth write */
         const u32 snap = eng_zdepth_snapshot_rgba8(i);   /* queues the decode */
         u8* dst = (u8*)eng_guest_ptr(NULL, location, z->offset, row * z->h);
