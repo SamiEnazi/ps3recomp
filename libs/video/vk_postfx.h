@@ -25,8 +25,12 @@
  *                                     (default), CAS's scaling form, or the
  *                                     plain bilinear blit
  *   PS3RECOMP_ANISO=1..16             default 16 (1 = the guest's filtering)
- *   PS3RECOMP_RENDER_SCALE=1|1.5|2    internal resolution (see vk_postfx.c:
- *                                     accepted, reported as 1 -- not done)
+ *   PS3RECOMP_RENDER_SCALE=1|1.5|2|3  internal resolution, or 720p|1080p|1440p|4k
+ *                                     (PS3_RES_SCALE as on Metal when unset): the
+ *                                     backend draws the game's screen targets
+ *                                     that much larger (rsx_vulkan_backend.c,
+ *                                     [res]); read at start. A frame larger than
+ *                                     the window is area-downsampled here.
  *   PS3RECOMP_POSTFX_PROF=1           log the passes' GPU time every 5 s
  * All four at their "off" values (AA=off, SHARPEN=0, ANISO=1) give exactly
  * the old picture: the present blits the frame unchanged.
@@ -51,8 +55,11 @@ int   vk_postfx_aniso(void);                 /* the level in effect (1 when the 
 enum { VK_POSTFX_UP_FSR = 0, VK_POSTFX_UP_CAS = 1, VK_POSTFX_UP_BILINEAR = 2 };
 void  vk_postfx_set_upscale(int mode);       /* VK_POSTFX_UP_* */
 int   vk_postfx_upscale(void);
-void  vk_postfx_set_render_scale(float s);   /* 1, 1.5, 2: see the note in vk_postfx.c */
-float vk_postfx_render_scale(void);          /* the scale in effect (1 today) */
+void  vk_postfx_set_render_scale(float s);   /* 1 .. 4 in quarter steps: the next start's */
+float vk_postfx_render_scale(void);          /* the scale in effect this session (1 = 720p) */
+/* [res] the backend: the setting read at start, and the scale it runs at. */
+float vk_postfx_render_scale_wanted(void);
+void  vk_postfx_render_scale_active(float s);
 /* By environment-variable name ("PS3RECOMP_AA", "PS3RECOMP_SHARPEN",
  * "PS3RECOMP_ANISO", "PS3RECOMP_RENDER_SCALE", "PS3RECOMP_UPSCALE") and its
  * text value, as the

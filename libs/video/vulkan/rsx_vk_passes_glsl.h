@@ -26,8 +26,11 @@
  * fuse the separate multiplies into neighbouring adds nor reassociate. The
  * light pass is ordinary float math and has no such qualifiers, like its MSL.
  *
- * PS3_RES_SCALE does not exist on Vulkan: the MSL's `rs` scale is a constant
- * 1 here, and ssao_up4s_fs (its scaled-output variant) is not ported.
+ * [res] PS3RECOMP_RENDER_SCALE (rsx_vulkan_backend.c's [res] block): the
+ * MSL's `rs` scale is the block's `res.xy` (1 unscaled -- the old constant),
+ * ssao_up4s_fs (the upsample at the scaled size) is kVkSsaoUpScFS, and the
+ * full-res AO chain (PS3RECOMP_SSAO >= 1) runs at the scaled size with its
+ * sample offsets and clamps scaled to match.
  */
 #ifndef PS3RECOMP_RSX_VK_PASSES_GLSL_H
 #define PS3RECOMP_RSX_VK_PASSES_GLSL_H
@@ -119,11 +122,12 @@ static const char kVkLightDitherFS[] = VK_LIGHT_GLSL("#define LQ(x, n) max(floor
 "    vec4 up;\n" \
 "    uvec4 dims;\n" \
 "    vec4 lfx;\n" /* ps3_lightfx: x = AO strength (1 = the game's); never read by the exact passes */ \
+"    vec4 res;\n" /* [res] xy = the scale of the depth / normals read (1 unscaled) */ \
 "} c;\n" \
 "layout(set = 0, binding = 1) uniform sampler2D t0;\n" \
 "layout(set = 0, binding = 2) uniform sampler2D t1;\n" \
 "layout(set = 0, binding = 3) uniform sampler2D t2;\n" \
-"const vec2 rs = vec2(1.0);\n" \
+"#define rs (c.res.xy)\n" \
 "float cX(int k) { return c.X4[k >> 2][k & 3]; }\n" \
 "float cY(int k) { return c.Y4[k >> 2][k & 3]; }\n" \
 "float cZ(int k) { return c.Z4[k >> 2][k & 3]; }\n" \
@@ -271,6 +275,40 @@ static const char kVkSsaoBlurVFS[] = VK_SSAO_GLSL_COMMON VK_SSAO_GLSL_BLUR
 static const char kVkSsaoUp4FS[] = VK_SSAO_UP4("(b)");
 static const char kVkSsaoUp4sFS[] = VK_SSAO_UP4("clamp(254.0 - (254.0 - (b)) * c.lfx.x, 0.0, 254.0)");
 
+/* [res] Metal's ssao_up4s_fs: the same upsample run per SCALED pixel (the
+ * output is the size of the scaled targets). Each pixel takes its own depth
+ * and the half-res AO texel nearest to its centre plus the neighbours on its
+ * side; at rs = 1 exactly ssao_up4_fs's b = P >> 1 and parity sign. The
+ * job-size output stretched over the scaled image had its depth-aware edges
+ * in 720p steps; this one follows the scaled depth. kVkSsaoUpScsFS: with the
+ * strength, as kVkSsaoUp4sFS. */
+#define VK_SSAO_UP4SC(OUT) VK_SSAO_GLSL_COMMON \
+"#define UPOUT(b) " OUT "\n" \
+"layout(location = 0) out vec4 o;\n" \
+"void main() {\n" \
+"    ivec2 P  = ivec2(gl_FragCoord.xy);\n" \
+"    ivec2 hm = ivec2(c.dims.zw) - 1;\n" \
+"    float Z  = ssao_lin(ssao_z24(texelFetch(t2, P, 0).r), c.up.x, c.up.y);\n" \
+"    precise float kz = c.up.z * ssao_recip(Z);\n" \
+"    vec2 h = (vec2(P) + 0.5) / (2.0 * rs) - 0.5;\n" \
+"    ivec2 b = ivec2(floor(h + 0.5));\n" \
+"    ivec2 s = ivec2(h.x >= float(b.x) ? 1 : -1, h.y >= float(b.y) ? 1 : -1);\n" \
+"    ivec2 off[4] = ivec2[4](ivec2(0, 0), ivec2(0, s.y), ivec2(s.x, 0), s);\n" \
+"    float bw[4]  = float[4](9.0, 3.0, 3.0, 1.0);\n" \
+"    float eps[4] = float[4](uintBitsToFloat(0x3A6BEDFAu), uintBitsToFloat(0x399D4952u),\n" \
+"                            uintBitsToFloat(0x399D4952u), uintBitsToFloat(0x38D1B717u));\n" \
+"    precise float num = 0.0, den = 0.0;\n" \
+"    for (int k = 0; k < 4; k++) {\n" \
+"        ivec2 t = clamp(b + off[k], ivec2(0), hm);\n" \
+"        precise float w = fma(max(0.0, fma(-abs(texelFetch(t1, t, 0).r - Z), kz, 1.0)), bw[k], eps[k]);\n" \
+"        num = fma(w, ssao_byte(t0, t), num);\n" \
+"        den += w;\n" \
+"    }\n" \
+"    o = vec4(UPOUT(floor(ssao_mul_rz(num, ssao_recip(den)))) / 255.0);\n" \
+"}\n"
+static const char kVkSsaoUpScFS[]  = VK_SSAO_UP4SC("(b)");
+static const char kVkSsaoUpScsFS[] = VK_SSAO_UP4SC("clamp(254.0 - (254.0 - (b)) * c.lfx.x, 0.0, 254.0)");
+
 
 /* ---- PS3RECOMP_SSAO=1|2 (ps3_lightfx.h): the game's occlusion at full
  * resolution. Plain float math (no SPU emulation: this is not the job's
@@ -297,7 +335,7 @@ static const char kVkLfxHdFS[] = VK_SSAO_GLSL_COMMON
 "const float bayer4[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);\n" \
 "void main() {\n" \
 "    ivec2 p = ivec2(gl_FragCoord.xy);\n" \
-"    ivec2 fm = ivec2(c.dims.xy) - 1;\n" \
+"    ivec2 fm = ivec2(floor(vec2(c.dims.xy) * rs + 0.5)) - 1;\n" /* [res] the scaled full size */ \
 "    float d = texelFetch(t0, p, 0).r;\n" \
 "    float dc = clamp(d, c.E0.z, c.E0.w);\n" \
 "    float rcp = 1.0 / dc;\n" \
@@ -305,8 +343,8 @@ static const char kVkLfxHdFS[] = VK_SSAO_GLSL_COMMON
 "    vec3 n = roundEven(texelFetch(t1, p, 0).rgb * 255.0) * (1.0 / 127.5) - 1.0;\n" \
 "    vec3 n2 = n.x * c.M[0].xyz + n.y * c.M[1].xyz + n.z * c.M[2].xyz;\n" \
 "    float dref = d + n2.z * q;\n" \
-"    vec2 b = 2.0 * n2.xy * rcp + 0.5;\n" \
-"    vec2 sc = 2.0 * c.D0.yz * rcp;\n" \
+"    vec2 b = 2.0 * rs * n2.xy * rcp + 0.5;\n" /* [res] offsets in scaled pixels */ \
+"    vec2 sc = 2.0 * rs * c.D0.yz * rcp;\n" \
 "    float hz = c.D0.w * q;\n" \
 "    float e0 = c.E0.x / q, e1 = c.E0.y * q;\n" \
 "    float a0 = (bayer4[(p.y & 3) * 4 + (p.x & 3)] + 0.5) * (6.2831853 / 16.0);\n" \
@@ -333,7 +371,7 @@ static const char kVkLfxAo2FS[] = VK_LFX_AO(2);
  * px) times the game's depth weight 1 - |dz| * k / z (k = its blur.x). */
 #define VK_LFX_BLUR \
 "float lfx_blur(ivec2 p, ivec2 dir) {\n" \
-"    ivec2 fm = ivec2(c.dims.xy) - 1;\n" \
+"    ivec2 fm = ivec2(floor(vec2(c.dims.xy) * rs + 0.5)) - 1;\n" /* [res] */ \
 "    float d0 = texelFetch(t1, p, 0).r;\n" \
 "    float kk = c.blur.x / d0;\n" \
 "    float num = 0.0, den = 0.0;\n" \

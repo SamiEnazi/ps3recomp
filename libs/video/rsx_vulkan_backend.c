@@ -262,6 +262,49 @@ typedef struct vk_state {
 } vk_state;
 
 static vk_state s_vk;
+/* ---- [res] internal resolution (PS3RECOMP_RENDER_SCALE) ---------------------
+ * The draw engine's screen targets drawn s times the guest's size: 1 = 720p
+ * (off, the old path exactly), 1.5 = 1080p, 2 = 1440p, 3 = 4K (quarter steps,
+ * read once at the engine's init; vk_postfx.c parses the setting). Mirrors the
+ * Metal backend's PS3_RES_SCALE (rsx_metal_backend.m res_px / s_res_scaled):
+ *   - every engine object keeps the guest's size (gw, gh) and its image size
+ *     (w, h); a colour or depth target is scaled when it fits the guest's
+ *     display (w <= 1280, h <= 720): the screen-space chain. Anything larger --
+ *     the sun-shadow cascades (1024x1024 in a 1280x1024 zeta) -- stays at its
+ *     own size, and so does every guest texture;
+ *   - copies, views, depth snapshots and decodes inherit the source's scale;
+ *     viewports and scissors of a draw into a scaled target are scaled with
+ *     Metal's edge rounding; fragment programs divide WPOS back
+ *     (rsx_fp_set_wpos_scale_xy); the GPU light and SSAO passes run on the
+ *     scaled images (SSAO: the game's half-res passes read the scaled depth
+ *     and normals under each of their pixels, the upsample writes the scaled
+ *     size, Metal's ssao_up4s_fs);
+ *   - readbacks point-sample the scaled image down to the guest's pixels;
+ *   - the present blits into a display image of the scaled size (s_res.disp),
+ *     which vk_postfx.c takes as the frame (AA, sharpening, then FSR up or its
+ *     area downsample to the window).
+ * Fragment programs that read their own target (the engine's framebuffer
+ * fetch, on whenever the targets are scaled) read a copy of it at their own
+ * pixel (vk_res_fbf_rewrite): this backend has no input attachments. */
+static struct {
+    int       on;              /* the engine's screen targets are scaled         */
+    u32       q;               /* the scale in quarter steps (4 = 1x)            */
+    float     s;               /* q / 4                                          */
+    u32       gw, gh;          /* the guest's display (what fits is scaled)      */
+    vk_image  disp;            /* the display image at the scaled size           */
+    vk_buffer readback;        /* ... and its CPU copy (PS3RECOMP_VK_DUMP)       */
+    u32       dw, dh;
+    u32       warned;
+} s_res = { .q = 4u, .s = 1.0f };
+/* Metal's floorf(v * s + 0.5), exact in quarter steps */
+static u32 vk_res_px(u32 v) { return s_res.on ? (v * s_res.q + 2u) / 4u : v; }
+static int vk_res_fits(u32 w, u32 h) { return s_res.on && w <= s_res.gw && h <= s_res.gh; }
+/* the image the present reads (and the frame dump): the scaled one when on */
+static vk_image* vk_disp_img(void) { return s_res.disp.img ? &s_res.disp : &s_vk.color; }
+static u32 vk_disp_w(void) { return s_res.disp.img ? s_res.dw : s_vk.width; }
+static u32 vk_disp_h(void) { return s_res.disp.img ? s_res.dh : s_vk.height; }
+static vk_buffer* vk_disp_readback(void) { return s_res.disp.img ? &s_res.readback : &s_vk.readback; }
+/* ---- [res] end ---- */
 static int s_vk_indep_blend;   /* device has independentBlend (per-attachment state) */
 static int s_vk_depth_clamp_ok; /* device has depthClamp (ZMIN_MAX_CONTROL clamp, not clip) */
 /* DEPTH, or DEPTH|STENCIL when the depth format carries the RSX's 8 stencil
@@ -1096,7 +1139,9 @@ static int64_t vk_batch_gstage(VkDeviceSize bytes)
         const VkDeviceSize old = s_batch.garena.buf ? s_batch.garena.size : 0;
         const VkDeviceSize need = vk_arena_need(&s_batch.garena, bytes, was_recording, 512ull << 20, "GPU bounce");
         if (s_batch.garena.buf && s_batch.garena.size >= need) continue;
-        VkDeviceSize size = s_batch.garena.size ? s_batch.garena.size * 2 : (64u << 20);
+        /* [res] the depth decodes it bounces are s^2 larger: as many fit a batch as at 1x */
+        VkDeviceSize size = s_batch.garena.size ? s_batch.garena.size * 2
+                                                : ((VkDeviceSize)(64u << 20) * s_res.q * s_res.q / 16u);
         while (size < need) size *= 2;
         vk_destroy_buffer(&s_batch.garena);
         if (vk_create_device_buffer(&s_batch.garena, size,
@@ -3684,12 +3729,13 @@ static void vk_present_async(void)
     if (was_batch) vk_flush_note(__LINE__, s_batch.draws);
     if (vk_begin()) return;                 /* batched: ends the open pass */
     s_batch.recording = 0;
-    vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_image* const di = vk_disp_img();     /* [res] the scaled display image when on */
+    vk_barrier_image(di->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     vk_frame_limit();                       /* the cap's beat, before the frame goes to the worker */
     tq_present_rec* p = (tq_present_rec*)(void*)tq_alloc(TQ_PRESENT, sizeof(tq_present_rec), s_vk.cmd);
     if (p) {
         p->fence = s_vk.fence; p->acq = s_vk.sem_acquire;
-        p->img = s_vk.color.img; p->view = s_vk.color.view; p->w = s_vk.width; p->ht = s_vk.height;
+        p->img = di->img; p->view = di->view; p->w = vk_disp_w(); p->ht = vk_disp_h();
         p->seq = ++s_tq_pres_sent;
         tq_commit((const u8*)p);
         tq_wake_force();                    /* the frame goes now, whatever the wake threshold */
@@ -3697,8 +3743,8 @@ static void vk_present_async(void)
         vk_tq_sync();
         const int was = s_tq.direct;
         s_tq.direct = 1;
-        vk_present_finish(s_vk.cmd, s_vk.fence, s_vk.sem_acquire, s_vk.color.img, s_vk.color.view,
-                          s_vk.width, s_vk.height);
+        vk_present_finish(s_vk.cmd, s_vk.fence, s_vk.sem_acquire, di->img, di->view,
+                          vk_disp_w(), vk_disp_h());
         s_tq.direct = was;
     }
     s_fif_pending[s_fif_cur] = 1;           /* waited for when the slot comes round */
@@ -3749,15 +3795,17 @@ static void vk_present_window_body(void)
     if (was_batch) vk_flush_note(__LINE__, s_batch.draws);
     if (vk_begin()) return;                 /* batched: ends the open pass */
     s_batch.recording = 0;
-    vk_gprof_stamp(GP_PGAP, s_vk.width, s_vk.height);
+    vk_image* const di = vk_disp_img();     /* [res] the scaled display image when on */
+    const u32 di_w = vk_disp_w(), di_h = vk_disp_h();
+    vk_gprof_stamp(GP_PGAP, di_w, di_h);
     vk_gprof_note_present();
-    vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image(di->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     /* [postfx] AA + CAS (vk_postfx.c) on the frame; the window gets its output */
-    VkImage pf_img = s_vk.color.img;
-    uint32_t pf_w = s_vk.width, pf_h = s_vk.height;
-    if (!vk_postfx_apply(s_vk.cmd, s_vk.color.img, s_vk.color.view, s_vk.width, s_vk.height,
+    VkImage pf_img = di->img;
+    uint32_t pf_w = di_w, pf_h = di_h;
+    if (!vk_postfx_apply(s_vk.cmd, di->img, di->view, di_w, di_h,
                          s_vk.sc_extent.width, s_vk.sc_extent.height, &pf_img, &pf_w, &pf_h)) {
-        pf_img = s_vk.color.img; pf_w = s_vk.width; pf_h = s_vk.height;
+        pf_img = di->img; pf_w = di_w; pf_h = di_h;
     }
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3835,8 +3883,8 @@ static void vk_dump_ppm(const unsigned char* rgba)
 {
     FILE* f = fopen(s_vk.dump_path, "wb");
     if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); return; }
-    fprintf(f, "P6\n%u %u\n255\n", s_vk.width, s_vk.height);
-    for (size_t i = 0; i < (size_t)s_vk.width * s_vk.height; i++)
+    fprintf(f, "P6\n%u %u\n255\n", vk_disp_w(), vk_disp_h());   /* [res] the display image's size */
+    for (size_t i = 0; i < (size_t)vk_disp_w() * vk_disp_h(); i++)
         fwrite(rgba + i * 4, 1, 3, f);
     fclose(f);
 }
@@ -3865,26 +3913,29 @@ static void vk_cb_present(void* ud, u32 buffer_id)
       } }
 
     if (vk_begin()) return;
-    vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_image* const di = vk_disp_img();     /* [res] the scaled display image when on */
+    vk_buffer* const rb = vk_disp_readback();
+    const u32 di_w = vk_disp_w(), di_h = vk_disp_h();
+    vk_barrier_image(di->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkBufferImageCopy region = {
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageExtent = { s_vk.width, s_vk.height, 1 },
+        .imageExtent = { di_w, di_h, 1 },
     };
-    pvkCmdCopyImageToBuffer(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
-                            s_vk.readback.buf, 1, &region);
+    pvkCmdCopyImageToBuffer(s_vk.cmd, di->img, VK_IMAGE_LAYOUT_GENERAL,
+                            rb->buf, 1, &region);
     VkBufferMemoryBarrier host = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = s_vk.readback.buf, .offset = 0, .size = VK_WHOLE_SIZE,
+        .buffer = rb->buf, .offset = 0, .size = VK_WHOLE_SIZE,
     };
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           0, 0, NULL, 1, &host, 0, NULL);
     if (vk_submit_and_wait()) return;
 
-    vk_invalidate(&s_vk.readback);
-    const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
-    size_t c = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
+    vk_invalidate(rb);
+    const unsigned char* px = (const unsigned char*)rb->ptr;
+    size_t c = ((size_t)(di_h / 2) * di_w + di_w / 2) * 4;
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
     s_vk.presented++;
     s_g.last_draws = s_g.draws;
@@ -3925,7 +3976,13 @@ typedef struct vk_eng_obj {
     u32      tag;                    /* E5: which cache made it, 0 = none   */
     u32      faces;                  /* TEXTURE: 6 = a cube (layers = faces) */
     u32      depth;                  /* TEXTURE: > 1 = a volume (3D image)  */
+    /* [res] the size the engine knows it by; w, h above are the image's.
+     * scaled: the image is vk_res_px() of gw x gh (else gw, gh == w, h). */
+    u32      gw, gh;
+    u8       scaled;
 } vk_eng_obj;
+/* [res] v (guest pixels) in this object's image pixels */
+static u32 vk_res_obj_px(const vk_eng_obj* o, u32 v) { return (o && o->scaled) ? vk_res_px(v) : v; }
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
 
@@ -4078,9 +4135,57 @@ static int vk_lfx_apply_tmid(const char* v)     { ps3_lightfx_set(PS3_LFX_TONE_M
 static int vk_lfx_apply_thi(const char* v)      { ps3_lightfx_set(PS3_LFX_TONE_HIGHLIGHTS, v); return 1; }
 static int vk_lfx_apply_clarity(const char* v)  { ps3_lightfx_set(PS3_LFX_CLARITY, v); return 1; }
 
+/* [res] the session's internal resolution, read once at the engine's init
+ * (the vtable path never scales: vk_res_off when the engine does not start). */
+static void vk_res_off(void)
+{
+    if (s_res.disp.img || s_res.disp.view) {
+        if (s_vk.device && pvkDeviceWaitIdle) pvkDeviceWaitIdle(s_vk.device);
+        vk_destroy_image_real(&s_res.disp);
+    }
+    if (s_res.readback.buf) vk_destroy_buffer(&s_res.readback);
+    s_res.on = 0; s_res.q = 4u; s_res.s = 1.0f; s_res.dw = s_res.dh = 0;
+    rsx_fp_set_wpos_scale_xy(1.0f, 1.0f);
+    vk_postfx_render_scale_active(1.0f);
+}
+static void vk_res_init(void)
+{
+    if (s_res.on) return;
+    s_res.gw = s_vk.width; s_res.gh = s_vk.height;
+    const u32 q = (u32)(vk_postfx_render_scale_wanted() * 4.0f + 0.5f);   /* quarter steps, 1x..4x */
+    if (q <= 4u || q > 16u || !s_vk.device) { vk_postfx_render_scale_active(1.0f); return; }
+    s_res.q = q; s_res.s = (float)q / 4.0f; s_res.on = 1;
+    s_res.dw = vk_res_px(s_vk.width); s_res.dh = vk_res_px(s_vk.height);
+    if (vk_create_image(&s_res.disp, VK_FORMAT_R8G8B8A8_UNORM, s_res.dw, s_res.dh,
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT) ||
+        vk_create_host_buffer(&s_res.readback, (VkDeviceSize)s_res.dw * s_res.dh * 4u,
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT) || vk_begin()) {
+        VK_LOG("internal resolution x%.2f: no %ux%u display image -- 720p\n", (double)s_res.s, s_res.dw, s_res.dh);
+        vk_res_off();
+        return;
+    }
+    vk_barrier_image(s_res.disp.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+    VkImageSubresourceRange cr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    pvkCmdClearColorImage(s_vk.cmd, s_res.disp.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &cr);
+    vk_submit_and_wait();
+    rsx_fp_set_wpos_scale_xy(s_res.s, s_res.s);
+    /* The decompiler's PS3_RES_SHADOW_FIX scales unnormalised shadow-map
+     * coordinates for a map made at the scaled size: the maps stay at their own
+     * size here (they never fit the display), so it stays off. */
+    if (!getenv("PS3_RES_SHADOW_FIX")) ps3_setting_setenv("PS3_RES_SHADOW_FIX", "0");
+    vk_postfx_render_scale_active(s_res.s);
+    VK_LOG("internal resolution x%.2f: screen targets up to %ux%u render at %u%% (display image %ux%u); "
+           "shadow maps and guest textures at their own size\n",
+           (double)s_res.s, s_res.gw, s_res.gh, s_res.q * 25u, s_res.dw, s_res.dh);
+}
+
 static int vk_eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
+    vk_res_init();                                  /* [res] */
     ps3_setting_register("PS3RECOMP_SSAO", vk_lfx_apply_ssao);
     ps3_setting_register("PS3RECOMP_SSAO_STRENGTH", vk_lfx_apply_strength);
     ps3_setting_register("PS3RECOMP_LIGHT_DITHER", vk_lfx_apply_dither);
@@ -4127,15 +4232,17 @@ static void vk_eng_submit_and_wait(void* user, u32 reason)
     vk_batch_flush();
 }
 
-static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
-                                      const void* seed, u32 seed_row_bytes)
+/* [res] gw x gh in guest pixels; scaled: the image is vk_res_px() of that. */
+static u32 vk_eng_color_target_make(void* user, rsx_be_format fmt, u32 gw, u32 gh, int scaled,
+                                    const void* seed, u32 seed_row_bytes)
 {
-    (void)user;
     u32 bpp;
     const VkFormat vf = vk_eng_format(fmt, &bpp);
+    scaled = scaled && s_res.on;
+    const u32 w = scaled ? vk_res_px(gw) : gw, h = scaled ? vk_res_px(gh) : gh;   /* [res] the image */
     /* E1: the render pass is built for R8G8B8A8, so that is the one colour
      * target format for now; FP16 HDR targets need their own pass. */
-    if (vf != VK_FORMAT_R8G8B8A8_UNORM || !w || !h || w > 4096u || h > 4096u) {
+    if (vf != VK_FORMAT_R8G8B8A8_UNORM || !w || !h || gw > 4096u || gh > 4096u || w > 16384u || h > 16384u) {
         VK_LOG("engine: colour target format %d %ux%u not supported yet\n", (int)fmt, w, h);
         return 0;
     }
@@ -4149,6 +4256,7 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_COLOR; o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h;
+    o->gw = gw; o->gh = gh; o->scaled = (u8)scaled;
     /* UNDEFINED -> GENERAL, then the guest's own bytes when the engine could
      * resolve them, else transparent black so the contents are defined. */
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
@@ -4158,15 +4266,41 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
     /* Batched, the transition and clear simply join the batch. */
     if (!s_batch.recording && vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
-    if (seed && seed_row_bytes)
+    if (seed && seed_row_bytes && !scaled)
         vk_eng_upload(o->im.img, 0, 0, w, h, bpp, seed, seed_row_bytes);
+    else if (seed && seed_row_bytes && seed_row_bytes >= gw * bpp) {
+        /* [res] the guest's bytes, nearest-neighbour up to the scaled size
+         * (rsx_metal_backend.m eng_color_target_create) */
+        u8* up = (u8*)malloc((size_t)w * h * bpp);
+        if (up) {
+            for (u32 y = 0; y < h; y++) {
+                u32 gy = y * 4u / s_res.q; if (gy >= gh) gy = gh - 1u;
+                const u8* srow = (const u8*)seed + (size_t)gy * seed_row_bytes;
+                u8* drow = up + (size_t)y * w * bpp;
+                for (u32 x = 0; x < w; x++) {
+                    u32 gx = x * 4u / s_res.q; if (gx >= gw) gx = gw - 1u;
+                    memcpy(drow + (size_t)x * bpp, srow + (size_t)gx * bpp, bpp);
+                }
+            }
+            vk_eng_upload(o->im.img, 0, 0, w, h, bpp, up, w * bpp);
+            free(up);
+        }
+    }
     return hd;
 }
+static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                      const void* seed, u32 seed_row_bytes)
+{
+    /* [res] the screen-space chain is scaled: whatever fits the display */
+    return vk_eng_color_target_make(user, fmt, w, h, vk_res_fits(w, h), seed, seed_row_bytes);
+}
 
-static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
+static u32 vk_eng_depth_target_create(void* user, u32 gw, u32 gh)
 {
     (void)user;
-    if (!w || !h || w > 4096u || h > 4096u) return 0;
+    const int scaled = vk_res_fits(gw, gh);                              /* [res] as the colour targets */
+    const u32 w = scaled ? vk_res_px(gw) : gw, h = scaled ? vk_res_px(gh) : gh;
+    if (!w || !h || gw > 4096u || gh > 4096u || w > 16384u || h > 16384u) return 0;
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
     vk_eng_obj* o = &s_eobj[hd];
@@ -4177,6 +4311,7 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_DEPTH; o->fmt = s_vk.depth_format; o->w = w; o->h = h;
+    o->gw = gw; o->gh = gh; o->scaled = (u8)scaled;
     /* Far plane, for the reason the display depth starts there. */
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -4411,8 +4546,11 @@ static void vk_eng_present(void* user, u32 surface)
     vk_rtd_frame(surface);
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (o && !vk_begin()) {
+        /* [res] the display image is the scaled one when on (vk_disp_img) */
+        vk_image* const di = vk_disp_img();
+        const u32 di_w = vk_disp_w(), di_h = vk_disp_h();
         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-        vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(di->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         if (vk_lfx_tone(o)) {                           /* [light] tone pass instead of the blit */
             if (!s_batch.recording) vk_submit_and_wait();
             vk_cb_present(&s_vk, 0);
@@ -4422,12 +4560,12 @@ static void vk_eng_present(void* user, u32 surface)
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->w, (int32_t)o->h, 1 } },
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.width, (int32_t)s_vk.height, 1 } },
+            .dstOffsets = { { 0, 0, 0 }, { (int32_t)di_w, (int32_t)di_h, 1 } },
         };
         pvkCmdBlitImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL,
-                        s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                        (o->w == s_vk.width && o->h == s_vk.height) ? VK_FILTER_NEAREST
-                                                                    : VK_FILTER_LINEAR);
+                        di->img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                        (o->w == di_w && o->h == di_h) ? VK_FILTER_NEAREST
+                                                       : VK_FILTER_LINEAR);
         if (!s_batch.recording) vk_submit_and_wait();   /* batched: vk_cb_present submits */
     }
     vk_cb_present(&s_vk, 0);
@@ -4438,7 +4576,53 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
 {
     (void)user;
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
-    if (!o || !out || !out_pitch || !w || !h || x + w > o->w || y + h > o->h) return;
+    if (!o || !out || !out_pitch || !w || !h || x + w > o->gw || y + h > o->gh) return;
+    if (o->scaled) {
+        /* [res] the guest asks for its own pixels: read the scaled rectangle
+         * and point-sample it down -- the pixel the guest's would be (no
+         * filtering: depth and packed normals must stay exact; Metal's
+         * eng_readback does the same). Row r of the guest's is image row
+         * floor((r + 0.5) * s), clamped to the rectangle. */
+        const u32 sx0 = vk_res_px(x), sy0 = vk_res_px(y), sx1 = vk_res_px(x + w), sy1 = vk_res_px(y + h);
+        if (sx1 > o->w || sy1 > o->h || sx1 <= sx0 || sy1 <= sy0 || !o->bpp) return;
+        const u32 bpp = o->bpp, sw = sx1 - sx0, sh = sy1 - sy0;
+        const size_t stight = (size_t)sw * bpp;
+        vk_buffer sst = {0};
+        if (vk_create_host_buffer(&sst, (VkDeviceSize)stight * sh, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+            vk_destroy_buffer(&sst); return;
+        }
+        if (!vk_begin()) {
+            vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+            VkBufferImageCopy region = {
+                .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .imageOffset = { (int32_t)sx0, (int32_t)sy0, 0 }, .imageExtent = { sw, sh, 1 },
+            };
+            pvkCmdCopyImageToBuffer(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, sst.buf, 1, &region);
+            VkBufferMemoryBarrier hb = {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = sst.buf, .offset = 0, .size = VK_WHOLE_SIZE,
+            };
+            pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                  0, 0, NULL, 1, &hb, 0, NULL);
+            if (!vk_submit_and_wait()) {
+                vk_invalidate(&sst);
+                const u8* big = (const u8*)sst.ptr;
+                for (u32 row = 0; row < h; row++) {
+                    u32 r = (2u * row + 1u) * s_res.q / 8u; if (r >= sh) r = sh - 1u;
+                    const u8* srow = big + (size_t)r * stight;
+                    u8* drow = (u8*)out + (size_t)row * out_pitch;
+                    for (u32 col = 0; col < w; col++) {
+                        u32 c = (2u * col + 1u) * s_res.q / 8u; if (c >= sw) c = sw - 1u;
+                        memcpy(drow + (size_t)col * bpp, srow + (size_t)c * bpp, bpp);
+                    }
+                }
+            }
+        }
+        vk_destroy_buffer(&sst);
+        return;
+    }
     const size_t tight = (size_t)w * o->bpp;
     vk_buffer st = {0};
     if (vk_create_host_buffer(&st, (VkDeviceSize)tight * h, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
@@ -4613,6 +4797,7 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
         vk_eng_make_view(o->im.img, vf, mips, faces, vk_remap(remap, rsx_fmt), &o->im.view))
         goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->faces = faces;
+    o->gw = w; o->gh = h; o->scaled = 0;                 /* [res] guest textures keep their size */
     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
     /* UNDEFINED -> GENERAL for every level before the uploads arrive
      * (batched: the transition joins the batch, ahead of those uploads). */
@@ -4678,6 +4863,7 @@ static u32 vk_eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1 } };
     if (pvkCreateImageView(s_vk.device, &vci, NULL, &o->im.view) != VK_SUCCESS) goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->faces = 1; o->depth = depth;
+    o->gw = w; o->gh = h; o->scaled = 0;                 /* [res] */
     o->bpp = bpp; o->block = 0;
     if (vk_begin()) goto fail;
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -4727,6 +4913,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
         memset(o, 0, sizeof *o); return 0;
     }
     o->kind = VK_ENG_VIEW; o->fmt = t->fmt; o->w = t->w; o->h = t->h;
+    o->gw = t->gw; o->gh = t->gh; o->scaled = t->scaled;   /* [res] a view of the same image */
     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
     return hd;
 }
@@ -4865,9 +5052,13 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
 {
     vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
     if (!z || !vk_eng_depth_copyable()) return 0;
+    if (w > z->gw) w = z->gw;                       /* [res] guest pixels, then the image's */
+    if (h > z->gh) h = z->gh;
+    if (!w || !h) return 0;
+    const u32 gw = w, gh = h;
+    w = vk_res_obj_px(z, gw); h = vk_res_obj_px(z, gh);
     if (w > z->w) w = z->w;
     if (h > z->h) h = z->h;
-    if (!w || !h) return 0;
 
     const u32 snap = vk_eng_alloc();
     if (!snap) return 0;
@@ -4878,6 +5069,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
     }
     t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = w; t->h = h;
+    t->gw = gw; t->gh = gh; t->scaled = z->scaled;   /* [res] */
     if (vk_eng_copy_depth(z, t->im.img, VK_IMAGE_LAYOUT_UNDEFINED, w, h)) {
         vk_eng_release(user, snap); return 0;
     }
@@ -4922,6 +5114,13 @@ typedef struct vk_eng_pipe {
     u32                 sblend;
     VkShaderModule      fs_neg;
     VkPipeline          variant_neg[VK_ENG_TOPOLOGIES][4];
+    /* [res] units that read their own target at their own pixel (the engine's
+     * framebuffer fetch, vk_res_fbf_rewrite): unit u reads a copy of colour
+     * attachment fbf_att[u], taken at the draw. res_wpos: the program reads
+     * WPOS (divided by the scale: wrong in an unscaled target). */
+    u32                 fbf_mask;
+    u8                  fbf_att[16];
+    u8                  res_wpos;
 } vk_eng_pipe;
 
 /* Bit u set for each "<kind> rsx_tex<u>" declaration in the program text. */
@@ -5157,9 +5356,9 @@ static char* vk_eng_sblend_hlsl(const char* ps_hlsl, u32 lanes, int neg)
     return out;
 }
 
-static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
-                                  const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
-                                  u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
+static u32 vk_eng_pipeline_create_body(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                       const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
+                                       u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
 {
     (void)user;
     /* Same gate as Metal: no guest programs, no engine pipelines. */
@@ -5242,6 +5441,98 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     P->vol_mask  = vk_eng_decl_mask(ps_hlsl, "Texture3D");
     P->used = 1;
     return slot + 1u;
+}
+
+/* ---- [res] framebuffer fetch without input attachments ----------------------
+ * With the targets scaled the engine lets a program that samples its own
+ * target read the attachment itself (rsx_fp_apply_fbfetch: SubpassInput, the
+ * fragment's own pixel) instead of a copy sampled at the game's 720p-grid
+ * texcoord, which lands on a neighbour's texel at 1.5x (Metal: specks and
+ * streaks on faces). This backend's render passes and set layout have no
+ * input attachments, so the program reads a copy of that attachment, taken at
+ * the draw (as the engine's copies are), at its own pixel: SubpassLoad()
+ * becomes rsx_texU.Load(int3(int2(SV_Position.xy), 0)) of the unit the engine
+ * left unbound for it, and vk_eng_draw_ex binds the copy there. */
+static char* vk_res_replace(char* s, const char* from, const char* to, u32* count)
+{
+    const size_t fl = strlen(from), tl = strlen(to);
+    size_t n = 0;
+    for (const char* p = s; (p = strstr(p, from)) != NULL; p += fl) n++;
+    if (count) *count = (u32)n;
+    if (!n) return s;
+    char* out = (char*)malloc(strlen(s) + n * (tl > fl ? tl - fl : 0) + 1);
+    if (!out) { free(s); return NULL; }
+    char* o = out;
+    const char* p = s;
+    for (const char* q; (q = strstr(p, from)) != NULL; p = q + fl) {
+        memcpy(o, p, (size_t)(q - p)); o += q - p;
+        memcpy(o, to, tl); o += tl;
+    }
+    strcpy(o, p);
+    free(s);
+    return out;
+}
+static char* vk_res_fbf_rewrite(const char* hlsl, u32* mask, u8 att[16])
+{
+    *mask = 0;
+    memset(att, 0, 16);
+    const size_t len = strlen(hlsl);
+    char* s = (char*)malloc(len + 1);
+    if (!s) return NULL;
+    memcpy(s, hlsl, len + 1);
+    for (u32 k = 0; k < 4u && s; k++) {
+        char d[112];
+        snprintf(d, sizeof d, "[[vk::input_attachment_index(%u)]] SubpassInput<float4> _rsx_att%u;\n", k, k);
+        s = vk_res_replace(s, d, "", NULL);
+    }
+    for (u32 u = 0; u < 16u && s; u++) {
+        for (u32 k = 0; k < 4u && s; k++) {
+            char from[128], to[160];
+            u32 n = 0;
+            snprintf(from, sizeof from, "float4 _rsx_fb%u() { float4 c = _rsx_att%u.SubpassLoad();", u, k);
+            snprintf(to, sizeof to, "float4 _rsx_fb%u(float4 _rsx_p) { float4 c = rsx_tex%u.Load(int3(int2(_rsx_p.xy), 0));", u, u);
+            s = vk_res_replace(s, from, to, &n);
+            if (n) { *mask |= 1u << u; att[u] = (u8)k; }
+        }
+        if (s && ((*mask >> u) & 1u)) {
+            char from[32], to[48];
+            snprintf(from, sizeof from, "_rsx_fb%u()", u);
+            snprintf(to, sizeof to, "_rsx_fb%u(input.position)", u);
+            s = vk_res_replace(s, from, to, NULL);
+        }
+    }
+    if (s && (!*mask || strstr(s, "SubpassInput") || strstr(s, "SubpassLoad") || strstr(s, "_rsx_att"))) {
+        free(s); return NULL;
+    }
+    return s;
+}
+static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
+                                  const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
+                                  u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
+{
+    char* fbf = NULL;
+    u32 fbf_mask = 0;
+    u8 fbf_att[16];
+    memset(fbf_att, 0, sizeof fbf_att);
+    if (ps_hlsl && strstr(ps_hlsl, "SubpassInput<")) {
+        if (!(fbf = vk_res_fbf_rewrite(ps_hlsl, &fbf_mask, fbf_att))) {
+            static int said;   /* 0: the engine takes its copies instead */
+            if (said++ < 4) VK_LOG("engine: a framebuffer-fetch program this backend cannot rewrite: copies instead\n");
+            return 0;
+        }
+        ps_hlsl = fbf;
+    }
+    const u32 h = vk_eng_pipeline_create_body(user, vs_hlsl, ps_hlsl, rs, layout, vertex_stride, rt_fmt, rt_count);
+    if (h) {
+        vk_eng_pipe* P = &s_epipe[h - 1u];
+        P->fbf_mask = fbf_mask;
+        memcpy(P->fbf_att, fbf_att, sizeof P->fbf_att);
+        P->res_wpos = (ps_hlsl && strstr(ps_hlsl, "_rsx_wpos(")) ? 1u : 0u;
+        if (fbf_mask) { static int said;
+            if (said++ < 4) VK_LOG("engine: framebuffer fetch: units 0x%X read a copy of their own target at their own pixel\n", fbf_mask); }
+    }
+    free(fbf);
+    return h;
 }
 
 static void vk_eng_pipeline_release(void* user, u32 pipeline)
@@ -6055,9 +6346,42 @@ static unsigned long long s_ecs_skipped;
 
 /* One draw: vertices from host memory (staged) or from a persistent buffer
  * (pvb/pvo), indices likewise -- host, persistent (pib/pio) or none. */
+static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
+                                u32 vertex_count, u32 stride, const u32* indices, VkBuffer pib, VkDeviceSize pio,
+                                u32 index_count);
+static u32 vk_eng_color_snapshot(void* user, u32 surface);
+/* [res] a pipeline whose units read their own target (vk_res_fbf_rewrite):
+ * each gets a copy of its attachment, taken before this draw, for the draw. */
 static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
                            u32 vertex_count, u32 stride, const u32* indices, VkBuffer pib, VkDeviceSize pio,
                            u32 index_count)
+{
+    const vk_eng_pipe* P = (s_e2.pipeline && s_e2.pipeline <= VK_ENG_MAX_PIPE) ? &s_epipe[s_e2.pipeline - 1] : NULL;
+    if (!P || !P->used || !P->fbf_mask) {
+        vk_eng_draw_ex_body(topology, vertices, pvb, pvo, vertex_count, stride, indices, pib, pio, index_count);
+        return;
+    }
+    u32 saved[sizeof s_e2.tex / sizeof s_e2.tex[0]];
+    memcpy(saved, s_e2.tex, sizeof saved);
+    const u32 saved_mask = s_e2.tex_mask;
+    int ok = 1;
+    for (u32 u = 0; u < 16u && u < sizeof saved / sizeof saved[0] && ok; u++) {
+        if (!((P->fbf_mask >> u) & 1u)) continue;
+        const u32 k = P->fbf_att[u];
+        const u32 rt = k < s_eng_bound.nrt ? s_eng_bound.rt[k] : 0u;
+        const u32 snap = rt ? vk_eng_color_snapshot(NULL, rt) : 0u;
+        if (!snap) { ok = 0; break; }
+        s_e2.tex[u] = snap;
+        s_e2.tex_mask |= 1u << u;
+    }
+    if (ok) vk_eng_draw_ex_body(topology, vertices, pvb, pvo, vertex_count, stride, indices, pib, pio, index_count);
+    else if (!(s_res.warned & 1u)) { s_res.warned |= 1u; VK_LOG("engine: no copy of a target its draw reads: draw skipped\n"); }
+    memcpy(s_e2.tex, saved, sizeof saved);
+    s_e2.tex_mask = saved_mask;
+}
+static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
+                                u32 vertex_count, u32 stride, const u32* indices, VkBuffer pib, VkDeviceSize pio,
+                                u32 index_count)
 {
     if (!s_e2.pipeline || (!vertices && !pvb) || !vertex_count || !stride) return;
     if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
@@ -6078,6 +6402,18 @@ static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer
     vk_rtd_note_tex(s_e2.tex, s_e2.tex_mask);
     const u32 w = rt0->w, h = rt0->h;
     vk_eng_obj* zo = vk_eng_get(s_eng_bound.depth, VK_ENG_DEPTH);
+    if (s_res.on) {   /* [res] diagnostics: a pass whose pixels do not map one way */
+        if (zo && zo->scaled != rt0->scaled && !(s_res.warned & 2u)) {
+            s_res.warned |= 2u;
+            VK_LOG("engine: [res] a %ux%u %s colour target drawn with a %ux%u %s depth target (first; more not logged)\n",
+                   rt0->gw, rt0->gh, rt0->scaled ? "scaled" : "unscaled", zo->gw, zo->gh, zo->scaled ? "scaled" : "unscaled");
+        }
+        if (!rt0->scaled && P->res_wpos && !(s_res.warned & 4u)) {
+            s_res.warned |= 4u;
+            VK_LOG("engine: [res] a program reading WPOS draws into the unscaled %ux%u target (first; more not logged)\n",
+                   rt0->gw, rt0->gh);
+        }
+    }
     VkImageView dview = (zo && zo->w >= w && zo->h >= h) ? zo->im.view : vk_eng_scratch_depth(w, h);
     if (!dview) return;
     const u32 dkey = (zo && dview == zo->im.view) ? s_eng_bound.depth : 0xFFFFFFFFu;
@@ -6207,12 +6543,22 @@ static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer
     else s_ecs_skipped++;
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
-        vp.x = s_e2.vp[0]; vp.y = s_e2.vp[1]; vp.width = s_e2.vp[2]; vp.height = s_e2.vp[3];
+        const float k = rt0->scaled ? s_res.s : 1.0f;   /* [res] the guest's pixels in the target's */
+        vp.x = s_e2.vp[0] * k; vp.y = s_e2.vp[1] * k; vp.width = s_e2.vp[2] * k; vp.height = s_e2.vp[3] * k;
     }
     VkRect2D sc = { { 0, 0 }, { w, h } };
     if (s_e2.have_sc) {                       /* clamped: Vulkan rejects negative or over-size */
-        u32 x0 = s_e2.sc[0] < w ? s_e2.sc[0] : w, y0 = s_e2.sc[1] < h ? s_e2.sc[1] : h;
-        u32 x1 = s_e2.sc[0] + s_e2.sc[2], y1 = s_e2.sc[1] + s_e2.sc[3];
+        /* [res] both edges rounded as vk_res_px sizes the target, so a
+         * scissor that reaches the surface's edge still ends on it (Metal's
+         * eng_set_scissor); an empty one stays empty */
+        u32 sx = s_e2.sc[0], sy = s_e2.sc[1], sx1 = s_e2.sc[0] + s_e2.sc[2], sy1 = s_e2.sc[1] + s_e2.sc[3];
+        if (rt0->scaled) {
+            sx1 = s_e2.sc[2] ? vk_res_px(sx1) : vk_res_px(sx);
+            sy1 = s_e2.sc[3] ? vk_res_px(sy1) : vk_res_px(sy);
+            sx = vk_res_px(sx); sy = vk_res_px(sy);
+        }
+        u32 x0 = sx < w ? sx : w, y0 = sy < h ? sy : h;
+        u32 x1 = sx1, y1 = sy1;
         if (x1 > w) x1 = w;
         if (y1 > h) y1 = h;
         sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
@@ -6312,6 +6658,8 @@ enum { VK_PASS_LIGHT, VK_PASS_SSAO_HD, VK_PASS_SSAO_AO, VK_PASS_SSAO_BLUR_H, VK_
         * passes they stand in for (one of the two runs in a frame). */
        VK_PASS_LIGHT_DITHER, VK_PASS_SSAO_UPS, VK_PASS_LFX_HD, VK_PASS_LFX_AO1, VK_PASS_LFX_AO2,
        VK_PASS_LFX_BLUR_H, VK_PASS_LFX_BLUR_V, VK_PASS_TONE,
+       /* [res] the upsample at the scaled size (and with the strength) */
+       VK_PASS_SSAO_UPSC, VK_PASS_SSAO_UPSCS,
        VK_PASS_COUNT };
 #define VK_PASS_TEXTURES  3u                /* bindings 1..3: MSL texture(0..2) */
 #define VK_SSAO_UBO_BYTES 512u              /* the engine's bound (s_gs.consts) */
@@ -6645,9 +6993,10 @@ static void vk_fif_advance(void)
 }
 
 /* A backend-owned RGBA8 COLOR object (cleared to transparent black). */
-static u32 vk_pass_color(void* user, u32 w, u32 h, u32 tag)
+static u32 vk_pass_color(void* user, u32 gw, u32 gh, int scaled, u32 tag)
 {
-    const u32 hd = vk_eng_color_target_create(user, RSX_BE_FMT_R8G8B8A8, w, h, NULL, 0);
+    /* [res] gw x gh guest pixels; the image is scaled with the pass's inputs */
+    const u32 hd = vk_eng_color_target_make(user, RSX_BE_FMT_R8G8B8A8, gw, gh, scaled, NULL, 0);
     if (hd) s_eobj[hd].tag = tag;
     return hd;
 }
@@ -6680,7 +7029,8 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
         if (s_csnap[i].src == surface) {
             slot = i;
             const vk_eng_obj* d = vk_eng_get(s_csnap[i].dst, VK_ENG_COLOR);
-            if (d && d->tag == VK_TAG_CSNAP && d->w == s->w && d->h == s->h && d->fmt == s->fmt)
+            if (d && d->tag == VK_TAG_CSNAP && d->w == s->w && d->h == s->h && d->fmt == s->fmt &&
+                d->scaled == s->scaled)                     /* [res] */
                 dst = s_csnap[i].dst;
             break;
         }
@@ -6698,7 +7048,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                 slot = s_csnap_count++;
             }
         }
-        if (!(dst = vk_pass_color(user, s->w, s->h, VK_TAG_CSNAP))) return 0;
+        if (!(dst = vk_pass_color(user, s->gw, s->gh, s->scaled, VK_TAG_CSNAP))) return 0;   /* [res] its image is s's size */
         s_csnap[slot].src = surface;
         s_csnap[slot].dst = dst;
     }
@@ -6754,13 +7104,17 @@ static u32 vk_eng_light_pass(void* user, u32 normals, u32 depth, u32 w, u32 h,
         const VkPipeline pd = vk_pass_pipeline(VK_PASS_LIGHT_DITHER, kVkLightDitherFS, "GPU light (dither)", rp, 2);
         if (pd) pipe = pd;
     }
+    /* [res] the pass runs per pixel of its inputs: scaled with the normals copy */
+    const int lsc = normals < VK_ENG_MAX_OBJ && s_eobj[normals].scaled;
+    const u32 lw = lsc ? vk_res_px(w) : w, lh = lsc ? vk_res_px(h) : h;
     if (!s_lp.light_fb || s_lp.light_w != w || s_lp.light_h != h ||
-        !vk_pass_out_live(s_lp.light_out[0]) || !vk_pass_out_live(s_lp.light_out[1])) {
+        !vk_pass_out_live(s_lp.light_out[0]) || !vk_pass_out_live(s_lp.light_out[1]) ||
+        s_eobj[s_lp.light_out[0]].w != lw || s_eobj[s_lp.light_out[0]].h != lh) {
         vk_pass_drop_light();
         for (u32 k = 0; k < 2; k++)
-            if (!(s_lp.light_out[k] = vk_pass_color(user, w, h, VK_TAG_PASS))) { vk_pass_drop_light(); return 0; }
+            if (!(s_lp.light_out[k] = vk_pass_color(user, w, h, lsc, VK_TAG_PASS))) { vk_pass_drop_light(); return 0; }
         const VkImageView views[2] = { s_eobj[s_lp.light_out[0]].im.view, s_eobj[s_lp.light_out[1]].im.view };
-        if (!(s_lp.light_fb = vk_pass_framebuffer(rp, views, 2, w, h))) { vk_pass_drop_light(); return 0; }
+        if (!(s_lp.light_fb = vk_pass_framebuffer(rp, views, 2, lw, lh))) { vk_pass_drop_light(); return 0; }
         s_lp.light_w = w; s_lp.light_h = h;
     }
     /* Batched, the pass rides in the frame's batch: its outputs are only
@@ -6772,9 +7126,15 @@ static u32 vk_eng_light_pass(void* user, u32 normals, u32 depth, u32 w, u32 h,
     const size_t cap = (size_t)s_lp.light_ubo.size;
     memset(s_lp.light_ubo.ptr, 0, cap);
     memcpy(s_lp.light_ubo.ptr, params, param_bytes < cap ? param_bytes : cap);
+    /* [res] u, v = px / size: the scaled size (Metal's eng_light_pass) */
+    if (lsc && param_bytes >= offsetof(rsx_gpu_light_params, height) + sizeof(float) &&
+        cap >= offsetof(rsx_gpu_light_params, height) + sizeof(float)) {
+        rsx_gpu_light_params* gp = (rsx_gpu_light_params*)s_lp.light_ubo.ptr;
+        gp->width = (float)lw; gp->height = (float)lh;
+    }
     vk_pass_write_set(s_lp.set[VK_PASS_LIGHT], &s_lp.light_ubo, nv, zv, VK_NULL_HANDLE);
     if (vk_begin()) return 0;
-    vk_pass_record(rp, s_lp.light_fb, pipe, s_lp.set[VK_PASS_LIGHT], w, h);
+    vk_pass_record(rp, s_lp.light_fb, pipe, s_lp.set[VK_PASS_LIGHT], lw, lh);
     if (s_batch.recording) s_batch.light_pending = 1;
     else if (vk_submit_and_wait()) return 0;
     *spec_out = s_lp.light_out[1];
@@ -6846,18 +7206,29 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
     const VkPipeline p_bv = vk_pass_pipeline(VK_PASS_SSAO_BLUR_V, kVkSsaoBlurVFS, "SSAO blur v", rp_ao, 1);
     const VkPipeline p_up = vk_pass_pipeline(VK_PASS_SSAO_UP, kVkSsaoUp4FS, "SSAO upsample", rp_out, 1);
     if (!p_hd || !p_ao || !p_bh || !p_bv || !p_up) return 0;
+    /* [res] scaled with the depth it reads: the game's half-res passes stay at
+     * hw x hh and read the scaled pixel under each of theirs (rs); the output
+     * (and the full-res AO chain) is the scaled size, Metal's ssao_up4s_fs */
+    const int ssc = depth < VK_ENG_MAX_OBJ && s_eobj[depth].scaled;
+    const u32 ow = ssc ? vk_res_px(fw) : fw, oh = ssc ? vk_res_px(fh) : fh;
+    VkPipeline p_upsc = VK_NULL_HANDLE, p_upscs = VK_NULL_HANDLE;
+    if (ssc) {
+        p_upsc = vk_pass_pipeline(VK_PASS_SSAO_UPSC, kVkSsaoUpScFS, "SSAO upsample (scaled)", rp_out, 1);
+        if (!p_upsc) return 0;
+    }
 
     if (!s_lp.ssao_fb[3] || s_lp.ssao_dims[0] != fw || s_lp.ssao_dims[1] != fh ||
-        s_lp.ssao_dims[2] != hw || s_lp.ssao_dims[3] != hh || !vk_pass_out_live(s_lp.ssao_out)) {
+        s_lp.ssao_dims[2] != hw || s_lp.ssao_dims[3] != hh || !vk_pass_out_live(s_lp.ssao_out) ||
+        s_eobj[s_lp.ssao_out].w != ow || s_eobj[s_lp.ssao_out].h != oh) {
         vk_pass_drop_ssao();
         if (vk_pass_image(&s_lp.ssao_hd, VK_FORMAT_R32_SFLOAT, hw, hh) ||
             vk_pass_image(&s_lp.ssao_a, VK_FORMAT_R8_UNORM, hw, hh) ||
             vk_pass_image(&s_lp.ssao_b, VK_FORMAT_R8_UNORM, hw, hh) ||
-            !(s_lp.ssao_out = vk_pass_color(user, fw, fh, VK_TAG_PASS))) { vk_pass_drop_ssao(); return 0; }
+            !(s_lp.ssao_out = vk_pass_color(user, fw, fh, ssc, VK_TAG_PASS))) { vk_pass_drop_ssao(); return 0; }
         s_lp.ssao_fb[0] = vk_pass_framebuffer(rp_hd, &s_lp.ssao_hd.view, 1, hw, hh);
         s_lp.ssao_fb[1] = vk_pass_framebuffer(rp_ao, &s_lp.ssao_a.view, 1, hw, hh);
         s_lp.ssao_fb[2] = vk_pass_framebuffer(rp_ao, &s_lp.ssao_b.view, 1, hw, hh);
-        s_lp.ssao_fb[3] = vk_pass_framebuffer(rp_out, &s_eobj[s_lp.ssao_out].im.view, 1, fw, fh);
+        s_lp.ssao_fb[3] = vk_pass_framebuffer(rp_out, &s_eobj[s_lp.ssao_out].im.view, 1, ow, oh);
         if (!s_lp.ssao_fb[0] || !s_lp.ssao_fb[1] || !s_lp.ssao_fb[2] || !s_lp.ssao_fb[3]) {
             vk_pass_drop_ssao(); return 0;
         }
@@ -6878,13 +7249,22 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
         const float lv[4] = { (float)lfx_str / 100.0f, (float)lfx_q, 0.0f, 0.0f };
         memcpy((u8*)s_lp.ssao_ubo.ptr + 320, lv, sizeof lv);
     }
+    /* [res] the block's `res` (rsx_vk_passes_glsl.h, offset 336): xy = the
+     * scale between the depth / normals the passes read and the job's pixels
+     * (the MSL's `rs`), 1 unscaled -- written after the game's bytes always */
+    { const float rv[4] = { ssc ? s_res.s : 1.0f, ssc ? s_res.s : 1.0f, 0.0f, 0.0f };
+      memcpy((u8*)s_lp.ssao_ubo.ptr + 336, rv, sizeof rv); }
+    if (ssc) {   /* the strength's scaled upsample, as p_upx below */
+        if (lfx_str != 100 && const_bytes <= 320u)
+            p_upscs = vk_pass_pipeline(VK_PASS_SSAO_UPSCS, kVkSsaoUpScsFS, "SSAO upsample (scaled, strength)", rp_out, 1);
+    }
     if (lfx_q >= 1 && const_bytes <= 320u) {
         const VkPipeline l_hd = vk_pass_pipeline(VK_PASS_LFX_HD, kVkLfxHdFS, "SSAO full-res depth", rp_hd, 1);
         const VkPipeline l_ao = lfx_q >= 2 ? vk_pass_pipeline(VK_PASS_LFX_AO2, kVkLfxAo2FS, "SSAO full-res (24)", rp_ao, 1)
                                            : vk_pass_pipeline(VK_PASS_LFX_AO1, kVkLfxAo1FS, "SSAO full-res (12)", rp_ao, 1);
         const VkPipeline l_bh = vk_pass_pipeline(VK_PASS_LFX_BLUR_H, kVkLfxBlurHFS, "SSAO full-res blur h", rp_ao, 1);
         const VkPipeline l_bv = vk_pass_pipeline(VK_PASS_LFX_BLUR_V, kVkLfxBlurVFS, "SSAO full-res blur v", rp_out, 1);
-        if (l_hd && l_ao && l_bh && l_bv && !vk_pass_make_lfx(rp_hd, rp_ao, fw, fh)) {
+        if (l_hd && l_ao && l_bh && l_bv && !vk_pass_make_lfx(rp_hd, rp_ao, ow, oh)) {   /* [res] ow, oh */
             const VkImageView fhd = s_lp.lfx_hd.view, fa = s_lp.lfx_a.view, fb = s_lp.lfx_b.view;
             const struct { u32 set; VkPipeline pipe; VkRenderPass rp; VkFramebuffer fb;
                            VkImageView t0, t1; } ls[4] = {
@@ -6896,7 +7276,7 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
                 vk_pass_write_set(s_lp.set[ls[k].set], &s_lp.ssao_ubo, ls[k].t0, ls[k].t1, VK_NULL_HANDLE);
             if (vk_begin()) return 0;
             for (u32 k = 0; k < 4; k++)
-                vk_pass_record(ls[k].rp, ls[k].fb, ls[k].pipe, s_lp.set[ls[k].set], fw, fh);
+                vk_pass_record(ls[k].rp, ls[k].fb, ls[k].pipe, s_lp.set[ls[k].set], ow, oh);
             if (s_batch.recording) { s_batch.ssao_pending = 1; return s_lp.ssao_out; }
             return vk_submit_and_wait() ? 0 : s_lp.ssao_out;
         }
@@ -6910,7 +7290,8 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
         { VK_PASS_SSAO_AO,     p_ao, rp_ao,  s_lp.ssao_fb[1], hw, hh, hd, nv, VK_NULL_HANDLE },
         { VK_PASS_SSAO_BLUR_H, p_bh, rp_ao,  s_lp.ssao_fb[2], hw, hh, a, hd, VK_NULL_HANDLE },
         { VK_PASS_SSAO_BLUR_V, p_bv, rp_ao,  s_lp.ssao_fb[1], hw, hh, b, hd, VK_NULL_HANDLE },
-        { VK_PASS_SSAO_UP,     p_upx ? p_upx : p_up, rp_out, s_lp.ssao_fb[3], fw, fh, a, hd, zv } };
+        { VK_PASS_SSAO_UP,     ssc ? (p_upscs ? p_upscs : p_upsc) : (p_upx ? p_upx : p_up),   /* [res] */
+                               rp_out, s_lp.ssao_fb[3], ow, oh, a, hd, zv } };
     for (u32 k = 0; k < 5; k++)
         vk_pass_write_set(s_lp.set[steps[k].set], &s_lp.ssao_ubo, steps[k].t0, steps[k].t1, steps[k].t2);
     if (vk_begin()) return 0;
@@ -6932,9 +7313,13 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
 {
     const vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
     if (!z || !vk_eng_depth_copyable()) return 0;
+    if (w > z->gw) w = z->gw;                       /* [res] guest pixels (the cache's key) */
+    if (h > z->gh) h = z->gh;
+    if (!w || !h || vk_pass_init()) return 0;
+    const u32 gw = w, gh = h;                       /* [res] ... and the image's */
+    w = vk_res_obj_px(z, gw); h = vk_res_obj_px(z, gh);
     if (w > z->w) w = z->w;
     if (h > z->h) h = z->h;
-    if (!w || !h || vk_pass_init()) return 0;
     VkRenderPass rp = vk_pass_render_pass(&s_lp.rp_rgba8, VK_FORMAT_R8G8B8A8_UNORM, 1);
     VkPipeline pipe = vk_pass_pipeline(VK_PASS_ZRGBA, kVkDepthRgba8FS, "depth-as-RGBA8", rp, 1);
     if (!pipe) return 0;
@@ -6942,17 +7327,17 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
     const u32 tag = VK_TAG_ZRGBA | depth;
     u32 dst = 0, slot = VK_ZRGBA_MAX;
     for (u32 i = 0; i < s_zrgba_count; i++)
-        if (s_zrgba[i].depth == depth && s_zrgba[i].w == w && s_zrgba[i].h == h) {
+        if (s_zrgba[i].depth == depth && s_zrgba[i].w == gw && s_zrgba[i].h == gh) {
             slot = i;
             const vk_eng_obj* o = vk_eng_get(s_zrgba[i].dst, VK_ENG_COLOR);
             if (o && o->tag == tag && o->w == w && o->h == h) dst = s_zrgba[i].dst;
             break;
         }
     if (!dst) {
-        if (!(dst = vk_pass_color(user, w, h, tag))) return 0;
+        if (!(dst = vk_pass_color(user, gw, gh, z->scaled, tag))) return 0;
         if (slot == VK_ZRGBA_MAX)
             slot = s_zrgba_count < VK_ZRGBA_MAX ? s_zrgba_count++ : depth % VK_ZRGBA_MAX;
-        s_zrgba[slot].depth = depth; s_zrgba[slot].w = w; s_zrgba[slot].h = h; s_zrgba[slot].dst = dst;
+        s_zrgba[slot].depth = depth; s_zrgba[slot].w = gw; s_zrgba[slot].h = gh; s_zrgba[slot].dst = dst;
     }
 
     VkImageLayout zl = VK_IMAGE_LAYOUT_GENERAL;
@@ -7012,22 +7397,25 @@ static int vk_lfx_tone(const vk_eng_obj* src)
     const int sh = ps3_lightfx_get(PS3_LFX_TONE_SHADOWS), mt = ps3_lightfx_get(PS3_LFX_TONE_MIDTONES);
     const int hl = ps3_lightfx_get(PS3_LFX_TONE_HIGHLIGHTS), cl = ps3_lightfx_get(PS3_LFX_CLARITY);
     if (!sh && !mt && !hl && !cl) return 0;
-    if (!src || src->w != s_vk.width || src->h != s_vk.height || !src->im.view || vk_pass_init()) return 0;
+    /* [res] onto the display image: the scaled one when on */
+    vk_image* const di = vk_disp_img();
+    const u32 di_w = vk_disp_w(), di_h = vk_disp_h();
+    if (!src || src->w != di_w || src->h != di_h || !src->im.view || vk_pass_init()) return 0;
     VkRenderPass rp = vk_pass_render_pass(&s_lp.rp_rgba8, VK_FORMAT_R8G8B8A8_UNORM, 1);
     VkPipeline pipe = vk_pass_pipeline(VK_PASS_TONE, kVkToneFS, "tone", rp, 1);
     if (!pipe) return 0;
-    if (!s_lp.tone_fb || s_lp.tone_fb_img != s_vk.color.img) {
+    if (!s_lp.tone_fb || s_lp.tone_fb_img != di->img) {
         if (s_lp.tone_fb) { vk_batch_flush(); vk_fif_wait_other(); pvkDestroyFramebuffer(s_vk.device, s_lp.tone_fb, NULL); }
-        s_lp.tone_fb = vk_pass_framebuffer(rp, &s_vk.color.view, 1, s_vk.width, s_vk.height);
-        s_lp.tone_fb_img = s_lp.tone_fb ? s_vk.color.img : VK_NULL_HANDLE;
+        s_lp.tone_fb = vk_pass_framebuffer(rp, &di->view, 1, di_w, di_h);
+        s_lp.tone_fb_img = s_lp.tone_fb ? di->img : VK_NULL_HANDLE;
         if (!s_lp.tone_fb) return 0;
     }
     const float tp[8] = { (float)sh / 100.0f, (float)mt / 100.0f, (float)hl / 100.0f, (float)cl / 100.0f,
-                          (float)s_vk.width, (float)s_vk.height, 0.0f, 0.0f };
+                          (float)di_w, (float)di_h, 0.0f, 0.0f };
     memcpy(s_lp.tone_ubo.ptr, tp, sizeof tp);
     vk_pass_write_set(s_lp.set[VK_PASS_TONE], &s_lp.tone_ubo, src->im.view, VK_NULL_HANDLE, VK_NULL_HANDLE);
     if (vk_begin()) return 0;
-    vk_pass_record(rp, s_lp.tone_fb, pipe, s_lp.set[VK_PASS_TONE], s_vk.width, s_vk.height);
+    vk_pass_record(rp, s_lp.tone_fb, pipe, s_lp.set[VK_PASS_TONE], di_w, di_h);
     vk_barrier_all();
     return 1;
 }
@@ -7325,8 +7713,10 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
     rsx_draw_engine_set_default(s_g.on ? 1 : 0);
     if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
         s_vk.eng_active = 1;
-    else
+    else {
+        vk_res_off();                    /* [res] the vtable path draws at the guest's size */
         rsx_set_backend(&s_vulkan_backend);
+    }
     VK_LOG("%s path\n", s_vk.eng_active ? "register-file draw engine" : "vtable");
     VK_LOG("offscreen target %ux%u ready, depth format %d (%s)\n",
            s_vk.width, s_vk.height, (int)s_vk.depth_format, title ? title : "");
@@ -7371,6 +7761,7 @@ void rsx_vulkan_backend_shutdown(void)
         for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) vk_destroy_image(&s_vk.tex[u]);
         vk_destroy_image(&s_vk.dummy);
         vk_destroy_image(&s_vk.depth);
+        vk_res_off();                    /* [res] the scaled display image */
         vk_destroy_image(&s_vk.color);
         vk_destroy_buffer(&s_vk.vertices);
         vk_destroy_buffer(&s_vk.readback);
