@@ -61,6 +61,7 @@
 #include "vk_postfx.h"                           /* [postfx] AA, sharpening, anisotropy */
 #include "../../include/ps3emu/ps3_ftrace.h"    /* PS3_FTRACE: GPU_WAIT spans at each fence wait */
 #include "../../include/ps3emu/ps3_settings.h"  /* [overlay] PC settings the in-game menu changes live */
+#include "../../include/ps3emu/ps3_lightfx.h"   /* [light] the menu's Lighting page: AO, light dither */
 #include "vk_overlay.h"                          /* [overlay] HUD + settings menu (vk_overlay.cpp) */
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
@@ -852,6 +853,9 @@ static void vk_gprof_collect(void)
                 (double)s_gp.kcnt[best] / F, gp_kind[lab >> 28], ((lab >> 14) & 0x3FFFu) << 2, (lab & 0x3FFFu) << 2);
         s_gp.kcnt[best] = 0;
     }
+    /* [light] the per-interval sums too: a label slot reused after nk = 0 kept
+     * adding to the old window's ms (intervals summed to more than the total) */
+    for (u32 k = 0; k < s_gp.nk; k++) { s_gp.kms[k] = 0.0; s_gp.kcnt[k] = 0; }
     s_gp.nk = 0; s_gp.total_ms = 0; s_gp.batches = 0; s_gp.frames = 0; s_gp.dropped = 0;
     s_gp.t_print = now;
 }
@@ -3973,9 +3977,26 @@ static int vk_eng_make_view(VkImage img, VkFormat fmt, u32 levels, u32 faces, Vk
     return pvkCreateImageView(s_vk.device, &vci, NULL, out) == VK_SUCCESS ? 0 : -1;
 }
 
+/* [light] The Lighting page's settings this backend owns (ps3_lightfx.h):
+ * read by the passes at their next run, so every one is live. */
+static int vk_lfx_apply_ssao(const char* v)     { ps3_lightfx_set(PS3_LFX_SSAO, v); return 1; }
+static int vk_lfx_apply_strength(const char* v) { ps3_lightfx_set(PS3_LFX_SSAO_STRENGTH, v); return 1; }
+static int vk_lfx_apply_dither(const char* v)   { ps3_lightfx_set(PS3_LFX_LIGHT_DITHER, v); return 1; }
+static int vk_lfx_apply_tsh(const char* v)      { ps3_lightfx_set(PS3_LFX_TONE_SHADOWS, v); return 1; }
+static int vk_lfx_apply_tmid(const char* v)     { ps3_lightfx_set(PS3_LFX_TONE_MIDTONES, v); return 1; }
+static int vk_lfx_apply_thi(const char* v)      { ps3_lightfx_set(PS3_LFX_TONE_HIGHLIGHTS, v); return 1; }
+static int vk_lfx_apply_clarity(const char* v)  { ps3_lightfx_set(PS3_LFX_CLARITY, v); return 1; }
+
 static int vk_eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
+    ps3_setting_register("PS3RECOMP_SSAO", vk_lfx_apply_ssao);
+    ps3_setting_register("PS3RECOMP_SSAO_STRENGTH", vk_lfx_apply_strength);
+    ps3_setting_register("PS3RECOMP_LIGHT_DITHER", vk_lfx_apply_dither);
+    ps3_setting_register("PS3RECOMP_TONE_SHADOWS", vk_lfx_apply_tsh);
+    ps3_setting_register("PS3RECOMP_TONE_MIDTONES", vk_lfx_apply_tmid);
+    ps3_setting_register("PS3RECOMP_TONE_HIGHLIGHTS", vk_lfx_apply_thi);
+    ps3_setting_register("PS3RECOMP_CLARITY", vk_lfx_apply_clarity);
     memset(s_eobj, 0, sizeof s_eobj);
     memset(&s_eng_bound, 0, sizeof s_eng_bound);
     return s_vk.device ? 0 : -1;
@@ -4292,6 +4313,7 @@ static void vk_rtd_frame(u32 presented)
 
 /* The named surface becomes the frame: blit it onto the display image, then
  * the existing present does the readback, the PPM dump and the window. */
+static int vk_lfx_tone(const vk_eng_obj* src);   /* [light] the Lighting page's tone pass */
 static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
@@ -4300,6 +4322,11 @@ static void vk_eng_present(void* user, u32 surface)
     if (o && !vk_begin()) {
         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        if (vk_lfx_tone(o)) {                           /* [light] tone pass instead of the blit */
+            if (!s_batch.recording) vk_submit_and_wait();
+            vk_cb_present(&s_vk, 0);
+            return;
+        }
         VkImageBlit blit = {
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->w, (int32_t)o->h, 1 } },
@@ -6084,7 +6111,13 @@ static void vk_eng_draw_vbuf_ib(void* user, rsx_topology topology, u32 vb, u32 v
  * colour copies (they persist and are refilled, as on Metal); it does release
  * a depth decode it has replaced, which `tag` lets the cache notice. */
 enum { VK_PASS_LIGHT, VK_PASS_SSAO_HD, VK_PASS_SSAO_AO, VK_PASS_SSAO_BLUR_H, VK_PASS_SSAO_BLUR_V,
-       VK_PASS_SSAO_UP, VK_PASS_ZRGBA, VK_PASS_COUNT };
+       VK_PASS_SSAO_UP, VK_PASS_ZRGBA,
+       /* [light] the Lighting page's variants (ps3_lightfx.h). Their pipelines
+        * have slots of their own; they record with the sets of the game
+        * passes they stand in for (one of the two runs in a frame). */
+       VK_PASS_LIGHT_DITHER, VK_PASS_SSAO_UPS, VK_PASS_LFX_HD, VK_PASS_LFX_AO1, VK_PASS_LFX_AO2,
+       VK_PASS_LFX_BLUR_H, VK_PASS_LFX_BLUR_V, VK_PASS_TONE,
+       VK_PASS_COUNT };
 #define VK_PASS_TEXTURES  3u                /* bindings 1..3: MSL texture(0..2) */
 #define VK_SSAO_UBO_BYTES 512u              /* the engine's bound (s_gs.consts) */
 #define VK_PASS_SPV_WORDS 16384u
@@ -6115,20 +6148,32 @@ static struct {
     vk_image              zr32;                    /* the depth decode's R32F copy */
     vk_image              zs8;                     /* ... and its stencil (R8), same size */
     u32                   zr32_w, zr32_h;
+    /* [light] PS3RECOMP_SSAO >= 1: full-res linear depth (R32F) and two R8 AO
+     * planes, made on first use at the output's size */
+    vk_image              lfx_hd, lfx_a, lfx_b;
+    VkFramebuffer         lfx_fb[3];               /* hd, a, b */
+    u32                   lfx_w, lfx_h;
+    /* [light] PS3RECOMP_TONE_* / CLARITY: its constants (one per frame slot,
+     * as the other passes') and the frame's framebuffer */
+    vk_buffer             tone_ubo;
+    VkFramebuffer         tone_fb;
+    VkImage               tone_fb_img;
 } s_lp;
 /* the parked slot's pass UBOs and descriptor sets (see frames in flight) */
 static struct {
     VkDescriptorSet set[VK_PASS_COUNT], zset[VK_ZRGBA_SETS];
-    vk_buffer       light_ubo, ssao_ubo;
+    vk_buffer       light_ubo, ssao_ubo, tone_ubo;
 } s_lp_park[VK_FIF_MAX];
 static void vk_lp_swap(u32 out, u32 in)
 {
     memcpy(s_lp_park[out].set, s_lp.set, sizeof s_lp.set);
     memcpy(s_lp_park[out].zset, s_lp.zset, sizeof s_lp.zset);
     s_lp_park[out].light_ubo = s_lp.light_ubo; s_lp_park[out].ssao_ubo = s_lp.ssao_ubo;
+    s_lp_park[out].tone_ubo = s_lp.tone_ubo;
     memcpy(s_lp.set, s_lp_park[in].set, sizeof s_lp.set);
     memcpy(s_lp.zset, s_lp_park[in].zset, sizeof s_lp.zset);
     s_lp.light_ubo = s_lp_park[in].light_ubo; s_lp.ssao_ubo = s_lp_park[in].ssao_ubo;
+    s_lp.tone_ubo = s_lp_park[in].tone_ubo;
 }
 
 static struct { u32 src, dst; } s_csnap[VK_CSNAP_MAX];
@@ -6203,7 +6248,8 @@ static int vk_pass_init(void)
     if (vk_create_host_buffer(&s_lp.light_ubo, sizeof(rsx_gpu_light_params),
                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp.light_ubo.coherent ||
         vk_create_host_buffer(&s_lp.ssao_ubo, VK_SSAO_UBO_BYTES,
-                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp.ssao_ubo.coherent)
+                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp.ssao_ubo.coherent ||
+        vk_create_host_buffer(&s_lp.tone_ubo, 64, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp.tone_ubo.coherent)
         return -1;
     /* the parked slot's own group (frames in flight) */
     { const u32 o = s_fif_cur ^ 1u;
@@ -6218,7 +6264,9 @@ static int vk_pass_init(void)
       if (vk_create_host_buffer(&s_lp_park[o].light_ubo, sizeof(rsx_gpu_light_params),
                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp_park[o].light_ubo.coherent ||
           vk_create_host_buffer(&s_lp_park[o].ssao_ubo, VK_SSAO_UBO_BYTES,
-                                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp_park[o].ssao_ubo.coherent)
+                                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp_park[o].ssao_ubo.coherent ||
+          vk_create_host_buffer(&s_lp_park[o].tone_ubo, 64, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
+          !s_lp_park[o].tone_ubo.coherent)
           return -1; }
     s_lp.ok = 1;
     return 0;
@@ -6502,6 +6550,12 @@ static u32 vk_eng_light_pass(void* user, u32 normals, u32 depth, u32 w, u32 h,
     VkRenderPass rp = vk_pass_render_pass(&s_lp.rp_light, VK_FORMAT_R8G8B8A8_UNORM, 2);
     VkPipeline pipe = vk_pass_pipeline(VK_PASS_LIGHT, kVkLightFS, "GPU light", rp, 2);
     if (!pipe) return 0;
+    /* [light] PS3RECOMP_LIGHT_DITHER: the same pass with a dithered byte
+     * step (rsx_vk_passes_glsl.h); the exact one if it cannot be built. */
+    if (ps3_lightfx_get(PS3_LFX_LIGHT_DITHER)) {
+        const VkPipeline pd = vk_pass_pipeline(VK_PASS_LIGHT_DITHER, kVkLightDitherFS, "GPU light (dither)", rp, 2);
+        if (pd) pipe = pd;
+    }
     if (!s_lp.light_fb || s_lp.light_w != w || s_lp.light_h != h ||
         !vk_pass_out_live(s_lp.light_out[0]) || !vk_pass_out_live(s_lp.light_out[1])) {
         vk_pass_drop_light();
@@ -6529,6 +6583,33 @@ static u32 vk_eng_light_pass(void* user, u32 normals, u32 depth, u32 w, u32 h,
     return s_lp.light_out[0];
 }
 
+/* [light] the full-res AO's own images (PS3RECOMP_SSAO >= 1). */
+static void vk_pass_drop_lfx(void)
+{
+    for (u32 k = 0; k < 3; k++) {
+        if (s_lp.lfx_fb[k]) { vk_batch_flush(); vk_fif_wait_other(); pvkDestroyFramebuffer(s_vk.device, s_lp.lfx_fb[k], NULL); }
+        s_lp.lfx_fb[k] = VK_NULL_HANDLE;
+    }
+    vk_destroy_image(&s_lp.lfx_hd);
+    vk_destroy_image(&s_lp.lfx_a);
+    vk_destroy_image(&s_lp.lfx_b);
+    s_lp.lfx_w = s_lp.lfx_h = 0;
+}
+static int vk_pass_make_lfx(VkRenderPass rp_hd, VkRenderPass rp_ao, u32 w, u32 h)
+{
+    if (s_lp.lfx_fb[2] && s_lp.lfx_w == w && s_lp.lfx_h == h) return 0;
+    vk_pass_drop_lfx();
+    if (vk_pass_image(&s_lp.lfx_hd, VK_FORMAT_R32_SFLOAT, w, h) ||
+        vk_pass_image(&s_lp.lfx_a, VK_FORMAT_R8_UNORM, w, h) ||
+        vk_pass_image(&s_lp.lfx_b, VK_FORMAT_R8_UNORM, w, h)) { vk_pass_drop_lfx(); return -1; }
+    s_lp.lfx_fb[0] = vk_pass_framebuffer(rp_hd, &s_lp.lfx_hd.view, 1, w, h);
+    s_lp.lfx_fb[1] = vk_pass_framebuffer(rp_ao, &s_lp.lfx_a.view, 1, w, h);
+    s_lp.lfx_fb[2] = vk_pass_framebuffer(rp_ao, &s_lp.lfx_b.view, 1, w, h);
+    if (!s_lp.lfx_fb[0] || !s_lp.lfx_fb[1] || !s_lp.lfx_fb[2]) { vk_pass_drop_lfx(); return -1; }
+    s_lp.lfx_w = w; s_lp.lfx_h = h;
+    return 0;
+}
+
 static void vk_pass_drop_ssao(void)
 {
     for (u32 k = 0; k < 4; k++) {
@@ -6541,6 +6622,7 @@ static void vk_pass_drop_ssao(void)
     if (vk_pass_out_live(s_lp.ssao_out)) vk_eng_release(NULL, s_lp.ssao_out);
     s_lp.ssao_out = 0;
     memset(s_lp.ssao_dims, 0, sizeof s_lp.ssao_dims);
+    vk_pass_drop_lfx();
 }
 
 /* rsx_draw_backend.ssao_pass (Metal: eng_ssao_pass and its ENG_REC_SSAO
@@ -6588,6 +6670,41 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
     if (s_batch.recording && s_batch.ssao_pending) vk_batch_flush();
     memset(s_lp.ssao_ubo.ptr, 0, VK_SSAO_UBO_BYTES);
     memcpy(s_lp.ssao_ubo.ptr, consts, const_bytes < VK_SSAO_UBO_BYTES ? const_bytes : VK_SSAO_UBO_BYTES);
+    /* [light] The Lighting page (ps3_lightfx.h): the strength rides after the
+     * game's 320 bytes (the block's `lfx`); PS3RECOMP_SSAO >= 1 runs the
+     * full-res chain instead of the game's five passes. A pipeline that
+     * cannot be built falls back to the game's passes. */
+    const int lfx_q = ps3_lightfx_get(PS3_LFX_SSAO);
+    const int lfx_str = ps3_lightfx_get(PS3_LFX_SSAO_STRENGTH);
+    if (const_bytes <= 320u) {
+        const float lv[4] = { (float)lfx_str / 100.0f, (float)lfx_q, 0.0f, 0.0f };
+        memcpy((u8*)s_lp.ssao_ubo.ptr + 320, lv, sizeof lv);
+    }
+    if (lfx_q >= 1 && const_bytes <= 320u) {
+        const VkPipeline l_hd = vk_pass_pipeline(VK_PASS_LFX_HD, kVkLfxHdFS, "SSAO full-res depth", rp_hd, 1);
+        const VkPipeline l_ao = lfx_q >= 2 ? vk_pass_pipeline(VK_PASS_LFX_AO2, kVkLfxAo2FS, "SSAO full-res (24)", rp_ao, 1)
+                                           : vk_pass_pipeline(VK_PASS_LFX_AO1, kVkLfxAo1FS, "SSAO full-res (12)", rp_ao, 1);
+        const VkPipeline l_bh = vk_pass_pipeline(VK_PASS_LFX_BLUR_H, kVkLfxBlurHFS, "SSAO full-res blur h", rp_ao, 1);
+        const VkPipeline l_bv = vk_pass_pipeline(VK_PASS_LFX_BLUR_V, kVkLfxBlurVFS, "SSAO full-res blur v", rp_out, 1);
+        if (l_hd && l_ao && l_bh && l_bv && !vk_pass_make_lfx(rp_hd, rp_ao, fw, fh)) {
+            const VkImageView fhd = s_lp.lfx_hd.view, fa = s_lp.lfx_a.view, fb = s_lp.lfx_b.view;
+            const struct { u32 set; VkPipeline pipe; VkRenderPass rp; VkFramebuffer fb;
+                           VkImageView t0, t1; } ls[4] = {
+                { VK_PASS_SSAO_HD,     l_hd, rp_hd,  s_lp.lfx_fb[0],  zv,  VK_NULL_HANDLE },
+                { VK_PASS_SSAO_AO,     l_ao, rp_ao,  s_lp.lfx_fb[1],  fhd, nv },
+                { VK_PASS_SSAO_BLUR_H, l_bh, rp_ao,  s_lp.lfx_fb[2],  fa,  fhd },
+                { VK_PASS_SSAO_BLUR_V, l_bv, rp_out, s_lp.ssao_fb[3], fb,  fhd } };
+            for (u32 k = 0; k < 4; k++)
+                vk_pass_write_set(s_lp.set[ls[k].set], &s_lp.ssao_ubo, ls[k].t0, ls[k].t1, VK_NULL_HANDLE);
+            if (vk_begin()) return 0;
+            for (u32 k = 0; k < 4; k++)
+                vk_pass_record(ls[k].rp, ls[k].fb, ls[k].pipe, s_lp.set[ls[k].set], fw, fh);
+            if (s_batch.recording) { s_batch.ssao_pending = 1; return s_lp.ssao_out; }
+            return vk_submit_and_wait() ? 0 : s_lp.ssao_out;
+        }
+    }
+    const VkPipeline p_upx = lfx_str != 100 && const_bytes <= 320u
+        ? vk_pass_pipeline(VK_PASS_SSAO_UPS, kVkSsaoUp4sFS, "SSAO upsample (strength)", rp_out, 1) : VK_NULL_HANDLE;
     const VkImageView hd = s_lp.ssao_hd.view, a = s_lp.ssao_a.view, b = s_lp.ssao_b.view;
     const struct { u32 set; VkPipeline pipe; VkRenderPass rp; VkFramebuffer fb; u32 w, h;
                    VkImageView t0, t1, t2; } steps[5] = {
@@ -6595,7 +6712,7 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
         { VK_PASS_SSAO_AO,     p_ao, rp_ao,  s_lp.ssao_fb[1], hw, hh, hd, nv, VK_NULL_HANDLE },
         { VK_PASS_SSAO_BLUR_H, p_bh, rp_ao,  s_lp.ssao_fb[2], hw, hh, a, hd, VK_NULL_HANDLE },
         { VK_PASS_SSAO_BLUR_V, p_bv, rp_ao,  s_lp.ssao_fb[1], hw, hh, b, hd, VK_NULL_HANDLE },
-        { VK_PASS_SSAO_UP,     p_up, rp_out, s_lp.ssao_fb[3], fw, fh, a, hd, zv } };
+        { VK_PASS_SSAO_UP,     p_upx ? p_upx : p_up, rp_out, s_lp.ssao_fb[3], fw, fh, a, hd, zv } };
     for (u32 k = 0; k < 5; k++)
         vk_pass_write_set(s_lp.set[steps[k].set], &s_lp.ssao_ubo, steps[k].t0, steps[k].t1, steps[k].t2);
     if (vk_begin()) return 0;
@@ -6686,6 +6803,37 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
     return rc ? 0 : dst;
 }
 
+/* [light] PS3RECOMP_TONE_SHADOWS / _MIDTONES / _HIGHLIGHTS / PS3RECOMP_CLARITY
+ * (ps3_lightfx.h): when any is set, the finished frame (the surface the
+ * engine presents) is drawn onto the display image through kVkToneFS instead
+ * of vk_eng_present's blit -- on the RSX thread, inside the frame's batch,
+ * like the light and SSAO passes; the present after it (postfx, window) reads
+ * the result. Same size only (a scaled present keeps the blit). 1 = done. */
+static int vk_lfx_tone(const vk_eng_obj* src)
+{
+    const int sh = ps3_lightfx_get(PS3_LFX_TONE_SHADOWS), mt = ps3_lightfx_get(PS3_LFX_TONE_MIDTONES);
+    const int hl = ps3_lightfx_get(PS3_LFX_TONE_HIGHLIGHTS), cl = ps3_lightfx_get(PS3_LFX_CLARITY);
+    if (!sh && !mt && !hl && !cl) return 0;
+    if (!src || src->w != s_vk.width || src->h != s_vk.height || !src->im.view || vk_pass_init()) return 0;
+    VkRenderPass rp = vk_pass_render_pass(&s_lp.rp_rgba8, VK_FORMAT_R8G8B8A8_UNORM, 1);
+    VkPipeline pipe = vk_pass_pipeline(VK_PASS_TONE, kVkToneFS, "tone", rp, 1);
+    if (!pipe) return 0;
+    if (!s_lp.tone_fb || s_lp.tone_fb_img != s_vk.color.img) {
+        if (s_lp.tone_fb) { vk_batch_flush(); vk_fif_wait_other(); pvkDestroyFramebuffer(s_vk.device, s_lp.tone_fb, NULL); }
+        s_lp.tone_fb = vk_pass_framebuffer(rp, &s_vk.color.view, 1, s_vk.width, s_vk.height);
+        s_lp.tone_fb_img = s_lp.tone_fb ? s_vk.color.img : VK_NULL_HANDLE;
+        if (!s_lp.tone_fb) return 0;
+    }
+    const float tp[8] = { (float)sh / 100.0f, (float)mt / 100.0f, (float)hl / 100.0f, (float)cl / 100.0f,
+                          (float)s_vk.width, (float)s_vk.height, 0.0f, 0.0f };
+    memcpy(s_lp.tone_ubo.ptr, tp, sizeof tp);
+    vk_pass_write_set(s_lp.set[VK_PASS_TONE], &s_lp.tone_ubo, src->im.view, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    if (vk_begin()) return 0;
+    vk_pass_record(rp, s_lp.tone_fb, pipe, s_lp.set[VK_PASS_TONE], s_vk.width, s_vk.height);
+    vk_barrier_all();
+    return 1;
+}
+
 /* Before the object table goes (vk_eng_shutdown): the passes' own objects.
  * The COLOR handles they made go with the table. */
 static void vk_eng5_shutdown(void)
@@ -6694,6 +6842,11 @@ static void vk_eng5_shutdown(void)
         const VkDevice d = s_vk.device;
         if (s_lp.light_fb) pvkDestroyFramebuffer(d, s_lp.light_fb, NULL);
         for (u32 k = 0; k < 4; k++) if (s_lp.ssao_fb[k]) pvkDestroyFramebuffer(d, s_lp.ssao_fb[k], NULL);
+        for (u32 k = 0; k < 3; k++) if (s_lp.lfx_fb[k]) pvkDestroyFramebuffer(d, s_lp.lfx_fb[k], NULL);
+        if (s_lp.tone_fb) pvkDestroyFramebuffer(d, s_lp.tone_fb, NULL);
+        vk_destroy_image(&s_lp.lfx_hd);
+        vk_destroy_image(&s_lp.lfx_a);
+        vk_destroy_image(&s_lp.lfx_b);
         vk_destroy_image(&s_lp.ssao_hd);
         vk_destroy_image(&s_lp.ssao_a);
         vk_destroy_image(&s_lp.ssao_b);
@@ -6708,6 +6861,7 @@ static void vk_eng5_shutdown(void)
         for (u32 k = 0; k < 4; k++) if (*rps[k]) pvkDestroyRenderPass(d, *rps[k], NULL);
         vk_destroy_buffer(&s_lp.light_ubo);
         vk_destroy_buffer(&s_lp.ssao_ubo);
+        vk_destroy_buffer(&s_lp.tone_ubo);
         if (s_lp.pool)        pvkDestroyDescriptorPool(d, s_lp.pool, NULL);
         if (s_lp.pipe_layout) pvkDestroyPipelineLayout(d, s_lp.pipe_layout, NULL);
         if (s_lp.set_layout)  pvkDestroyDescriptorSetLayout(d, s_lp.set_layout, NULL);

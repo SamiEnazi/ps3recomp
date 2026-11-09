@@ -44,52 +44,66 @@ static const char kVkPassVS[] =
  * inFAMOUS 2's SPU light job. Set 0: binding 0 the rsx_gpu_light_params block
  * (its C layout is std140-compatible: vec4 groups, 64-byte light records),
  * binding 1 the normals copy (RGBA8), binding 2 the resolved depth (R32F).
- * Two RGBA8 outputs: diffuse (location 0) and specular (location 1). */
-static const char kVkLightFS[] =
-"#version 450\n"
-"struct GLight { vec4 pos_type; vec4 col_inner; vec4 oacbn; vec4 dir; };\n"
-"layout(std140, set = 0, binding = 0) uniform GLParams { vec4 m[4]; vec4 misc; GLight l[128]; } p;\n"
-"layout(set = 0, binding = 1) uniform sampler2D nt;\n"
-"layout(set = 0, binding = 2) uniform sampler2D zt;\n"
-"layout(location = 0) out vec4 o_diff;\n"
-"layout(location = 1) out vec4 o_spec;\n"
-"void main() {\n"
-"    uvec2 px = uvec2(gl_FragCoord.xy);\n"
-"    o_diff = vec4(0.0); o_spec = vec4(0.0);\n"
-"    uint z24 = uint(clamp(texelFetch(zt, ivec2(px), 0).x, 0.0, 1.0) * 16777215.0);\n"
-"    if (z24 >= 0xFFFFFFu) return;\n"
-"    float zf = float(z24) / 16777216.0;\n"
-"    float u = float(px.x) / p.misc.z, v = float(px.y) / p.misc.w;\n"
-"    vec4 h = u * p.m[0] + v * p.m[1] + zf * p.m[2] + p.m[3];\n"
-"    vec3 P = h.xyz / h.w;\n"
-"    vec4 nr = floor(texelFetch(nt, ivec2(px), 0) * 255.0 + 0.5);\n"
-"    vec3 N = normalize(nr.rgb * (2.0 / 255.0) - 1.0);\n"
-"    float s = exp2(nr.a * (8.0 / 255.0) - 0.88896);\n"
-"    vec3 V = -normalize(P);\n"
-"    vec3 acc = vec3(0.0); float sp = 0.0;\n"
-"    int n = min(int(p.misc.y), 128);\n"   /* the engine clamps to 128 already */
-"    for (int k = 0; k < n; k++) {\n"
-"        GLight L = p.l[k];\n"
-"        vec3 Lv = L.pos_type.xyz - P; float d = length(Lv); vec3 l = Lv / d;\n"
-"        float ndl = max(dot(N, l), 0.0);\n"
-"        float att = clamp((L.oacbn.x - d) / (L.oacbn.x - L.col_inner.w), 0.0, 1.0); att *= att;\n"
-"        if (L.pos_type.w > 1.5) {\n"
-"            float c = clamp((dot(-l, L.dir.xyz) - L.oacbn.z) * -L.oacbn.y, 0.0, 1.0);\n"
-"            att *= c * c * (d > L.oacbn.w ? 1.0 : 0.0);\n"
-"        }\n"
-"        float w = att * ndl;\n"
-"        if (w <= 0.0) continue;\n"
-"        vec3 C = L.col_inner.xyz * p.misc.x;\n"
-"        float ndh = max(dot(N, normalize(l + V)), 0.0);\n"
-"        acc += w * C;\n"
-"        sp += w * length(C) * (1.0 + 25.0 / 27.0 * s) * pow(1.0 + s * (1.0 - ndh), -8.0);\n"
-"    }\n"
-"    const float K = 0.35355339 * 255.0;\n"
-"    vec3 q = sqrt(acc);\n"
-"    float a = min(255.0, floor(max(1.0, max(q.r, max(q.g, q.b))) * K));\n"
-"    o_diff = vec4(min(vec3(255.0), floor(q * K * 255.0 / a)), a) / 255.0;\n"
-"    o_spec = vec4(0.0, 0.0, 0.0, min(255.0, floor(sqrt(sp) * K)) / 255.0);\n"
-"}\n";
+ * Two RGBA8 outputs: diffuse (location 0) and specular (location 1).
+ *
+ * VK_LIGHT_GLSL(QDEF): QDEF defines LQ(x, n), the step that turns a value in
+ * 0..255 into the byte written. kVkLightFS truncates, as the SPU job does
+ * (floor; n unused). kVkLightDitherFS (PS3RECOMP_LIGHT_DITHER, ps3_lightfx.h)
+ * adds a static per-pixel dither n in 0..1 (interleaved gradient noise,
+ * Jimenez 2014) before the truncation, less half a step: the mean stays the
+ * truncation's, the 8-bit steps of a soft light falloff become fine noise.
+ * A pixel with no light stays exactly 0. The scale byte (alpha) is never
+ * dithered, so a pixel's colour ratios stay the job's. */
+#define VK_LIGHT_GLSL(QDEF) \
+"#version 450\n" \
+QDEF \
+"float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }\n" \
+"struct GLight { vec4 pos_type; vec4 col_inner; vec4 oacbn; vec4 dir; };\n" \
+"layout(std140, set = 0, binding = 0) uniform GLParams { vec4 m[4]; vec4 misc; GLight l[128]; } p;\n" \
+"layout(set = 0, binding = 1) uniform sampler2D nt;\n" \
+"layout(set = 0, binding = 2) uniform sampler2D zt;\n" \
+"layout(location = 0) out vec4 o_diff;\n" \
+"layout(location = 1) out vec4 o_spec;\n" \
+"void main() {\n" \
+"    uvec2 px = uvec2(gl_FragCoord.xy);\n" \
+"    o_diff = vec4(0.0); o_spec = vec4(0.0);\n" \
+"    uint z24 = uint(clamp(texelFetch(zt, ivec2(px), 0).x, 0.0, 1.0) * 16777215.0);\n" \
+"    if (z24 >= 0xFFFFFFu) return;\n" \
+"    float zf = float(z24) / 16777216.0;\n" \
+"    float u = float(px.x) / p.misc.z, v = float(px.y) / p.misc.w;\n" \
+"    vec4 h = u * p.m[0] + v * p.m[1] + zf * p.m[2] + p.m[3];\n" \
+"    vec3 P = h.xyz / h.w;\n" \
+"    vec4 nr = floor(texelFetch(nt, ivec2(px), 0) * 255.0 + 0.5);\n" \
+"    vec3 N = normalize(nr.rgb * (2.0 / 255.0) - 1.0);\n" \
+"    float s = exp2(nr.a * (8.0 / 255.0) - 0.88896);\n" \
+"    vec3 V = -normalize(P);\n" \
+"    vec3 acc = vec3(0.0); float sp = 0.0;\n" \
+"    int n = min(int(p.misc.y), 128);\n" \
+"    for (int k = 0; k < n; k++) {\n" \
+"        GLight L = p.l[k];\n" \
+"        vec3 Lv = L.pos_type.xyz - P; float d = length(Lv); vec3 l = Lv / d;\n" \
+"        float ndl = max(dot(N, l), 0.0);\n" \
+"        float att = clamp((L.oacbn.x - d) / (L.oacbn.x - L.col_inner.w), 0.0, 1.0); att *= att;\n" \
+"        if (L.pos_type.w > 1.5) {\n" \
+"            float c = clamp((dot(-l, L.dir.xyz) - L.oacbn.z) * -L.oacbn.y, 0.0, 1.0);\n" \
+"            att *= c * c * (d > L.oacbn.w ? 1.0 : 0.0);\n" \
+"        }\n" \
+"        float w = att * ndl;\n" \
+"        if (w <= 0.0) continue;\n" \
+"        vec3 C = L.col_inner.xyz * p.misc.x;\n" \
+"        float ndh = max(dot(N, normalize(l + V)), 0.0);\n" \
+"        acc += w * C;\n" \
+"        sp += w * length(C) * (1.0 + 25.0 / 27.0 * s) * pow(1.0 + s * (1.0 - ndh), -8.0);\n" \
+"    }\n" \
+"    const float K = 0.35355339 * 255.0;\n" \
+"    vec3 q = sqrt(acc);\n" \
+"    float a = min(255.0, floor(max(1.0, max(q.r, max(q.g, q.b))) * K));\n" \
+"    float dn = ign(gl_FragCoord.xy);\n" \
+"    o_diff = vec4(min(vec3(255.0), LQ(q * K * 255.0 / a, dn)), a) / 255.0;\n" \
+"    o_spec = vec4(0.0, 0.0, 0.0, min(255.0, LQ(sqrt(sp) * K, fract(dn + 0.5))) / 255.0);\n" \
+"}\n"
+static const char kVkLightFS[] = VK_LIGHT_GLSL("#define LQ(x, n) floor(x)\n");
+static const char kVkLightDitherFS[] = VK_LIGHT_GLSL("#define LQ(x, n) max(floor((x) + (n) - 0.5), 0.0)\n");
 
 /* The SSAO passes' shared part: struct SsaoC (SsaoGpuConsts, 320 bytes) as a
  * std140 block, and the SPU-exact helpers. Set 0: binding 0 the block,
@@ -104,6 +118,7 @@ static const char kVkLightFS[] =
 "    vec4 blur;\n" \
 "    vec4 up;\n" \
 "    uvec4 dims;\n" \
+"    vec4 lfx;\n" /* ps3_lightfx: x = AO strength (1 = the game's); never read by the exact passes */ \
 "} c;\n" \
 "layout(set = 0, binding = 1) uniform sampler2D t0;\n" \
 "layout(set = 0, binding = 2) uniform sampler2D t1;\n" \
@@ -226,28 +241,161 @@ static const char kVkSsaoBlurVFS[] = VK_SSAO_GLSL_COMMON VK_SSAO_GLSL_BLUR
 "void main() { o = ssao_blur(ivec2(gl_FragCoord.xy), ivec2(0, 1)); }\n";
 
 /* ssao_up4_fs: the bilateral 2x upsample, the AO byte in every channel.
- * t0 = AO, t1 = half depth, t2 = resolved depth. RGBA8 out. */
-static const char kVkSsaoUp4FS[] = VK_SSAO_GLSL_COMMON
+ * t0 = AO, t1 = half depth, t2 = resolved depth. RGBA8 out.
+ * VK_SSAO_UP4(OUT): OUT(b) is the byte written (0..254); kVkSsaoUp4FS writes
+ * it as computed, kVkSsaoUp4sFS (PS3RECOMP_SSAO_STRENGTH != 100) scales the
+ * occlusion: 254 - (254 - b) * strength, so open ground stays open. */
+#define VK_SSAO_UP4(OUT) VK_SSAO_GLSL_COMMON \
+"#define UPOUT(b) " OUT "\n" \
+"layout(location = 0) out vec4 o;\n" \
+"void main() {\n" \
+"    ivec2 P  = ivec2(gl_FragCoord.xy);\n" \
+"    ivec2 hm = ivec2(c.dims.zw) - 1;\n" \
+"    float Z  = ssao_lin(ssao_z24(texelFetch(t2, ivec2(ssao_sc(P, rs)), 0).r), c.up.x, c.up.y);\n" \
+"    precise float kz = c.up.z * ssao_recip(Z);\n" \
+"    ivec2 b = P >> 1;\n" \
+"    ivec2 s = ivec2((P.x & 1) != 0 ? 1 : -1, (P.y & 1) != 0 ? 1 : -1);\n" \
+"    ivec2 off[4] = ivec2[4](ivec2(0, 0), ivec2(0, s.y), ivec2(s.x, 0), s);\n" \
+"    float bw[4]  = float[4](9.0, 3.0, 3.0, 1.0);\n" \
+"    float eps[4] = float[4](uintBitsToFloat(0x3A6BEDFAu), uintBitsToFloat(0x399D4952u),\n" \
+"                            uintBitsToFloat(0x399D4952u), uintBitsToFloat(0x38D1B717u));\n" \
+"    precise float num = 0.0, den = 0.0;\n" \
+"    for (int k = 0; k < 4; k++) {\n" \
+"        ivec2 t = clamp(b + off[k], ivec2(0), hm);\n" \
+"        precise float w = fma(max(0.0, fma(-abs(texelFetch(t1, t, 0).r - Z), kz, 1.0)), bw[k], eps[k]);\n" \
+"        num = fma(w, ssao_byte(t0, t), num);\n" \
+"        den += w;\n" \
+"    }\n" \
+"    o = vec4(UPOUT(floor(ssao_mul_rz(num, ssao_recip(den)))) / 255.0);\n" \
+"}\n"
+static const char kVkSsaoUp4FS[] = VK_SSAO_UP4("(b)");
+static const char kVkSsaoUp4sFS[] = VK_SSAO_UP4("clamp(254.0 - (254.0 - (b)) * c.lfx.x, 0.0, 254.0)");
+
+
+/* ---- PS3RECOMP_SSAO=1|2 (ps3_lightfx.h): the game's occlusion at full
+ * resolution. Plain float math (no SPU emulation: this is not the job's
+ * output any more), same formula and constants as ssao_ao_fs, with:
+ *   - every 1280x720 pixel computed (the game: one per 2x2 block, then a
+ *     bilateral upsample), sample offsets in full-res pixels (x2);
+ *   - the 12-sample pattern rotated per pixel (4x4 Bayer angles), LFX_SETS
+ *     rotations per pixel (1: 12 samples, 2: 24);
+ *   - a 9-tap separable depth-aware blur at full res (the game's 5 taps at
+ *     half res, its depth weight), which also removes the 4x4 rotation
+ *     pattern; the second pass writes the RGBA8 result with the strength.
+ * Passes: hd (R32F fw x fh) <- depth; a <- (hd, normals); b <- blur_h(a, hd);
+ * out <- blur_v(b, hd). Credits: the occlusion formula is the game's
+ * (decoded in notes/ssao of the Mac port); rotation + blur are the standard
+ * interleaved-sampling recipe (Keller & Heidrich 2001). */
+static const char kVkLfxHdFS[] = VK_SSAO_GLSL_COMMON
+"layout(location = 0) out float o;\n"
+"void main() {\n"
+"    o = ssao_lin(ssao_z24(texelFetch(t0, ivec2(gl_FragCoord.xy), 0).r), c.depth_ab.x, c.depth_ab.y);\n"
+"}\n";
+
+#define VK_LFX_AO(SETS) VK_SSAO_GLSL_COMMON \
+"layout(location = 0) out float o;\n" \
+"const float bayer4[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);\n" \
+"void main() {\n" \
+"    ivec2 p = ivec2(gl_FragCoord.xy);\n" \
+"    ivec2 fm = ivec2(c.dims.xy) - 1;\n" \
+"    float d = texelFetch(t0, p, 0).r;\n" \
+"    float dc = clamp(d, c.E0.z, c.E0.w);\n" \
+"    float rcp = 1.0 / dc;\n" \
+"    float q = d * rcp;\n" \
+"    vec3 n = roundEven(texelFetch(t1, p, 0).rgb * 255.0) * (1.0 / 127.5) - 1.0;\n" \
+"    vec3 n2 = n.x * c.M[0].xyz + n.y * c.M[1].xyz + n.z * c.M[2].xyz;\n" \
+"    float dref = d + n2.z * q;\n" \
+"    vec2 b = 2.0 * n2.xy * rcp + 0.5;\n" \
+"    vec2 sc = 2.0 * c.D0.yz * rcp;\n" \
+"    float hz = c.D0.w * q;\n" \
+"    float e0 = c.E0.x / q, e1 = c.E0.y * q;\n" \
+"    float a0 = (bayer4[(p.y & 3) * 4 + (p.x & 3)] + 0.5) * (6.2831853 / 16.0);\n" \
+"    float acc = 0.0;\n" \
+"    for (int r = 0; r < " #SETS "; r++) {\n" \
+"        float a = a0 + float(r) * 1.1999816;\n" \
+"        vec2 cs = vec2(cos(a), sin(a));\n" \
+"        for (int k = 0; k < 12; k++) {\n" \
+"            vec2 xy = vec2(cX(k) * cs.x - cY(k) * cs.y, cX(k) * cs.y + cY(k) * cs.x);\n" \
+"            ivec2 t = clamp(p + ivec2(floor(xy * sc + b)), ivec2(0), fm);\n" \
+"            float ds = texelFetch(t0, t, 0).r;\n" \
+"            float h = cZ(k) * hz;\n" \
+"            float tt = (ds - (dref - h)) * 0.5;\n" \
+"            acc += clamp(tt, 0.0, h) + h * clamp(tt * e0 + e1, 0.0, 1.0);\n" \
+"        }\n" \
+"    }\n" \
+"    acc /= c.D0.x * q * float(" #SETS ");\n" \
+"    o = clamp(acc * c.F0.x + c.F0.y, 0.0, 1.0);\n" \
+"}\n"
+static const char kVkLfxAo1FS[] = VK_LFX_AO(1);
+static const char kVkLfxAo2FS[] = VK_LFX_AO(2);
+
+/* The 9-tap blur: t0 = AO, t1 = full-res linear depth. Gaussian (sigma ~2.4
+ * px) times the game's depth weight 1 - |dz| * k / z (k = its blur.x). */
+#define VK_LFX_BLUR \
+"float lfx_blur(ivec2 p, ivec2 dir) {\n" \
+"    ivec2 fm = ivec2(c.dims.xy) - 1;\n" \
+"    float d0 = texelFetch(t1, p, 0).r;\n" \
+"    float kk = c.blur.x / d0;\n" \
+"    float num = 0.0, den = 0.0;\n" \
+"    for (int k = -4; k <= 4; k++) {\n" \
+"        ivec2 s = clamp(p + k * dir, ivec2(0), fm);\n" \
+"        float w = exp2(-0.125 * float(k * k)) * max(0.0, 1.0 - abs(texelFetch(t1, s, 0).r - d0) * kk);\n" \
+"        num += w * texelFetch(t0, s, 0).r;\n" \
+"        den += w;\n" \
+"    }\n" \
+"    return num / den;\n" \
+"}\n"
+static const char kVkLfxBlurHFS[] = VK_SSAO_GLSL_COMMON VK_LFX_BLUR
+"layout(location = 0) out float o;\n"
+"void main() { o = lfx_blur(ivec2(gl_FragCoord.xy), ivec2(1, 0)); }\n";
+/* ... and the vertical one writes the composite's RGBA8 texture: the AO in
+ * every channel, open = 254/255 as the game's, occlusion x strength. */
+static const char kVkLfxBlurVFS[] = VK_SSAO_GLSL_COMMON VK_LFX_BLUR
 "layout(location = 0) out vec4 o;\n"
 "void main() {\n"
-"    ivec2 P  = ivec2(gl_FragCoord.xy);\n"
-"    ivec2 hm = ivec2(c.dims.zw) - 1;\n"
-"    float Z  = ssao_lin(ssao_z24(texelFetch(t2, ivec2(ssao_sc(P, rs)), 0).r), c.up.x, c.up.y);\n"
-"    precise float kz = c.up.z * ssao_recip(Z);\n"
-"    ivec2 b = P >> 1;\n"
-"    ivec2 s = ivec2((P.x & 1) != 0 ? 1 : -1, (P.y & 1) != 0 ? 1 : -1);\n"
-"    ivec2 off[4] = ivec2[4](ivec2(0, 0), ivec2(0, s.y), ivec2(s.x, 0), s);\n"
-"    float bw[4]  = float[4](9.0, 3.0, 3.0, 1.0);\n"
-"    float eps[4] = float[4](uintBitsToFloat(0x3A6BEDFAu), uintBitsToFloat(0x399D4952u),\n"
-"                            uintBitsToFloat(0x399D4952u), uintBitsToFloat(0x38D1B717u));\n"
-"    precise float num = 0.0, den = 0.0;\n"
-"    for (int k = 0; k < 4; k++) {\n"
-"        ivec2 t = clamp(b + off[k], ivec2(0), hm);\n"
-"        precise float w = fma(max(0.0, fma(-abs(texelFetch(t1, t, 0).r - Z), kz, 1.0)), bw[k], eps[k]);\n"
-"        num = fma(w, ssao_byte(t0, t), num);\n"
-"        den += w;\n"
+"    float v = lfx_blur(ivec2(gl_FragCoord.xy), ivec2(0, 1));\n"
+"    o = vec4(clamp(1.0 - (1.0 - v) * c.lfx.x, 0.0, 1.0) * (254.0 / 255.0));\n"
+"}\n";
+
+/* ---- PS3RECOMP_TONE_* / PS3RECOMP_CLARITY (ps3_lightfx.h): the Metal
+ * backend's present-pass clarity and tone curve (rsx_metal_backend.m,
+ * eng_present_fs), ported to a pass that writes the frame instead of the
+ * display-surface blit (vk_lfx_tone). Same arithmetic; the clarity taps are
+ * texel fetches at rounded offsets (Metal: bilinear samples). Binding 0:
+ * c = (shadows, midtones, highlights, clarity) in -1..1, sz = (w, h, 0, 0);
+ * binding 1 the game's finished frame. RGBA8 out, alpha kept. */
+static const char kVkToneFS[] =
+"#version 450\n"
+"layout(std140, set = 0, binding = 0) uniform ToneP { vec4 c; vec4 sz; } p;\n"
+"layout(set = 0, binding = 1) uniform sampler2D src;\n"
+"layout(location = 0) out vec4 o;\n"
+"const vec3 W = vec3(0.2126, 0.7152, 0.0722);\n"
+"float tl(ivec2 q) { return dot(clamp(texelFetch(src, clamp(q, ivec2(0), ivec2(p.sz.xy) - 1), 0).rgb, 0.0, 1.0), W); }\n"
+"void main() {\n"
+"    ivec2 P = ivec2(gl_FragCoord.xy);\n"
+"    vec4 c = texelFetch(src, P, 0);\n"
+"    if (p.c.w != 0.0) {\n"
+"        float l0 = dot(clamp(c.rgb, 0.0, 1.0), W), acc = l0 * 0.5, wsum = 0.5;\n"
+"        float r = 0.011 * p.sz.y;\n"
+"        for (int k = 0; k < 8; k++) {\n"
+"            float a = float(k) * 0.785398 + 0.392699;\n"
+"            vec2 d = vec2(cos(a), sin(a)) * r;\n"
+"            acc += tl(P + ivec2(round(d))) * 0.6;\n"
+"            acc += tl(P + ivec2(round(d * 0.5)));\n"
+"            wsum += 1.6;\n"
+"        }\n"
+"        float det = clamp(l0 - acc / wsum, -0.15, 0.15);\n"
+"        float mid = clamp(1.0 - abs(l0 * 2.0 - 1.0), 0.0, 1.0);\n"
+"        c.rgb = clamp(c.rgb + det * p.c.w * 1.25 * (0.35 + 0.65 * mid), 0.0, 1.0);\n"
 "    }\n"
-"    o = vec4(floor(ssao_mul_rz(num, ssao_recip(den))) / 255.0);\n"
+"    if (p.c.x != 0.0 || p.c.y != 0.0 || p.c.z != 0.0) {\n"
+"        vec3 x = clamp(c.rgb, 0.0, 1.0), y = 1.0 - x;\n"
+"        vec3 ws = 9.4815 * x * y * y * y;\n"
+"        vec3 wm = 16.0 * x * x * y * y;\n"
+"        vec3 wh = 9.4815 * x * x * x * y;\n"
+"        c.rgb = clamp(x + 0.1 * (p.c.x * ws + p.c.y * wm + p.c.z * wh), 0.0, 1.0);\n"
+"    }\n"
+"    o = c;\n"
 "}\n";
 
 /* eng_depth_rgba8_fs: Z24S8 read through A8R8G8B8 (RPCS3 decode_depth24):

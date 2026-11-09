@@ -158,6 +158,10 @@ typedef struct rsx_fp_shadow_desc {
      * fixed-point steps first (PS3RECOMP_ENG_SHADOW_D24). mode: that knob's
      * diagnostic variants (2 filter-then-compare, 3 ties pass, 4 bias). */
     u8 grid, mode;
+    /* soft: 0 the RSX's 2x2 bilinear PCF; 1..3 a tent filter over 4x4 / 6x6 /
+     * 8x8 texels (PS3RECOMP_SOFT_SHADOWS, ps3_lightfx.h), for filtered and
+     * point lookups alike; mode 0 (no D24 diagnostic) only. */
+    u8 soft;
 } rsx_fp_shadow_desc;
 void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
     u32 dimension, u32 cube, u32 mips, u32 filter, u32 address, u32 control0);
@@ -168,6 +172,9 @@ void rsx_fp_set_shadow_rsx_order(int on);
 /* PS3RECOMP_ENG_SHADOW_D24 (live, diagnostic, default 0): the depth
  * compare's precision and filter order; see rsx_fp_decompiler.c. */
 void rsx_fp_set_shadow_d24(int mode);
+/* PS3RECOMP_SOFT_SHADOWS (live, default 0): 0..3, see rsx_fp_shadow_desc.soft.
+ * The caller re-keys its pipelines (a new desc). */
+void rsx_fp_set_shadow_soft(int level);
 u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);
 int rsx_fp_decompile_buffered_shadow_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,

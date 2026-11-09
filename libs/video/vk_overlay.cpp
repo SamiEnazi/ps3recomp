@@ -24,6 +24,7 @@
 #include "backends/imgui_impl_sdl2.h"
 
 #include "../../include/ps3emu/ps3_settings.h"
+#include "../../include/ps3emu/ps3_lightfx.h"   /* [light] the Lighting page (vk_overlay_light.inc) */
 #include "vk_postfx.h"
 #include "../../include/ps3emu/ps3_pad_icons.h"
 #if defined(__clang__)
@@ -257,6 +258,27 @@ static void set_value(int v, const char* fmt, ...)
     }
 }
 
+/* A setting that is not in kVar (a page with its own list, e.g. the Lighting
+ * page, vk_overlay_light.inc): kept with the file's other lines and written
+ * at the next save. */
+static void extra_set(const char* name, const char* value)
+{
+    std::lock_guard<std::mutex> g(s_set_lock);
+    int i = 0;
+    while (i < s_n_extra && strcmp(s_extra[i][0], name)) i++;
+    if (i == s_n_extra) {
+        if (s_n_extra >= EXTRA_N) return;
+        snprintf(s_extra[i][0], sizeof s_extra[i][0], "%s", name);
+        s_extra[i][1][0] = 0;
+        s_n_extra++;
+    }
+    if (strcmp(s_extra[i][1], value)) {
+        snprintf(s_extra[i][1], sizeof s_extra[i][1], "%s", value);
+        s_dirty = true;
+        s_dirty_t = now_s();
+    }
+}
+
 /* A setting a module may take live (ps3_settings.h): environment, applier,
  * and the file. 1 = live now. */
 static int apply_setting(int v, const char* value)
@@ -441,12 +463,13 @@ static void toggle_fullscreen(void)
     s_ui_stale = true;
 }
 
+enum { MENU_TABS = 6 };   /* [light] + Lighting */
 static int tab_from_name(const char* e)
 {
-    static const char* const names[] = { "display", "graphics", "audio", "controls", "hud" };
+    static const char* const names[MENU_TABS] = { "display", "graphics", "audio", "controls", "hud", "lighting" };
     if (!e || !*e) return -1;
-    if (e[0] >= '0' && e[0] <= '9') { const int t = atoi(e); return t >= 0 && t < 5 ? t : 0; }
-    for (int i = 0; i < 5; i++) if (!SDL_strcasecmp(e, names[i])) return i;
+    if (e[0] >= '0' && e[0] <= '9') { const int t = atoi(e); return t >= 0 && t < MENU_TABS ? t : 0; }
+    for (int i = 0; i < MENU_TABS; i++) if (!SDL_strcasecmp(e, names[i])) return i;
     if (!SDL_strcasecmp(e, "performance") || !SDL_strcasecmp(e, "perf")) return 4;
     return -1;
 }
@@ -500,6 +523,8 @@ static void ev_push(const SDL_Event* e)
     if (s_ev_n < 128) s_ev[s_ev_n++] = *e;
 }
 
+static void lfx_compare_toggle(void);   /* [light] F3, vk_overlay_light.inc */
+
 extern "C" int vk_overlay_event(const void* ev)
 {
     if (!s_enabled || !ev) return 0;
@@ -510,6 +535,7 @@ extern "C" int vk_overlay_event(const void* ev)
         const bool press = e->type == SDL_KEYDOWN && !e->key.repeat;
         if (k == SDLK_F1) { if (press) { set_hud(!s_hud); if (!s_hud) vk_overlay_notice("Performance HUD off (F1 shows it)"); } return 1; }
         if (k == SDLK_F2) { if (press) set_open(!s_open); return 1; }
+        if (k == SDLK_F3) { if (press) lfx_compare_toggle(); return 1; }   /* [light] lighting A/B */
         if (k == SDLK_F11 || (k == SDLK_RETURN && (e->key.keysym.mod & KMOD_ALT))) {
             if (press) toggle_fullscreen();
             return 1;
@@ -1376,6 +1402,8 @@ static void quit_confirm(void)
     ImGui::EndPopup();
 }
 
+#include "vk_overlay_light.inc"   /* [light] tab_lighting, lfx_compare_toggle */
+
 static void draw_menu(double now)
 {
     const ImGuiIO& io = ImGui::GetIO();
@@ -1389,15 +1417,16 @@ static void draw_menu(double now)
                                                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
         ImGui::End(); return;
     }
-    static const char* const names[5] = { "Display", "Graphics", "Audio", "Controls", "HUD" };
+    static const char* const names[MENU_TABS] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Lighting" };
     if (ImGui::BeginTabBar("tabs")) {
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < MENU_TABS; i++) {
             const ImGuiTabItemFlags f = (s_tab_want == i) ? ImGuiTabItemFlags_SetSelected : 0;
             if (ImGui::BeginTabItem(names[i], NULL, f)) {
                 s_tab = i;
                 ImGui::BeginChild("page", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() * 1.4f));
                 switch (i) { case 0: tab_display(); break; case 1: tab_graphics(); break; case 2: tab_audio(); break;
-                             case 3: tab_controls(now); break; default: tab_hud(); break; }
+                             case 3: tab_controls(now); break; case 5: tab_lighting(); break;
+                             default: tab_hud(); break; }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
@@ -1503,8 +1532,8 @@ static void feed_pad(ImGuiIO& io)
     const uint16_t pressed = b & (uint16_t)~prev;
     prev = b;
     if (s_quit_ask) { if (pressed & PAD_CIRCLE) s_quit_cancel = true; return; }
-    if (pressed & PAD_L1) s_tab_want = (s_tab + 4) % 5;
-    if (pressed & PAD_R1) s_tab_want = (s_tab + 1) % 5;
+    if (pressed & PAD_L1) s_tab_want = (s_tab + MENU_TABS - 1) % MENU_TABS;
+    if (pressed & PAD_R1) s_tab_want = (s_tab + 1) % MENU_TABS;
     if ((pressed & PAD_CIRCLE) && !ImGui::IsAnyItemActive()) set_open(0);
 }
 
