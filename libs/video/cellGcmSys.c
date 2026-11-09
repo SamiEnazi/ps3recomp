@@ -997,6 +997,21 @@ static void gcm_flip_stats_tick(void)
         s_fst.t0 = now; s_fst.last_flip = now;
     }
 }
+/* (limits) PS3_STALL_MS: where the FIFO walker stands, in one line. */
+int gcm_stall_snapshot(char* buf, int size)
+{
+    extern unsigned long long ps3_ms_now(void);
+    const u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    const u32 ref = vm_read32(GCM_CONTROL_GUEST_ADDR + 8);
+    const u32 gea = gcm_io2ea(s_fifo_getoff);
+    const unsigned long long since = s_park_since;
+    return snprintf(buf, (size_t)size, " get=%X put=%X word=%08X park=%X/%llums sema=%X ref=%X lab134-137=%X/%X/%X/%X",
+                    s_fifo_getoff, put, gea ? vm_read32(gea) : 0u, s_park_off,
+                    since ? ps3_ms_now() - since : 0ull, s_sema_offset, ref,
+                    vm_read32(GCM_LABEL_GUEST_BASE + 0x860), vm_read32(GCM_LABEL_GUEST_BASE + 0x870),
+                    vm_read32(GCM_LABEL_GUEST_BASE + 0x880), vm_read32(GCM_LABEL_GUEST_BASE + 0x890));
+}
+
 /* How long a self-JUMP park may stand with `put` somewhere else before the
  * drain gives up on it being patched and follows `put` instead. The hardware
  * waits for ever; GCM_PARK_GRACE_MS=<ms> overrides the default. inFAMOUS 2

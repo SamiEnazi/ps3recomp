@@ -160,6 +160,7 @@ int ps3_limits_format(char* buf, int len, int size)
 unsigned cellGcm_flip_request_count(void);
 int ppu_stall_snapshot(char* buf, int size);
 int spu_stall_snapshot(char* buf, int size);
+int gcm_stall_snapshot(char* buf, int size);
 
 static double lim_ms(void)
 {
@@ -201,7 +202,9 @@ static void* stall_thread(void* p)
                          (now - t0) / 1000.0, gap, f);
         k += ppu_stall_snapshot(buf + k, (int)sizeof buf - k - 512);
         if (k < (int)sizeof buf - 400) { k += snprintf(buf + k, sizeof buf - (size_t)k, " SPU:");
-                                         k += spu_stall_snapshot(buf + k, (int)sizeof buf - k - 2); }
+                                         k += spu_stall_snapshot(buf + k, (int)sizeof buf - k - 300); }
+        if (k < (int)sizeof buf - 260) { k += snprintf(buf + k, sizeof buf - (size_t)k, " RSX:");
+                                         k += gcm_stall_snapshot(buf + k, (int)sizeof buf - k - 2); }
         fprintf(stderr, "%s\n", buf);
         fflush(stderr);
         lines++;

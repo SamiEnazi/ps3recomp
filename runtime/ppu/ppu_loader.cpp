@@ -936,6 +936,7 @@ extern "C" void ppu_report_guest_lrs(void)
  * site (lr) and r3..r5 (a syscall's object id / timeout). Racy reads on purpose:
  * a diagnostic taken while the threads run. Returns the length written. */
 extern "C" uint32_t g_sc_inflight[];
+extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" int ppu_stall_snapshot(char* buf, int size)
 {
     int k = 0;
@@ -945,10 +946,37 @@ extern "C" int ppu_stall_snapshot(char* buf, int size)
         if (!c) continue;
         const unsigned t = (unsigned)c->thread_id;
         const unsigned sc = t < 64 ? g_sc_inflight[t] : 0;
-        const int w = snprintf(buf + k, (size_t)(size - k), " t%u:%s%u@%X(%X,%X,%X)", t, sc ? "sc" : "-",
-                               sc, (uint32_t)c->lr, (uint32_t)c->gpr[3], (uint32_t)c->gpr[4], (uint32_t)c->gpr[5]);
+        const int w = snprintf(buf + k, (size_t)(size - k), " t%u:%s%u@%X(%X,%X,%X;r31=%X)", t, sc ? "sc" : "-",
+                               sc, (uint32_t)c->lr, (uint32_t)c->gpr[3], (uint32_t)c->gpr[4], (uint32_t)c->gpr[5],
+                               (uint32_t)c->gpr[31]);
         if (w < 0 || w >= size - k) break;
         k += w;
+    }
+    /* PS3_STALL_PEEK=<tid>:<reg>:<off-hex>[:<off2-hex>],... -- the word at
+     * r<reg>+off of guest thread <tid> (and, with off2, the word at that value
+     * + off2): the object a poll loop waits on, read while it waits. */
+    static const char* peek = (const char*)-1;
+    if (peek == (const char*)-1) peek = getenv("PS3_STALL_PEEK");
+    for (const char* p = peek; p && *p && k < size - 48;) {
+        unsigned t = 0, reg = 0, off = 0, off2 = 0; int n = 0, two = 0;
+        if (sscanf(p, "%u:%u:%x%n", &t, &reg, &off, &n) < 3) break;
+        p += n;
+        if (*p == ':') { int n2 = 0; if (sscanf(p + 1, "%x%n", &off2, &n2) == 1) { two = 1; p += 1 + n2; } }
+        uint32_t v = 0xDEADDEAD, v2 = 0;
+        long nn = g_resv_ctx_n; if (nn > PPU_RESV_MAX) nn = PPU_RESV_MAX;
+        for (long i = 0; i < nn; i++) {
+            const ppu_context* c = g_resv_ctxs[i];
+            if (!c || (unsigned)c->thread_id != t || reg > 31) continue;
+            const uint32_t a = (uint32_t)c->gpr[reg] + off;
+            if (a >= 0x10000u) v = vm_read32(a);
+            if (two && v >= 0x10000u && v != 0xDEADDEAD) v2 = vm_read32(v + off2);
+            break;
+        }
+        const int w = two ? snprintf(buf + k, (size_t)(size - k), " [t%u r%u+%X]=%X->%X", t, reg, off, v, v2)
+                          : snprintf(buf + k, (size_t)(size - k), " [t%u r%u+%X]=%X", t, reg, off, v);
+        if (w < 0 || w >= size - k) break;
+        k += w;
+        if (*p == ',') p++;
     }
     return k;
 }
