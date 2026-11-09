@@ -7,6 +7,7 @@
  * a notice naming them; off = all off at every start.
  */
 #include "imgui.h"
+#include "vk_overlay_theme.h"   /* [theme] the accent colour */
 
 #include "../../include/ps3emu/ps3_cheats.h"
 
@@ -22,7 +23,6 @@ extern "C" void vk_overlay_notice_for(const char* text, double secs);
  * window opens; PS3_CHEATS_REMEMBER=0 in the file = off (nothing kept, nothing set). */
 static bool s_remember = true;
 
-static const ImVec4 kCheatCyan(0.20f, 0.80f, 0.95f, 1.0f);
 static const ImVec4 kCheatGrey(0.62f, 0.66f, 0.72f, 1.0f);
 static const ImVec4 kCheatOrange(1.0f, 0.60f, 0.20f, 1.0f);
 static const ImVec4 kCheatGreen(0.45f, 0.85f, 0.45f, 1.0f);
@@ -221,7 +221,7 @@ extern "C" void vk_overlay_cheats_page(float w)
     }
     for (int k = 0; k < ng; k++) {
         ImGui::Spacing();
-        ImGui::TextColored(kCheatCyan, "%s", groups[k]);
+        ImGui::TextColored(vk_ov_theme().accent, "%s", groups[k]);
         ImGui::Separator();
         for (int i = 0; i < n; i++) {
             ps3_cheat* c = g_ps3_cheats.e[i];
