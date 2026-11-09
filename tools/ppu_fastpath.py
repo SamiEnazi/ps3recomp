@@ -24,6 +24,11 @@ computes -- only the order and number of tests change.
                     the same bit (see header_preamble).
   PPU_VM_RUNS_LOADS=1  ppu_nv_dirty's access runs for loads (see _RUNS_C);
                     PPU_VM_RUNS_VERIFY=1 = the check build of it.
+
+Two run-time switches for a title's own code (cheats agent, 2026-11-09), each read from a
+file of title knowledge kept with the title, not here (both unset = the lift as before):
+  PPU_HOOK_FILE=<file>   a hook slot at chosen function entries (see _hooks)
+  PPU_PATCH_FILE=<file>  run-time alternatives for single instructions (see patch_line)
 """
 import os
 import re
@@ -221,6 +226,19 @@ def source_preamble(text: str) -> str:
         text += ("\n/* PPU_NATIVE_FILE (ppu3): native libc bodies, runtime/ppu/ppu_loader.cpp */\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
                  + "".join("int ppu_native_%s(ppu_context* ctx);\n" % k for k in _NATIVE_KINDS)
                  + "#ifdef __cplusplus\n}\n#endif\n")
+    if _hooks():
+        text += ("\n/* PPU_HOOK_FILE: run-time hook slots at function entries, runtime/ppu/ppu_loader.cpp */\n"
+                 "typedef void (*ppu_hook_body)(ppu_context*);\n"
+                 "typedef void (*ppu_hook_fn)(ppu_context*, ppu_hook_body);\n"
+                 "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+                 "int ppu_hook_register(uint32_t addr, ppu_hook_fn volatile* slot);\n"
+                 "#ifdef __cplusplus\n}\n#endif\n")
+    if _patches():
+        text += ("\n/* PPU_PATCH_FILE: run-time instruction alternatives, runtime/ppu/ppu_loader.cpp */\n"
+                 "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+                 "extern volatile uint8_t g_ppu_patch[256];\n"
+                 "int ppu_patch_register(int slot);\n"
+                 "#ifdef __cplusplus\n}\n#endif\n")
     return text
 
 
@@ -318,28 +336,134 @@ def _natives() -> dict:
 _RE_FUNC_HEAD = re.compile(r"^void (func_[0-9A-F]{8})\(ppu_context\* ctx\) \{$")
 
 
+# PPU_HOOK_FILE=<file> (cheats agent, 2026-11-09): a hook slot at chosen function entries,
+# for a title's own run-time code (cheats, fixes). The file -- title knowledge, kept with the
+# title -- has one "<hex guest address>" per line (# comments; words after the address are
+# ignored). Each listed func_X becomes func_X_lifted and an entry
+#     void func_X(ctx) { h = slot; if (h) { h(ctx, func_X_lifted); return; } func_X_lifted(ctx); }
+# whose slot registers itself with the runtime at start (runtime/ppu/ppu_loader.cpp
+# ppu_hook_register). An empty slot costs one load and a never-taken branch per call; the
+# title's code fills one with ppu_hook_set(addr, fn) while the game runs (include/ps3emu/
+# ppu_hooks.h). The hook sees in ctx the registers the lifted body reads at entry (its callers
+# write those back) and runs the body itself (ppu_hook_call: the body and its trampoline drain);
+# after that ctx holds what the callers read back (r3/f1 returns).
+_hook_set = None
+
+
+def _hooks() -> set:
+    global _hook_set
+    if _hook_set is None:
+        _hook_set = set()
+        path = os.environ.get("PPU_HOOK_FILE", "")
+        if path:
+            for ln in open(path, encoding="utf-8"):
+                ln = ln.split("#")[0].strip()
+                if ln:
+                    _hook_set.add("func_%08X" % int(ln.split()[0], 16))
+    return _hook_set
+
+
+def _hook_entry(name: str) -> list:
+    a = name[5:]
+    slot = "s_ppu_hook_" + a
+    return ["static ppu_hook_fn volatile %s;" % slot,
+            "static const int %s_reg = ppu_hook_register(0x%su, &%s);" % (slot, a, slot),
+            "void %s(ppu_context* ctx) { ppu_hook_fn _h = %s; if (__builtin_expect(_h != 0, 0)) "
+            "{ _h(ctx, %s_lifted); return; } %s_lifted(ctx); }" % (name, slot, name, name)]
+
+
 def _native_wrap(lines: list) -> list:
-    nat = _natives()
+    nat, hk = _natives(), _hooks()
     out, cur = [], None
     for ln in lines:
         m = _RE_FUNC_HEAD.match(ln) if ln.startswith("void func_") else None
-        if m and m.group(1) in nat:
+        if m and (m.group(1) in nat or m.group(1) in hk):
             cur = m.group(1)
+            if cur in nat and cur in hk:
+                raise RuntimeError(f"{cur} is in both PPU_NATIVE_FILE and PPU_HOOK_FILE")
             out.append("void %s_lifted(ppu_context* ctx) {" % cur)
-            STATS["native"] = STATS.get("native", 0) + 1
+            STATS["native" if cur in nat else "hook"] = STATS.get("native" if cur in nat else "hook", 0) + 1
             continue
         out.append(ln)
         if cur and ln == "}":
-            out.append("void %s(ppu_context* ctx) { if (ppu_native_%s(ctx)) return; %s_lifted(ctx); }"
-                       % (cur, nat[cur], cur))
+            if cur in nat:
+                out.append("void %s(ppu_context* ctx) { if (ppu_native_%s(ctx)) return; %s_lifted(ctx); }"
+                           % (cur, nat[cur], cur))
+            else:
+                out += _hook_entry(cur)
             cur = None
     return out
 
 
+# PPU_PATCH_FILE=<file> (cheats agent, 2026-11-09): run-time alternatives for single
+# instructions. The file -- title knowledge, kept with the title -- has lines
+#     <hex address> <slot 0-255> <hex original word> <hex alternative>[,<hex alternative>...]
+# (# comments). The instruction is lifted as
+#     if (g_ppu_patch[slot] == 1) { <alternative 1> } else if (... == 2) { ... } else { <original> }
+# each side the lifter's own translation of that word, so slot value 0 (the default) runs the
+# original and the title's code picks an alternative while the game runs (runtime/ppu/
+# ppu_loader.cpp g_ppu_patch). Both sides must be straight-line (no branch, call, return or
+# trap); the original word is checked against the EBOOT, and the lift stops on a mismatch.
+_patch_map = None
+_RE_XFER = re.compile(r"\bgoto\b|\breturn\b|func_[0-9A-Fa-f]{8}\(|ps3_(?:hle|indirect)_call|lv2_syscall|"
+                      r"g_trampoline_fn|DRAIN_TRAMPOLINE|\bloc_[0-9A-Fa-f]{8}")
+
+
+def _patches() -> dict:
+    global _patch_map
+    if _patch_map is None:
+        _patch_map = {}
+        path = os.environ.get("PPU_PATCH_FILE", "")
+        if path:
+            for ln in open(path, encoding="utf-8"):
+                ln = ln.split("#")[0].strip()
+                if not ln:
+                    continue
+                f = ln.split()
+                if len(f) != 4:
+                    raise RuntimeError(f"PPU_PATCH_FILE: '{ln}': want <addr> <slot> <orig> <alt>[,<alt>...]")
+                a, slot, orig = int(f[0], 16), int(f[1], 0), int(f[2], 16)
+                alts = [int(w, 16) for w in f[3].split(",") if w]
+                if not 0 <= slot < 256 or not alts or a in _patch_map:
+                    raise RuntimeError(f"PPU_PATCH_FILE: bad or repeated line '{ln}'")
+                _patch_map[a] = (slot, orig, alts)
+    return _patch_map
+
+
+def patch_line(lifter, insn, func, c_line: str) -> str:
+    """The lifted statement of `insn`, with its PPU_PATCH_FILE alternatives if it has any."""
+    p = _patches().get(insn.addr)
+    if p is None:
+        return c_line
+    slot, orig, alts = p
+    if insn.raw != orig:
+        raise RuntimeError(f"PPU_PATCH_FILE: 0x{insn.addr:08X} holds {insn.raw:08X}, not {orig:08X} "
+                           f"(another EBOOT?)")
+    from ppu_disasm import decode
+    sides = []
+    for w in alts + [None]:
+        code = c_line if w is None else lifter._translate(decode(w, insn.addr), func)
+        code = (code or "").strip() or ";"
+        if _RE_XFER.search(code):
+            raise RuntimeError(f"PPU_PATCH_FILE: 0x{insn.addr:08X}: {'the original' if w is None else '%08X' % w} "
+                               f"is not straight-line code: {code[:80]}")
+        sides.append(code)
+    STATS["patch"] = STATS.get("patch", 0) + 1
+    out = " else ".join("if (__builtin_expect(g_ppu_patch[%d] == %d, 0)) { %s }" % (slot, k + 1, s)
+                        for k, s in enumerate(sides[:-1]))
+    return out + " else { %s }" % sides[-1]
+
+
+_RE_PATCH_SLOT = re.compile(r"g_ppu_patch\[(\d+)\] == 1\b")
+
+
 def rewrite_body(lines: list) -> list:
     """A chunk's function lines with the switched-on statement rewrites."""
-    if _natives():
+    if _natives() or _hooks():
         lines = _native_wrap(lines)
+    if _patches():   # the instruction slots this chunk lifted: the runtime can tell they exist
+        slots = sorted({int(s) for ln in lines if "g_ppu_patch[" in ln for s in _RE_PATCH_SLOT.findall(ln)})
+        lines = lines + ["static const int s_ppu_patch_reg_%d = ppu_patch_register(%d);" % (s, s) for s in slots]
     if not _on("PPU_VMX_SSE"):
         return lines
     out = []

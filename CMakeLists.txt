@@ -243,6 +243,7 @@ if(PS3RECOMP_RSX_VULKAN)
     set(PS3_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui")
     set(PS3_VK_OVERLAY_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_overlay.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_overlay_cheats.cpp"
         "${PS3_IMGUI_DIR}/imgui.cpp"
         "${PS3_IMGUI_DIR}/imgui_draw.cpp"
         "${PS3_IMGUI_DIR}/imgui_tables.cpp"

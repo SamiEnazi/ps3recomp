@@ -30,10 +30,13 @@
  *   PS3_OVERLAY_PAD=0        no L3+R3 chord
  * Tests / screenshots:
  *   PS3RECOMP_OVERLAY_MENU_OPEN=1        menu open from the start
- *   PS3RECOMP_OVERLAY_TAB=<page>         0..4 or display|graphics|audio|controls|hud
+ *   PS3RECOMP_OVERLAY_TAB=<page>         0..5 or display|graphics|audio|controls|hud|cheats
+ *                                        (cheats: only when the title registered some,
+ *                                        include/ps3emu/ps3_cheats.h, vk_overlay_cheats.cpp)
  *   PS3RECOMP_OVERLAY_MENU_AT="40:display,50:audio,60:close"  a timed script
  *                                        (seconds after the window opened); also
- *                                        hud0 / hud1 and set=VAR=value (as the menu sets it)
+ *                                        hud0 / hud1, set=VAR=value (as the menu sets it)
+ *                                        and cheat=id=value (as the Cheats page sets it)
  *
  * Threads: everything runs on the thread that owns the window and presents
  * (the port's frame-clock / RSX thread): attach, draw, poll and the event
