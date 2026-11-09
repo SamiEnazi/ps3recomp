@@ -76,6 +76,10 @@ void  ps3_host_quit(const char* why);           /* libs/system/cellSysutil.c */
 int   vk_overlay_cheats_count(void);            /* vk_overlay_cheats.cpp: the title's cheats (ps3_cheats.h) */
 void  vk_overlay_cheats_page(float w);
 int   ps3_overlay_cheat_set(const char* id, double v);   /* below: "cheat=id=value" in the timed script */
+int   vk_overlay_cheats_owns_key(const char* k);         /* its PS3_CHEAT_* lines of the settings file */
+void  vk_overlay_cheats_write(FILE* f);
+void  vk_overlay_cheats_attach(void);                    /* the remembered cheats, at window open */
+int   vk_overlay_cheats_remember(void);
 extern volatile int      g_pad_overlay_open;   /* libs/input/cellPad.c */
 extern volatile int      g_pad_overlay_present; /* cellPad: a menu exists, Esc keeps the mouse capture for after it */
 extern volatile uint32_t g_pad_overlay_nav, g_pad_overlay_nav2, g_pad_overlay_raw;
@@ -208,6 +212,8 @@ static void preload(void)
                 if (i >= 0) {
                     snprintf(s_saved[i], sizeof s_saved[i], "%s", v);
                     in_file[i] = true;
+                } else if (vk_overlay_cheats_owns_key(k)) {
+                    /* the Cheats page writes its own lines (vk_overlay_cheats_write) */
                 } else if (s_n_extra < EXTRA_N) {
                     snprintf(s_extra[s_n_extra][0], sizeof s_extra[0][0], "%s", k);
                     snprintf(s_extra[s_n_extra][1], sizeof s_extra[0][1], "%s", v);
@@ -306,6 +312,7 @@ static int settings_save(void)
             if (s_value[i][0]) snprintf(s_saved[i], sizeof s_saved[i], "%s", s_value[i]);
         }
         for (int i = 0; i < s_n_extra; i++) fprintf(f, "%s=%s\n", s_extra[i][0], s_extra[i][1]);
+        if (vk_overlay_cheats_count() > 0) vk_overlay_cheats_write(f);
         s_dirty = false;
     }
     bool ok = fclose(f) == 0;
@@ -385,6 +392,14 @@ static void notice_for(const char* text, double secs)
 }
 
 extern "C" void vk_overlay_notice(const char* text) { notice_for(text, 3.0); }
+extern "C" void vk_overlay_notice_for(const char* text, double secs) { notice_for(text, secs); }
+/* Something outside this file's settings changed what the file holds (the Cheats page). */
+extern "C" void vk_overlay_settings_changed(void)
+{
+    std::lock_guard<std::mutex> g(s_set_lock);
+    s_dirty = true;
+    s_dirty_t = now_s();
+}
 static void set_open(int o);
 /* Esc with the menu closed (the backend's pump, after cellPad took it as the
  * window's key): open the menu. 1 = opened (an overlay exists). */
@@ -1424,7 +1439,8 @@ static void draw_menu(double now)
     ImGui::SameLine();
     if (ImGui::Button("Quit game")) s_quit_ask = 1;
     ImGui::SameLine();
-    hint(s_tab == TAB_CHEATS ? "Cheats apply at once and are never saved."
+    hint(s_tab == TAB_CHEATS ? (vk_overlay_cheats_remember() ? "Cheats apply at once and are remembered."
+                                                             : "Cheats apply at once and are not saved.")
          : s_ini_path[0] ? "Changes apply at once where they can and are saved."
                          : "Changes apply at once (not saved: PS3_OVERLAY_INI is empty).");
     quit_confirm();
@@ -1557,6 +1573,7 @@ extern "C" void vk_overlay_attach(const vk_overlay_attach_info* info)
     g_pad_overlay_present = 1;
     if (env_on("PS3RECOMP_OVERLAY_MENU_OPEN") || env_on("PS3_OVERLAY_FORCE_OPEN")) set_open(1);
     notice_for("F2: settings    F1: performance HUD", 6.0);
+    vk_overlay_cheats_attach();      /* remembered cheats on again, and a notice naming them */
     update_active();
     fprintf(stderr, "[overlay] in-game menu: F2 (or hold L3+R3); HUD %s (F1); fullscreen Alt+Enter / F11; settings %s\n",
             s_hud ? "on" : "off", s_ini_path[0] ? s_ini_path : "not saved (PS3_OVERLAY_INI empty)");

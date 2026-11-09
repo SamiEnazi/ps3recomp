@@ -17,10 +17,12 @@
  * short -- store a flag, set a hook -- and return 1 (0 = it could not apply: the
  * menu says so). An ACTION's apply is the press.
  *
- * Everything starts at its declared value (cheats off) and nothing is saved: a
- * cheat is on until it is switched off or the game quits. PS3_CHEAT_SAVES marks a
- * cheat whose effect the game writes into its save (XP, unlocks); the page then
- * shows the title's note (ps3_cheats_set_note) or a default warning.
+ * Everything starts at its declared value (cheats off). With the menu's "Remember
+ * cheats" (default on) the toggles, choices and sliders that are on are kept in its
+ * settings file and set again when the window opens (ps3_cheat_rememberable; ACTIONs
+ * and PS3_CHEAT_NO_REMEMBER never). PS3_CHEAT_SAVES marks a cheat whose effect the
+ * game writes into its own save (XP, unlocks); the page then shows the title's note
+ * (ps3_cheats_set_note) or a default warning.
  *
  * Tests: PS3_CHEATS="id=value,id=value" applies values once the title calls
  * ps3_cheats_env() (an ACTION fires with that amount).
@@ -45,7 +47,9 @@ extern "C" {
 #endif
 
 enum { PS3_CHEAT_TOGGLE, PS3_CHEAT_CHOICE, PS3_CHEAT_INT, PS3_CHEAT_FLOAT, PS3_CHEAT_ACTION };
-enum { PS3_CHEAT_SAVES = 1 };   /* flags */
+/* flags: SAVES = the game writes its effect into the save; NO_REMEMBER = never kept in the
+ * settings file (ACTIONs never are: re-running them at every start would repeat them) */
+enum { PS3_CHEAT_SAVES = 1, PS3_CHEAT_NO_REMEMBER = 2 };
 
 typedef struct ps3_cheat ps3_cheat;
 struct ps3_cheat {
@@ -115,15 +119,38 @@ static inline int ps3_cheat_set(ps3_cheat* c, double v)
     return ok;
 }
 
-/* Any cheat not at its start value? (`start` is not kept: a TOGGLE/CHOICE/
- * slider at 0 counts as off.) For a HUD mark. */
+/* A cheat that is doing something: a TOGGLE/CHOICE not at 0 (off / the first choice), a
+ * slider not at its bottom (a 1x..10x multiplier at 1x is off). ACTIONs never are. */
+static inline int ps3_cheat_is_on(const ps3_cheat* c)
+{
+    if (c->kind == PS3_CHEAT_ACTION) return 0;
+    if ((c->kind == PS3_CHEAT_INT || c->kind == PS3_CHEAT_FLOAT) && c->max > c->min) return c->value != c->min;
+    return c->value != 0.0;
+}
+
+/* Any cheat on? For a HUD mark. */
 static inline int ps3_cheats_any_on(void)
 {
-    for (int i = 0; i < ps3_cheats_count(); i++) {
-        const ps3_cheat* c = g_ps3_cheats.e[i];
-        if (c->kind != PS3_CHEAT_ACTION && c->value != 0.0) return 1;
-    }
+    for (int i = 0; i < ps3_cheats_count(); i++)
+        if (ps3_cheat_is_on(g_ps3_cheats.e[i])) return 1;
     return 0;
+}
+
+/* "Remember cheats" (the in-game menu, libs/video/vk_overlay_cheats.cpp): a cheat that can be
+ * remembered is kept in the menu's settings file as PS3_CHEAT_<ID>=<value> and set again when
+ * the window opens (before the game reaches play: an apply callback must only switch things on,
+ * never touch the game's memory before the game is ready -- the title's code does that from
+ * its own hooks). */
+static inline int ps3_cheat_rememberable(const ps3_cheat* c)
+{
+    return c->kind != PS3_CHEAT_ACTION && !(c->flags & PS3_CHEAT_NO_REMEMBER);
+}
+static inline void ps3_cheat_env_name(const ps3_cheat* c, char* out, size_t n)
+{
+    size_t k = (size_t)snprintf(out, n, "PS3_CHEAT_");
+    for (const char* p = c->id; *p && k + 1 < n; p++)
+        out[k++] = (char)((*p >= 'a' && *p <= 'z') ? *p - 32 : *p);
+    out[k < n ? k : n - 1] = 0;
 }
 
 /* PS3_CHEATS="id=value,..." (tests). */
