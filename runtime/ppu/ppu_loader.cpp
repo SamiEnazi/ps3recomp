@@ -931,6 +931,28 @@ extern "C" void ppu_report_guest_lrs(void)
     fflush(stderr);
 }
 
+/* (limits) PS3_STALL_MS: where every guest thread is, in one line -- guest tid,
+ * the lv2 syscall it is inside (g_sc_inflight, 0 = none), its last direct call
+ * site (lr) and r3..r5 (a syscall's object id / timeout). Racy reads on purpose:
+ * a diagnostic taken while the threads run. Returns the length written. */
+extern "C" uint32_t g_sc_inflight[];
+extern "C" int ppu_stall_snapshot(char* buf, int size)
+{
+    int k = 0;
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n && k < size - 96; i++) {
+        const ppu_context* c = g_resv_ctxs[i];
+        if (!c) continue;
+        const unsigned t = (unsigned)c->thread_id;
+        const unsigned sc = t < 64 ? g_sc_inflight[t] : 0;
+        const int w = snprintf(buf + k, (size_t)(size - k), " t%u:%s%u@%X(%X,%X,%X)", t, sc ? "sc" : "-",
+                               sc, (uint32_t)c->lr, (uint32_t)c->gpr[3], (uint32_t)c->gpr[4], (uint32_t)c->gpr[5]);
+        if (w < 0 || w >= size - k) break;
+        k += w;
+    }
+    return k;
+}
+
 /* Break every reservation on ea's word (real-PPC granule semantics on a store).
  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
  * recheck reads reserve_addr under its slot lock and the value-CAS backstops the

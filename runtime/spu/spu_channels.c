@@ -759,6 +759,21 @@ static mfc_engine* mfc_for(spu_context* ctx)
     return e;
 }
 
+/* (limits) PS3_STALL_MS: each live SPU context -- spu id, image, pc -- in one line. */
+int spu_stall_snapshot(char* buf, int size)
+{
+    int k = 0;
+    for (int i = 0; i < SPU_MAX_CONTEXTS && k < size - 48; i++) {
+        const spu_context* c = __atomic_load_n(&mfc_slot(i)->ctx, __ATOMIC_ACQUIRE);
+        if (!c) continue;
+        const int w = snprintf(buf + k, (size_t)(size - k), " %X:i%d@%05X", c->spu_id, c->image_id,
+                               c->pc & SPU_LS_MASK);
+        if (w < 0 || w >= size - k) break;
+        k += w;
+    }
+    return k;
+}
+
 /* Give the slot `ctx` holds back to the table, called when its context is done.
  * Slots used to be claimed and never released, so a title with more SPU
  * contexts over its life than there are slots ran the rest of them on the

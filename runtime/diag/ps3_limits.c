@@ -150,6 +150,70 @@ int ps3_limits_format(char* buf, int len, int size)
     return len;
 }
 
+/* ---- PS3_STALL_MS=<ms>: the game made no frame for that long -----------------
+ * A thread polls the guest's flip count every 5 ms; when it has not moved for
+ * <ms>, one [stall] line says where every guest PPU thread is (syscall, lr,
+ * args: ppu_stall_snapshot) and where every SPU is (image, pc), and again at
+ * 2.5x, 5x and every further second of the same stall: what a 1-second gap is
+ * waiting on, caught while it waits. At most 60 lines a run. Default: off
+ * (PS3RECOMP_LIMITS=1 turns it on at 150 ms). */
+unsigned cellGcm_flip_request_count(void);
+int ppu_stall_snapshot(char* buf, int size);
+int spu_stall_snapshot(char* buf, int size);
+
+static double lim_ms(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+#else
+    return 0.0;
+#endif
+}
+
+#ifdef _WIN32
+static DWORD WINAPI stall_thread(LPVOID p)
+#else
+static void* stall_thread(void* p)
+#endif
+{
+    const double thr = (double)(long)(size_t)p;
+    const double t0 = lim_ms();
+    unsigned last = cellGcm_flip_request_count();
+    double since = t0, next = thr;
+    int lines = 0;
+    static char buf[4096];
+    while (lines < 60) {
+#ifdef _WIN32
+        Sleep(5);
+#else
+        usleep(5000);
+#endif
+        const unsigned f = cellGcm_flip_request_count();
+        const double now = lim_ms();
+        if (f != last || !f) { last = f; since = now; next = thr; continue; }
+        const double gap = now - since;
+        if (gap < next) continue;
+        int k = snprintf(buf, sizeof buf, "[stall] t=%.2fs no guest flip for %.0f ms (flips %u) PPU:",
+                         (now - t0) / 1000.0, gap, f);
+        k += ppu_stall_snapshot(buf + k, (int)sizeof buf - k - 512);
+        if (k < (int)sizeof buf - 400) { k += snprintf(buf + k, sizeof buf - (size_t)k, " SPU:");
+                                         k += spu_stall_snapshot(buf + k, (int)sizeof buf - k - 2); }
+        fprintf(stderr, "%s\n", buf);
+        fflush(stderr);
+        lines++;
+        next = next < 2.5 * thr ? 2.5 * thr : next < 5 * thr ? 5 * thr : next + 1000.0;
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
 static double s_period = 5.0;
 
 #ifdef _WIN32
@@ -174,11 +238,26 @@ static void* lim_thread(void* p)
 #endif
 }
 
+static void stall_start(int lim_on)
+{
+    const char* e = getenv("PS3_STALL_MS");
+    const long ms = e ? atol(e) : (lim_on ? 150 : 0);
+    if (ms <= 0) return;
+#ifdef _WIN32
+    HANDLE h = CreateThread(NULL, 64u * 1024u, stall_thread, (LPVOID)(size_t)ms, 0, NULL);
+    if (h) CloseHandle(h);
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, stall_thread, (void*)(size_t)ms) == 0) pthread_detach(th);
+#endif
+}
+
 void ps3_limits_init(void)
 {
     static volatile long once;
     if (LIM_CAS(&once, 1, 0) != 0) return;
     const char* e = getenv("PS3RECOMP_LIMITS");
+    stall_start(e && *e && *e != '0');
     if (!(e && *e && *e != '0')) return;
     const char* s = getenv("PS3RECOMP_LIMITS_S");
     const double v = s ? atof(s) : 0.0;
