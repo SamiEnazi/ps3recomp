@@ -85,7 +85,7 @@ typedef struct {
     int seeded;                 /* 0 no, 1 seeding, 2 done */
     int value[PS3_LFX_COUNT];
     int gen;                    /* bumped on every change */
-    int test;                   /* -1 unknown, 0 no PS3_TOGGLE_FILE, 1 poll it */
+    int test;                   /* 0 not read yet, 1 no PS3_TOGGLE_FILE, 2 poll it */
 } ps3_lightfx_state;
 
 PS3_LIGHTFX_SHARED ps3_lightfx_state g_ps3_lightfx = { 0 };
@@ -156,13 +156,14 @@ static inline int ps3_lightfx_set(int id, const char* v)
  * the file does not set keeps its value). Returns a bit per changed id. */
 static inline unsigned ps3_lightfx_test_poll(void)
 {
+    /* test: 0 not read yet (the zero-initialised state), 1 no toggle file, 2 poll it */
     int t = __atomic_load_n(&g_ps3_lightfx.test, __ATOMIC_RELAXED);
-    if (__builtin_expect(t == 0, 1)) return 0;
-    if (t < 0) {
+    if (__builtin_expect(t == 1, 1)) return 0;
+    if (t == 0) {
         const char* e = getenv("PS3_TOGGLE_FILE");
-        t = (e && *e) ? 1 : 0;
+        t = (e && *e) ? 2 : 1;
         __atomic_store_n(&g_ps3_lightfx.test, t, __ATOMIC_RELAXED);
-        if (!t) return 0;
+        if (t == 1) return 0;
     }
     unsigned changed = 0;
     for (int id = 0; id < PS3_LFX_COUNT; id++) {
