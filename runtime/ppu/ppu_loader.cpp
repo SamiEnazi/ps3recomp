@@ -2405,6 +2405,73 @@ extern "C" int ppu_native_memset(ppu_context* ctx)
     return 1;
 }
 
+/* Run-time hooks and instruction alternatives (cheats agent, 2026-11-09): a title's own
+ * code switching guest behaviour while the game runs (include/ps3emu/ppu_hooks.h). A lift
+ * with PPU_HOOK_FILE gives each listed function an entry with a hook slot that registers
+ * itself here before main; one with PPU_PATCH_FILE lifts each listed instruction with
+ * alternatives picked by g_ppu_patch[slot] (0 = the original) and registers the slots it
+ * uses (tools/ppu_fastpath.py). Neither file = nothing registers and these do nothing. */
+#include "../../include/ps3emu/ppu_hooks.h"
+extern "C" { volatile uint8_t g_ppu_patch[256]; }
+enum { PPU_HOOK_MAX = 64 };
+static struct { uint32_t addr; ppu_hook_fn volatile* slot; } s_ppu_hooks[PPU_HOOK_MAX];
+static int s_ppu_hook_n;
+static uint8_t s_ppu_patch_lifted[256];
+/* A hook set during static initialisation, before its chunk registered the slot
+ * (the order of the TUs' initialisers is the linker's): kept until it does. */
+static struct { uint32_t addr; ppu_hook_fn fn; } s_ppu_hook_pending[16];
+static int s_ppu_hook_npend;
+/* Static initialisation of the lifted chunks (one thread): no lock. */
+extern "C" int ppu_hook_register(uint32_t addr, ppu_hook_fn volatile* slot)
+{
+    if (s_ppu_hook_n >= PPU_HOOK_MAX) { fprintf(stderr, "[hook] more than %d hook slots: 0x%08X has none\n", PPU_HOOK_MAX, addr); return 0; }
+    s_ppu_hooks[s_ppu_hook_n].addr = addr;
+    s_ppu_hooks[s_ppu_hook_n].slot = slot;
+    for (int i = 0; i < s_ppu_hook_npend; i++)
+        if (s_ppu_hook_pending[i].addr == addr) *slot = s_ppu_hook_pending[i].fn;
+    return ++s_ppu_hook_n;
+}
+extern "C" int ppu_patch_register(int slot)
+{
+    if (slot >= 0 && slot < 256) s_ppu_patch_lifted[slot] = 1;
+    return slot;
+}
+extern "C" int ppu_hook_exists(uint32_t addr)
+{
+    for (int i = 0; i < s_ppu_hook_n; i++) if (s_ppu_hooks[i].addr == addr) return 1;
+    return 0;
+}
+extern "C" int ppu_hook_set(uint32_t addr, ppu_hook_fn fn)
+{
+    for (int i = 0; i < s_ppu_hook_n; i++)
+        if (s_ppu_hooks[i].addr == addr) { __atomic_store_n(s_ppu_hooks[i].slot, fn, __ATOMIC_RELEASE); return 1; }
+    int i = 0;                         /* not (yet) registered: remembered for ppu_hook_register */
+    while (i < s_ppu_hook_npend && s_ppu_hook_pending[i].addr != addr) i++;
+    if (i < 16) {
+        s_ppu_hook_pending[i].addr = addr;
+        s_ppu_hook_pending[i].fn = fn;
+        if (i == s_ppu_hook_npend) s_ppu_hook_npend++;
+    }
+    return 0;
+}
+extern "C" int ppu_patch_lifted(int slot)
+{
+    return slot >= 0 && slot < 256 && s_ppu_patch_lifted[slot];
+}
+extern "C" void ppu_patch_set(int slot, int alternative)
+{
+    if (slot >= 0 && slot < 256) __atomic_store_n(&g_ppu_patch[slot], (uint8_t)alternative, __ATOMIC_RELEASE);
+}
+extern "C" void ppu_hook_call(ppu_context* ctx, ppu_hook_body body)
+{
+    body(ctx);
+    while (g_trampoline_fn) {          /* the body's tail jumps, as its caller's drain would run them */
+        void (*tf)(void*) = g_trampoline_fn;
+        g_trampoline_fn = 0;
+        tf((void*)ctx);
+    }
+}
+
 /* Bridge the lifter-emitted function_table[] (declared in ppu_recomp.h) into the
  * address->function hash map. The host boot harness calls this once at startup. */
 extern "C" void ppu_recomp_register(void)

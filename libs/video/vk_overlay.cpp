@@ -74,6 +74,9 @@ void  ps3_button_icons_set_mode(int mode);      /* rsx_button_icons.h */
 int   ps3_button_icons_mode_setting(void);
 int   ps3_button_icons_effective(void);
 void  ps3_host_quit(const char* why);           /* libs/system/cellSysutil.c */
+int   vk_overlay_cheats_count(void);            /* vk_overlay_cheats.cpp: the title's cheats (ps3_cheats.h) */
+void  vk_overlay_cheats_page(float w);
+int   ps3_overlay_cheat_set(const char* id, double v);   /* below: "cheat=id=value" in the timed script */
 extern volatile int      g_pad_overlay_open;   /* libs/input/cellPad.c */
 extern volatile int      g_pad_overlay_present; /* cellPad: a menu exists, Esc keeps the mouse capture for after it */
 extern volatile uint32_t g_pad_overlay_nav, g_pad_overlay_nav2, g_pad_overlay_raw;
@@ -464,13 +467,18 @@ static void toggle_fullscreen(void)
     s_ui_stale = true;
 }
 
-enum { MENU_TABS = 7 };   /* [light] + Lighting, [fx] + Effects */
+/* The menu's pages: the settings pages, then Cheats (always the last one) when the title
+ * has any. A new settings page goes before it: TAB_CHEATS is the number of settings pages
+ * ([light] Lighting = 5, [fx] Effects = 6). */
+enum { TAB_CHEATS = 7, MENU_TABS = TAB_CHEATS };
+static int tab_count(void) { return TAB_CHEATS + (vk_overlay_cheats_count() > 0 ? 1 : 0); }
+
 static int tab_from_name(const char* e)
 {
-    static const char* const names[MENU_TABS] = { "display", "graphics", "audio", "controls", "hud", "lighting", "effects" };
+    static const char* const names[TAB_CHEATS + 1] = { "display", "graphics", "audio", "controls", "hud", "lighting", "effects", "cheats" };
     if (!e || !*e) return -1;
-    if (e[0] >= '0' && e[0] <= '9') { const int t = atoi(e); return t >= 0 && t < MENU_TABS ? t : 0; }
-    for (int i = 0; i < MENU_TABS; i++) if (!SDL_strcasecmp(e, names[i])) return i;
+    if (e[0] >= '0' && e[0] <= '9') { const int t = atoi(e); return t >= 0 && t < tab_count() ? t : 0; }
+    for (int i = 0; i < tab_count(); i++) if (!SDL_strcasecmp(e, names[i])) return i;
     if (!SDL_strcasecmp(e, "performance") || !SDL_strcasecmp(e, "perf")) return 4;
     return -1;
 }
@@ -509,6 +517,11 @@ static void script_poll(double now)
             if (v == V_VOLUME) { cellAudio_host_set_volume(atoi(eq + 1)); set_value(v, "%d", atoi(eq + 1)); }
             else if (v >= 0) fprintf(stderr, "[overlay] %s=%s: %s\n", k, eq + 1, apply_setting(v, eq + 1) ? "live" : "at the next start");
             s_ui_stale = true;
+        }
+        else if (!SDL_strncasecmp(w, "cheat=", 6)) {   /* "cheat=id=value": as the Cheats page would set it */
+            char k[64]; snprintf(k, sizeof k, "%s", w + 6);
+            char* eq = strchr(k, '=');
+            if (eq) { *eq = 0; ps3_overlay_cheat_set(k, atof(eq + 1)); }
         }
         else { const int t = tab_from_name(w); if (t >= 0) s_tab_want = t; set_open(1); }
     }
@@ -1531,17 +1544,18 @@ static void draw_menu(double now)
                                                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
         ImGui::End(); return;
     }
-    static const char* const names[MENU_TABS] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Lighting", "Effects" };
-    s_ntabs = MENU_TABS;
+    static const char* const names[TAB_CHEATS + 1] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Lighting", "Effects", "Cheats" };
+    s_ntabs = tab_count();
     if (ImGui::BeginTabBar("tabs")) {
-        for (int i = 0; i < MENU_TABS; i++) {
+        for (int i = 0; i < tab_count(); i++) {
             const ImGuiTabItemFlags f = (s_tab_want == i) ? ImGuiTabItemFlags_SetSelected : 0;
             if (ImGui::BeginTabItem(names[i], NULL, f)) {
                 s_tab = i;
                 ImGui::BeginChild("page", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() * 1.4f));
                 switch (i) { case 0: tab_display(); break; case 1: tab_graphics(); break; case 2: tab_audio(); break;
                              case 3: tab_controls(now); break; case 4: tab_hud(); break;
-                             case 5: tab_lighting(); break; case 6: tab_effects(); break; default: break; }
+                             case 5: tab_lighting(); break; case 6: tab_effects(); break;
+                             case TAB_CHEATS: vk_overlay_cheats_page(combo_w()); break; default: break; }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
@@ -1554,8 +1568,9 @@ static void draw_menu(double now)
     ImGui::SameLine();
     if (ImGui::Button("Quit game")) s_quit_ask = 1;
     ImGui::SameLine();
-    hint(s_ini_path[0] ? "Changes apply at once where they can and are saved."
-                       : "Changes apply at once (not saved: PS3_OVERLAY_INI is empty).");
+    hint(s_tab == TAB_CHEATS ? "Cheats apply at once and are never saved."
+         : s_ini_path[0] ? "Changes apply at once where they can and are saved."
+                         : "Changes apply at once (not saved: PS3_OVERLAY_INI is empty).");
     quit_confirm();
     ImGui::End();
 }
@@ -1647,8 +1662,8 @@ static void feed_pad(ImGuiIO& io)
     const uint16_t pressed = b & (uint16_t)~prev;
     prev = b;
     if (s_quit_ask) { if (pressed & PAD_CIRCLE) s_quit_cancel = true; return; }
-    if (pressed & PAD_L1) s_tab_want = (s_tab + MENU_TABS - 1) % MENU_TABS;
-    if (pressed & PAD_R1) s_tab_want = (s_tab + 1) % MENU_TABS;
+    if (pressed & PAD_L1) s_tab_want = (s_tab + tab_count() - 1) % tab_count();
+    if (pressed & PAD_R1) s_tab_want = (s_tab + 1) % tab_count();
     if ((pressed & PAD_CIRCLE) && !ImGui::IsAnyItemActive()) set_open(0);
 }
 

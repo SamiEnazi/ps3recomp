@@ -1077,6 +1077,14 @@ def _env_on(name: str) -> bool:
     return os.environ.get(name, "0") not in ("0", "")
 
 
+# PPU_PATCH_FILE=<file>: run-time instruction alternatives (ppu_fastpath.patch_line); unset
+# = None and the per-instruction path is the old one.
+if os.environ.get("PPU_PATCH_FILE"):
+    import ppu_fastpath as _PATCHES
+else:
+    _PATCHES = None
+
+
 def _so_zero() -> bool:
     """PPU_SO_ZERO=1: compares and record forms leave CR's SO bit 0 instead of
     copying XER[SO]. Only for a lift whose own code never sets SO (no o-form,
@@ -1306,6 +1314,8 @@ class PPULifter:
                 emitted_labels.add(insn.addr)
 
             c_line = self._translate(insn, func)
+            if _PATCHES:   # PPU_PATCH_FILE: run-time alternatives (ppu_fastpath.patch_line)
+                c_line = _PATCHES.patch_line(self, insn, func, c_line)
             if c_line:
                 func.body_lines.append(f"    {c_line}")
 
