@@ -436,6 +436,13 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
                                             const u32* occurrence_to_unique,
                                             u32* indices);
 
+/* Texture packs (PS3_MODS) for the PC menu: the packs folder (PS3_MODS_DIR,
+ * or a "texpacks" folder found beside the executable or two folders up; ""
+ * when none), and what is loaded (packs and replacement files in use, uploads
+ * replaced so far, whether a dump runs). */
+const char* rsx_texpack_dir(void);
+void rsx_texpack_status(unsigned* packs, unsigned* files, unsigned* applied, int* dumping);
+
 #ifdef __cplusplus
 }
 #endif

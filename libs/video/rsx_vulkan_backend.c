@@ -62,6 +62,7 @@
 #include "../../include/ps3emu/ps3_ftrace.h"    /* PS3_FTRACE: GPU_WAIT spans at each fence wait */
 #include "../../include/ps3emu/ps3_settings.h"  /* [overlay] PC settings the in-game menu changes live */
 #include "vk_overlay.h"                          /* [overlay] HUD + settings menu (vk_overlay.cpp) */
+#include "rsx_image_io.h"                        /* [fx] texture-pack PNGs */
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
@@ -6717,8 +6718,26 @@ static void vk_eng5_shutdown(void)
     memset(s_zrgba, 0, sizeof s_zrgba);  s_zrgba_count = 0;
 }
 
+/* [fx] Image files for texture packs (rsx_draw_engine.c PS3_MODS, PS3_MODS_DUMP):
+ * PNG through stb (rsx_image_io.c). */
+static int vk_eng_image_load(void* user, const char* path, u8** rgba, u32* w, u32* h)
+{
+    (void)user;
+    unsigned ww = 0, hh = 0;
+    const int ok = rsx_image_load_png(path, rgba, &ww, &hh);
+    *w = ww; *h = hh;
+    return ok;
+}
+static int vk_eng_image_save(void* user, const char* path, const u8* rgba, u32 w, u32 h, u32 row_bytes)
+{
+    (void)user;
+    return rsx_image_save_png(path, rgba, w, h, row_bytes);
+}
+
 static const rsx_draw_backend s_vk_engine_backend = {
     .user                 = NULL,
+    .image_load           = vk_eng_image_load,   /* [fx] texture packs */
+    .image_save           = vk_eng_image_save,
     .init                 = vk_eng_init,
     .shutdown             = vk_eng_shutdown,
     .submit_and_wait      = vk_eng_submit_and_wait,
