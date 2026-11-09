@@ -259,6 +259,8 @@ static void* ppu_host_thread_proc(void* param)
 
     /* Its lwarx reservation record (spu_coherency.c) goes with the thread. */
     { extern void spu_coh_ppu_thread_exit(void); spu_coh_ppu_thread_exit(); }
+    /* ...and its guest-callback stacks (ppu_loader.cpp, PS3_STACK_REUSE) */
+    { extern void ppu_callback_stack_release(void); ppu_callback_stack_release(); }
 
     if (s_exit_done) {             /* sys_ppu_thread_exit finished the slot */
         s_exit_done = 0;

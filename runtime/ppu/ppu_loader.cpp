@@ -4216,11 +4216,54 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
 }
 
 extern "C" uint32_t sys_ppu_thread_alloc_stack(uint32_t size) __attribute__((weak));
-static uint32_t ppu_callback_stack(void)
+/* (limits, 2026-11-09) A callback stack was taken for every host thread that
+ * ever ran a guest callback and never given back. GCM's vblank/flip handlers
+ * are delivered at every HLE boundary and timer sleep of whatever guest thread
+ * is there (ppu_gcm_pump), so each guest thread -- the transient ones too: Bink
+ * IO/Snd per movie, the Game State Thread -- took 2 x 260 KB of the 256 MB guest
+ * stack region (the soak's ppu_stack_kb grew 260 KB at a time with no thread
+ * created). A guest thread now hands its callback stacks back as it ends
+ * (ppu_callback_stack_release, sys_ppu_thread.c) and the next one takes them,
+ * zeroed. PS3_STACK_REUSE=0 = never reused (the old way). */
+enum { CB_STACK = 0x40000 };
+#define CB_POOL_MAX 64
+static std::atomic<uint32_t> s_cb_pool[CB_POOL_MAX];   /* stack tops, 0 = empty */
+static PPU_THREAD_LOCAL uint32_t t_cb_top_a = 0, t_cb_top_b = 0;   /* ppu_guest_call / _ct */
+static int cb_reuse_on(void)
 {
-    enum { CB_STACK = 0x40000 };
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_STACK_REUSE"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static uint32_t ppu_callback_stack(uint32_t* top_out)
+{
+    if (cb_reuse_on())
+        for (int i = 0; i < CB_POOL_MAX; i++) {
+            const uint32_t t = s_cb_pool[i].exchange(0);
+            if (!t) continue;
+            memset(vm_to_host(t - CB_STACK), 0, CB_STACK);
+            *top_out = t;
+            return (t - 0x100) & ~0xFu;
+        }
     const uint32_t top = sys_ppu_thread_alloc_stack ? sys_ppu_thread_alloc_stack(CB_STACK) : 0;
+    *top_out = top;
     return top ? (top - 0x100) & ~0xFu : 0xCFFE0000u;   /* no allocator linked: the old fixed stack */
+}
+static void cb_give_back(uint32_t* top)
+{
+    if (!*top) return;
+    if (cb_reuse_on())
+        for (int i = 0; i < CB_POOL_MAX; i++) {
+            uint32_t z = 0;
+            if (s_cb_pool[i].compare_exchange_strong(z, *top)) break;
+        }
+    *top = 0;
+}
+/* The calling guest thread is ending: its callback stacks go to the pool. */
+extern "C" void ppu_callback_stack_release(void)
+{
+    cb_give_back(&t_cb_top_a);
+    cb_give_back(&t_cb_top_b);
 }
 
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
@@ -4251,7 +4294,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
      * one shared address let two host threads delivering callbacks at once
      * (a SPURS handler thread and a sysutil callback) run on the same stack. */
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = ppu_callback_stack();
+    if (!s_cb_sp || !t_cb_top_a) s_cb_sp = ppu_callback_stack(&t_cb_top_a);
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -4297,7 +4340,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = ppu_callback_stack();
+    if (!s_cb_sp || !t_cb_top_b) s_cb_sp = ppu_callback_stack(&t_cb_top_b);
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
