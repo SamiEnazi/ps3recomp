@@ -28,6 +28,7 @@
 #ifndef PS3RECOMP_RSX_DRAW_ENGINE_H
 #define PS3RECOMP_RSX_DRAW_ENGINE_H
 
+#include <stdio.h>   /* FILE: rsx_lim_summary */
 #include "rsx_dispatch.h"
 #include "rsx_primitives.h"
 #include "rsx_texture_layout.h"
@@ -137,6 +138,57 @@ typedef struct rsx_hattr {
     unsigned long long tex_cached;  /* gauge: entries in the cache at the present */
 } rsx_hattr;
 extern rsx_hattr g_rsx_hattr;
+
+/* ---- PS3RECOMP_LIMITS: the renderer's capacities and how close a run came --
+ * (rsx5, 2026-11-09, Sami: "stability more than fps" -- the 1024-entry
+ * texture cache once turned the city into a 4-10 fps slideshow.) Every
+ * fixed-size or capacity-limited structure of the engine and the Vulkan
+ * backend has an entry: its capacity (0 = grows without a set bound), the
+ * use now, the peak, and the events that mean it was not enough --
+ * `full` (a refusal: work dropped, an object not made, a stall to make room)
+ * and `evict` (a live entry pushed out to make room, a re-creation later).
+ * Cheap: the use is stored where the structure changes, events are counted.
+ * The first events of each kind are logged once each ([limits] lines);
+ * PS3RECOMP_LIMITS=1 prints a one-line summary every 5 s, and one summary
+ * line is always printed at exit. A frame in which an event happened names
+ * the structure on its PS3RECOMP_PLAYLOG HITCH line (lim=), and a LIMIT line
+ * per second carries the counts even when the frame was not slow. */
+enum {
+    RSX_LIM_TEXCACHE, RSX_LIM_TEXEVICT_RECENT, RSX_LIM_SURFACES, RSX_LIM_ZDEPTHS, RSX_LIM_PIPELINES,
+    RSX_LIM_VCACHE, RSX_LIM_VCACHE_MB, RSX_LIM_ICACHE, RSX_LIM_ICACHE_MB,
+    RSX_LIM_DRAW_REFS, RSX_LIM_DRAW_BATCHES, RSX_LIM_INLINE, RSX_LIM_IMM, RSX_LIM_GPU_LIGHTS, RSX_LIM_DROPS,
+    RSX_LIM_VK_OBJ, RSX_LIM_VK_PIPE, RSX_LIM_VK_FB, RSX_LIM_VK_SAMP, RSX_LIM_VK_DSETS, RSX_LIM_VK_DEAD_IMG,
+    RSX_LIM_VK_DEAD_FB, RSX_LIM_VK_DEAD_BUF, RSX_LIM_VK_VB, RSX_LIM_VK_ARENA_V, RSX_LIM_VK_ARENA_I,
+    RSX_LIM_VK_ARENA_U, RSX_LIM_VK_ARENA_S, RSX_LIM_VK_ARENA_G, RSX_LIM_VK_CSNAP, RSX_LIM_VK_ZRGBA,
+    RSX_LIM_VK_FBFIN, RSX_LIM_VK_TQ_RING, RSX_LIM_VK_MIDFLUSH, RSX_LIM_VK_IMGPOOL,
+    RSX_LIM_GCM_IOMAP, RSX_LIM_GCM_REFQ, RSX_LIM_GCM_UPLOADS, RSX_LIM_GCM_TABLES,
+    RSX_LIM_COUNT
+};
+typedef struct rsx_lim {
+    const char* name;
+    unsigned long long cap;          /* 0: no fixed bound (grows) */
+    unsigned long long cur, peak;
+    unsigned long long full, evict;  /* events (see above) */
+    unsigned long long frame_ev;     /* events since the last present (HITCH lim=) */
+} rsx_lim;
+extern rsx_lim g_rsx_lim[RSX_LIM_COUNT];
+static inline void rsx_lim_use(int id, unsigned long long cur)
+{
+    rsx_lim* l = &g_rsx_lim[id];
+    l->cur = cur;
+    if (cur > l->peak) l->peak = cur;
+}
+static inline void rsx_lim_cap(int id, unsigned long long cap) { g_rsx_lim[id].cap = cap; }
+/* kind 0 = full (refused / dropped / stalled), 1 = evict (a live entry pushed
+ * out). `what` is logged with the first events of each structure. */
+void rsx_lim_event(int id, int kind, const char* what);
+/* Per present (the Vulkan backend's): the PS3RECOMP_LIMITS summary when due.
+ * rsx_lim_take_frame: the names of the structures with events since the last
+ * call ("" if none) -- the HITCH line's lim= field. */
+void rsx_lim_frame(void);
+const char* rsx_lim_take_frame(char* buf, unsigned n);
+/* One summary line (also registered with atexit by the engine's init). */
+void rsx_lim_summary(FILE* f, const char* why);
 
 /* ---- the backend interface ---------------------------------------------- */
 
@@ -334,7 +386,9 @@ typedef struct rsx_draw_backend {
 } rsx_draw_backend;
 
 /* The light pass's constants, as the backend's shader reads them. */
-#define RSX_GPU_LIGHT_MAX 128
+/* (rsx5) 128 before: the city's light list reached 92 (limits audit) --
+ * lights past the bound go unlit. The shader's array is VK_LIGHT_GLSL's l[]. */
+#define RSX_GPU_LIGHT_MAX 512
 typedef struct {
     float m[16];            /* depth -> camera-relative position: h = u*m[0..3] + v*m[4..7] + z*m[8..11] + m[12..15] */
     float scale;            /* colour multiplier (inFAMOUS 2: 1.6) */
