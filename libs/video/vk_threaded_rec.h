@@ -214,6 +214,7 @@ static u8* tq_alloc(u32 op, u32 bytes, VkCommandBuffer cb)
     const u32 fill = (off + bytes > TQ_RING_BYTES) ? TQ_RING_BYTES - off : 0u;
     if (pos + fill + bytes - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) > TQ_RING_BYTES) {
         s_tq.n_full++;
+        rsx_lim_event(RSX_LIM_VK_TQ_RING, 0, "recording ring full: the RSX thread waits for the recording worker");   /* (rsx5) */
         tq_ring();
         while (pos + fill + bytes - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) > TQ_RING_BYTES) _mm_pause();
     }

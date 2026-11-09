@@ -1822,11 +1822,14 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
     u32 t = s_ref_qtail;
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
         s_ref_qhead++;
+        rsx_lim_event(RSX_LIM_GCM_REFQ, 0, "fence queue full: the oldest fence is dropped");
         static int _o = 0;
         if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
     s_ref_qtail = t + 1;
+    { const u32 d = s_ref_qtail - s_ref_qhead;   /* (rsx5) PS3RECOMP_LIMITS */
+      if (d > g_rsx_lim[RSX_LIM_GCM_REFQ].peak) { rsx_lim_cap(RSX_LIM_GCM_REFQ, GCM_REF_QLEN); rsx_lim_use(RSX_LIM_GCM_REFQ, d); } }
 }
 
 /* Global fence-publication counter: lets the lwmutex convoy trace correlate a
@@ -3340,6 +3343,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
         address < s_config.localAddress + s_config.localSize) {
         u32 loff = address - s_config.localAddress;
         if ((loff >> 20) < sizeof(s_local_offset_page)) s_local_offset_page[loff >> 20] = 1;
+        else rsx_lim_event(RSX_LIM_GCM_TABLES, 0, "local-memory page past 1 GB not recorded");
         vm_write32(off_ea, loff);
         return CELL_OK;
     }
@@ -3412,6 +3416,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
         } else {
             printf("[cellGcmSys] WARNING: auto-map has no free IO mapping slot; "
                    "the FIFO will not be able to walk io 0x%08X\n", io);
+            rsx_lim_event(RSX_LIM_GCM_IOMAP, 0, "IO mapping table full: an auto-mapped range is not walkable");
         }
         printf("[cellGcmSys] AddressToOffset: auto-mapped ea 0x%08X -> io 0x%08X\n",
                ea_page, io);
@@ -3477,6 +3482,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
     IoMapping* mapping = find_free_mapping();
     if (!mapping) {
         printf("[cellGcmSys] WARNING: no free IO mapping slots\n");
+        rsx_lim_event(RSX_LIM_GCM_IOMAP, 0, "IO mapping table full: MapMainMemory refused");
         return CELL_GCM_ERROR_FAILURE;
     }
 
@@ -3516,6 +3522,7 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
     IoMapping* mapping = find_free_mapping();
     if (!mapping) {
         printf("[cellGcmSys] MapEaIoAddress REFUSED: no free IO mapping slots\n");
+        rsx_lim_event(RSX_LIM_GCM_IOMAP, 0, "IO mapping table full: MapEaIoAddress refused");
         return CELL_GCM_ERROR_FAILURE;
     }
 
@@ -4294,13 +4301,14 @@ u32 cellGcm_control_guest_addr(void) { return GCM_CONTROL_GUEST_ADDR; }
 void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
 {
     populate_offset_table(ea, io, size);
-    if (s_io_mapping_count < CELL_GCM_MAX_IO_MAPPINGS) {
-        s_io_mappings[s_io_mapping_count].ea     = ea;
-        s_io_mappings[s_io_mapping_count].io     = io;
-        s_io_mappings[s_io_mapping_count].size   = size;
-        s_io_mappings[s_io_mapping_count].active = 1;
+    /* (rsx5) a free slot, as the other mapping paths take: appending at the
+     * count overwrote an active mapping once an unmap had left a hole */
+    IoMapping* m = find_free_mapping();
+    if (m) {
+        m->ea = ea; m->io = io; m->size = size; m->active = 1;
         s_io_mapping_count++;
-    }
+    } else rsx_lim_event(RSX_LIM_GCM_IOMAP, 0, "IO mapping table full: a syscall mapping is not walkable");
+    rsx_lim_cap(RSX_LIM_GCM_IOMAP, CELL_GCM_MAX_IO_MAPPINGS); rsx_lim_use(RSX_LIM_GCM_IOMAP, (unsigned long long)s_io_mapping_count);
     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }
 }
 
