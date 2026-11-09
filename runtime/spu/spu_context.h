@@ -1149,6 +1149,19 @@ extern uint8_t g_spu_stack_reset_hint[1024];
         return;                                                              \
     } while (0)
 
+/* A constant-target indirect branch inside one lifted function (spu_lifter.py
+ * --const-bi / SPU_LIFT_CONST_BI=1): the lifted code jumps straight to the target
+ * when the drain loop would do nothing there but dispatch -- the same tests as
+ * SPU_DIRECT plus the ones spu_indirect_branch makes before its fast path (a stop
+ * request, an interrupt register save armed). Otherwise it takes the indirect
+ * branch as before. PS3_SPU_CONST_BI=0 = always the indirect branch (spu_drain.c). */
+extern volatile int g_spu_const_bi;
+#define SPU_CONST_BI_OK(ctx, PC)                                                  \
+    (g_spu_const_bi > 0 && g_spu_direct > 0 &&                                    \
+     !__atomic_load_n(&(ctx)->stop_request, __ATOMIC_RELAXED) &&                 \
+     !(ctx)->irq_saved && !g_spu_stack_reset_hint[((PC) >> 2) & 1023u] &&        \
+     !((ctx)->int_enable && (spu_ev_get((ctx)) & (ctx)->event_mask)))
+
 #define SPU_RET(ctx) do {                                      \
         (ctx)->pc = (ctx)->gpr[0]._u32[0];                     \
         if ((ctx)->host_depth == 0)                            \

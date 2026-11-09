@@ -122,6 +122,10 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel);
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 
+/* A native rewrite of a lifted function (SPU_NATIVE_FILE lifts only): nonzero = it did
+ * the function's work (runtime/spu/spu_channels.c, spu_native_register). */
+int spu_native_entry(spu_context* ctx, uint32_t addr);
+
 /* Execution trace (only emitted when the lifter was invoked with --trace). */
 void spu_trace_init(const char* path);
 void spu_trace_pc(spu_context* ctx, uint32_t pc);
@@ -336,6 +340,98 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
                     jumps.add(insn.addr)
                 break
     return jumps
+
+
+# Constant-target indirect branches (SPU_LIFT_CONST_BI=1 / --const-bi; off by default).
+# Sony's SPU code moves between the halves of an interrupt window with `ila $rN,<next> /
+# bid $rN` and `ila $rN,<resume> / bie $rN` -- around every MFC command sequence and tag
+# wait (the DMA-heavy job modules do it a few hundred times per job) and all over the WWS
+# job manager. Lifted as an indirect branch, each one returned to the drain loop, went
+# through spu_indirect_branch and its cache lookup, and re-entered a chunk function that
+# reloads every register -- to land on an address known at lift time, usually the next
+# instruction, which a merged group already holds. With the option, such a `bi` inside a
+# merged group whose target lies in the same group becomes a guarded goto: taken only when
+# the register still holds the constant and the drain loop would do nothing but dispatch
+# (SPU_CONST_BI_OK, spu_context.h: no interrupt pending with interrupts enabled, no
+# interrupt save armed, no stop request, no stack-reset hint, the direct-call switches on).
+# Anything else takes the indirect branch exactly as before. The idea is ThiagoFraga761/
+# infamous2-pc's --const-bi (MIT); this is our lifter's own form of it.
+# Run-time kill switch without a re-lift: PS3_SPU_CONST_BI=0.
+_CB_FLOW_BREAKS = {"bi", "iret", "biz", "binz", "bihz", "bihnz", "br", "bra", "brz", "brnz",
+                   "brhz", "brhnz", "brsl", "brasl", "bisl", "bisled", "stop", "stopd"}
+# Targets where spu_indirect_branch does more than dispatch (spu_channels.c): never a goto.
+_CB_SPECIAL = {0x0, 0xA00, 0x808, 0x290, 0xA70, 0x3FF00}
+
+
+def _const_bi_default() -> bool:
+    return os.environ.get("SPU_LIFT_CONST_BI", "0") == "1"
+
+
+def compute_const_bi_targets(insns, bounds, bi_r0_jump, link_return) -> dict:
+    """{bi addr: constant target} for unconditional `bi $rN` (bie/bid included) whose
+    register was last written, inside the same chunk and with no call, branch or stop in
+    between, by `il`/`ila`. A chunk starts at every branch target, so nothing enters
+    between the load and the branch. `bi $r0` counts only where it is a computed jump
+    (compute_bi_r0_jumps), never a return; link-register returns are left out; so are
+    call return addresses and the runtime's service addresses as targets."""
+    import bisect
+    ordered = sorted(insns, key=lambda x: x.addr)
+    addrs = [i.addr for i in ordered]
+    call_rets = {i.addr + 4 for i in ordered if i.mnemonic in ("brsl", "brasl", "bisl", "bisled")}
+    out = {}
+    for (s, e) in bounds:
+        lo, hi = bisect.bisect_left(addrs, s), bisect.bisect_left(addrs, e)
+        for k in range(lo, hi):
+            insn = ordered[k]
+            if insn.mnemonic != "bi" or insn.addr in link_return:
+                continue
+            reg = _bi_target_reg(insn)
+            if reg is None:
+                continue
+            r = int(reg)
+            if r == 0 and insn.addr not in bi_r0_jump:
+                continue                     # a function return
+            for j in range(k - 1, lo - 1, -1):
+                w = ordered[j]
+                if w.mnemonic in _CB_FLOW_BREAKS:
+                    break
+                if w.mnemonic in _NO_RT_WRITE or _dest_reg(w) != r or _is_identity_move(w):
+                    continue
+                v = None
+                if w.mnemonic == "ila":
+                    v = (w.raw >> 7) & 0x3FFFF
+                elif w.mnemonic == "il":
+                    v = (w.raw >> 7) & 0xFFFF
+                    v = (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF
+                if v is not None and not (v & 3) and v < 0x40000 and v not in _CB_SPECIAL \
+                        and v not in call_rets:
+                    out[insn.addr] = v
+                break
+    return out
+
+
+def load_native_entries(prefix: str) -> dict:
+    """SPU_NATIVE_FILE=<file>: lifted functions a native rewrite may take over (the
+    rewrite registers itself with spu_native_register, runtime/spu/spu_channels.c).
+    Lines `<image name> 0x<addr>[:0x<continuation>]  # comment`, image name = the lift's
+    symbol prefix without its trailing underscore (jobmod_<sha>_e<entry>). Returns
+    {addr: continuation or None} for this image."""
+    path = os.environ.get("SPU_NATIVE_FILE", "")
+    want = prefix[:-1] if prefix.endswith("_") else prefix
+    out = {}
+    if not path or not want or not os.path.isfile(path):
+        return out
+    for ln in open(path, encoding="utf-8"):
+        ln = ln.split("#", 1)[0].strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        if len(parts) < 2 or parts[0] != want:
+            continue
+        for tok in parts[1:]:
+            a, _, c = tok.partition(":")
+            out[int(a, 0)] = int(c, 0) if c else None
+    return out
 
 
 def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
@@ -718,6 +814,10 @@ class SPULifter:
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+        # {bi addr: constant target} (compute_const_bi_targets, SPU_LIFT_CONST_BI=1).
+        self.const_bi: dict = {}
+        # {function addr: continuation or None} (load_native_entries, SPU_NATIVE_FILE).
+        self.native_entries: dict = {}
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -732,6 +832,20 @@ class SPULifter:
             tgt = self._branch_target(insn)
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
+            ct = self.const_bi.get(insn.addr)
+            if ct is not None and start <= ct < end:
+                internal.add(ct)
+
+        if start in self.native_entries:
+            # A native rewrite may do this function's work (spu_native_entry); then the
+            # function returns as its `bi $r0` would, or a chunk goes on at its continuation.
+            cont = self.native_entries[start]
+            if cont is None:
+                done = "SPU_RET(ctx);"
+            else:
+                self.branch_targets.add(cont)
+                done = f"SPU_DIRECT(ctx, {self._A(cont)}, {self.prefix}spu_func_{cont:08X});"
+            func.body_lines.append(f"    if (spu_native_entry(ctx, 0x{start:X}u)) {{ {done} }}")
 
         last_insn = None
         for insn in insns:
@@ -1179,6 +1293,15 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}SPU_RET(ctx);"
+            # A constant target inside this function (compute_const_bi_targets): a guarded
+            # goto; the indirect branch below whenever the guard says the drain loop would
+            # do more than dispatch.
+            ct = self.const_bi.get(addr)
+            if ct is not None and func.start_addr <= ct < func.end_addr:
+                return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+                        f"if (__builtin_expect(ctx->pc == 0x{ct:X}u && SPU_CONST_BI_OK(ctx, 0x{ct:X}u), 1)) "
+                        f"goto loc_{ct:08X}; "
+                        f"g_spu_trampoline_fn = spu_indirect_branch; return;")
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
@@ -1407,6 +1530,10 @@ def main() -> None:
                         "registered on its own for indirect entry, so this only "
                         "changes speed, not which code can be reached. "
                         "SPU_LIFT_MERGE_CHUNKS=1 makes it the default (every lift_* tool).")
+    p.add_argument("--const-bi", action="store_true",
+                   help="A `bi` whose target is a constant (il/ila in the same chunk) and lies "
+                        "in the same function becomes a guarded goto (compute_const_bi_targets). "
+                        "SPU_LIFT_CONST_BI=1 makes it the default (every lift_* tool).")
     p.add_argument("--max-group-insns", type=int, default=4000,
                    help="Cap on instructions per merged group (keeps clang fast).")
     p.add_argument("--force-indirect", default="",
@@ -1554,6 +1681,19 @@ def main() -> None:
         print(f"  {len(lifter.link_return)} non-r0 link-register return site(s) "
               f"(`bi $rN` where rN is a brsl/bisl link reg): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
+    if (args.const_bi or _const_bi_default()) and not args.trace and not args.relocatable:
+        lifter.const_bi = compute_const_bi_targets(insns, bounds, lifter.bi_r0_jump, lifter.link_return)
+        print(f"  {len(lifter.const_bi)} constant-target `bi` site(s) (--const-bi: a guarded goto "
+              f"where the target is in the same function)")
+    lifter.native_entries = load_native_entries(args.symbol_prefix or "")
+    if lifter.native_entries:
+        starts = {s for s, e in bounds}
+        missing = [a for a in lifter.native_entries if a not in starts]
+        if missing:
+            sys.exit(f"[spu_lifter] SPU_NATIVE_FILE: no function at "
+                     f"{', '.join(f'0x{a:X}' for a in missing)} in {args.symbol_prefix}")
+        print(f"  {len(lifter.native_entries)} native rewrite entr(y/ies) (SPU_NATIVE_FILE): "
+              f"{', '.join(f'0x{a:X}' for a in sorted(lifter.native_entries))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     groups = {}
     if args.merge_chunks:

@@ -50,13 +50,25 @@ extern "C" {
 #include <windows.h>   /* SwitchToThread */
 typedef struct { __declspec(align(128)) volatile long v; volatile long seq; char pad[120]; } ll_stripe;
 static ll_stripe g_ll[SPU_LL_STRIPES];
+/* After ~1 ms of spinning (six rounds of 4096 pauses) the waiter sleeps instead
+ * (upstream ps3recomp 61186bef, MaChInEgUn3, MIT). SwitchToThread only hands the
+ * core to a thread queued on this same processor, and Sleep(0) only to one of
+ * equal or higher priority -- neither reaches a lower-priority holder that is
+ * waiting for a core, which waiters above its priority could keep off the CPU
+ * for tens of milliseconds. A normal wait is far under a microsecond and never
+ * gets here. SPU_LOCKLINE_SLEEP=0 keeps the plain spin. */
+static int s_ll_sleep = -1;
 static void ll_take(ll_stripe* s)
 {
-    unsigned spins = 0;
+    unsigned spins = 0, rounds = 0;
     while (_InterlockedExchange(&s->v, 1)) {
         do {
             _mm_pause();
-            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
+            if (++spins >= 4096) {
+                spins = 0;
+                if (s_ll_sleep < 0) { const char* e = getenv("SPU_LOCKLINE_SLEEP"); s_ll_sleep = !(e && e[0] == '0'); }
+                if (rounds++ < 6 || !s_ll_sleep) SwitchToThread(); else Sleep(1);
+            }
         } while (s->v);
     }
     _InterlockedIncrement(&s->seq);                  /* odd: a writer is in */
