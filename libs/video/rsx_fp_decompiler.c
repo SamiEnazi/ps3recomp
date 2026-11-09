@@ -572,6 +572,23 @@ static int fp_shadow_d24(void)
     return v;
 }
 
+/* PS3RECOMP_SOFT_SHADOWS (live, default 0; ps3_lightfx.h): a wider filter
+ * for the filtered shadow lookups (see fp_shadow_helper). The engine's
+ * applier sets it and re-keys its pipelines. */
+static int s_fp_shadow_soft = -1;
+void rsx_fp_set_shadow_soft(int level)
+{
+    __atomic_store_n(&s_fp_shadow_soft, level < 0 ? 0 : level > 3 ? 3 : level, __ATOMIC_RELAXED);
+}
+static int fp_shadow_soft(void)
+{
+    int v = __atomic_load_n(&s_fp_shadow_soft, __ATOMIC_RELAXED);
+    if (v < 0) { const char* e = getenv("PS3RECOMP_SOFT_SHADOWS"); v = e && *e ? atoi(e) : 0;
+                 v = v < 0 ? 0 : v > 3 ? 3 : v;
+                 __atomic_store_n(&s_fp_shadow_soft, v, __ATOMIC_RELAXED); }
+    return v;
+}
+
 void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
     u32 dimension, u32 cube, u32 mips, u32 filter, u32 address, u32 control0)
 {
@@ -595,6 +612,9 @@ void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
         if (d24 != 2) out->grid = base == 0x92 ? 2 : 1;
         if (d24 == 3 && (out->func == 1 || out->func == 4)) out->func = (u8)(out->func + 2);
     }
+    /* The soft filter: only lookups the game filters itself (its sun
+     * shadows), only with the exact compare (no D24 diagnostic mode). */
+    if (out->enabled == 1 && out->linear && !out->mode) out->soft = (u8)fp_shadow_soft();
 }
 
 u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
@@ -664,6 +684,37 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
             "    float depth = %s%s.SampleLevel(rsx_samp[%u], uv, 0.0).r%s;\n"
             "    return (float4)_rsx_shadow_cmp%u(reference, depth);\n}\n",
             tq0, tex, unit, tq1, unit);
+        out_puts(p, text);
+        return;
+    }
+    /* PS3RECOMP_SOFT_SHADOWS: a tent filter of radius R = soft + 1 texels in
+     * place of the 2x2 bilinear one (R = 1 is exactly that). Texel k columns
+     * from base (k = 1-R .. R) weighs R - |k - f|; the 2R x 2R footprint is
+     * read as R x R gathers of 2x2 texels, each tap compared on its own, so
+     * the cost is R*R gathers (4 / 9 / 16) where the RSX form takes 4 point
+     * fetches. Gather order (D3D and Vulkan): x (i0,j1), y (i1,j1),
+     * z (i1,j0), w (i0,j0). The map's own sampler, so its border/clamp
+     * addressing is the same as the RSX form's. */
+    if (d->soft && !d->grid) {
+        const int R = d->soft + 1;
+        snprintf(text, sizeof text,
+            "    float2 position = uv * size - 0.5;\n"
+            "    float2 base = floor(position); float2 fraction = position - base;\n"
+            "    float sum = 0.0;\n"
+            "    [unroll] for (int gy = 0; gy < %d; gy++) {\n"
+            "        float l0 = (float)(2 * gy - %d);\n"
+            "        float wy0 = %d.0 - abs(l0 - fraction.y), wy1 = %d.0 - abs(l0 + 1.0 - fraction.y);\n"
+            "        [unroll] for (int gx = 0; gx < %d; gx++) {\n"
+            "            float k0 = (float)(2 * gx - %d);\n"
+            "            float wx0 = %d.0 - abs(k0 - fraction.x), wx1 = %d.0 - abs(k0 + 1.0 - fraction.x);\n"
+            "            float4 g = %s.Gather(rsx_samp[%u], (base + float2(k0, l0) + 1.0) / size);\n"
+            "            sum += _rsx_shadow_cmp%u(reference, g.w) * (wx0 * wy0) + _rsx_shadow_cmp%u(reference, g.z) * (wx1 * wy0)\n"
+            "                 + _rsx_shadow_cmp%u(reference, g.x) * (wx0 * wy1) + _rsx_shadow_cmp%u(reference, g.y) * (wx1 * wy1);\n"
+            "        }\n"
+            "    }\n"
+            "    return (float4)(sum * %.9g);\n}\n",
+            R, R - 1, R, R, R, R - 1, R, R, tex, unit, unit, unit, unit, unit,
+            1.0 / (double)(R * R * R * R));
         out_puts(p, text);
         return;
     }

@@ -38,6 +38,7 @@
 #include "../../include/ps3emu/ps3_toggles.h"   /* PS3_TOGGLE_FILE: live knobs */
 #include "../../include/ps3emu/ps3_ftrace.h"    /* PS3_FTRACE: compile / texture spans */
 #include "../../include/ps3emu/ps3_settings.h"  /* the PC menu's live settings (PS3RECOMP_DOF, ...) */
+#include "../../include/ps3emu/ps3_lightfx.h"   /* the menu's Lighting page (PS3RECOMP_SOFT_SHADOWS, ...) */
 
 /* Knobs PS3_TOGGLE_FILE can change while the game runs (their watchers only
  * store; the RSX thread reads). */
@@ -56,6 +57,20 @@ static void eng_shadow_cmp_set(int id, int v) { (void)id; rsx_fp_set_shadow_rsx_
  * and filter order (rsx_fp_set_shadow_d24); part of the shadow descriptor,
  * so a change recompiles the comparing programs too. */
 static void eng_shadow_d24_set(int id, int v) { (void)id; rsx_fp_set_shadow_d24(v); __atomic_fetch_add(&s_shadow_epoch, 1, __ATOMIC_RELAXED); }
+/* PS3RECOMP_SOFT_SHADOWS (live, the menu's Lighting page; ps3_lightfx.h): the
+ * filter of the game's filtered shadow lookups (rsx_fp_shadow_desc.soft), so
+ * like the two above a change re-keys the programs that read a shadow map. */
+static void eng_soft_shadows_set(int level)
+{
+    rsx_fp_set_shadow_soft(level);
+    __atomic_fetch_add(&s_shadow_epoch, 1, __ATOMIC_RELAXED);
+}
+static int eng_soft_shadows_apply(const char* v)
+{
+    ps3_lightfx_set(PS3_LFX_SOFT_SHADOWS, v);
+    eng_soft_shadows_set(ps3_lightfx_get(PS3_LFX_SOFT_SHADOWS));
+    return 1;
+}
 /* PS3RECOMP_ENG_POLY_OFFSET (live): the polygon offset
  * (SET_POLY_OFFSET_FILL_ENABLE 0x0A68, SET_POLYGON_OFFSET_SCALE_FACTOR /
  * _BIAS 0x0A78 / 0x0A7C), which this engine used to ignore. inFAMOUS 2 draws
@@ -5768,6 +5783,10 @@ presented:;
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
+    /* PS3_TOGGLE_FILE runs: the Lighting page's names from the toggle file
+     * (one load and out otherwise). */
+    if (ps3_lightfx_test_poll() & (1u << PS3_LFX_SOFT_SHADOWS))
+        eng_soft_shadows_set(ps3_lightfx_get(PS3_LFX_SOFT_SHADOWS));
     g.last_flip_buffer = arg & 7u;
     eng_present(g.last_flip_buffer);
 }
@@ -5828,6 +5847,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     /* The game's post effects the PC menu turns off (ENG_DOF_BLEND_FP). */
     ps3_setting_register("PS3RECOMP_DOF", eng_fx_dof_apply);
     ps3_setting_register("PS3RECOMP_EDGE_BLUR", eng_fx_edge_apply);
+    ps3_setting_register("PS3RECOMP_SOFT_SHADOWS", eng_soft_shadows_apply);   /* Lighting page */
     g.ready = 1;
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
             g.width, g.height);
