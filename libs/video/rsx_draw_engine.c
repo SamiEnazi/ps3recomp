@@ -1499,7 +1499,15 @@ static void eng_texdump(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
  * remap looks remapped in the dump too, and the replacement is read the same
  * way. A texture the game samples with unnormalised coordinates (format bit
  * 0x40) must keep its size. Cube maps and volumes are not replaced. */
-typedef struct { u64 key; u32 path; u16 pack; u8 logged, bad; } eng_mod_entry;
+typedef struct {
+    u64 key; u32 path; u16 pack; u8 logged, bad;
+    /* (perf) the image decoded once (eng_mod_take): st 0 not yet, 1 being
+     * decoded (the preload thread or the RSX thread), 2 px/pw/ph hold it,
+     * 3 it cannot be read */
+    u8* px; u32 pw, ph; int st;
+} eng_mod_entry;
+static void eng_mods_preload_start(void);
+static void eng_mods_preload_stop(void);
 static struct {
     int init, on;
     eng_mod_entry* e; u32 n, cap;
@@ -1735,6 +1743,7 @@ static void eng_mods_init(void)
         q = e;
     }
     s_mods.on = s_mods.n > 0;
+    if (s_mods.on) eng_mods_preload_start();
 }
 
 static int eng_mods_wanted(void)
@@ -1772,6 +1781,7 @@ static void eng_tex_mark_changed(eng_texture* e)
 static void eng_mods_reload(void)
 {
     const int was_on = s_mods.on, was_dump = s_mods.dump_dir[0] != 0;
+    eng_mods_preload_stop();                 /* the entries and their images go away below */
     s_mods.init = s_mods.on = 0;
     s_mods.n = s_mods.npacks = s_mods.pool_used = 0;
     if (s_mods.idx) memset(s_mods.idx, 0, s_mods.idx_size * sizeof *s_mods.idx);
@@ -1943,6 +1953,110 @@ static int eng_dds_load(const char* path, u8** out, u32* ow, u32* oh)
     return 1;
 }
 
+/* ---- pack images decoded once, off the RSX thread (perf, 2026-11-09) --------
+ * A replacement's PNG used to be decoded on the RSX thread every time its
+ * texture was created: 15-65 ms each (one 65 ms frame on the first fire after
+ * a load), and again after every eviction from the texture cache. Each entry
+ * now keeps its decoded image (up to ENG_MOD_PX_BUDGET in all), and a
+ * background thread decodes every pack file once when the packs are read, so
+ * the RSX thread normally finds it ready. An entry the thread is decoding at
+ * that moment is waited for; one it has not reached is decoded by the RSX
+ * thread itself, as before. PS3_MODS_PRELOAD=0: no background thread (the
+ * images are still kept once decoded). */
+#define ENG_MOD_PX_BUDGET (512ll << 20)
+static long long s_mods_px_bytes;
+static int s_mods_pre_stop, s_mods_pre_running;
+
+static int eng_mod_decode(const eng_mod_entry* m, u8** px, u32* pw, u32* ph)
+{
+    const char* path = s_mods.pool + m->path;
+    const size_t plen = strlen(path);
+    const int dds = plen > 4 && (path[plen - 1] | 32) == 's' && (path[plen - 2] | 32) == 'd';
+    return (dds ? eng_dds_load(path, px, pw, ph) : g.be->image_load(g.be->user, path, px, pw, ph)) &&
+           *px && *pw && *ph;
+}
+/* Keep a decoded image in its entry if the budget allows: 1 = kept (st 2). */
+static int eng_mod_keep(eng_mod_entry* m, u8* px, u32 pw, u32 ph)
+{
+    const long long bytes = (long long)pw * ph * 4;
+    if (__atomic_add_fetch(&s_mods_px_bytes, bytes, __ATOMIC_RELAXED) > ENG_MOD_PX_BUDGET) {
+        __atomic_sub_fetch(&s_mods_px_bytes, bytes, __ATOMIC_RELAXED);
+        return 0;
+    }
+    m->px = px; m->pw = pw; m->ph = ph;
+    __atomic_store_n(&m->st, 2, __ATOMIC_RELEASE);
+    return 1;
+}
+static void eng_mods_preload_run(void)
+{
+    u32 kept = 0;
+    for (u32 i = 0; i < s_mods.n && !__atomic_load_n(&s_mods_pre_stop, __ATOMIC_ACQUIRE); i++) {
+        eng_mod_entry* m = &s_mods.e[i];
+        int zero = 0;
+        if (!__atomic_compare_exchange_n(&m->st, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+        u8* px = NULL; u32 pw = 0, ph = 0;
+        if (!eng_mod_decode(m, &px, &pw, &ph)) { free(px); __atomic_store_n(&m->st, 3, __ATOMIC_RELEASE); continue; }
+        if (eng_mod_keep(m, px, pw, ph)) { kept++; continue; }
+        free(px);                                         /* over the budget: decoded when needed */
+        __atomic_store_n(&m->st, 0, __ATOMIC_RELEASE);
+    }
+    fprintf(stderr, "[mods] %u pack image(s) decoded ahead (%.0f MB)\n", kept,
+            (double)__atomic_load_n(&s_mods_px_bytes, __ATOMIC_RELAXED) / 1048576.0);
+    __atomic_store_n(&s_mods_pre_running, 0, __ATOMIC_RELEASE);
+}
+#ifdef _WIN32
+static void __cdecl eng_mods_preload_thread(void* arg) { (void)arg; eng_mods_preload_run(); }
+#else
+static void* eng_mods_preload_thread(void* arg) { (void)arg; eng_mods_preload_run(); return NULL; }
+#endif
+static void eng_mods_preload_start(void)
+{
+    const char* e = getenv("PS3_MODS_PRELOAD");
+    if ((e && e[0] == '0') || __atomic_load_n(&s_mods_pre_running, __ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&s_mods_pre_stop, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_mods_pre_running, 1, __ATOMIC_RELEASE);
+#ifdef _WIN32
+    if (_beginthread(eng_mods_preload_thread, 0, NULL) == (uintptr_t)-1L)
+        __atomic_store_n(&s_mods_pre_running, 0, __ATOMIC_RELEASE);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, eng_mods_preload_thread, NULL) == 0) pthread_detach(t);
+    else __atomic_store_n(&s_mods_pre_running, 0, __ATOMIC_RELEASE);
+#endif
+}
+/* Before the entries change (eng_mods_reload): the thread stops after the
+ * image it is on, and every kept image is freed. */
+static void eng_mods_preload_stop(void)
+{
+    __atomic_store_n(&s_mods_pre_stop, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&s_mods_pre_running, __ATOMIC_ACQUIRE)) usleep(1000);
+    for (u32 i = 0; i < s_mods.n; i++) {
+        free(s_mods.e[i].px);
+        s_mods.e[i].px = NULL; s_mods.e[i].st = 0;
+    }
+    __atomic_store_n(&s_mods_px_bytes, 0, __ATOMIC_RELAXED);
+}
+/* The entry's image for the RSX thread: *kept points at the entry's own copy
+ * (do not free), or *own is a fresh decode the caller frees. 0 = unreadable. */
+static int eng_mod_take(eng_mod_entry* m, const u8** kept, u8** own, u32* pw, u32* ph)
+{
+    *kept = NULL; *own = NULL;
+    for (;;) {
+        const int st = __atomic_load_n(&m->st, __ATOMIC_ACQUIRE);
+        if (st == 2) { *kept = m->px; *pw = m->pw; *ph = m->ph; return 1; }
+        if (st == 3) return 0;
+        if (st == 1) { usleep(200); continue; }           /* the preload thread is on it */
+        int zero = 0;
+        if (!__atomic_compare_exchange_n(&m->st, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+        u8* px = NULL; u32 w = 0, h = 0;
+        if (!eng_mod_decode(m, &px, &w, &h)) { free(px); __atomic_store_n(&m->st, 3, __ATOMIC_RELEASE); return 0; }
+        if (eng_mod_keep(m, px, w, h)) continue;          /* st 2 now */
+        __atomic_store_n(&m->st, 0, __ATOMIC_RELEASE);
+        *own = px; *pw = w; *ph = h;
+        return 1;
+    }
+}
+
 /* The pack's replacement for `key` as a backend texture, or 0 (none, or it
  * cannot be used: then the original is uploaded as always). */
 static u32 eng_texmod_apply(u64 key, u32 fmt, u32 w, u32 h, u32 nlv, u32 remap)
@@ -1950,14 +2064,12 @@ static u32 eng_texmod_apply(u64 key, u32 fmt, u32 w, u32 h, u32 nlv, u32 remap)
     eng_mod_entry* m = (eng_mod_entry*)eng_mod_find(key);
     if (!m || m->bad) return 0;
     const char* path = s_mods.pool + m->path;
-    u8* px = NULL; u32 pw = 0, ph = 0;
-    const size_t plen = strlen(path);
-    const int dds = plen > 4 && (path[plen - 1] | 32) == 's' && (path[plen - 2] | 32) == 'd';
-    if (!(dds ? eng_dds_load(path, &px, &pw, &ph)
-              : g.be->image_load(g.be->user, path, &px, &pw, &ph)) || !px || !pw || !ph) {
+    const u8* kept = NULL; u8* px = NULL; u32 pw = 0, ph = 0;
+    if (!eng_mod_take(m, &kept, &px, &pw, &ph)) {
         fprintf(stderr, "[mods] %s: cannot read the image; the original is used\n", path);
-        free(px); m->bad = 1; return 0;
+        m->bad = 1; return 0;
     }
+    const u8* src = kept ? kept : px;               /* px: ours to free; kept: the entry's */
     if (pw > 8192u || ph > 8192u) {
         fprintf(stderr, "[mods] %s is %ux%u: at most 8192x8192; the original is used\n", path, pw, ph);
         free(px); m->bad = 1; return 0;
@@ -1971,15 +2083,15 @@ static u32 eng_texmod_apply(u64 key, u32 fmt, u32 w, u32 h, u32 nlv, u32 remap)
     if (nlv > 1) { u32 big = pw > ph ? pw : ph; while (big > 1) { big >>= 1; mips++; } }
     const u32 handle = g.be->texture_create(g.be->user, RSX_BE_FMT_R8G8B8A8, pw, ph, mips, 1, remap, fmt);
     if (!handle) { free(px); return 0; }
-    g.be->texture_upload(g.be->user, handle, 0, 0, pw, ph, px, pw * 4u, ph);
+    g.be->texture_upload(g.be->user, handle, 0, 0, pw, ph, src, pw * 4u, ph);
     u32 cw = pw, chh = ph;
     for (u32 lvl = 1; lvl < mips; lvl++) {
         const u32 nw = cw > 1 ? cw / 2 : 1, nh = chh > 1 ? chh / 2 : 1;
         u8* half = (u8*)malloc((size_t)nw * nh * 4);
         if (!half) break;
-        eng_rgba_half(px, cw, chh, half, nw, nh);
-        free(px); px = half; cw = nw; chh = nh;
-        g.be->texture_upload(g.be->user, handle, 0, lvl, cw, chh, px, cw * 4u, chh);
+        eng_rgba_half(src, cw, chh, half, nw, nh);
+        free(px); px = half; src = half; cw = nw; chh = nh;
+        g.be->texture_upload(g.be->user, handle, 0, lvl, cw, chh, src, cw * 4u, chh);
     }
     free(px);
     s_mods.applied++;
