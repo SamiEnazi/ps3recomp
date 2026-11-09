@@ -2868,20 +2868,20 @@ static void eng_vpgen_set(int id, int v) { (void)id; __atomic_store_n(&s_vpgen_o
  * old table missed and re-analysed (copy, structural hash, constants, three
  * microcode walks) on many draws. The lookup scans compact key arrays, not the
  * 32 KB entries. */
-/* (rsx5) PS3RECOMP_ENG_FP_KPATCH (default 1; 0 = the memo as before, cap 8):
+/* (rsx5) PS3RECOMP_ENG_FP_KPATCH (default 1; 0 = the memo as before):
  * inFAMOUS 2 patches the inline constants of a fragment program in place
- * between draws (same address, same microcode, other constant values). Each
- * such draw missed the memo and re-ran the whole analysis -- a 32 KB clear in
+ * between draws (same address, same microcode, other constant values). Such a
+ * draw missed the memo and re-ran the whole analysis -- a 32 KB clear in
  * rsx_fp_collect_constants, the structural hash a byte at a time, four more
- * microcode walks: ~9% of the RSX thread in the city dock view -- and every
- * patched copy took another slot (why a bigger memo was slower). Now an entry
+ * microcode walks; the memo's misses were ~9% of the RSX thread in the city
+ * dock view -- and every patched copy took another slot. Now an entry
  * whose instruction blocks are unchanged takes the new constant values in
  * place (everything else the memo derives depends on the instruction blocks
  * alone) when no entry matches exactly, so a program has one entry however
- * its constants move, and the memo keeps 128 programs. (A first version kept
- * one entry per ADDRESS: the city puts several programs at one address in
- * turn, and re-analysing on every switch made it slower than before.) */
-#define ENG_FP_MEMO_MAX 128u
+ * its constants move. (Measured and dropped: one entry per ADDRESS -- the
+ * city puts several programs at one address in turn -- and a 128-entry memo,
+ * whose misses each cleared a cold 32 KB block: both slower than before.) */
+#define ENG_FP_MEMO_MAX 64u
 static int s_fp_kpatch = -1;
 static u8 s_fp_hint[256];                       /* (kpatch) key hash -> slot + 1 */
 static eng_fp_memo s_fp_memo[ENG_FP_MEMO_MAX];
@@ -3042,9 +3042,10 @@ static const eng_fp_memo* eng_fp_current(void)
         s_fp_kpatch = !(k && *k == '0');
         const char* e = getenv("PS3RECOMP_ENG_FP_MEMO");
         /* rsx3: 64 measured WORSE without kpatch (same-address programs with
-         * patched constants piled up and were all compared); with kpatch they
-         * share one entry per program. */
-        const long n = e ? strtol(e, NULL, 10) : (s_fp_kpatch ? (long)ENG_FP_MEMO_MAX : 8L);
+         * patched constants piled up and were all compared). rsx5: 128 with
+         * kpatch was worse too -- the misses stayed (new programs every frame)
+         * and each one cleared a cold 32 KB constant block -- so 8 either way. */
+        const long n = e ? strtol(e, NULL, 10) : 8L;
         s_fp_cap = n < 1 ? 1u : n > (long)ENG_FP_MEMO_MAX ? ENG_FP_MEMO_MAX : (u32)n;
         fprintf(stderr, "[rsx engine] fragment program memo: %u entries, constant refresh in place %s (PS3RECOMP_ENG_FP_KPATCH)\n",
                 s_fp_cap, s_fp_kpatch ? "on" : "off");
