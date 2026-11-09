@@ -612,9 +612,11 @@ void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
         if (d24 != 2) out->grid = base == 0x92 ? 2 : 1;
         if (d24 == 3 && (out->func == 1 || out->func == 4)) out->func = (u8)(out->func + 2);
     }
-    /* The soft filter: only lookups the game filters itself (its sun
-     * shadows), only with the exact compare (no D24 diagnostic mode). */
-    if (out->enabled == 1 && out->linear && !out->mode) out->soft = (u8)fp_shadow_soft();
+    /* The soft filter: every plain 2D compare lookup (filtered ones and
+     * point ones alike: a point lookup is one hard compare, where a wider
+     * filter gains most), only with the exact compare (no D24 diagnostic
+     * mode). */
+    if (out->enabled == 1 && !out->mode) out->soft = (u8)fp_shadow_soft();
 }
 
 u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
@@ -663,7 +665,7 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     }
     char tq0[32] = "", tq1[48] = "";
     if (d->grid) { snprintf(tq0, sizeof tq0, "floor(saturate("); snprintf(tq1, sizeof tq1, ") * %s + 0.5)", grid); }
-    if (d->linear || d->unnormalized) {
+    if (d->linear || d->unnormalized || d->soft) {
         snprintf(text, sizeof text, "    uint width, height; %s.GetDimensions(width, height);\n"
             "    float2 size = float2(width, height);\n", tex);
         out_puts(p, text);
@@ -679,7 +681,7 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     } else
         out_puts(p, d->unnormalized ? "    float2 uv = coordinate.xy / size;\n" :
                                          "    float2 uv = coordinate.xy;\n");
-    if (!d->linear) {
+    if (!d->linear && !(d->soft && !d->grid)) {
         snprintf(text, sizeof text,
             "    float depth = %s%s.SampleLevel(rsx_samp[%u], uv, 0.0).r%s;\n"
             "    return (float4)_rsx_shadow_cmp%u(reference, depth);\n}\n",

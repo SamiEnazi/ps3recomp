@@ -9,8 +9,8 @@
  *       bilinear PCF, as the PS3 shows it; 1/2/3 = a tent filter over 4x4 /
  *       6x6 / 8x8 shadow texels (4 / 9 / 16 gathers). inFAMOUS 2's sun
  *       shadows are one such lookup per pixel into a 1024x1024 cascade, so
- *       their edges are stair-stepped at 720p; the tent smooths them. Only
- *       lookups the game itself asked to be filtered (linear) change.
+ *       their edges are stair-stepped at 720p; the tent smooths them.
+ *       Filtered and point (one hard compare) lookups alike.
  *   PS3RECOMP_SSAO=0..2           ambient occlusion (rsx_vulkan_backend.c,
  *       vk_eng_ssao_pass; needs the GPU SSAO path, PS3RECOMP_ENG_GPU_SSAO):
  *       0 = the game's half-resolution AO (12 samples, bit-exact with the

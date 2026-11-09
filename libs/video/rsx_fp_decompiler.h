@@ -159,8 +159,8 @@ typedef struct rsx_fp_shadow_desc {
      * diagnostic variants (2 filter-then-compare, 3 ties pass, 4 bias). */
     u8 grid, mode;
     /* soft: 0 the RSX's 2x2 bilinear PCF; 1..3 a tent filter over 4x4 / 6x6 /
-     * 8x8 texels (PS3RECOMP_SOFT_SHADOWS, ps3_lightfx.h). Filtered (linear)
-     * lookups of mode 0 only. */
+     * 8x8 texels (PS3RECOMP_SOFT_SHADOWS, ps3_lightfx.h), for filtered and
+     * point lookups alike; mode 0 (no D24 diagnostic) only. */
     u8 soft;
 } rsx_fp_shadow_desc;
 void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
