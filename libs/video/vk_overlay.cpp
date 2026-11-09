@@ -81,6 +81,16 @@ int   vk_overlay_cheats_owns_key(const char* k);         /* its PS3_CHEAT_* line
 void  vk_overlay_cheats_write(FILE* f);
 void  vk_overlay_cheats_attach(void);                    /* the remembered cheats, at window open */
 int   vk_overlay_cheats_remember(void);
+/* [saves] the system's save-data list (vk_overlay_saves.cpp, include/ps3emu/ps3_savedlg.h): it
+ * takes the menu's window while up -- the same input hold, cursor and RSX-thread drawing */
+int   vk_overlay_saves_active(void);
+int   vk_overlay_saves_poll(void);                 /* 1: open the window for it, 2: close it */
+void  vk_overlay_saves_draw(float scale);
+void  vk_overlay_saves_pad(uint32_t buttons, int lx, int ly);
+void  vk_overlay_saves_back(void);                 /* Esc */
+void  vk_overlay_saves_attach(void);
+void  vk_overlay_saves_shutdown(void);
+extern volatile uint32_t g_pad_overlay_inject;   /* cellPad: scripted buttons while a system dialog holds the pad */
 extern volatile int      g_pad_overlay_open;   /* libs/input/cellPad.c */
 extern volatile int      g_pad_overlay_present; /* cellPad: a menu exists, Esc keeps the mouse capture for after it */
 extern volatile uint32_t g_pad_overlay_nav, g_pad_overlay_nav2, g_pad_overlay_raw;
@@ -401,6 +411,9 @@ static void update_active(void)
                            (s_open || s_hud || s_notice_until > now_s())) ? 1 : 0;
 }
 
+/* [saves] a system dialog can be drawn (vk_overlay_saves.cpp waits for the player) */
+extern "C" int vk_overlay_can_show(void) { return s_enabled && s_color_ok && !s_failed; }
+
 static void notice_for(const char* text, double secs)
 {
     if (!s_enabled || !text) return;
@@ -433,6 +446,7 @@ extern "C" int vk_overlay_menu_open(void) { return s_enabled && s_open; }
 static void set_open(int o)
 {
     if (!s_enabled || (o != 0) == (s_open != 0)) return;
+    if (!o && vk_overlay_saves_active()) return;   /* [saves] the save-data list closes itself */
     std::lock_guard<std::recursive_mutex> il(s_imgui_lock);
     s_open = o;
     g_pad_overlay_open = o;          /* cellPad: every port reads neutral while open */
@@ -563,7 +577,7 @@ extern "C" int vk_overlay_event(const void* ev)
         const SDL_Keycode k = e->key.keysym.sym;
         const bool press = e->type == SDL_KEYDOWN && !e->key.repeat;
         if (k == SDLK_F1) { if (press) { set_hud(!s_hud); if (!s_hud) vk_overlay_notice("Performance HUD off (F1 shows it)"); } return 1; }
-        if (k == SDLK_F2) { if (press) set_open(!s_open); return 1; }
+        if (k == SDLK_F2) { if (press && !vk_overlay_saves_active()) set_open(!s_open); return 1; }
         if (k == SDLK_F3) { if (press) lfx_compare_toggle(); return 1; }   /* [light] lighting A/B */
         if (k == SDLK_F11 || (k == SDLK_RETURN && (e->key.keysym.mod & KMOD_ALT))) {
             if (press) toggle_fullscreen();
@@ -571,7 +585,7 @@ extern "C" int vk_overlay_event(const void* ev)
         }
         if (!s_open) return 0;
         if (k == SDLK_ESCAPE) {
-            if (press) { if (s_quit_ask) s_quit_cancel = true; else set_open(0); }
+            if (press) { if (vk_overlay_saves_active()) vk_overlay_saves_back(); else if (s_quit_ask) s_quit_cancel = true; else set_open(0); }
             return 1;
         }
         ev_push(e);
@@ -595,6 +609,11 @@ extern "C" void vk_overlay_poll(void)
     if (!s_enabled) return;
     const double now = now_s();
     if (s_n_script) script_poll(now);
+    switch (vk_overlay_saves_poll()) {   /* [saves] the save-data list opens / closes the window */
+    case 1: set_open(1); if (s_open) g_pad_overlay_open = 2; break;   /* 2: scripted input goes to it (cellPad) */
+    case 2: set_open(0); break;
+    default: break;
+    }
     /* Hold L3+R3 for a second: port 0 as cellPad saw it before the menu's
      * neutral copy, or the two stick clicks on any controller (SDL buttons 7
      * and 8 in g_pad_overlay_raw, whatever they are bound to). cellPad keeps
@@ -857,7 +876,7 @@ static bool vk_backend_init(void)
     ii.Device = s_vk.device;
     ii.QueueFamily = s_vk.queue_family;
     ii.Queue = s_vk.queue;
-    ii.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE * 2;
+    ii.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE * 8;   /* [saves] + up to 32 save icons */
     ii.MinImageCount = 2;
     ii.ImageCount = 4;                 /* vertex buffers rotated: > frames in flight */
     ii.PipelineInfoMain.RenderPass = s_rp;
@@ -1548,6 +1567,7 @@ static void quit_confirm(void)
 
 static void draw_menu(double now)
 {
+    if (vk_overlay_saves_active()) { vk_overlay_saves_draw(S(1.0f)); return; }   /* [saves] */
     const ImGuiIO& io = ImGui::GetIO();
     /* the game dimmed behind the menu */
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 110));
@@ -1655,6 +1675,7 @@ static void feed_pad(ImGuiIO& io)
     uint16_t b = (uint16_t)nav;
     const uint32_t raw = g_pad_overlay_raw;
     for (const auto& r : kRaw) if (raw >> r.sdl & 1u) b |= r.pad;
+    b |= (uint16_t)g_pad_overlay_inject;   /* [saves] PAD_SCRIPT / PAD_FILE while a system dialog holds the pad */
     const int lx = (nav >> 16) & 255, ly = (nav >> 24) & 255, ry = (nav2 >> 8) & 255;
     io.AddKeyEvent(ImGuiKey_GamepadDpadUp,    (b & PAD_UP) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadDown,  (b & PAD_DOWN) != 0);
@@ -1677,6 +1698,7 @@ static void feed_pad(ImGuiIO& io)
     for (const auto& s : sticks) io.AddKeyAnalogEvent(s.k, s.v > 0.1f, s.v);
     const uint16_t pressed = b & (uint16_t)~prev;
     prev = b;
+    if (vk_overlay_saves_active()) { vk_overlay_saves_pad(b, lx, ly); return; }   /* [saves] */
     if (s_quit_ask) { if (pressed & PAD_CIRCLE) s_quit_cancel = true; return; }
     if (pressed & PAD_L1) s_tab_want = (s_tab + tab_count() - 1) % tab_count();
     if (pressed & PAD_R1) s_tab_want = (s_tab + 1) % tab_count();
@@ -1718,6 +1740,7 @@ extern "C" void vk_overlay_attach(const vk_overlay_attach_info* info)
     if (env_on("PS3RECOMP_OVERLAY_MENU_OPEN") || env_on("PS3_OVERLAY_FORCE_OPEN")) set_open(1);
     notice_for("F2: settings    F1: performance HUD", 6.0);
     vk_overlay_cheats_attach();      /* remembered cheats on again, and a notice naming them */
+    vk_overlay_saves_attach();       /* [saves] the save-data list dialog for cellSaveData */
     update_active();
     fprintf(stderr, "[overlay] in-game menu: F2 (or hold L3+R3); HUD %s (F1); fullscreen Alt+Enter / F11; settings %s\n",
             s_hud ? "on" : "off", s_ini_path[0] ? s_ini_path : "not saved (PS3_OVERLAY_INI empty)");
@@ -1871,4 +1894,5 @@ extern "C" void vk_overlay_shutdown(void)
     s_attached = false;
     g_vk_overlay_active = 0;
     g_pad_overlay_open = 0;
+    vk_overlay_saves_shutdown();     /* [saves] a waiting save/load backs out; its icons freed */
 }

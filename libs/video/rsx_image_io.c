@@ -50,6 +50,19 @@ int rsx_image_load_png(const char* path, unsigned char** rgba, unsigned* w, unsi
     return 1;
 }
 
+/* The same from PNG bytes in memory (the save-data list's icons, vk_overlay_saves.cpp). */
+int rsx_image_load_png_mem(const unsigned char* png, unsigned size, unsigned char** rgba,
+                           unsigned* w, unsigned* h)
+{
+    *rgba = NULL; *w = *h = 0;
+    if (!png || size < 8 || size > 0x7FFFFFFFu) return 0;
+    int x = 0, y = 0, n = 0;
+    stbi_uc* px = stbi_load_from_memory(png, (int)size, &x, &y, &n, 4);
+    if (!px || x <= 0 || y <= 0 || x > 16384 || y > 16384) { if (px) stbi_image_free(px); return 0; }
+    *rgba = px; *w = (unsigned)x; *h = (unsigned)y;
+    return 1;
+}
+
 int rsx_image_save_png(const char* path, const unsigned char* rgba, unsigned w, unsigned h,
                        unsigned row_bytes)
 {
