@@ -876,6 +876,8 @@ static uint64_t jr_fnv(uint64_t h, const void* p, size_t n)
     return h;
 }
 
+extern SPU_THREAD_LOCAL unsigned g_spu_native_ran;   /* spu_channels.c: calls a native rewrite took */
+
 /* The end-of-job context fields that must match. */
 typedef struct { const char* name; size_t off, size; uint32_t mask; int dispatch; } jr_field;
 #define JRF(f, m) { #f, offsetof(jr_state, f), sizeof(((jr_state*)0)->f), m, 0 }
@@ -917,8 +919,13 @@ static int jr_compare_end(const jr_file* f, spu_context* ctx, const uint8_t* rec
             return 0;
         }
     }
+    /* A native rewrite ran in this job (spu_native_entry): it leaves the volatile
+     * registers r2, r4..r79 as the SPU ABI allows (no caller reads them), so only the
+     * ABI-visible ones are compared -- the link, the stack pointer, r3, r80..r127. The
+     * job's outputs (DMA, channels, atomics) and the local store are compared in full. */
+    const int abi_only = g_spu_native_ran != 0;
     for (int r = 0; r < 128; r++)
-        if (memcmp(&ctx->gpr[r], &f->gpr1[r], 16)) {
+        if (!(abi_only && (r == 2 || (r >= 4 && r < 80))) && memcmp(&ctx->gpr[r], &f->gpr1[r], 16)) {
             int nr = 0; for (int q = 0; q < 128; q++) nr += memcmp(&ctx->gpr[q], &f->gpr1[q], 16) != 0;
             snprintf(why, wn, "end register r%d = %08X %08X %08X %08X, recording %08X %08X %08X %08X (%d registers differ)",
                      r, ctx->gpr[r]._u32[0], ctx->gpr[r]._u32[1], ctx->gpr[r]._u32[2], ctx->gpr[r]._u32[3],
@@ -958,6 +965,7 @@ static void jr_replay_entry(spu_context* ctx)
     t->done = 1;
 }
 
+static volatile long s_native_jobs = 0;   /* replayed jobs in which a native rewrite ran */
 static int s_break_get = 0;   /* PS3_JOBREPLAY_BREAK=get: corrupt one served GET byte (checker self-test) */
 
 /* A replay that runs away (a broken build looping) is stopped by the
@@ -977,7 +985,9 @@ static void jr_replay_one(const jr_file* f, jr_result* r, uint8_t* rec_ls, jr_sl
     t->f = f; t->cur[0] = t->cur[1] = 0; t->failed = 0; t->done = 0; t->why[0] = 0;
     AcquireSRWLockExclusive(&slot->lock); slot->ctx = ctx; slot->t0_ms = jr_ms_now(); ReleaseSRWLockExclusive(&slot->lock);
     const uint64_t q0 = jr_qpc();
+    g_spu_native_ran = 0;
     const int halted = spu_run_with_halt(jr_replay_entry, ctx);
+    if (g_spu_native_ran) __atomic_add_fetch(&s_native_jobs, 1, __ATOMIC_RELAXED);
     AcquireSRWLockExclusive(&slot->lock); slot->ctx = NULL; ReleaseSRWLockExclusive(&slot->lock);
     r->us = jr_ns(jr_qpc() - q0) / 1e3;
     t->active = 0; t->replaying = 0;
@@ -1189,6 +1199,9 @@ int spu_jobreplay_main(void)
         }
         fprintf(w, "TOTAL: %ld passed, %ld FAILED, %ld unreadable, %ld nondeterministic (repeat differs), %ld skipped\n",
                 np, nf, nbad, ndet, nskip);
+        if (s_native_jobs)
+            fprintf(w, "native rewrites ran in %ld replayed job(s) (end registers compared: r0 r1 r3 r80..r127)\n",
+                    s_native_jobs);
         for (int o = 0; o < JR_MAX_OVL; o++) {
             if (mod[o].first_fail < 0) continue;
             const jr_result* r = &js.res[mod[o].first_fail];

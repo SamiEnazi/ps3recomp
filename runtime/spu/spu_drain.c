@@ -77,6 +77,14 @@ static void spu_tlc_plain_init(void)
  * the diagnostics that watch every step (lockstep, the step/exit traces, the
  * PM flow trace) keep it off. */
 volatile int g_spu_direct = -1;
+/* SPU_CONST_BI_OK (spu_context.h): constant-target `bi` gotos in --const-bi lifts.
+ * PS3_SPU_CONST_BI=0 makes every one take the indirect branch again (no re-lift). */
+volatile int g_spu_const_bi = 1;
+__attribute__((constructor)) static void spu_const_bi_init(void)
+{
+    const char* e = getenv("PS3_SPU_CONST_BI");
+    if (e && e[0] == '0') g_spu_const_bi = 0;
+}
 static int spu_step_diag(void)
 {
     static int d = -1;

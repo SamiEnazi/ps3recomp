@@ -2174,6 +2174,50 @@ static int spu_image_is_reloc(int image_id)
     return image_id > 0 && image_id < 4096 && s_reloc_img[image_id];
 }
 
+/* Native rewrites of lifted functions (a title's game-derived C, kept out of the
+ * toolkit; the lift calls spu_native_entry at the head of each function its
+ * SPU_NATIVE_FILE names, spu_lifter.py). A registered function that returns
+ * nonzero has done the guest function's work -- the local store and every
+ * register a caller can see (r0, r1, r3 where it is a result, r80..r127) exactly
+ * as the lifted code leaves them -- and the lifted function returns as from its
+ * `bi $r0`. Zero = it declined and changed nothing: the lifted body runs.
+ * Registration happens from constructors, before any SPU runs.
+ * PS3_SPU_NATIVE=0: every rewrite declines (the lifted code everywhere).
+ * g_spu_native_ran counts, per thread, the calls a rewrite took (the job replay
+ * reads it: a rewrite leaves the volatile registers r2, r4..r79 as the SPU ABI
+ * allows, which no caller reads, so the replay compares the ABI-visible ones). */
+#define SPU_NATIVE_MAX 32
+static struct { int image_id; uint32_t addr; int (*fn)(spu_context*); } s_native[SPU_NATIVE_MAX];
+static int s_native_n, s_native_on = -1;
+SPU_THREAD_LOCAL unsigned g_spu_native_ran;
+int spu_native_register(int image_id, uint32_t addr, int (*fn)(spu_context*))
+{
+    if (s_native_n >= SPU_NATIVE_MAX || !fn) return -1;
+    s_native[s_native_n].image_id = image_id;
+    s_native[s_native_n].addr = addr;
+    s_native[s_native_n].fn = fn;
+    s_native_n++;
+    return 0;
+}
+int spu_native_entry(spu_context* ctx, uint32_t addr)
+{
+    if (__builtin_expect(s_native_on < 0, 0)) {
+        const char* e = getenv("PS3_SPU_NATIVE");
+        s_native_on = !(e && e[0] == '0');
+        fprintf(stderr, "[spu-native] %d native rewrite(s) registered, %s\n", s_native_n,
+                s_native_on ? "on" : "off (PS3_SPU_NATIVE=0)");
+    }
+    if (!s_native_on) return 0;
+    for (int i = 0; i < s_native_n; i++)
+        if (s_native[i].addr == addr &&
+            (s_native[i].image_id == ctx->resident_ovl || s_native[i].image_id == ctx->image_id)) {
+            const int r = s_native[i].fn(ctx);
+            if (r) g_spu_native_ran++;
+            return r;
+        }
+    return 0;
+}
+
 spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
 {
     /* Match the context's active image; image_id 0 (context or entry) matches
