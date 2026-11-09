@@ -853,6 +853,9 @@ static void vk_gprof_collect(void)
                 (double)s_gp.kcnt[best] / F, gp_kind[lab >> 28], ((lab >> 14) & 0x3FFFu) << 2, (lab & 0x3FFFu) << 2);
         s_gp.kcnt[best] = 0;
     }
+    /* [light] the per-interval sums too: a label slot reused after nk = 0 kept
+     * adding to the old window's ms (intervals summed to more than the total) */
+    for (u32 k = 0; k < s_gp.nk; k++) { s_gp.kms[k] = 0.0; s_gp.kcnt[k] = 0; }
     s_gp.nk = 0; s_gp.total_ms = 0; s_gp.batches = 0; s_gp.frames = 0; s_gp.dropped = 0;
     s_gp.t_print = now;
 }
