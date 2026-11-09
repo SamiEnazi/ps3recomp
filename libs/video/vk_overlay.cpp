@@ -987,8 +987,10 @@ static const char* const kPresentName[] = { "Vsync (FIFO)", "Low latency, no tea
                                             "Immediate (lowest latency, may tear)" };
 static const char* const kAA[] = { "off", "fxaa", "smaa" };
 static const char* const kAAName[] = { "Off", "FXAA (fast)", "SMAA (sharper)" };
-static const char* const kScale[] = { "1", "1.5", "2" };
-static const char* const kScaleName[] = { "1x  (1280x720, native)", "1.5x  (1920x1080)", "2x  (2560x1440)" };
+/* [res] PS3RECOMP_RENDER_SCALE (rsx_vulkan_backend.c's [res] block) */
+static const char* const kScale[] = { "1", "1.5", "2", "3" };
+static const char* const kScaleName[] = { "720p  (1280x720, the PS3's)", "1080p  (1920x1080)",
+                                          "1440p  (2560x1440, untested)", "4K  (3840x2160, untested)" };
 static const char* const kAniso[] = { "1", "2", "4", "8", "16" };
 static const char* const kAnisoName[] = { "Off (1x)", "2x", "4x", "8x", "16x" };
 static const char* const kUp[] = { "fsr", "cas", "bilinear" };   /* VK_POSTFX_UP_* order */
@@ -1029,9 +1031,12 @@ static void ui_load(void)
     s_ui.upscale = vk_postfx_upscale();
     { const char* e = getenv(kVar[V_DOF]); s_ui.dof = !(e && !strcmp(e, "0")); }
     { const char* e = getenv(kVar[V_EDGE_BLUR]); s_ui.edge_blur = !(e && !strcmp(e, "0")); }
-    { const char* e = getenv(kVar[V_RENDER_SCALE]);
-      const double v = e ? atof(e) : 1.0;
-      s_ui.scale = v >= 1.75 ? 2 : v >= 1.25 ? 1 : 0; }
+    { const char* e = getenv(kVar[V_RENDER_SCALE]);   /* [res] numbers or 720p/1080p/1440p/4k */
+      double v = e ? atof(e) : 1.0;
+      if (e && !SDL_strcasecmp(e, "1080p")) v = 1.5;
+      else if (e && !SDL_strcasecmp(e, "1440p")) v = 2.0;
+      else if (e && (!SDL_strcasecmp(e, "4k") || !SDL_strcasecmp(e, "2160p"))) v = 3.0;
+      s_ui.scale = v >= 2.5 ? 3 : v >= 1.75 ? 2 : v >= 1.25 ? 1 : 0; }
     { const int v = vk_postfx_aniso();
       s_ui.aniso = v >= 16 ? 4 : v >= 8 ? 3 : v >= 4 ? 2 : v >= 2 ? 1 : 0; }
     s_ui.volume = cellAudio_host_volume();
@@ -1127,7 +1132,9 @@ static void tab_display(void)
     section("Now");
     { SDL_Window* w = (SDL_Window*)s_vk.sdl_window;
       int ww = 0, wh = 0; if (w) SDL_GetWindowSize(w, &ww, &wh);
-      ImGui::Text("Window %d x %d, game image %u x %u", ww, wh, s_vk.render_width, s_vk.render_height); }
+      const float rs = vk_postfx_render_scale();   /* [res] the internal resolution in effect */
+      ImGui::Text("Window %d x %d, game image %u x %u", ww, wh,
+                  (unsigned)((float)s_vk.render_width * rs + 0.5f), (unsigned)((float)s_vk.render_height * rs + 0.5f)); }
 }
 
 static void tab_graphics(void)
@@ -1143,19 +1150,23 @@ static void tab_graphics(void)
     }
     live_mark(V_SHARPEN);
     ImGui::SetNextItemWidth(combo_w());
-    ImGui::BeginDisabled();   /* not on Vulkan yet (vk_postfx.c's work list) */
-    if (ImGui::Combo("Render scale", &s_ui.scale, kScaleName, 3)) apply_setting(V_RENDER_SCALE, kScale[s_ui.scale]);
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextColored(kGrey, "coming");
+    /* [res] internal resolution: the targets are made at start, so "restart" */
+    if (ImGui::Combo("Internal resolution", &s_ui.scale, kScaleName, 4)) apply_setting(V_RENDER_SCALE, kScale[s_ui.scale]);
+    live_mark(V_RENDER_SCALE);
+    { const float rs = vk_postfx_render_scale();
+      char b[320];
+      snprintf(b, sizeof b, "The game draws its 3D scene, effects and HUD at this size (now %ux%u); the window then "
+               "gets it scaled with FSR or shrunk. Each step costs GPU time: 1080p draws 2.25x the pixels of 720p.",
+               (unsigned)(1280.0f * rs + 0.5f), (unsigned)(720.0f * rs + 0.5f));
+      hint(b); }
     ImGui::SetNextItemWidth(combo_w());
     if (ImGui::Combo("Anisotropic filtering", &s_ui.aniso, kAnisoName, 5)) apply_setting(V_ANISO, kAniso[s_ui.aniso]);
     live_mark(V_ANISO);
     ImGui::SetNextItemWidth(combo_w());
-    if (ImGui::Combo("Upscaling (window larger than 1280x720)", &s_ui.upscale, kUpName, 3)) apply_setting(V_UPSCALE, kUp[s_ui.upscale]);
+    if (ImGui::Combo("Upscaling (window larger than the game image)", &s_ui.upscale, kUpName, 3)) apply_setting(V_UPSCALE, kUp[s_ui.upscale]);
     live_mark(V_UPSCALE);
     hint("\"live\" settings change at once; \"on restart\" ones are saved now and used the next time the "
-         "game starts. A higher render scale costs GPU time (see the HUD).");
+         "game starts. A higher internal resolution costs GPU time (see the HUD).");
 
     section("Game effects");
     if (ImGui::Checkbox("Depth of field", &s_ui.dof)) apply_setting(V_DOF, s_ui.dof ? "1" : "0");

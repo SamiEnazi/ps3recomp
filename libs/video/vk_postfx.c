@@ -34,8 +34,13 @@
  * an image is (re)made, which waits for the device first -- so a set is never
  * rewritten under a frame in flight. Per-frame values go in push constants.
  *
- * Internal resolution (PS3RECOMP_RENDER_SCALE) is NOT done here: the setting
- * is accepted and reported as 1. Rendering the game larger is the backend's
+ * Internal resolution (PS3RECOMP_RENDER_SCALE): parsed here (the setting, read
+ * at start), drawn by the backend (rsx_vulkan_backend.c, the [res] block, done
+ * 2026-11-09 along the survey below): the frame this module is handed is then
+ * that much larger than 1280x720. Same size as the window: AA and CAS at that
+ * size; larger than the window on both axes: AA, then an area downsample
+ * (PS_DOWN), then CAS at the window's size. The survey, as it was:
+ * Rendering the game larger is the backend's
  * business, as rsx_metal_backend.m's PS3_RES_SCALE does it; on Vulkan it needs,
  * in rsx_vulkan_backend.c (2026-11-08 survey):
  *   - vk_eng_obj: the guest's size AND the image's size (o->w/h is both today,
@@ -164,7 +169,13 @@ static int pfx_set_one(const char* name, const char* value, int from_env)
         if (m < 0) goto bad;
         vk_postfx_set_upscale(m);
     } else if (!strcmp(name, "PS3RECOMP_RENDER_SCALE")) {
-        if (pfx_parse_num(value, &d) || !(d >= 1.0 && d <= 4.0)) goto bad;
+        /* [res] the names Metal's PS3_RES_SCALE takes, too */
+        if (!strcmp(value, "720p") || !strcmp(value, "native")) d = 1.0;
+        else if (!strcmp(value, "1080p")) d = 1.5;
+        else if (!strcmp(value, "1440p")) d = 2.0;
+        else if (!strcmp(value, "4k") || !strcmp(value, "4K") || !strcmp(value, "2160p")) d = 3.0;
+        else if (pfx_parse_num(value, &d)) goto bad;
+        if (!(d >= 1.0 && d <= 4.0)) goto bad;
         vk_postfx_set_render_scale((float)d);
     } else {
         return -1;
@@ -190,7 +201,10 @@ static void pfx_env(void)
         const char* v = getenv(names[k]);
         if (v) pfx_set_one(names[k], v, 1);
     }
-    /* RENDER_SCALE is not registered: not live (see the work list above). */
+    /* [res] Metal's name for it, when the menu's is not set */
+    if (!getenv("PS3RECOMP_RENDER_SCALE") && getenv("PS3_RES_SCALE"))
+        pfx_set_one("PS3RECOMP_RENDER_SCALE", getenv("PS3_RES_SCALE"), 1);
+    /* RENDER_SCALE is not registered: not live (the targets are made at start). */
     ps3_setting_register("PS3RECOMP_AA", pfx_apply_aa);
     ps3_setting_register("PS3RECOMP_SHARPEN", pfx_apply_sharpen);
     ps3_setting_register("PS3RECOMP_ANISO", pfx_apply_aniso);
@@ -228,7 +242,16 @@ void vk_postfx_set_render_scale(float s)
     const int q = (int)floor(s * 4.0 + 0.5);
     PFX_STORE(s_set_scale, q < 4 ? 4 : q > 16 ? 16 : q);
 }
-float vk_postfx_render_scale(void) { pfx_env(); return 1.0f; }   /* not done on Vulkan yet */
+/* [res] the setting (the backend reads it once, at the engine's init) and the
+ * scale it then runs at: 1 until it says otherwise. */
+static int s_scale_active = 4;        /* quarter steps */
+float vk_postfx_render_scale(void) { pfx_env(); return (float)PFX_LOAD(s_scale_active) / 4.0f; }
+float vk_postfx_render_scale_wanted(void) { pfx_env(); return (float)PFX_LOAD(s_set_scale) / 4.0f; }
+void vk_postfx_render_scale_active(float s)
+{
+    const int q = (int)floor(s * 4.0 + 0.5);
+    PFX_STORE(s_scale_active, q < 4 ? 4 : q > 16 ? 16 : q);
+}
 void vk_postfx_set_upscale(int mode)
 {
     pfx_env();
@@ -250,9 +273,13 @@ typedef struct pfx_image {
     uint32_t       w, h;
 } pfx_image;
 
-enum { PS_SMAA_EDGE, PS_SMAA_WEIGHT, PS_SMAA_BLEND, PS_FXAA, PS_CAS, PS_CAS_SCALE, PS_EASU, PS_RCAS, PS_COUNT };
+enum { PS_SMAA_EDGE, PS_SMAA_WEIGHT, PS_SMAA_BLEND, PS_FXAA, PS_CAS, PS_CAS_SCALE, PS_EASU, PS_RCAS,
+       PS_DOWN,                            /* [res] the area downsample */
+       PS_COUNT };
 enum { VS_PLAIN, VS_SMAA_EDGE, VS_SMAA_WEIGHT, VS_SMAA_BLEND, VS_COUNT };
-enum { DS_EDGE, DS_WEIGHT, DS_BLEND, DS_FXAA, DS_CAS_SRC, DS_CAS_AA, DS_EASU_SRC, DS_EASU_AA, DS_RCAS, DS_COUNT };
+enum { DS_EDGE, DS_WEIGHT, DS_BLEND, DS_FXAA, DS_CAS_SRC, DS_CAS_AA, DS_EASU_SRC, DS_EASU_AA, DS_RCAS,
+       DS_DOWN_SRC, DS_DOWN_AA, DS_CAS_DOWN,   /* [res] */
+       DS_COUNT };
 #define PFX_QPAIRS 4u                      /* timestamp pairs: a ring, read 3 frames later */
 
 static struct {
@@ -279,6 +306,7 @@ static struct {
     /* the frame-sized targets and the window-sized CAS output */
     pfx_image        edges, weights, aa_out, out;
     pfx_image        up;                   /* FSR: EASU's output (window-sized), RCAS's input */
+    pfx_image        down;                 /* [res] the area downsample's output (window-sized), CAS's input */
     VkImageView      src_view;             /* what the DS_* sets that read the frame name */
     int              aa_disabled[3];       /* a mode whose pipelines failed: off, logged once */
     /* PS3RECOMP_POSTFX_PROF */
@@ -454,6 +482,28 @@ static const char kPfxRcasFS[] =
     "    o = vec4(c, 1.0);\n"
     "}\n";
 
+/* [res] A frame larger than the window (PS3RECOMP_RENDER_SCALE above the
+ * window's size): each output pixel the mean of n x n bilinear taps spread
+ * evenly over its footprint, n = ceil(source texels per output pixel) per
+ * axis -- at 2x and 3x exactly the box of texels it covers, at 1.5x a tent
+ * over ~2.5. rt = the output's metrics, p = (in_w, in_h, n_x, n_y). */
+static const char kPfxDownFS[] =
+    "#version 450\n" VK_PFX_PC
+    "layout(set = 0, binding = 0) uniform sampler2D srcTex;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() {\n"
+    "    vec2 k = pc.p.xy * pc.rt.xy;\n"
+    "    ivec2 n = ivec2(pc.p.zw);\n"
+    "    vec2 base = floor(gl_FragCoord.xy) * k;\n"
+    "    vec2 dk = k / vec2(n);\n"
+    "    vec2 inv = 1.0 / pc.p.xy;\n"
+    "    vec3 acc = vec3(0.0);\n"
+    "    for (int j = 0; j < n.y; j++)\n"
+    "        for (int i = 0; i < n.x; i++)\n"
+    "            acc += texture(srcTex, (base + (vec2(i, j) + 0.5) * dk) * inv).rgb;\n"
+    "    o = vec4(acc / float(n.x * n.y), 1.0);\n"
+    "}\n";
+
 /* Each pass: its vertex shader (an index into the VS table) and fragment parts. */
 static const char* const kPfxVS[VS_COUNT][3] = {
     [VS_PLAIN]       = { kPfxPlainVS, NULL, NULL },
@@ -470,6 +520,7 @@ static const struct { const char* what; int vs; const char* fs[5]; } kPfxPass[PS
     [PS_CAS_SCALE]   = { "CAS scaling",        VS_PLAIN,       { kPfxCasHead, kFfxAGLSL, kPfxCasMid, kFfxCasGLSL, kPfxCasScaleFS } },
     [PS_EASU]        = { "FSR EASU",           VS_PLAIN,       { kPfxFsrHead, kFsrAGLSL, kPfxEasuMid, kFsr1GLSL, kPfxEasuFS } },
     [PS_RCAS]        = { "FSR RCAS",           VS_PLAIN,       { kPfxFsrHead, kFsrAGLSL, kPfxRcasMid, kFsr1GLSL, kPfxRcasFS } },
+    [PS_DOWN]        = { "area downsample",    VS_PLAIN,       { kPfxDownFS } },   /* [res] */
 };
 /* ---- helpers ------------------------------------------------------------ */
 static int pfx_memtype(uint32_t bits, VkMemoryPropertyFlags want, uint32_t* out)
@@ -767,9 +818,9 @@ int vk_postfx_init(VkInstance inst, VkPhysicalDevice phys, VkDevice dev,
     P.ok = 1;
     {
         static const char* const aa_name[] = { "off", "FXAA 3.11", "SMAA 1x" };
-        PFX_LOG("AA %s, CAS sharpen %.2f, anisotropic %dx (device max %d)%s\n",
+        PFX_LOG("AA %s, CAS sharpen %.2f, anisotropic %dx (device max %d), render scale setting %.2fx\n",
                 aa_name[vk_postfx_aa()], (double)vk_postfx_sharpen(), vk_postfx_aniso(), s_dev_aniso,
-                PFX_LOAD(s_set_scale) != 4 ? "; PS3RECOMP_RENDER_SCALE is not done on Vulkan yet: 1x" : "");
+                (double)PFX_LOAD(s_set_scale) / 4.0);
     }
     return 0;
 }
@@ -788,6 +839,7 @@ void vk_postfx_shutdown(void)
     pfx_free_targets();
     pfx_image_destroy(&P.out);
     pfx_image_destroy(&P.up);
+    pfx_image_destroy(&P.down);                 /* [res] */
     pfx_image_destroy(&P.area);
     pfx_image_destroy(&P.search);
     if (P.staging)     qvkDestroyBuffer(P.dev, P.staging, NULL);
@@ -884,7 +936,24 @@ static int pfx_targets(VkCommandBuffer cmd, VkImageView src_view, uint32_t w, ui
     pfx_write_set(P.ds[DS_CAS_AA], P.aa_out.view, P.point, NULL, P.point, NULL, P.point);
     pfx_write_set(P.ds[DS_EASU_SRC], src_view, P.linear, NULL, P.linear, NULL, P.linear);
     pfx_write_set(P.ds[DS_EASU_AA], P.aa_out.view, P.linear, NULL, P.linear, NULL, P.linear);
+    pfx_write_set(P.ds[DS_DOWN_SRC], src_view, P.linear, NULL, P.linear, NULL, P.linear);      /* [res] */
+    pfx_write_set(P.ds[DS_DOWN_AA], P.aa_out.view, P.linear, NULL, P.linear, NULL, P.linear);
     P.src_view = src_view;
+    return 0;
+}
+
+/* [res] the downsample's window-sized output and the set CAS reads it through;
+ * remade (after the device is idle) when the window's size changes. */
+static int pfx_down_target(VkCommandBuffer cmd, uint32_t w, uint32_t h)
+{
+    if (P.down.img && P.down.w == w && P.down.h == h) return 0;
+    if (P.down.img) { qvkDeviceWaitIdle(P.dev); pfx_image_destroy(&P.down); }
+    if (pfx_image_make(&P.down, VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT, P.rp_rgba8))
+        return -1;
+    pfx_to_general(cmd, P.down.img);
+    pfx_write_set(P.ds[DS_CAS_DOWN], P.down.view, P.point, NULL, P.point, NULL, P.point);
     return 0;
 }
 
@@ -965,7 +1034,11 @@ int vk_postfx_apply(VkCommandBuffer cmd, VkImage src, VkImageView src_view, uint
     if (up == VK_POSTFX_UP_CAS && !pfx_pipeline(PS_CAS_SCALE))
         up = VK_POSTFX_UP_BILINEAR;
     const int cas = up == VK_POSTFX_UP_BILINEAR && sharp > 0.0f && pfx_pipeline(PS_CAS);
-    if (!aa && up == VK_POSTFX_UP_BILINEAR && !cas) return 0;
+    /* [res] a frame larger than the window on both axes (PS3RECOMP_RENDER_SCALE
+     * in a smaller window): the area downsample, then CAS at the window's size,
+     * instead of the blit's 2-tap bilinear shrink */
+    const int smaller = dst_w < w && dst_h < h && pfx_pipeline(PS_DOWN);
+    if (!aa && up == VK_POSTFX_UP_BILINEAR && !cas && !smaller) return 0;
 
     /* the AA pipelines: a mode that cannot build is off from now on */
     if (aa == VK_POSTFX_AA_SMAA &&
@@ -978,13 +1051,15 @@ int vk_postfx_apply(VkCommandBuffer cmd, VkImage src, VkImageView src_view, uint
         PFX_LOG("FXAA unavailable: AA off\n");
         P.aa_disabled[aa] = 1; aa = VK_POSTFX_AA_OFF;
     }
-    if (!aa && up == VK_POSTFX_UP_BILINEAR && !cas) return 0;
+    if (!aa && up == VK_POSTFX_UP_BILINEAR && !cas && !smaller) return 0;
     if (pfx_targets(cmd, src_view, w, h)) { P.ok = 0; PFX_LOG("targets failed: post passes off\n"); return 0; }
     const int rcas = up == VK_POSTFX_UP_FSR && sharp > 0.0f;
-    if (up != VK_POSTFX_UP_BILINEAR || cas) {
-        if (pfx_out_target(cmd, up != VK_POSTFX_UP_BILINEAR ? dst_w : w, up != VK_POSTFX_UP_BILINEAR ? dst_h : h, rcas))
+    if (up != VK_POSTFX_UP_BILINEAR || cas || smaller) {
+        const int win = up != VK_POSTFX_UP_BILINEAR || smaller;   /* [res] the output at the window's size */
+        if (pfx_out_target(cmd, win ? dst_w : w, win ? dst_h : h, rcas))
             return 0;
     }
+    if (smaller && cas && pfx_down_target(cmd, dst_w, dst_h)) return 0;   /* [res] */
 
     if (P.prof) {
         pfx_prof_collect();
@@ -1012,7 +1087,20 @@ int vk_postfx_apply(VkCommandBuffer cmd, VkImage src, VkImageView src_view, uint
     uint32_t ow = w, oh = h;
     const pfx_pc wc = { { 1.0f / (float)dst_w, 1.0f / (float)dst_h, (float)dst_w, (float)dst_h },
                         { sharp, (float)w, (float)h, 0.0f } };
-    if (up == VK_POSTFX_UP_FSR) {
+    if (smaller) {                              /* [res] area downsample, then CAS at the window's size */
+        uint32_t nx = (w + dst_w - 1u) / dst_w, ny = (h + dst_h - 1u) / dst_h;
+        if (nx > 8u) nx = 8u;
+        if (ny > 8u) ny = 8u;
+        const pfx_pc dc = { { 1.0f / (float)dst_w, 1.0f / (float)dst_h, (float)dst_w, (float)dst_h },
+                            { (float)w, (float)h, (float)nx, (float)ny } };
+        pfx_pass(cmd, PS_DOWN, P.rp_rgba8, cas ? &P.down : &P.out, P.ds[from_aa ? DS_DOWN_AA : DS_DOWN_SRC], &dc);
+        if (cas) {
+            const pfx_pc cp = { { 1.0f / (float)dst_w, 1.0f / (float)dst_h, (float)dst_w, (float)dst_h },
+                                { sharp, (float)dst_w, (float)dst_h, 0.0f } };
+            pfx_pass(cmd, PS_CAS, P.rp_rgba8, &P.out, P.ds[DS_CAS_DOWN], &cp);
+        }
+        cur = P.out.img; ow = dst_w; oh = dst_h;
+    } else if (up == VK_POSTFX_UP_FSR) {
         pfx_pass(cmd, PS_EASU, P.rp_rgba8, rcas ? &P.up : &P.out, P.ds[from_aa ? DS_EASU_AA : DS_EASU_SRC], &wc);
         if (rcas) {
             /* our 0..1 to RCAS's stops (0 = most, each +1 halves): 1 -> 0, 0.5 -> 1, 0.3 -> 1.4 */
