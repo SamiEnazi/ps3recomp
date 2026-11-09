@@ -189,6 +189,14 @@ void rsx_lim_frame(void);
 const char* rsx_lim_take_frame(char* buf, unsigned n);
 /* One summary line (also registered with atexit by the engine's init). */
 void rsx_lim_summary(FILE* f, const char* why);
+/* (rsx5, round 3) The same line into buf (no newline); returns its length. */
+int rsx_lim_format(char* buf, int size, const char* why);
+/* (rsx5, round 3) Where the engine's own log lines ([limits]) go when a backend
+ * set it: the Vulkan backend's background writer (PS3RECOMP_LOG_ASYNC), so a
+ * slow stderr -- a pipe whose reader is behind, a log on a busy disk -- never
+ * holds the RSX thread. NULL: written to stderr directly, as before. Each call
+ * is one whole line, '\n' included. */
+extern void (*g_rsx_log_hook)(const char* line, unsigned n);
 
 /* ---- the backend interface ---------------------------------------------- */
 

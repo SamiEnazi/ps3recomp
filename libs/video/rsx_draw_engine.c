@@ -364,6 +364,15 @@ rsx_lim g_rsx_lim[RSX_LIM_COUNT] = {
     [RSX_LIM_GCM_UPLOADS] = { "gcm_uploads" },     [RSX_LIM_GCM_TABLES] = { "gcm_tables" },
 };
 static volatile long s_lim_any;
+void (*g_rsx_log_hook)(const char* line, unsigned n);
+/* (rsx5, round 3) one whole line to the log hook, or to stderr as before */
+static void rsx_log_line(char* line, int len, int cap)
+{
+    if (len < 0) return;
+    if (len >= cap - 1) { len = cap - 2; line[len++] = '\n'; line[len] = 0; }   /* cut: keep the newline */
+    if (g_rsx_log_hook) g_rsx_log_hook(line, (unsigned)len);
+    else                fputs(line, stderr);
+}
 void rsx_lim_event(int id, int kind, const char* what)
 {
     if (id < 0 || id >= RSX_LIM_COUNT) return;
@@ -372,10 +381,13 @@ void rsx_lim_event(int id, int kind, const char* what)
     l->frame_ev++;
     s_lim_any = 1;
     /* nothing silent, nothing flooding: the 1st, 2nd, 3rd, then every power of two */
-    if (n <= 3u || (n & (n - 1u)) == 0u)
-        fprintf(stderr, "[limits] %s %s #%llu%s%s (use %llu, peak %llu, cap %llu)\n", l->name,
-                kind ? "evicted a live entry" : "FULL", n, what ? ": " : "", what ? what : "",
-                l->cur, l->peak, l->cap);
+    if (n <= 3u || (n & (n - 1u)) == 0u) {
+        char line[640];
+        const int k = snprintf(line, sizeof line, "[limits] %s %s #%llu%s%s (use %llu, peak %llu, cap %llu)\n",
+                               l->name, kind ? "evicted a live entry" : "FULL", n, what ? ": " : "",
+                               what ? what : "", l->cur, l->peak, l->cap);
+        rsx_log_line(line, k, (int)sizeof line);
+    }
 }
 const char* rsx_lim_take_frame(char* buf, unsigned n)
 {
@@ -394,22 +406,37 @@ const char* rsx_lim_take_frame(char* buf, unsigned n)
     }
     return buf;
 }
+int rsx_lim_format(char* line, int size, const char* why)
+{
+    if (!line || size < 128) return 0;
+    int p = 0;
+#define LIM_APPEND(...) do { if (p < size) { const int w_ = snprintf(line + p, (size_t)(size - p), __VA_ARGS__); \
+                                             if (w_ > 0) p += w_; } } while (0)
+    LIM_APPEND("[limits] %s:", why ? why : "summary");
+    for (int i = 0; i < RSX_LIM_COUNT && p < size - 64; i++) {
+        const rsx_lim* l = &g_rsx_lim[i];
+        if (!l->peak && !l->full && !l->evict) continue;
+        LIM_APPEND(" %s=%llu/", l->name, l->peak);
+        if (l->cap) LIM_APPEND("%llu", l->cap); else LIM_APPEND("-");
+        if (l->full)  LIM_APPEND("!%llu", l->full);
+        if (l->evict) LIM_APPEND("~%llu", l->evict);
+    }
+#undef LIM_APPEND
+    if (p > 0 && p < size)   /* (limits) the runtime's half: process + ps3_lim gauges */
+        p = ps3_limits_format(line, p, size);
+    if (p < 0) p = 0;
+    if (p >= size) p = size - 1;
+    line[p] = 0;
+    return p;
+}
 void rsx_lim_summary(FILE* f, const char* why)
 {
     if (!f) return;
-    char line[3072]; int p = snprintf(line, sizeof line, "[limits] %s:", why ? why : "summary");
-    for (int i = 0; i < RSX_LIM_COUNT && p > 0 && p < (int)sizeof line - 64; i++) {
-        const rsx_lim* l = &g_rsx_lim[i];
-        if (!l->peak && !l->full && !l->evict) continue;
-        p += snprintf(line + p, sizeof line - (size_t)p, " %s=%llu/", l->name, l->peak);
-        p += l->cap ? snprintf(line + p, sizeof line - (size_t)p, "%llu", l->cap)
-                    : snprintf(line + p, sizeof line - (size_t)p, "-");
-        if (l->full)  p += snprintf(line + p, sizeof line - (size_t)p, "!%llu", l->full);
-        if (l->evict) p += snprintf(line + p, sizeof line - (size_t)p, "~%llu", l->evict);
-    }
-    if (p > 0 && p < (int)sizeof line)   /* (limits) the runtime's half: process + ps3_lim gauges */
-        p = ps3_limits_format(line, p, (int)sizeof line);
-    fprintf(f, "%s\n", line);
+    char line[3072];
+    int p = rsx_lim_format(line, (int)sizeof line - 1, why);
+    line[p++] = '\n'; line[p] = 0;
+    if (f == stderr && g_rsx_log_hook) { g_rsx_log_hook(line, (unsigned)p); return; }   /* (rsx5) */
+    fputs(line, f);
     fflush(f);
 }
 static void eng_dsp_limit(int what, u32 n)

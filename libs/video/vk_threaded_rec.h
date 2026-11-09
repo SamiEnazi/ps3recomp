@@ -170,6 +170,11 @@ static void tq_wake_force(void)
     if (s_tq_sleep) { s_tq.n_wakes++; WakeByAddressSingle((PVOID)&s_tq_w); }
 }
 
+/* (rsx5, round 3) The producer's time waiting for the worker since the last
+ * HITCH line (tqw=): a worker stuck in the driver (a present, a destroy) shows
+ * here, on whatever RSX-thread call had to drain. */
+static unsigned long long s_tqw_ns;
+
 /* Make every recorded call reach the driver before returning. */
 static void vk_tq_sync(void)
 {
@@ -177,12 +182,14 @@ static void vk_tq_sync(void)
     const u64 w = __atomic_load_n(&s_tq_w, __ATOMIC_ACQUIRE);
     if (__atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) == w) return;
     s_tq.n_syncs++;
+    const u64 tw0 = ps3_ft_now();
     tq_ring();
     u32 spins = 0;
     while (__atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) != w) {
         _mm_pause();
         if (++spins > 20000u) { SwitchToThread(); spins = 0; tq_ring(); }
     }
+    s_tqw_ns += ps3_ft_now() - tw0;
     if (s_tq.err != VK_SUCCESS) {
         fprintf(stderr, "[RSX vulkan] threaded recording: op %u failed (VkResult %d)\n",
                 s_tq.err_op, (int)s_tq.err);
@@ -195,12 +202,14 @@ static void vk_tq_sync(void)
 static void vk_tq_present_wait(u64 seq)
 {
     if (!s_tq.running || __atomic_load_n(&s_tq_pres_done, __ATOMIC_ACQUIRE) >= seq) return;
+    const u64 tw0 = ps3_ft_now();
     tq_ring();
     u32 spins = 0;
     while (__atomic_load_n(&s_tq_pres_done, __ATOMIC_ACQUIRE) < seq) {
         _mm_pause();
         if (++spins > 20000u) { SwitchToThread(); spins = 0; tq_ring(); }
     }
+    s_tqw_ns += ps3_ft_now() - tw0;
 }
 
 /* Room for one record of `bytes` (header included); NULL: record it directly. */
@@ -215,8 +224,10 @@ static u8* tq_alloc(u32 op, u32 bytes, VkCommandBuffer cb)
     if (pos + fill + bytes - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) > TQ_RING_BYTES) {
         s_tq.n_full++;
         rsx_lim_event(RSX_LIM_VK_TQ_RING, 0, "recording ring full: the RSX thread waits for the recording worker");   /* (rsx5) */
+        const u64 tw0 = ps3_ft_now();
         tq_ring();
         while (pos + fill + bytes - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) > TQ_RING_BYTES) _mm_pause();
+        s_tqw_ns += ps3_ft_now() - tw0;
     }
     if (fill) {
         tq_hdr* f = (tq_hdr*)(s_tq.ring + off);
@@ -700,6 +711,7 @@ static void vk_tq_install(void) {}
 static void vk_tq_stop(void) {}
 static void vk_tq_sync(void) {}
 static struct { int on, running, direct; } s_tq;
+static unsigned long long s_tqw_ns;
 #define VK_TQ_NO_ASYNC_PRESENT 1
 #endif
 

@@ -160,6 +160,198 @@ static u32 s_gp_ops[8];
 #include "vk_threaded_rec.h"
 
 /* ---------------------------------------------------------------------------
+ * (rsx5, round 3) The background log writer: PS3RECOMP_LOG_ASYNC (default 1;
+ * 0 = every write on the calling thread, as before).
+ *
+ * The play log's once-a-second line (PS3RECOMP_PLAYLOG: on in every play
+ * session and every test) was written and flushed by the RSX thread inside
+ * the present. The logs live on S:, a busy 2 TB SMR hard disk, where that
+ * small write sometimes took 130-650 ms -- and the whole game stood still
+ * with it: every "present stall" of the 2026-11-09 soaks began exactly at a
+ * per-second line (the HITCH frame starts where the line was written). The
+ * engine's [limits] lines went to stderr, a pipe the test runner copies to
+ * the same disk. Now those threads only append to a buffer; this thread
+ * writes and flushes (and serves the game-side screenshots, vk_shot_*).
+ * Lines reach the file within ~50 ms; at exit everything queued is written.
+ * -------------------------------------------------------------------------*/
+#include <stdarg.h>
+enum { VK_AIO_ERR, VK_AIO_PL, VK_AIO_SINKS };
+typedef struct { char* buf; size_t n, cap; } vk_aio_q;
+static struct {
+    int on;                              /* 0 unread, -1 off (direct), 1 thread running, 2 stopped */
+    vk_aio_q q[VK_AIO_SINKS];            /* bytes waiting, per sink (under the lock) */
+    FILE* f[VK_AIO_SINKS];               /* stderr, the play log */
+    int flush_req, quit;
+    unsigned long long dropped;          /* refused: a sink more than 8 MB behind */
+    volatile unsigned long long max_ns;  /* longest write+flush since vk_aio_take_max */
+    void (*poll)(void);                  /* vk_shot_poll: on every wake, at least every 50 ms */
+#ifdef _WIN32
+    SRWLOCK lock; CONDITION_VARIABLE cv; HANDLE th;
+#else
+    pthread_mutex_t lock; pthread_cond_t cv; pthread_t th;
+#endif
+} s_aio;
+#ifdef _WIN32
+static void vk_aio_lock(void)   { AcquireSRWLockExclusive(&s_aio.lock); }
+static void vk_aio_unlock(void) { ReleaseSRWLockExclusive(&s_aio.lock); }
+static void vk_aio_signal(void) { WakeConditionVariable(&s_aio.cv); }
+static void vk_aio_sleep(u32 ms) { SleepConditionVariableSRW(&s_aio.cv, &s_aio.lock, ms ? ms : INFINITE, 0); }
+#else
+static void vk_aio_lock(void)   { pthread_mutex_lock(&s_aio.lock); }
+static void vk_aio_unlock(void) { pthread_mutex_unlock(&s_aio.lock); }
+static void vk_aio_signal(void) { pthread_cond_signal(&s_aio.cv); }
+static void vk_aio_sleep(u32 ms)
+{
+    if (!ms) { pthread_cond_wait(&s_aio.cv, &s_aio.lock); return; }
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += (long)(ms % 1000u) * 1000000L; ts.tv_sec += ms / 1000u + ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+    pthread_cond_timedwait(&s_aio.cv, &s_aio.lock, &ts);
+}
+#endif
+static int vk_aio_pending(void)
+{
+    for (int i = 0; i < VK_AIO_SINKS; i++) if (s_aio.q[i].n) return 1;
+    return 0;
+}
+/* the writes themselves (this thread, or the caller's when the thread is off) */
+static void vk_aio_put(int sink, const char* s, size_t n, int flush)
+{
+    FILE* f = s_aio.f[sink] ? s_aio.f[sink] : stderr;
+    const u64 t0 = ps3_ft_now();
+    if (n) fwrite(s, 1, n, f);
+    if (flush || sink == VK_AIO_ERR) fflush(f);
+    const u64 d = ps3_ft_now() - t0;
+    if (d > s_aio.max_ns) s_aio.max_ns = d;    /* a gauge: a lost race only loses a sample */
+}
+#ifdef _WIN32
+static DWORD WINAPI vk_aio_main(LPVOID unused)
+#else
+static void* vk_aio_main(void* unused)
+#endif
+{
+    (void)unused;
+    vk_aio_q mine[VK_AIO_SINKS];
+    memset(mine, 0, sizeof mine);
+    for (;;) {
+        vk_aio_lock();
+        if (!s_aio.quit && !s_aio.flush_req && !vk_aio_pending()) vk_aio_sleep(s_aio.poll ? 50u : 0u);
+        const int quit = s_aio.quit, flush = s_aio.flush_req;
+        s_aio.flush_req = 0;
+        for (int i = 0; i < VK_AIO_SINKS; i++) {   /* take the bytes, leave an empty buffer */
+            const vk_aio_q t = s_aio.q[i]; s_aio.q[i] = mine[i]; s_aio.q[i].n = 0; mine[i] = t;
+        }
+        vk_aio_unlock();
+        for (int i = 0; i < VK_AIO_SINKS; i++)
+            if (mine[i].n || (flush && i == VK_AIO_PL)) { vk_aio_put(i, mine[i].buf, mine[i].n, flush); mine[i].n = 0; }
+        if (s_aio.poll) s_aio.poll();
+        if (quit) break;
+    }
+    for (int i = 0; i < VK_AIO_SINKS; i++) free(mine[i].buf);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+/* at exit (and from the play log's own exit hook): everything queued is written */
+static void vk_aio_stop(void)
+{
+    if (s_aio.on != 1) return;
+    vk_aio_lock();
+    s_aio.on = 2;                         /* writers from now on write directly */
+    s_aio.quit = 1;
+    vk_aio_signal();
+    vk_aio_unlock();
+#ifdef _WIN32
+    WaitForSingleObject(s_aio.th, 5000);  /* a disk stuck longer than that: give up waiting */
+#else
+    pthread_join(s_aio.th, NULL);
+#endif
+    vk_aio_lock();
+    for (int i = 0; i < VK_AIO_SINKS; i++)
+        if (s_aio.q[i].n) { vk_aio_put(i, s_aio.q[i].buf, s_aio.q[i].n, 1); s_aio.q[i].n = 0; }
+    vk_aio_unlock();
+    if (s_aio.f[VK_AIO_PL]) fflush(s_aio.f[VK_AIO_PL]);
+    if (s_aio.dropped) fprintf(stderr, "[RSX vulkan] log writer: %llu bytes dropped (the disk was too slow)\n",
+                               s_aio.dropped);
+}
+static int vk_aio_start(void)
+{
+    static volatile int starting;
+    int on = __atomic_load_n(&s_aio.on, __ATOMIC_ACQUIRE);
+    if (on) return on == 1;
+    if (__atomic_exchange_n(&starting, 1, __ATOMIC_ACQ_REL)) {   /* another thread starts it */
+#ifdef _WIN32
+        while (!(on = __atomic_load_n(&s_aio.on, __ATOMIC_ACQUIRE))) SwitchToThread();
+#else
+        while (!(on = __atomic_load_n(&s_aio.on, __ATOMIC_ACQUIRE))) sched_yield();
+#endif
+        return on == 1;
+    }
+    const char* e = getenv("PS3RECOMP_LOG_ASYNC");
+    if (e && e[0] == '0') { __atomic_store_n(&s_aio.on, -1, __ATOMIC_RELEASE); return 0; }
+    s_aio.f[VK_AIO_ERR] = stderr;
+#ifdef _WIN32
+    InitializeSRWLock(&s_aio.lock);
+    InitializeConditionVariable(&s_aio.cv);
+    s_aio.th = CreateThread(NULL, 0, vk_aio_main, NULL, 0, NULL);
+    if (!s_aio.th) { __atomic_store_n(&s_aio.on, -1, __ATOMIC_RELEASE); return 0; }
+    SetThreadPriority(s_aio.th, THREAD_PRIORITY_BELOW_NORMAL);
+#else
+    pthread_mutex_init(&s_aio.lock, NULL);
+    pthread_cond_init(&s_aio.cv, NULL);
+    if (pthread_create(&s_aio.th, NULL, vk_aio_main, NULL) != 0) { __atomic_store_n(&s_aio.on, -1, __ATOMIC_RELEASE); return 0; }
+#endif
+    atexit(vk_aio_stop);
+    __atomic_store_n(&s_aio.on, 1, __ATOMIC_RELEASE);
+    return 1;
+}
+/* Append `n` bytes for `sink`; wake = write them now (else at the next wake,
+ * <= 50 ms with screenshots on, or the next line that wakes). Thread-safe. */
+static void vk_aio_write(int sink, const char* s, size_t n, int wake)
+{
+    if (!n && !wake) return;
+    if (!s_aio.on) vk_aio_start();
+    if (s_aio.on == 1) {
+        vk_aio_lock();
+        if (s_aio.on == 1) {
+            vk_aio_q* q = &s_aio.q[sink];
+            if (q->n + n > (8u << 20)) { s_aio.dropped += n; n = 0; }
+            if (n && q->n + n > q->cap) {
+                size_t c = q->cap ? q->cap : 65536u;
+                while (c < q->n + n) c *= 2u;
+                char* b = (char*)realloc(q->buf, c);
+                if (b) { q->buf = b; q->cap = c; } else { s_aio.dropped += n; n = 0; }
+            }
+            if (n) { memcpy(q->buf + q->n, s, n); q->n += n; }
+            if (wake) { if (sink == VK_AIO_PL) s_aio.flush_req = 1; vk_aio_signal(); }
+            vk_aio_unlock();
+            return;
+        }
+        vk_aio_unlock();
+    }
+    vk_aio_put(sink, s, n, wake);         /* off, or stopped: as before */
+}
+static void vk_aio_printf(int sink, const char* fmt, ...)
+{
+    char line[1024];
+    va_list ap; va_start(ap, fmt);
+    int k = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (k < 0) return;
+    if (k >= (int)sizeof line) k = (int)sizeof line - 1;
+    vk_aio_write(sink, line, (size_t)k, 1);
+}
+static void vk_aio_log_hook(const char* line, unsigned n) { vk_aio_write(VK_AIO_ERR, line, n, 1); }
+static unsigned long long vk_aio_take_max(void)
+{
+    const unsigned long long m = s_aio.max_ns;
+    s_aio.max_ns = 0;
+    return m;
+}
+
+/* ---------------------------------------------------------------------------
  * Backend state
  * -------------------------------------------------------------------------*/
 typedef struct vk_vertex {
@@ -3326,6 +3518,288 @@ static void vk_window_open(const char* title)
  * swapchain is rebuilt as soon as the window has an area again. */
 static int s_sc_minimized;
 #define VK_SC_NO_AREA 1
+
+/* ---- (rsx5, round 3) hitch causes around the present -----------------------
+ * The swapchain acquire and present are timed on whichever thread makes them
+ * (the recording worker with PS3RECOMP_VK_PRESENT_ASYNC): the longest of each
+ * since the last HITCH line (acq= / qp=), and a [present] line for a call over
+ * 50 ms. The acquire used to wait for ever (UINT64_MAX); PS3RECOMP_VK_ACQUIRE_MS
+ * (default 100, 0 = for ever as before) bounds it -- past it the frame is
+ * submitted without being shown, as a minimized window's are. */
+static struct { volatile unsigned long long acq_max, qp_max; u32 n_slow, n_skip; } s_pt;
+static const char* vk_disp_name(void);
+static void vk_pt_note(int present, u64 ns)
+{
+    volatile unsigned long long* m = present ? &s_pt.qp_max : &s_pt.acq_max;
+    if (ns > *m) *m = ns;                    /* a gauge: a lost race only loses a sample */
+    if (ns > 50000000ull) {
+        const u32 n = __atomic_add_fetch(&s_pt.n_slow, 1u, __ATOMIC_RELAXED);
+        if (n <= 10u || (n & (n - 1u)) == 0u)
+            vk_aio_printf(VK_AIO_ERR, "[RSX vulkan] [present] %s took %.1f ms (#%u over 50 ms; display %s)\n",
+                          present ? "vkQueuePresentKHR" : "vkAcquireNextImageKHR", ns / 1e6, n, vk_disp_name());
+    }
+}
+static u64 vk_acquire_timeout(void)
+{
+    static u64 t;
+    if (!t) {
+        const char* e = getenv("PS3RECOMP_VK_ACQUIRE_MS");
+        const long v = (e && *e) ? atol(e) : 100;
+        t = v <= 0 ? UINT64_MAX : (u64)v * 1000000ull;
+    }
+    return t;
+}
+/* an acquire that timed out: this frame is not shown */
+static void vk_pt_skip(VkResult r)
+{
+    const u32 n = __atomic_add_fetch(&s_pt.n_skip, 1u, __ATOMIC_RELAXED);
+    if (n <= 3u || (n & (n - 1u)) == 0u)
+        vk_aio_printf(VK_AIO_ERR, "[RSX vulkan] [present] no swapchain image within %llu ms (VkResult %d, #%u;"
+                      " display %s): the frame is not shown (PS3RECOMP_VK_ACQUIRE_MS)\n",
+                      (unsigned long long)(vk_acquire_timeout() / 1000000ull), (int)r, n, vk_disp_name());
+}
+
+/* The display's power state (GUID_CONSOLE_DISPLAY_STATE): [display] lines, a
+ * DISPLAY line in the play log at each change and disp= on HITCH lines -- so a
+ * night test can say whether its hitches came with the screen asleep.
+ * PS3RECOMP_DISPLAY_WATCH=0: not watched. */
+#ifdef _WIN32
+static volatile LONG s_disp = -1, s_disp_changed;
+static volatile ULONGLONG s_disp_off_ms;          /* GetTickCount64 when it went off */
+static const char* vk_disp_name(void)
+{
+    const LONG d = s_disp;
+    return d == 0 ? "off" : d == 1 ? "on" : d == 2 ? "dimmed" : "unknown";
+}
+static ULONG CALLBACK vk_disp_cb(PVOID ctx, ULONG type, PVOID setting)
+{
+    (void)ctx;
+    if (type != PBT_POWERSETTINGCHANGE || !setting) return 0;
+    const unsigned char* p = (const unsigned char*)setting;   /* POWERBROADCAST_SETTING: GUID, DWORD size, data */
+    DWORD len = 0, v = 0;
+    memcpy(&len, p + 16, 4);
+    if (len < 4) return 0;
+    memcpy(&v, p + 20, 4);
+    if (InterlockedExchange(&s_disp, (LONG)v) != (LONG)v) {
+        if (v == 0) s_disp_off_ms = GetTickCount64();
+        InterlockedExchange(&s_disp_changed, 1);
+        vk_aio_printf(VK_AIO_ERR, "[RSX vulkan] [display] %s\n", vk_disp_name());
+    }
+    return 0;
+}
+static void vk_disp_watch(void)
+{
+    const char* e = getenv("PS3RECOMP_DISPLAY_WATCH");
+    if (e && e[0] == '0') return;
+    HMODULE m = LoadLibraryA("powrprof.dll");
+    typedef DWORD (WINAPI* reg_fn)(const GUID*, DWORD, HANDLE, void**);
+    reg_fn reg = m ? (reg_fn)(void*)GetProcAddress(m, "PowerSettingRegisterNotification") : NULL;
+    if (!reg) return;
+    /* DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS: the callback (fired once now, then on each change) */
+    static struct { ULONG (CALLBACK* cb)(PVOID, ULONG, PVOID); PVOID ctx; } params = { vk_disp_cb, NULL };
+    static const GUID display_state = { 0x6FE69556, 0x704A, 0x47A0, { 0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47 } };
+    void* h = NULL;
+    if (reg(&display_state, 2u /* DEVICE_NOTIFY_CALLBACK */, (HANDLE)&params, &h) != ERROR_SUCCESS)
+        VK_LOG("display state not watched (PowerSettingRegisterNotification failed)\n");
+}
+#else
+static const char* vk_disp_name(void) { return "unknown"; }
+static void vk_disp_watch(void) {}
+#endif
+/* With the display off (for 2 s: not a flicker), a frame is not presented. The
+ * night tests of 2026-11-10 (display asleep) caught vkQueuePresentKHR itself
+ * blocking 250-500 ms, and the RSX thread's texture creates waiting on the same
+ * driver lock meanwhile -- the "0.0 MB re-uploads that took 450 ms". Nobody can
+ * see the frame; it is still drawn, post-processed and submitted, only the
+ * swapchain is not fed, and presents resume with the first frame after the
+ * display comes back on. PS3RECOMP_VK_PRESENT_DARK=1: present anyway, as before. */
+static int vk_display_dark(void)
+{
+#ifdef _WIN32
+    static int keep = -1;
+    if (keep < 0) { const char* e = getenv("PS3RECOMP_VK_PRESENT_DARK"); keep = (e && e[0] == '1') ? 1 : 0; }
+    if (keep || s_disp != 0) return 0;
+    return GetTickCount64() - s_disp_off_ms >= 2000u;
+#else
+    return 0;
+#endif
+}
+static void vk_dark_note(int dark)
+{
+    static int was;
+    if (dark == was) return;
+    was = dark;
+    vk_aio_printf(VK_AIO_ERR, dark ? "[RSX vulkan] [present] the display is off: frames are drawn but not presented"
+                                     " (PS3RECOMP_VK_PRESENT_DARK=1 presents anyway)\n"
+                                   : "[RSX vulkan] [present] the display is on: presenting again\n");
+}
+
+/* The RSX thread's longest single backend call of the frame among the ones that
+ * can block in the driver (texture create/upload/release, a completed batch's
+ * frees): slow=<what>:<ms> on the HITCH line. Its log writes: io=. */
+static struct { const char* what; u64 ns; } s_slow;
+static u64 s_io_ns;
+static void vk_slow_note(const char* what, u64 t0)
+{
+    const u64 d = ps3_ft_now() - t0;
+    if (d > s_slow.ns) { s_slow.ns = d; s_slow.what = what; }
+}
+
+/* ---- Screenshots from the game's own image: PS3RECOMP_SHOT_REQ=<file> ------
+ * A window capture (PrintWindow, tools/window_shot.ps1) comes back black while
+ * the display sleeps: a night test's waitimg timed out and every picture check
+ * flagged -- and hammering a sleeping display with captures stalled the game.
+ * Here a test writes the PNG path it wants into <file>; the log writer (vk_aio,
+ * every 50 ms) takes the request; the next present copies the image the window
+ * gets -- the swapchain image after the blit and the overlay, what PrintWindow
+ * returned; the display image when there is no swapchain -- into a host buffer;
+ * once that frame's fence has passed the log writer encodes the PNG and renames
+ * it into place. <file>.ready (made at start) says this game serves requests. */
+enum { SHOT_IDLE, SHOT_REQ, SHOT_ARMED, SHOT_RECORDED, SHOT_READY };
+static struct {
+    char req[600], out[600];
+    volatile int state;
+    vk_buffer buf;
+    VkFence fence;
+    u32 w, h;
+    int bgra, disp_bgra, sc_bgra, can_read_sc;
+    unsigned long long n;
+} s_shot;
+/* the log writer's side: take a request, encode a finished copy */
+static void vk_shot_poll(void)
+{
+    const int st = __atomic_load_n(&s_shot.state, __ATOMIC_ACQUIRE);
+    if (st == SHOT_READY) {
+        const u32 w = s_shot.w, h = s_shot.h;
+        const unsigned char* src = (const unsigned char*)s_shot.buf.ptr;
+        unsigned char* px = (unsigned char*)malloc((size_t)w * h * 4u);
+        int ok = 0;
+        if (px && src) {
+            for (size_t i = 0, n = (size_t)w * h; i < n; i++) {
+                const unsigned char* s = src + i * 4u;
+                unsigned char* d = px + i * 4u;
+                d[0] = s_shot.bgra ? s[2] : s[0]; d[1] = s[1]; d[2] = s_shot.bgra ? s[0] : s[2]; d[3] = 255;
+            }
+            char tmp[620];
+            snprintf(tmp, sizeof tmp, "%s.tmp", s_shot.out);
+            remove(tmp);
+            ok = rsx_image_save_png(tmp, px, w, h, w * 4u);
+#ifdef _WIN32
+            if (ok) ok = MoveFileExA(tmp, s_shot.out, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+            if (ok) ok = rename(tmp, s_shot.out) == 0;
+#endif
+        }
+        free(px);
+        s_shot.n++;
+        vk_aio_printf(VK_AIO_ERR, "[RSX vulkan] [shot] %s %ux%u%s\n", s_shot.out, w, h, ok ? "" : " FAILED");
+        __atomic_store_n(&s_shot.state, SHOT_IDLE, __ATOMIC_RELEASE);
+        return;
+    }
+    if (st != SHOT_IDLE) return;
+    FILE* f = fopen(s_shot.req, "rb");
+    if (!f) return;
+    char path[600];
+    size_t n = fread(path, 1, sizeof path - 1, f);
+    fclose(f);
+    remove(s_shot.req);
+    path[n] = 0;
+    char* p = path;
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;   /* a BOM */
+    size_t k = strlen(p);
+    while (k && (p[k - 1] == '\r' || p[k - 1] == '\n' || p[k - 1] == ' ' || p[k - 1] == '\t')) p[--k] = 0;
+    if (!k) return;
+    memcpy(s_shot.out, p, k + 1);
+    __atomic_store_n(&s_shot.state, SHOT_REQ, __ATOMIC_RELEASE);
+}
+/* The RSX thread, before the present: a buffer for a new request */
+static void vk_destroy_buffer(vk_buffer* b);
+static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageFlags usage);
+static void vk_shot_arm(void)
+{
+    if (__atomic_load_n(&s_shot.state, __ATOMIC_ACQUIRE) != SHOT_REQ) return;
+    const vk_image* di = vk_disp_img();
+    const VkDeviceSize sc_px = (VkDeviceSize)s_vk.sc_extent.width * s_vk.sc_extent.height;
+    const VkDeviceSize di_px = (VkDeviceSize)vk_disp_w() * vk_disp_h();
+    const VkDeviceSize need = (sc_px > di_px ? sc_px : di_px) * 4u;
+    s_shot.disp_bgra = di->fmt == VK_FORMAT_B8G8R8A8_UNORM || di->fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    if (s_shot.buf.size < need) {
+        if (s_shot.buf.buf) { vk_tq_sync(); vk_destroy_buffer(&s_shot.buf); }   /* nothing records into it now */
+        if (vk_create_host_buffer(&s_shot.buf, need, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+            VK_LOG("[shot] no %llu KB host buffer: the request is dropped\n", (unsigned long long)(need >> 10));
+            __atomic_store_n(&s_shot.state, SHOT_IDLE, __ATOMIC_RELEASE);
+            return;
+        }
+    }
+    __atomic_store_n(&s_shot.state, SHOT_ARMED, __ATOMIC_RELEASE);
+}
+/* The presenting thread, in the frame's command buffer: copy `img` (in layout
+ * `now`, left in it) when a request is armed. */
+static void vk_shot_record(VkCommandBuffer cmd, VkImage img, VkImageLayout now, u32 w, u32 h, int bgra,
+                           VkFence fence)
+{
+    if (__atomic_load_n(&s_shot.state, __ATOMIC_ACQUIRE) != SHOT_ARMED) return;
+    if (!img || !w || !h || (VkDeviceSize)w * h * 4u > s_shot.buf.size) return;   /* stays armed */
+    const VkImageLayout rd = now == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL
+                                                            : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkImageMemoryBarrier b = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = now, .newLayout = rd,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    pvkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          0, 0, NULL, 0, NULL, 1, &b);
+    VkBufferImageCopy region = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { w, h, 1 },
+    };
+    pvkCmdCopyImageToBuffer(cmd, img, rd, s_shot.buf.buf, 1, &region);
+    VkBufferMemoryBarrier hb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = s_shot.buf.buf, .offset = 0, .size = VK_WHOLE_SIZE,
+    };
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT; b.dstAccessMask = 0;
+    b.oldLayout = rd; b.newLayout = now;
+    pvkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                          0, 0, NULL, 1, &hb, 1, &b);
+    s_shot.w = w; s_shot.h = h; s_shot.bgra = bgra; s_shot.fence = fence;
+    __atomic_store_n(&s_shot.state, SHOT_RECORDED, __ATOMIC_RELEASE);
+}
+/* The RSX thread, after waiting for `fence`: the copy is in the buffer */
+static void vk_invalidate(vk_buffer* b);
+static void vk_shot_fence_done(VkFence fence)
+{
+    if (__atomic_load_n(&s_shot.state, __ATOMIC_ACQUIRE) != SHOT_RECORDED || s_shot.fence != fence) return;
+    vk_invalidate(&s_shot.buf);
+    __atomic_store_n(&s_shot.state, SHOT_READY, __ATOMIC_RELEASE);
+    vk_aio_write(VK_AIO_ERR, "", 0, 1);       /* wake the writer: it encodes */
+}
+/* Backend init: the request file, its .ready marker, the writer's poll */
+static void vk_shot_init(void)
+{
+    const char* e = getenv("PS3RECOMP_SHOT_REQ");
+    if (!e || !*e || strlen(e) >= sizeof s_shot.req - 8) return;
+    snprintf(s_shot.req, sizeof s_shot.req, "%s", e);
+    s_aio.poll = vk_shot_poll;               /* the writer then sleeps 50 ms at most */
+    if (!vk_aio_start()) {
+        s_aio.poll = NULL; s_shot.req[0] = 0;
+        VK_LOG("[shot] PS3RECOMP_SHOT_REQ needs the log writer (PS3RECOMP_LOG_ASYNC=0): no game-side shots\n");
+        return;
+    }
+    vk_aio_write(VK_AIO_ERR, "", 0, 1);      /* a writer already asleep: wake it into the 50 ms rhythm */
+    char ready[620];
+    snprintf(ready, sizeof ready, "%s.ready", s_shot.req);
+    FILE* f = fopen(ready, "wb");
+    if (f) { fputs("1\n", f); fclose(f); }
+    VK_LOG("[shot] game-side screenshots: requests in %s\n", s_shot.req);
+}
+
 static int vk_create_swapchain(void)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -3414,7 +3888,9 @@ static int vk_create_swapchain(void)
         .imageFormat = fmt.format, .imageColorSpace = fmt.colorSpace,
         .imageExtent = ext, .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |   /* [overlay] it draws into them: */
-                      (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT),
+                      (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                      /* (rsx5) game-side screenshots (tests only) read them back */
+                      (s_shot.req[0] ? (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) : 0u),
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = caps.currentTransform, .compositeAlpha = alpha,
         .presentMode = mode,
@@ -3428,6 +3904,8 @@ static int vk_create_swapchain(void)
     s_vk.swapchain = VK_NULL_HANDLE;
     if (r != VK_SUCCESS) { VK_LOG("vkCreateSwapchainKHR failed (VkResult %d)\n", (int)r); return -1; }
     s_vk.swapchain = sc;
+    s_shot.can_read_sc = (sci.imageUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;   /* (rsx5) */
+    s_shot.sc_bgra = fmt.format == VK_FORMAT_B8G8R8A8_UNORM || fmt.format == VK_FORMAT_B8G8R8A8_SRGB;
 
     u32 n = 0;
     VK_CHECK(pvkGetSwapchainImagesKHR(s_vk.device, sc, &n, NULL), "vkGetSwapchainImagesKHR");
@@ -3670,9 +4148,15 @@ static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore ac
         sc = s_vk.windowed && s_vk.swapchain && !s_sc_minimized;
     }
     u32 idx = 0;
+    const int dark = sc && vk_display_dark();   /* (rsx5) the display is off: not presented */
+    vk_dark_note(dark);
+    if (dark) sc = 0;
     if (sc) {
-        const VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX, acq, VK_NULL_HANDLE, &idx);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); sc = 0; }
+        const u64 ta = ps3_ft_now();         /* (rsx5) timed and bounded (vk_acquire_timeout) */
+        const VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, vk_acquire_timeout(), acq, VK_NULL_HANDLE, &idx);
+        vk_pt_note(0, ps3_ft_now() - ta);
+        if (r == VK_TIMEOUT || r == VK_NOT_READY) { vk_pt_skip(r); sc = 0; }
+        else if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); sc = 0; }
         else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); sc = 0; }
     }
     if (sc) {
@@ -3711,6 +4195,23 @@ static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore ac
         if (!ov)
             pvkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                   0, 0, NULL, 0, NULL, 1, &b);
+        /* (rsx5) a test's screenshot: what the window gets */
+        if (s_shot.can_read_sc)
+            vk_shot_record(cmd, s_vk.sc_images[idx], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                           s_vk.sc_extent.width, s_vk.sc_extent.height, s_shot.sc_bgra, fence);
+        else
+            vk_shot_record(cmd, cimg, VK_IMAGE_LAYOUT_GENERAL, cw, ch, s_shot.disp_bgra, fence);
+    } else if (dark) {
+        /* (rsx5) the same post-processing as a shown frame; a shot reads its output */
+        VkImage pf_img = cimg;
+        uint32_t pf_w = cw, pf_h = ch;
+        if (vk_postfx_apply(cmd, cimg, cview, cw, ch, s_vk.sc_extent.width, s_vk.sc_extent.height,
+                            &pf_img, &pf_w, &pf_h) && pf_img != cimg)
+            vk_shot_record(cmd, pf_img, VK_IMAGE_LAYOUT_GENERAL, pf_w, pf_h, 0, fence);   /* postfx: RGBA8 */
+        else
+            vk_shot_record(cmd, cimg, VK_IMAGE_LAYOUT_GENERAL, cw, ch, s_shot.disp_bgra, fence);
+    } else {
+        vk_shot_record(cmd, cimg, VK_IMAGE_LAYOUT_GENERAL, cw, ch, s_shot.disp_bgra, fence);   /* (rsx5) not shown */
     }
     /* Not shown (no swapchain, minimized, acquire failed): the frame is still
      * submitted -- its targets are read by later frames. */
@@ -3735,7 +4236,9 @@ static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore ac
         .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
+    const u64 tp = ps3_ft_now();             /* (rsx5) */
     const VkResult r = pvkQueuePresentKHR(s_vk.queue, &pi);
+    vk_pt_note(1, ps3_ft_now() - tp);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
 }
@@ -3786,6 +4289,12 @@ static void vk_present_window(void)
 #ifndef VK_TQ_NO_ASYNC_PRESENT
     if (vk_present_async_ok()) { vk_present_async(); return; }
 #endif
+    if (vk_display_dark()) {                    /* (rsx5) as minimized: submitted, paced, not shown */
+        vk_dark_note(1);
+        vk_batch_flush();
+        vk_frame_limit();
+        return;
+    }
     vk_tq_sync();
     const int was = s_tq.direct;
     s_tq.direct = 1;
@@ -3802,8 +4311,12 @@ static void vk_present_window_body(void)
     }
 
     u32 idx = 0;
-    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+    const u64 ta = ps3_ft_now();             /* (rsx5) timed and bounded (vk_acquire_timeout) */
+    VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, vk_acquire_timeout(),
                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
+    vk_pt_note(0, ps3_ft_now() - ta);
+    /* not shown: the frame stays open and goes with the next one, as on a failed acquire */
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) { vk_pt_skip(r); return; }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
@@ -3859,6 +4372,11 @@ static void vk_present_window_body(void)
         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                               0, 0, NULL, 0, NULL, 1, &b);
     vk_gprof_stamp(GP_BLIT, s_vk.sc_extent.width, s_vk.sc_extent.height);
+    if (s_shot.can_read_sc)                  /* (rsx5) a test's screenshot: what the window gets */
+        vk_shot_record(s_vk.cmd, s_vk.sc_images[idx], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                       s_vk.sc_extent.width, s_vk.sc_extent.height, s_shot.sc_bgra, s_vk.fence);
+    else
+        vk_shot_record(s_vk.cmd, di->img, VK_IMAGE_LAYOUT_GENERAL, di_w, di_h, s_shot.disp_bgra, s_vk.fence);
     if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -3883,6 +4401,7 @@ static void vk_present_window_body(void)
         pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
         if (ft0) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 1u, s_batch.draws, ft0, ps3_ft_now());
         if (was_batch) vk_batch_completed();
+        vk_shot_fence_done(s_vk.fence);        /* (rsx5) */
     }
 
     VkPresentInfoKHR pi = {
@@ -3894,7 +4413,9 @@ static void vk_present_window_body(void)
 #ifdef _WIN32
     vk_rdoc_poll();
 #endif
+    const u64 tp = ps3_ft_now();             /* (rsx5) */
     r = pvkQueuePresentKHR(s_vk.queue, &pi);
+    vk_pt_note(1, ps3_ft_now() - tp);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
     if (fif) vk_fif_advance();
@@ -7332,7 +7853,10 @@ static void vk_fif_advance(void)
         s_ha.fif_ns += ft1 - ft0;
         if (PS3_FT_ON()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 1u, 0, ft0, ft1);
         s_fif_pending[in] = 0;
+        const u64 tb = ps3_ft_now();           /* (rsx5) slow= on the HITCH line */
         vk_batch_completed();                  /* its arenas, sets, dead objects */
+        vk_slow_note("batch_done", tb);
+        vk_shot_fence_done(s_vk.fence);        /* (rsx5) a screenshot's copy is in its buffer */
     }
     /* the cursors and per-batch counters are the open batch's: none is open,
      * and this slot's arenas are idle (never used, or just completed) */
@@ -7897,6 +8421,29 @@ static int vk_eng_image_save(void* user, const char* path, const u8* rgba, u32 w
     return rsx_image_save_png(path, rgba, w, h, row_bytes);
 }
 
+/* (rsx5, round 3) the texture calls timed for the HITCH line's slow= field */
+static u32 vk_eng_texture_create_t(void* user, rsx_be_format fmt, u32 w, u32 h,
+                                   u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
+{
+    const u64 t0 = ps3_ft_now();
+    const u32 hd = vk_eng_texture_create(user, fmt, w, h, mips, faces, remap, rsx_fmt);
+    vk_slow_note("tex_create", t0);
+    return hd;
+}
+static void vk_eng_texture_upload_t(void* user, u32 texture, u32 face, u32 mip, u32 w, u32 h,
+                                    const void* src, u32 row_bytes, u32 rows)
+{
+    const u64 t0 = ps3_ft_now();
+    vk_eng_texture_upload(user, texture, face, mip, w, h, src, row_bytes, rows);
+    vk_slow_note("tex_upload", t0);
+}
+static void vk_eng_texture_release_t(void* user, u32 handle)
+{
+    const u64 t0 = ps3_ft_now();
+    vk_eng_release(user, handle);
+    vk_slow_note("tex_release", t0);
+}
+
 static const rsx_draw_backend s_vk_engine_backend = {
     .user                 = NULL,
     .image_load           = vk_eng_image_load,   /* [fx] texture packs */
@@ -7904,11 +8451,11 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .init                 = vk_eng_init,
     .shutdown             = vk_eng_shutdown,
     .submit_and_wait      = vk_eng_submit_and_wait,
-    .texture_create       = vk_eng_texture_create,
-    .texture_upload       = vk_eng_texture_upload,
+    .texture_create       = vk_eng_texture_create_t,
+    .texture_upload       = vk_eng_texture_upload_t,
     .texture_create_3d    = vk_eng_texture_create_3d,
     .texture_upload_3d    = vk_eng_texture_upload_3d,
-    .texture_release      = vk_eng_release,
+    .texture_release      = vk_eng_texture_release_t,
     .color_target_create  = vk_eng_color_target_create,
     .color_target_release = vk_eng_release,
     .surface_view         = vk_eng_surface_view,
@@ -7965,6 +8512,14 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
+    /* (rsx5, round 3) the log writer (PS3RECOMP_LOG_ASYNC), the engine's [limits]
+     * lines through it, game-side screenshots (before the swapchain: it may need
+     * TRANSFER_SRC), the display's power state */
+    vk_shot_init();
+    { const char* pl = getenv("PS3RECOMP_PLAYLOG"); const char* lm = getenv("PS3RECOMP_LIMITS");
+      if (((pl && *pl) || (lm && *lm && *lm != '0') || s_shot.req[0]) && vk_aio_start())
+          g_rsx_log_hook = vk_aio_log_hook; }
+    vk_disp_watch();
 
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     if (vk_load_library()) return -1;
@@ -8218,10 +8773,39 @@ static struct {
     double hitch_s;                     /* PS3RECOMP_PLAYLOG_HITCH_MS (default 50) */
     int    lim_pending;                 /* (rsx5) a limit event this second: one LIMIT line */
 } s_pl;
-/* (rsx5) the session's limits summary, last in the play log */
+/* (rsx5, round 3) The RSX thread builds each frame's lines here and hands
+ * them to the log writer (vk_aio): it never writes the file itself -- with
+ * PS3RECOMP_LOG_ASYNC=0 it does, as before (the time it takes: io=). */
+static char s_plb[32768];
+static size_t s_plb_n;
+static void plb_printf(const char* fmt, ...)
+{
+    if (s_plb_n >= sizeof s_plb - 1) return;
+    va_list ap; va_start(ap, fmt);
+    const int k = vsnprintf(s_plb + s_plb_n, sizeof s_plb - s_plb_n, fmt, ap);
+    va_end(ap);
+    if (k > 0) s_plb_n += (size_t)k < sizeof s_plb - s_plb_n ? (size_t)k : sizeof s_plb - s_plb_n - 1;
+}
+/* second = the once-a-second flush is due */
+static void plb_hand_over(int second)
+{
+    if (!s_plb_n && !second) return;
+    const u64 t0 = ps3_ft_now();
+    vk_aio_write(VK_AIO_PL, s_plb, s_plb_n, second);
+    s_plb_n = 0;
+    s_io_ns += ps3_ft_now() - t0;
+}
+/* (rsx5) the session's limits summary, last in the play log; then everything queued */
 static void vk_pl_atexit(void)
 {
-    if (s_pl.state == 1 && s_pl.f) { fputs("LIMITS\t", s_pl.f); rsx_lim_summary(s_pl.f, "session (peak/cap, !full ~live evictions)"); }
+    if (s_pl.state == 1 && s_pl.f) {
+        char line[3200];
+        int k = snprintf(line, sizeof line, "LIMITS\t");
+        k += rsx_lim_format(line + k, (int)sizeof line - k - 1, "session (peak/cap, !full ~live evictions)");
+        line[k++] = '\n';
+        vk_aio_write(VK_AIO_PL, line, (size_t)k, 1);
+    }
+    vk_aio_stop();
 }
 static double vk_pl_now(void)
 {
@@ -8256,7 +8840,7 @@ void cellGcm_hattr_take(unsigned long long* drain_ns, unsigned long long* sema_n
  *   spv      shader translations (n/ms)    alloc vkAllocateMemory calls
  * The rest of the frame is the RSX thread waiting for commands: the guest's
  * PPU/SPU side was behind. */
-static void vk_playlog_attr(FILE* f, double ms)
+static void vk_playlog_attr(int write, double ms)
 {
     static unsigned long long l_pipes, l_pipe_ns, l_spv_n, l_spv_ns, l_alloc;
     unsigned long long drain = 0, sema = 0, gaveup = 0;
@@ -8272,7 +8856,14 @@ static void vk_playlog_attr(FILE* f, double ms)
     const unsigned long long fl_n = s_ha.flush_n, fl_ns = s_ha.flush_ns, fif = s_ha.fif_ns;
     const int fl_line = s_ha.flush_line;
     memset(&s_ha, 0, sizeof s_ha);
-    if (!f) {   /* (rsx5) a frame that was not slow: its limit events go on the second's LIMIT line */
+    /* (rsx5, round 3) the present's own causes, taken every frame */
+    const u64 io = s_io_ns, tqw = s_tqw_ns, slow = s_slow.ns;
+    const char* slow_what = s_slow.what ? s_slow.what : "-";
+    s_io_ns = 0; s_tqw_ns = 0; s_slow.ns = 0; s_slow.what = NULL;
+    const unsigned long long acq = s_pt.acq_max, qp = s_pt.qp_max;
+    s_pt.acq_max = 0; s_pt.qp_max = 0;
+    const unsigned long long aio = vk_aio_take_max();
+    if (!write) {   /* (rsx5) a frame that was not slow: its limit events go on the second's LIMIT line */
         char lim0[256];
         if (rsx_lim_take_frame(lim0, sizeof lim0)[0]) s_pl.lim_pending = 1;
         return;
@@ -8282,14 +8873,22 @@ static void vk_playlog_attr(FILE* f, double ms)
     char lim[256];
     rsx_lim_take_frame(lim, sizeof lim);
     if (lim[0]) s_pl.lim_pending = 1;
-    fprintf(f, "\tdraws=%u\tdrain=%.1f\tsema=%.1f/%llu\tflush=%llu/%.1f@%d\tfif=%.1f"
+    /* (rsx5, round 3) io = the RSX thread's own log writes (the play log's
+     * second, the [limits] lines), aio = the log writer's longest write since
+     * the last line (the disk's stall, now off the frame), acq/qp = the longest
+     * swapchain acquire / present, tqw = the RSX thread waiting for the
+     * recording worker, slow = its longest texture create/upload/release or
+     * completed-batch free, disp = the display's power state. */
+    plb_printf("\tdraws=%u\tdrain=%.1f\tsema=%.1f/%llu\tflush=%llu/%.1f@%d\tfif=%.1f"
                "\ttex=%llu+%llu/%llu,%.1fMB,%.1f\thash=%.1f\tmod=%llu/%.1f\ttexc=%llu"
-               "\tpipe=%llu/%.1f\tspv=%llu/%.1f\talloc=%llu\tlim=%s",
+               "\tpipe=%llu/%.1f\tspv=%llu/%.1f\talloc=%llu\tlim=%s"
+               "\tio=%.1f\taio=%.1f\tacq=%.1f\tqp=%.1f\ttqw=%.1f\tslow=%s:%.1f\tdisp=%s",
             rsx_vulkan_backend_guest_draws(), drain / 1e6, sema / 1e6, gaveup,
             fl_n, fl_ns / 1e6, fl_line, fif / 1e6,
             h.tex_new, h.tex_reup, h.tex_evict, h.tex_bytes / 1048576.0, h.tex_ns / 1e6,
             h.hash_ns / 1e6, h.mod_n, h.mod_ns / 1e6, cached,
-            pipes, pipe_ns / 1e6, spv_n, spv_ns / 1e6, alloc, lim);
+            pipes, pipe_ns / 1e6, spv_n, spv_ns / 1e6, alloc, lim,
+            io / 1e6, aio / 1e6, acq / 1e6, qp / 1e6, tqw / 1e6, slow_what, slow / 1e6, vk_disp_name());
     (void)ms;
 }
 static void vk_playlog_frame(void)
@@ -8304,12 +8903,14 @@ static void vk_playlog_frame(void)
             s_pl.hitch_s = (hm && atof(hm) > 0.0) ? atof(hm) / 1000.0 : 0.050;
             fprintf(s_pl.f, "#t_s	fps	p50_ms	p99_ms	max_ms	n17	n25	n33	n50	draws_per_frame\n");
             fflush(s_pl.f);
+            s_aio.f[VK_AIO_PL] = s_pl.f;     /* (rsx5) the log writer owns the file from here */
+            vk_aio_start();
             atexit(vk_pl_atexit);
         }
     }
     if (s_pl.state != 1) return;
     const double now = vk_pl_now();
-    if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; vk_playlog_attr(NULL, 0.0); return; }
+    if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; vk_playlog_attr(0, 0.0); return; }
     const double dt = now - s_pl.last;
     s_pl.last = now;
     if (s_pl.n < sizeof s_pl.dt / sizeof s_pl.dt[0]) {
@@ -8322,18 +8923,24 @@ static void vk_playlog_frame(void)
     /* HITCH <t> <ms>, then what the frame was spent on (vk_playlog_attr: extra
      * tab-separated name=value fields; tools/playlog_report.py reads the first 3) */
     if (dt > s_pl.hitch_s) {
-        fprintf(s_pl.f, "HITCH	%.2f	%.1f", now - s_pl.t0, dt * 1000.0);
-        vk_playlog_attr(s_pl.f, dt * 1000.0);
-        fputc('\n', s_pl.f);
+        plb_printf("HITCH	%.2f	%.1f", now - s_pl.t0, dt * 1000.0);
+        vk_playlog_attr(1, dt * 1000.0);
+        plb_printf("\n");
     } else {
-        vk_playlog_attr(NULL, 0.0);
+        vk_playlog_attr(0, 0.0);
     }
-    if (s_pl.mark) { fprintf(s_pl.f, "MARK	%.2f\n", now - s_pl.t0); s_pl.mark = 0; }
-    if (now - s_pl.sec_start < 1.0 || !s_pl.n) return;
+    if (s_pl.mark) { plb_printf("MARK	%.2f\n", now - s_pl.t0); s_pl.mark = 0; }
+#ifdef _WIN32
+    if (InterlockedExchange(&s_disp_changed, 0)) plb_printf("DISPLAY\t%.2f\t%s\n", now - s_pl.t0, vk_disp_name());
+#endif
+    if (now - s_pl.sec_start < 1.0 || !s_pl.n) { plb_hand_over(0); return; }
     if (s_pl.lim_pending) {   /* (rsx5) the counts so far of every structure that hit a wall */
         s_pl.lim_pending = 0;
-        fprintf(s_pl.f, "LIMIT\t%.2f\t", now - s_pl.t0);
-        rsx_lim_summary(s_pl.f, "events (peak/cap, !full ~live evictions)");
+        plb_printf("LIMIT\t%.2f\t", now - s_pl.t0);
+        if (s_plb_n < sizeof s_plb - 3200u) {
+            s_plb_n += (size_t)rsx_lim_format(s_plb + s_plb_n, 3150, "events (peak/cap, !full ~live evictions)");
+            plb_printf("\n");
+        }
     }
     u32 c17 = 0, c25 = 0, c33 = 0, c50 = 0;
     for (u32 i = 0; i < s_pl.n; i++) {
@@ -8342,10 +8949,10 @@ static void vk_playlog_frame(void)
     }
     qsort(s_pl.dt, s_pl.n, sizeof s_pl.dt[0], vk_pl_cmp);
     const double span = now - s_pl.sec_start;
-    fprintf(s_pl.f, "%.1f	%.1f	%.1f	%.1f	%.1f	%u	%u	%u	%u	%.0f\n",
-            now - s_pl.t0, s_pl.n / span, s_pl.dt[s_pl.n / 2], s_pl.dt[(s_pl.n * 99) / 100],
-            s_pl.dt[s_pl.n - 1], c17, c25, c33, c50, s_pl.draw_sum / s_pl.n);
-    fflush(s_pl.f);
+    plb_printf("%.1f	%.1f	%.1f	%.1f	%.1f	%u	%u	%u	%u	%.0f\n",
+               now - s_pl.t0, s_pl.n / span, s_pl.dt[s_pl.n / 2], s_pl.dt[(s_pl.n * 99) / 100],
+               s_pl.dt[s_pl.n - 1], c17, c25, c33, c50, s_pl.draw_sum / s_pl.n);
+    plb_hand_over(1);                        /* (rsx5) the second's flush: the writer does it */
     s_pl.draw_sum = 0.0;
     s_pl.n = 0;
     s_pl.sec_start = now;
@@ -8422,6 +9029,7 @@ int rsx_vulkan_backend_pump_messages(void)
 
 void rsx_vulkan_backend_present(void)
 {
+    vk_shot_arm();                   /* (rsx5) a test's screenshot request: its buffer */
     if (s_vk.eng_active) rsx_draw_engine_present();
     else                 vk_cb_present(&s_vk, 0);
     vk_sc_tick();                    /* save the pipeline cache once a burst ends */
@@ -8432,7 +9040,9 @@ void rsx_vulkan_backend_present(void)
           rsx_lim_cap(RSX_LIM_VK_OBJ, VK_ENG_MAX_OBJ - 1u); rsx_lim_use(RSX_LIM_VK_OBJ, live);
           rsx_lim_cap(RSX_LIM_VK_FB, VK_ENG_FB_CACHE); rsx_lim_use(RSX_LIM_VK_FB, s_e2.fb_count);
       } }
-    rsx_lim_frame();
+    { const u64 t0 = ps3_ft_now();   /* (rsx5) the [limits] print: io= with the writer off */
+      rsx_lim_frame();
+      s_io_ns += ps3_ft_now() - t0; }
     vk_playlog_frame();
 }
 
