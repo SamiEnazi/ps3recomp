@@ -40,6 +40,7 @@
 #include "../../include/ps3emu/ps3_savedlg.h"
 #include "../../include/ps3emu/ps3_msgdlg.h"
 #include "rsx_image_io.h"
+#include "vk_overlay_theme.h"   /* the menu's look (Hero blue / Infamous red) */
 
 #include <atomic>
 #include <chrono>
@@ -410,9 +411,10 @@ extern "C" void vk_overlay_saves_shutdown(void)
 }
 
 /* ---- drawing (render thread, inside the overlay's ImGui frame) ---------------- */
-static const ImU32 kText = IM_COL32(240, 244, 248, 255);
-static const ImU32 kDim = IM_COL32(158, 168, 184, 255);
-static const ImU32 kCyan = IM_COL32(51, 204, 242, 255);
+/* the theme's colours (vk_overlay_theme.h) */
+static ImU32 col_text(void) { return vk_ov_u32(vk_ov_theme().text); }
+static ImU32 col_dim(void) { return vk_ov_u32(vk_ov_theme().text_dim); }
+static ImU32 col_accent(void) { return vk_ov_u32(vk_ov_theme().accent); }
 
 /* The PlayStation face-button shapes, `r` = radius. */
 static void glyph(ImDrawList* dl, ImVec2 c, float r, int which)
@@ -447,8 +449,8 @@ static bool hint_button(const char* id, int which, const char* label, const char
         dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(255, 255, 255, 18), 5.0f * k);
     const float cy = p.y + size.y * 0.5f;
     if (enabled) glyph(dl, ImVec2(p.x + gw * 0.5f + 4.0f * k, cy), fs * 0.5f, which);
-    dl->AddText(f, fs, ImVec2(p.x + gw + gap, cy - ls.y * 0.5f), enabled ? kText : IM_COL32(110, 116, 128, 255), label);
-    dl->AddText(f, fs * 0.85f, ImVec2(p.x + gw + gap + ls.x + gap, cy - ks.y * 0.5f), kDim, key);
+    dl->AddText(f, fs, ImVec2(p.x + gw + gap, cy - ls.y * 0.5f), enabled ? col_text() : IM_COL32(110, 116, 128, 255), label);
+    dl->AddText(f, fs * 0.85f, ImVec2(p.x + gw + gap + ls.x + gap, cy - ks.y * 0.5f), col_dim(), key);
     return clicked;
 }
 
@@ -484,8 +486,11 @@ static void draw_row(int i, const SdRow& r, float k, bool live, double now, unsi
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p1(p0.x + w, p0.y + row_h);
     if (i == s_cur) {
-        dl->AddRectFilled(p0, p1, IM_COL32(26, 72, 92, 255), 6.0f * k);
-        dl->AddRect(p0, p1, kCyan, 6.0f * k, 0, 2.0f * k);
+        const VkOvTheme& th = vk_ov_theme();   /* the selected row: lit, with a soft glow round its edge */
+        dl->AddRect(ImVec2(p0.x - 2.0f * k, p0.y - 2.0f * k), ImVec2(p1.x + 2.0f * k, p1.y + 2.0f * k),
+                    vk_ov_u32(th.accent, 0.28f), 8.0f * k, 0, 3.0f * k);
+        dl->AddRectFilled(p0, p1, vk_ov_u32(th.sel_bg), 6.0f * k);
+        dl->AddRect(p0, p1, vk_ov_u32(th.accent_hi), 6.0f * k, 0, 2.0f * k);
     } else if (hov) {
         dl->AddRectFilled(p0, p1, IM_COL32(255, 255, 255, 14), 6.0f * k);
     }
@@ -495,12 +500,12 @@ static void draw_row(int i, const SdRow& r, float k, bool live, double now, unsi
         dl->AddImage(t->GetTexRef(), i0, i1);
     } else {
         dl->AddRectFilled(i0, i1, IM_COL32(18, 24, 32, 255), 4.0f * k);
-        dl->AddRect(i0, i1, IM_COL32(51, 204, 242, 90), 4.0f * k, 0, 1.0f * k);
+        dl->AddRect(i0, i1, vk_ov_u32(vk_ov_theme().accent, 0.35f), 4.0f * k, 0, 1.0f * k);
         if (r.is_new) {   /* a plus */
             const ImVec2 c((i0.x + i1.x) * 0.5f, (i0.y + i1.y) * 0.5f);
             const float a = icon_h * 0.22f;
-            dl->AddLine(ImVec2(c.x - a, c.y), ImVec2(c.x + a, c.y), kCyan, 3.0f * k);
-            dl->AddLine(ImVec2(c.x, c.y - a), ImVec2(c.x, c.y + a), kCyan, 3.0f * k);
+            dl->AddLine(ImVec2(c.x - a, c.y), ImVec2(c.x + a, c.y), col_accent(), 3.0f * k);
+            dl->AddLine(ImVec2(c.x, c.y - a), ImVec2(c.x, c.y + a), col_accent(), 3.0f * k);
         }
     }
     /* the text */
@@ -513,17 +518,17 @@ static void draw_row(int i, const SdRow& r, float k, bool live, double now, unsi
     float date_w = 0.0f;
     if (when[0]) {
         date_w = f->CalcTextSizeA(small, FLT_MAX, 0.0f, when).x;
-        dl->AddText(f, small, ImVec2(p1.x - pad - date_w, ty + (big - small) * 0.5f), kDim, when);
+        dl->AddText(f, small, ImVec2(p1.x - pad - date_w, ty + (big - small) * 0.5f), col_dim(), when);
     }
     dl->PushClipRect(ImVec2(tx, p0.y), ImVec2(p1.x - pad - date_w - 12.0f * k, p1.y), true);
-    dl->AddText(f, big, ImVec2(tx, ty), kText, row_name(r));
+    dl->AddText(f, big, ImVec2(tx, ty), col_text(), row_name(r));
     dl->PopClipRect();
     ty += big + 3.0f * k;
     const char* d = r.is_new ? (r.title.empty() ? "Make a new save." : r.title.c_str()) : r.detail.c_str();
     for (int line = 0; line < 4 && *d && ty + small <= p1.y - 2.0f * k; line++) {
         const char* e = strchr(d, '\n');
         if (!e) e = d + strlen(d);
-        if (e > d) dl->AddText(f, small, ImVec2(tx, ty), kDim, d, e);
+        if (e > d) dl->AddText(f, small, ImVec2(tx, ty), col_dim(), d, e);
         ty += small * 1.12f;
         d = *e ? e + 1 : e;
     }
@@ -539,17 +544,17 @@ static void draw_confirm(float k, unsigned* act)
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(480.0f * k, 0.0f), ImGuiCond_Always);
     ImGui::SetNextWindowFocus();
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.07f, 0.09f, 0.12f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.80f, 0.95f, 0.8f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, vk_ov_theme().panel_hi);
+    ImGui::PushStyleColor(ImGuiCol_Border, vk_ov_theme().accent);
     if (ImGui::Begin("##savedlg_confirm", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
                                                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) {
-        ImGui::PushFont(NULL, ImGui::GetStyle().FontSizeBase * 1.2f);
+        ImGui::PushFont(vk_ov_theme_bold(), ImGui::GetStyle().FontSizeBase * 1.2f);
         ImGui::TextUnformatted(s_confirm == 1 ? "Overwrite this save?" : "Delete this save?");
         ImGui::PopFont();
         if (r) {
             char when[40];
             fmt_time(r->mtime, when, sizeof when);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.72f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, vk_ov_theme().text_dim);
             ImGui::TextUnformatted(row_name(*r));
             if (when[0]) ImGui::TextUnformatted(when);
             ImGui::PopStyleColor();
@@ -560,16 +565,11 @@ static void draw_confirm(float k, unsigned* act)
         const ImVec2 bs(140.0f * k, 0.0f);
         for (int b = 0; b < 2; b++) {   /* Yes, No: the highlighted one is where the pad is */
             const bool hl = (b == 0) == s_yes;
-            ImGui::PushStyleColor(ImGuiCol_Button, hl ? ImVec4(0.12f, 0.45f, 0.55f, 1.0f) : ImVec4(0.12f, 0.16f, 0.20f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_Border, hl ? ImVec4(0.20f, 0.80f, 0.95f, 1.0f) : ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 2.0f * k);
             if (b) ImGui::SameLine();
-            if (ImGui::Button(b == 0 ? "Yes" : "No", bs)) *act |= b == 0 ? A_YES : A_NO;
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor(2);
+            if (vk_ov_choice(b == 0 ? "Yes" : "No", hl, bs)) *act |= b == 0 ? A_YES : A_NO;
         }
         ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.72f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, vk_ov_theme().text_dim);
         ImGui::TextUnformatted("Left / Right: choose    Cross / Enter: confirm    Circle / Esc: back");
         ImGui::PopStyleColor();
     }
@@ -595,13 +595,13 @@ static void draw_list(float k, unsigned act, double now, bool blocked)
                                     want.y < io.DisplaySize.y - 20 ? want.y : io.DisplaySize.y - 20), ImGuiCond_Always);
     if (!s_confirm) ImGui::SetNextWindowFocus();
     const char* title = s_is_save ? "Save Game###ps3savedlg" : "Load Game###ps3savedlg";
-    if (ImGui::Begin(title, NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+    if (vk_ov_begin(title, NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav)) {
         /* the game's name and how many saves */
         std::string game;
         int saves = 0;
         for (const SdRow& r : s_rows) { if (!r.is_new) saves++; if (game.empty() && !r.title.empty() && !r.is_new) game = r.title; }
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.72f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, vk_ov_theme().text_dim);
         ImGui::Text("%s%s%d saved game%s", game.c_str(), game.empty() ? "" : "    ", saves, saves == 1 ? "" : "s");
         ImGui::PopStyleColor();
         const float footer = ImGui::GetFontSize() * 1.6f + ImGui::GetStyle().ItemSpacing.y * 2.0f +
@@ -616,7 +616,7 @@ static void draw_list(float k, unsigned act, double now, bool blocked)
         }
         for (int i = 0; i < n; i++) draw_row(i, s_rows[i], k, live, now, &act);
         ImGui::EndChild();
-        if (!s_msg.empty()) ImGui::TextColored(ImVec4(1.0f, 0.60f, 0.20f, 1.0f), "%s", s_msg.c_str());
+        if (!s_msg.empty()) ImGui::TextColored(vk_ov_theme().warn, "%s", s_msg.c_str());
         /* the footer: what each button does (each is clickable too) */
         const bool can_pick = live && !s_confirm && n > 0;
         const bool can_del = live && !s_confirm && n > 0 && !s_rows[s_cur].is_new;
@@ -680,8 +680,8 @@ static void draw_msg(float k, unsigned act, double now, ps3_msgdlg_answer_fn* fi
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(w, 0.0f), ImGuiCond_Always);
     ImGui::SetNextWindowFocus();
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.07f, 0.09f, 0.12f, 0.98f));
-    ImGui::PushStyleColor(ImGuiCol_Border, s_md_error ? ImVec4(1.0f, 0.45f, 0.30f, 0.9f) : ImVec4(0.20f, 0.80f, 0.95f, 0.8f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, vk_ov_theme().panel_hi);
+    ImGui::PushStyleColor(ImGuiCol_Border, s_md_error ? vk_ov_theme().warn : vk_ov_theme().accent);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(26.0f * k, 22.0f * k));
     if (ImGui::Begin("##msgdlg", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove)) {
@@ -697,17 +697,12 @@ static void draw_msg(float k, unsigned act, double now, ps3_msgdlg_answer_fn* fi
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - total) * 0.5f);
         for (int b = 0; b < (yesno ? 2 : 1); b++) {
             const bool hl = !yesno || ((b == 0) == s_md_yes);
-            ImGui::PushStyleColor(ImGuiCol_Button, hl ? ImVec4(0.12f, 0.45f, 0.55f, 1.0f) : ImVec4(0.12f, 0.16f, 0.20f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_Border, hl ? ImVec4(0.20f, 0.80f, 0.95f, 1.0f) : ImVec4(0, 0, 0, 0));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 2.0f * k);
             if (b) ImGui::SameLine();
-            if (ImGui::Button(!yesno ? "OK" : b == 0 ? "Yes" : "No", ImVec2(bw, 0.0f)) && live)
+            if (vk_ov_choice(!yesno ? "OK" : b == 0 ? "Yes" : "No", hl, ImVec2(bw, 0.0f)) && live)
                 act |= (!yesno || b == 0) ? A_YES : A_NO;
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor(2);
         }
         ImGui::Dummy(ImVec2(1.0f, 6.0f * k));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.72f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, vk_ov_theme().text_dim);
         ImGui::TextUnformatted(yesno ? (s_md_cancel ? "Left / Right: choose    Cross / Enter: confirm    Circle / Esc: back"
                                                     : "Left / Right: choose    Cross / Enter: confirm")
                                      : (s_md_cancel ? "Cross / Enter: OK    Circle / Esc: back" : "Cross / Enter: OK"));

@@ -26,6 +26,7 @@
 #include "../../include/ps3emu/ps3_settings.h"
 #include "../../include/ps3emu/ps3_lightfx.h"   /* [light] the Lighting page (vk_overlay_light.inc) */
 #include "vk_postfx.h"
+#include "vk_overlay_theme.h"   /* the inFAMOUS look: Hero (blue) / Infamous (red) */
 #include "../../include/ps3emu/ps3_pad_icons.h"
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -136,6 +137,7 @@ enum {
     V_VOLUME,
     V_INPUT_MODE, V_BUTTON_ICONS, V_RUMBLE, V_RUMBLE_STRENGTH,
     V_HUD, V_HUD_CORNER, V_HUD_OPACITY, V_HUD_GRAPH, V_HUD_CPU,
+    V_THEME,
     V_N
 };
 static const char* const kVar[V_N] = {
@@ -146,6 +148,7 @@ static const char* const kVar[V_N] = {
     "PS3_INPUT_MODE", "PS3_BUTTON_ICONS", "PS3_RUMBLE", "PS3_RUMBLE_STRENGTH",
     "PS3_OVERLAY_HUD", "PS3_OVERLAY_HUD_CORNER", "PS3_OVERLAY_HUD_OPACITY",
     "PS3_OVERLAY_HUD_GRAPH", "PS3_OVERLAY_HUD_CPU",
+    "PS3_OVERLAY_THEME",
 };
 /* Plain arrays: filled during this file's dynamic initialisation, before
  * main (zero-initialised storage exists before any of it runs). */
@@ -300,9 +303,14 @@ static void extra_set(const char* name, const char* value)
 
 /* A setting a module may take live (ps3_settings.h): environment, applier,
  * and the file. 1 = live now. */
+/* [theme] the menu's look (vk_overlay_theme.h: Hero blue / Infamous red). A new
+ * one is put in at the start of the next frame, never inside one: a colour
+ * pushed before the switch would be popped back to the old look. -1 = none. */
+static volatile int s_theme_want = -1;
 static int apply_setting(int v, const char* value)
 {
     set_value(v, "%s", value);
+    if (v == V_THEME) s_theme_want = vk_ov_theme_parse(value);   /* [theme] the look is the overlay's own */
     return ps3_setting_apply(kVar[v], value);
 }
 
@@ -486,6 +494,9 @@ static void set_hud(bool on)
     set_value(V_HUD, "%d", on ? 1 : 0);
     update_active();
 }
+
+/* [theme] the applier (so the menu marks the setting "live" and ps3_setting_apply takes it) */
+static int theme_apply(const char* value) { s_theme_want = vk_ov_theme_parse(value); return 1; }
 
 static void toggle_fullscreen(void)
 {
@@ -929,46 +940,31 @@ static bool imgui_setup(void)
       for (const char* f : fonts) if (file_exists(f) && (font = io.Fonts->AddFontFromFileTTF(f, 17.0f)) != NULL) break; }
 #endif
     if (!font) io.Fonts->AddFontDefaultVector();
+    /* the bold face for headings, titles and tabs (vk_overlay_theme): the PC's own, never a game asset */
+    { ImFont* bold = NULL;
+#ifdef _WIN32
+      char win[MAX_PATH] = "C:\\Windows";
+      GetWindowsDirectoryA(win, sizeof win);
+      static const char* const bolds[] = { "segoeuib.ttf", "arialbd.ttf" };
+      for (const char* f : bolds) {
+          char p[MAX_PATH + 32];
+          snprintf(p, sizeof p, "%s\\Fonts\\%s", win, f);
+          if (file_exists(p) && (bold = io.Fonts->AddFontFromFileTTF(p, 17.0f)) != NULL) break;
+      }
+#else
+      static const char* const bolds[] = { "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                                           "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf" };
+      for (const char* f : bolds) if (file_exists(f) && (bold = io.Fonts->AddFontFromFileTTF(f, 17.0f)) != NULL) break;
+#endif
+      vk_ov_theme_set_bold(bold); }
 
     ImGuiStyle& st = ImGui::GetStyle();
-    ImGui::StyleColorsDark(&st);
-    st.FontSizeBase = 17.0f;
-    st.WindowRounding = 10.0f; st.FrameRounding = 5.0f; st.GrabRounding = 5.0f;
-    st.TabRounding = 5.0f; st.PopupRounding = 6.0f; st.ChildRounding = 6.0f;
-    st.WindowPadding = ImVec2(18, 14); st.FramePadding = ImVec2(10, 5); st.ItemSpacing = ImVec2(10, 8);
-    st.WindowBorderSize = 1.0f; st.GrabMinSize = 14.0f;
-    /* near-black with an electric cyan accent (the macOS menu's look) */
-    ImVec4* c = st.Colors;
-    const ImVec4 cyan(0.20f, 0.80f, 0.95f, 1.0f), cyan_dim(0.12f, 0.45f, 0.55f, 1.0f);
-    c[ImGuiCol_WindowBg]        = ImVec4(0.04f, 0.05f, 0.07f, 0.97f);
-    c[ImGuiCol_ChildBg]         = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_PopupBg]         = ImVec4(0.06f, 0.07f, 0.10f, 0.98f);
-    c[ImGuiCol_Border]          = ImVec4(0.20f, 0.80f, 0.95f, 0.35f);
-    c[ImGuiCol_FrameBg]         = ImVec4(0.12f, 0.14f, 0.18f, 1.0f);
-    c[ImGuiCol_FrameBgHovered]  = ImVec4(0.16f, 0.22f, 0.27f, 1.0f);
-    c[ImGuiCol_FrameBgActive]   = ImVec4(0.18f, 0.28f, 0.34f, 1.0f);
-    c[ImGuiCol_TitleBg]         = ImVec4(0.06f, 0.08f, 0.11f, 1.0f);
-    c[ImGuiCol_TitleBgActive]   = ImVec4(0.06f, 0.08f, 0.11f, 1.0f);
-    c[ImGuiCol_CheckMark]       = cyan;
-    c[ImGuiCol_SliderGrab]      = cyan_dim;
-    c[ImGuiCol_SliderGrabActive]= cyan;
-    c[ImGuiCol_Button]          = ImVec4(0.12f, 0.16f, 0.20f, 1.0f);
-    c[ImGuiCol_ButtonHovered]   = cyan_dim;
-    c[ImGuiCol_ButtonActive]    = cyan;
-    c[ImGuiCol_Header]          = ImVec4(0.12f, 0.30f, 0.38f, 1.0f);
-    c[ImGuiCol_HeaderHovered]   = cyan_dim;
-    c[ImGuiCol_Tab]             = ImVec4(0.10f, 0.12f, 0.16f, 1.0f);
-    c[ImGuiCol_TabHovered]      = cyan_dim;
-    c[ImGuiCol_TabSelected]     = ImVec4(0.12f, 0.38f, 0.48f, 1.0f);
-    c[ImGuiCol_PlotLines]       = cyan;
-    c[ImGuiCol_PlotHistogram]   = cyan;
-    c[ImGuiCol_NavCursor]       = ImVec4(1.0f, 0.60f, 0.20f, 1.0f);   /* warm orange: where the pad is */
-    c[ImGuiCol_Separator]       = ImVec4(0.20f, 0.80f, 0.95f, 0.25f);
-    c[ImGuiCol_TableRowBgAlt]   = ImVec4(1.0f, 1.0f, 1.0f, 0.03f);
+    vk_ov_theme_style(st);
     s_base_style = st;
     s_imgui_ready = true;
     return true;
 }
+
 
 /* The UI is laid out for 720 lines: everything scales with the window. */
 static float s_scale = 1.0f;
@@ -1067,7 +1063,6 @@ static void ui_load(void)
 }
 
 static const ImVec4 kOrange(1.0f, 0.60f, 0.20f, 1.0f);
-static const ImVec4 kCyan(0.20f, 0.80f, 0.95f, 1.0f);
 static const ImVec4 kGrey(0.62f, 0.66f, 0.72f, 1.0f);
 
 /* "env" after a setting whose variable was set at start: it wins next time. */
@@ -1090,12 +1085,7 @@ static void hint(const char* text)
     ImGui::PopStyleColor();
 }
 
-static void section(const char* text)
-{
-    ImGui::Spacing();
-    ImGui::TextColored(kCyan, "%s", text);
-    ImGui::Separator();
-}
+static void section(const char* text) { vk_ov_heading(text); }   /* [theme] bold, accent, a fading rule */
 
 /* "live" or "restart" after a setting a module may or may not take live. */
 static void live_mark(int v)
@@ -1147,6 +1137,14 @@ static void tab_display(void)
         apply_setting(V_FULLSCREEN, s_ui.fullscreen ? "1" : "0");
     live_mark(V_FULLSCREEN);
     hint("Also Alt+Enter or F11.");
+
+    section("Menu");   /* [theme] */
+    { static const char* const looks[] = { "Hero (blue)", "Infamous (red)" };
+      int look = vk_ov_theme_red();
+      ImGui::SetNextItemWidth(combo_w());
+      if (ImGui::Combo("Menu theme", &look, looks, 2)) apply_setting(V_THEME, look ? "infamous" : "hero"); }
+    live_mark(V_THEME);
+    hint("The colours of this menu, the save list and the system's questions: Cole's blue lightning, or the red of an infamous Cole.");
 
     section("Now");
     { SDL_Window* w = (SDL_Window*)s_vk.sdl_window;
@@ -1586,8 +1584,8 @@ static void draw_menu(double now)
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(size.x < io.DisplaySize.x - 20 ? size.x : io.DisplaySize.x - 20,
                                     size.y < io.DisplaySize.y - 20 ? size.y : io.DisplaySize.y - 20), ImGuiCond_Always);
-    if (!ImGui::Begin("inFAMOUS 2  -  Settings###ps3menu", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                                                                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+    if (!vk_ov_begin("inFAMOUS 2  -  Settings###ps3menu", NULL, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                                              ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
         ImGui::End(); return;
     }
     static const char* const names[TAB_CHEATS + 1] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Lighting", "Effects", "Cheats" };
@@ -1595,7 +1593,10 @@ static void draw_menu(double now)
     if (ImGui::BeginTabBar("tabs")) {
         for (int i = 0; i < tab_count(); i++) {
             const ImGuiTabItemFlags f = (s_tab_want == i) ? ImGuiTabItemFlags_SetSelected : 0;
-            if (ImGui::BeginTabItem(names[i], NULL, f)) {
+            ImGui::PushFont(vk_ov_theme_bold(), 0.0f);   /* [theme] tab labels in the bold face */
+            const bool tab_open = ImGui::BeginTabItem(names[i], NULL, f);
+            ImGui::PopFont();
+            if (tab_open) {
                 s_tab = i;
                 ImGui::BeginChild("page", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() * 1.4f));
                 switch (i) { case 0: tab_display(); break; case 1: tab_graphics(); break; case 2: tab_audio(); break;
@@ -1733,6 +1734,8 @@ extern "C" void vk_overlay_attach(const vk_overlay_attach_info* info)
     { const char* e = getenv("PS3_OVERLAY_HUD_GRAPH"); if (e && *e) s_hud_graph = strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3_OVERLAY_HUD_CPU"); if (e && *e) s_hud_cpu = strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3_OVERLAY_PAD"); s_pad_chord = !(e && e[0] == '0'); }
+    vk_ov_theme_select(vk_ov_theme_parse(getenv(kVar[V_THEME])));   /* [theme] default Hero */
+    ps3_setting_register("PS3_OVERLAY_THEME", theme_apply);
     { const int t = tab_from_name(getenv("PS3RECOMP_OVERLAY_TAB")); if (t >= 0) s_tab_want = t; }
     if (p_vkGetPhysicalDeviceProperties) {
         VkPhysicalDeviceProperties pp;
@@ -1853,6 +1856,14 @@ extern "C" int vk_overlay_draw(VkCommandBuffer cmd, uint32_t index, VkImage imag
     if (io.DisplaySize.x <= 0 || io.DisplaySize.y <= 0) io.DisplaySize = ImVec2((float)ext.width, (float)ext.height);
     /* What is drawn into is the swapchain image, whatever the window says. */
     io.DisplayFramebufferScale = ImVec2((float)ext.width / io.DisplaySize.x, (float)ext.height / io.DisplaySize.y);
+    if (s_theme_want >= 0) {   /* [theme] a new look: the whole style again, then scaled below */
+        vk_ov_theme_select(s_theme_want);
+        s_theme_want = -1;
+        ImGuiStyle st;
+        vk_ov_theme_style(st);
+        s_base_style = st;
+        s_scale_applied = -1.0f;
+    }
     apply_scale(io.DisplaySize.y);
     if (s_open) { io.BackendFlags |= ImGuiBackendFlags_HasGamepad; feed_pad(io); }
 

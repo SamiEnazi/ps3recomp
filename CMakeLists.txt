@@ -245,6 +245,7 @@ if(PS3RECOMP_RSX_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_overlay.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_overlay_cheats.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_overlay_saves.cpp"   # the system's save-data list (ps3_savedlg.h)
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/vk_overlay_theme.cpp"   # the menus' look: Hero (blue) / Infamous (red)
         "${PS3_IMGUI_DIR}/imgui.cpp"
         "${PS3_IMGUI_DIR}/imgui_draw.cpp"
         "${PS3_IMGUI_DIR}/imgui_tables.cpp"
