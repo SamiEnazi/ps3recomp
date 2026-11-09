@@ -5606,6 +5606,15 @@ static u64 eng_ds_now(void);
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    /* PS3_TOGGLE_FILE runs: the Lighting page's names from the toggle file,
+     * once a presented frame (one load and out otherwise). Here, not in
+     * sink_flip: inFAMOUS 2 presents through rsx_draw_engine_present (the
+     * host flip), and its FIFO carries no flip method. */
+    { const unsigned ch = ps3_lightfx_test_poll();
+      if (ch & (1u << PS3_LFX_SOFT_SHADOWS)) eng_soft_shadows_set(ps3_lightfx_get(PS3_LFX_SOFT_SHADOWS));
+      if (ch) fprintf(stderr, "[light] test toggles applied: soft shadows %d, ssao %d, strength %d%%, dither %d\n",
+                      ps3_lightfx_get(PS3_LFX_SOFT_SHADOWS), ps3_lightfx_get(PS3_LFX_SSAO),
+                      ps3_lightfx_get(PS3_LFX_SSAO_STRENGTH), ps3_lightfx_get(PS3_LFX_LIGHT_DITHER)); }
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
@@ -5783,10 +5792,6 @@ presented:;
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
-    /* PS3_TOGGLE_FILE runs: the Lighting page's names from the toggle file
-     * (one load and out otherwise). */
-    if (ps3_lightfx_test_poll() & (1u << PS3_LFX_SOFT_SHADOWS))
-        eng_soft_shadows_set(ps3_lightfx_get(PS3_LFX_SOFT_SHADOWS));
     g.last_flip_buffer = arg & 7u;
     eng_present(g.last_flip_buffer);
 }
