@@ -108,6 +108,20 @@ static void tab_lighting(void)
            "Same brightness."
          : "Needs the GPU lighting path (the default; the launcher's -SpuLighting turns it off).");
 
+    section("Tone (a PC extra: changes the game's look)");
+    { static const struct { int id; const char* label; } kTone[] = {
+          { PS3_LFX_TONE_SHADOWS, "Shadows" }, { PS3_LFX_TONE_MIDTONES, "Midtones" },
+          { PS3_LFX_TONE_HIGHLIGHTS, "Highlights" }, { PS3_LFX_CLARITY, "Clarity" } };
+      for (const auto& t : kTone) {
+          int v = ps3_lightfx_get(t.id);
+          ImGui::SetNextItemWidth(combo_w());
+          if (ImGui::SliderInt(t.label, &v, -100, 100, v ? "%+d" : "off")) lfx_choose(t.id, v);
+          lfx_live_mark(t.id);
+      } }
+    hint("Shadows, Midtones and Highlights lift (or lower) their part of the brightness range; black and "
+         "white stay where they are. Clarity adds local contrast between large shapes (more depth) without "
+         "the fine grain of sharpening. All off is the game's own grading. Very small GPU cost.");
+
     if (s_lfx.comparing) ImGui::EndDisabled();
     section("Compare");
     if (ImGui::Button(s_lfx.comparing ? "Show my settings (F3)" : "Show the PS3 look (F3)")) lfx_compare_toggle();

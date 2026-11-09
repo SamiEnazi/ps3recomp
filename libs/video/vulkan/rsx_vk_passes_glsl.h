@@ -357,6 +357,47 @@ static const char kVkLfxBlurVFS[] = VK_SSAO_GLSL_COMMON VK_LFX_BLUR
 "    o = vec4(clamp(1.0 - (1.0 - v) * c.lfx.x, 0.0, 1.0) * (254.0 / 255.0));\n"
 "}\n";
 
+/* ---- PS3RECOMP_TONE_* / PS3RECOMP_CLARITY (ps3_lightfx.h): the Metal
+ * backend's present-pass clarity and tone curve (rsx_metal_backend.m,
+ * eng_present_fs), ported to a pass that writes the frame instead of the
+ * display-surface blit (vk_lfx_tone). Same arithmetic; the clarity taps are
+ * texel fetches at rounded offsets (Metal: bilinear samples). Binding 0:
+ * c = (shadows, midtones, highlights, clarity) in -1..1, sz = (w, h, 0, 0);
+ * binding 1 the game's finished frame. RGBA8 out, alpha kept. */
+static const char kVkToneFS[] =
+"#version 450\n"
+"layout(std140, set = 0, binding = 0) uniform ToneP { vec4 c; vec4 sz; } p;\n"
+"layout(set = 0, binding = 1) uniform sampler2D src;\n"
+"layout(location = 0) out vec4 o;\n"
+"const vec3 W = vec3(0.2126, 0.7152, 0.0722);\n"
+"float tl(ivec2 q) { return dot(clamp(texelFetch(src, clamp(q, ivec2(0), ivec2(p.sz.xy) - 1), 0).rgb, 0.0, 1.0), W); }\n"
+"void main() {\n"
+"    ivec2 P = ivec2(gl_FragCoord.xy);\n"
+"    vec4 c = texelFetch(src, P, 0);\n"
+"    if (p.c.w != 0.0) {\n"
+"        float l0 = dot(clamp(c.rgb, 0.0, 1.0), W), acc = l0 * 0.5, wsum = 0.5;\n"
+"        float r = 0.011 * p.sz.y;\n"
+"        for (int k = 0; k < 8; k++) {\n"
+"            float a = float(k) * 0.785398 + 0.392699;\n"
+"            vec2 d = vec2(cos(a), sin(a)) * r;\n"
+"            acc += tl(P + ivec2(round(d))) * 0.6;\n"
+"            acc += tl(P + ivec2(round(d * 0.5)));\n"
+"            wsum += 1.6;\n"
+"        }\n"
+"        float det = clamp(l0 - acc / wsum, -0.15, 0.15);\n"
+"        float mid = clamp(1.0 - abs(l0 * 2.0 - 1.0), 0.0, 1.0);\n"
+"        c.rgb = clamp(c.rgb + det * p.c.w * 1.25 * (0.35 + 0.65 * mid), 0.0, 1.0);\n"
+"    }\n"
+"    if (p.c.x != 0.0 || p.c.y != 0.0 || p.c.z != 0.0) {\n"
+"        vec3 x = clamp(c.rgb, 0.0, 1.0), y = 1.0 - x;\n"
+"        vec3 ws = 9.4815 * x * y * y * y;\n"
+"        vec3 wm = 16.0 * x * x * y * y;\n"
+"        vec3 wh = 9.4815 * x * x * x * y;\n"
+"        c.rgb = clamp(x + 0.1 * (p.c.x * ws + p.c.y * wm + p.c.z * wh), 0.0, 1.0);\n"
+"    }\n"
+"    o = c;\n"
+"}\n";
+
 /* eng_depth_rgba8_fs: Z24S8 read through A8R8G8B8 (RPCS3 decode_depth24):
  * a = Z[23:16], r = Z[15:8], g = Z[7:0], b = stencil. t0 = resolved depth
  * (R32F, read at this pixel: a target smaller than the depth buffer is its

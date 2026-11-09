@@ -5612,9 +5612,12 @@ static void eng_present(u32 buffer_id)
      * host flip), and its FIFO carries no flip method. */
     { const unsigned ch = ps3_lightfx_test_poll();
       if (ch & (1u << PS3_LFX_SOFT_SHADOWS)) eng_soft_shadows_set(ps3_lightfx_get(PS3_LFX_SOFT_SHADOWS));
-      if (ch) fprintf(stderr, "[light] test toggles applied: soft shadows %d, ssao %d, strength %d%%, dither %d\n",
+      if (ch) fprintf(stderr, "[light] test toggles applied: soft shadows %d, ssao %d, strength %d%%, dither %d, "
+                      "tone %d/%d/%d, clarity %d\n",
                       ps3_lightfx_get(PS3_LFX_SOFT_SHADOWS), ps3_lightfx_get(PS3_LFX_SSAO),
-                      ps3_lightfx_get(PS3_LFX_SSAO_STRENGTH), ps3_lightfx_get(PS3_LFX_LIGHT_DITHER)); }
+                      ps3_lightfx_get(PS3_LFX_SSAO_STRENGTH), ps3_lightfx_get(PS3_LFX_LIGHT_DITHER),
+                      ps3_lightfx_get(PS3_LFX_TONE_SHADOWS), ps3_lightfx_get(PS3_LFX_TONE_MIDTONES),
+                      ps3_lightfx_get(PS3_LFX_TONE_HIGHLIGHTS), ps3_lightfx_get(PS3_LFX_CLARITY)); }
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
