@@ -58,6 +58,7 @@ typedef struct {
     uint32_t param;
 } SysutilEvent;
 
+#include "ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
 #define SYSUTIL_EVENT_QUEUE_SIZE 32
 static SysutilEvent s_event_queue[SYSUTIL_EVENT_QUEUE_SIZE];
 static int          s_event_head = 0;  /* next read */
@@ -65,8 +66,12 @@ static int          s_event_tail = 0;  /* next write */
 
 void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
 {
+    static ps3_lim s_lim_sue = PS3_LIM_INIT("sysutil_events", SYSUTIL_EVENT_QUEUE_SIZE - 1);
     int next = (s_event_tail + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
+    { const int depth = (next - s_event_head + SYSUTIL_EVENT_QUEUE_SIZE) % SYSUTIL_EVENT_QUEUE_SIZE;
+      if (depth > s_lim_sue.peak) ps3_lim_set(&s_lim_sue, depth); }
     if (next == s_event_head) {
+        ps3_lim_full(&s_lim_sue, "sysutil event 0x%X dropped", status);
         printf("[cellSysutil] event queue full — dropping status=0x%X\n", status);
         return;
     }

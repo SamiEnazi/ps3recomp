@@ -16,6 +16,8 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+static ps3_lim s_lim_timer = PS3_LIM_INIT("timer", SYS_TIMER_MAX);
 
 #ifdef _WIN32
 static LARGE_INTEGER s_qpc_freq;
@@ -630,12 +632,15 @@ int64_t sys_timer_create(ppu_context* ctx)
     for (int i = 0; i < SYS_TIMER_MAX; i++) {
         if (!g_sys_timers[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        ps3_lim_full(&s_lim_timer, "sys_timer_create -> EAGAIN");
         return (int64_t)(int32_t)CELL_EAGAIN;
+    }
 
     sys_timer_info* t = &g_sys_timers[slot];
     memset(t, 0, sizeof(*t));
     t->active  = 1;
+    PS3_LIM_COUNT(s_lim_timer, g_sys_timers, SYS_TIMER_MAX, active);
     t->running = 0;
     t->event_queue_id = 0;
 

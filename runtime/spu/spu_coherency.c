@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "spu_coherency.h"
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
 #ifndef _WIN32
 #include <execinfo.h>
 #include <dlfcn.h>
@@ -232,10 +233,20 @@ static struct { int v; char pad[60]; } __attribute__((aligned(64))) s_coh_armed_
 int* const           g_spu_coh_armed  = &s_coh_armed_line.v;
 unsigned char* const g_spu_coh_bitmap = s_coh_bitmap;
 
-/* The SPU contexts that have reserved a line. Sized to match the MFC engine
- * registry in spu_channels.c, which is the ceiling on live SPU contexts. */
-#define SPU_COH_MAX_CTX 8
+/* The SPU contexts that have reserved a line. (limits, 2026-11-09) Was 8, and
+ * inFAMOUS 2 runs 7 SPU contexts at once (the SPURS group's 5 + two one-SPU
+ * groups): one more -- a transient job context -- and the 9th "will not
+ * receive lock-line events", a lost wake-up of the kind that hung the loading
+ * screen. Now 32, and the hot walkers stop at the highest slot ever used
+ * (s_coh_ctx_hi, raised by CAS like s_ppu_resv_hi), so a pass costs what it
+ * did. PS3_COH_CTX_MAX=8 = the old size. */
+#define SPU_COH_MAX_CTX 32
 static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
+static int s_coh_ctx_hi;                          /* slots in use are below this */
+static int s_coh_ctx_cap = -1;                    /* PS3_COH_CTX_MAX, read once */
+static ps3_lim s_lim_coh_ctx = PS3_LIM_INIT("spu_coh_ctx", SPU_COH_MAX_CTX);
+static ps3_lim s_lim_coh_ppu = PS3_LIM_INIT("spu_coh_ppu", 256);
+#define COH_CTX_HI() __atomic_load_n(&s_coh_ctx_hi, __ATOMIC_ACQUIRE)
 
 unsigned long g_spu_lr_raise = 0;
 
@@ -388,13 +399,12 @@ void spu_coh_ppu_reserve(uint32_t ea)
                 while (hi < i + 1 &&
                        !__atomic_compare_exchange_n(&s_ppu_resv_hi, &hi, i + 1, 0,
                                                     __ATOMIC_RELEASE, __ATOMIC_RELAXED)) { }
+                if (i + 1 > s_lim_coh_ppu.peak) ps3_lim_set(&s_lim_coh_ppu, i + 1);   /* highest slot */
                 break;
             }
         }
         if (t_ppu_slot < 0) {
-            static int warned;
-            if (!warned++) fprintf(stderr, "[spu-coh] more than %d PPU threads hold reservations\n",
-                                   SPU_COH_MAX_PPU);
+            ps3_lim_full(&s_lim_coh_ppu, "more than %d PPU threads hold reservations", SPU_COH_MAX_PPU);
             return;
         }
     }
@@ -456,12 +466,26 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     /* Only this context's own thread adds it, so the membership check cannot
      * race another add of the same context; the slot is claimed by CAS because
      * other contexts join under other lines' stripes. */
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+    const int hi0 = COH_CTX_HI();
+    for (int i = 0; i < hi0; i++)
         if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) return;
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    if (s_coh_ctx_cap < 0) {
+        const char* e = getenv("PS3_COH_CTX_MAX");
+        const int v = e ? atoi(e) : 0;
+        s_lim_coh_ctx.cap = (v > 0 && v < SPU_COH_MAX_CTX) ? v : SPU_COH_MAX_CTX;
+        __atomic_store_n(&s_coh_ctx_cap, (int)s_lim_coh_ctx.cap, __ATOMIC_RELEASE);
+    }
+    for (int i = 0; i < s_coh_ctx_cap; i++) {
         spu_context* none = NULL;
         if (__atomic_compare_exchange_n(&s_coh_ctxs[i], &none, ctx, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            { int hi = __atomic_load_n(&s_coh_ctx_hi, __ATOMIC_RELAXED);
+              while (hi < i + 1 &&
+                     !__atomic_compare_exchange_n(&s_coh_ctx_hi, &hi, i + 1, 0,
+                                                  __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) { }
+              int n = 0;
+              for (int k = 0; k < s_coh_ctx_cap; k++) n += __atomic_load_n(&s_coh_ctxs[k], __ATOMIC_RELAXED) != NULL;
+              ps3_lim_set(&s_lim_coh_ctx, n); }
             /* SPU_COH_LOG=1: name each context as it joins the reserving set,
              * with the host call chain that reserved, so an entry that outlives
              * its context can be traced to the path that skipped unregister. */
@@ -480,12 +504,8 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     }
     /* More live SPU contexts than the registry holds. The ones already in it
      * still get their events; this one would silently never wake, so say so. */
-    { static int warned = 0;
-      if (!warned) { warned = 1;
-          fprintf(stderr, "[spu-coh] more than %d reserving SPU contexts -- "
-                          "spu=0x%X will not receive lock-line events\n",
-                  SPU_COH_MAX_CTX, ctx->spu_id);
-          fflush(stderr); } }
+    ps3_lim_full(&s_lim_coh_ctx, "more than %d reserving SPU contexts -- spu=0x%X will not "
+                 "receive lock-line events", s_coh_ctx_cap, ctx->spu_id);
 }
 
 /* Drop a context from the reserving set.
@@ -556,7 +576,8 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
     ppu_resv_clear(line, -1);
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    const int hi = COH_CTX_HI();
+    for (int i = 0; i < hi; i++) {
         spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
         if (!c || (const void*)c == self) continue;
         if (spu_resv_break(c, line)) {
@@ -584,7 +605,8 @@ void spu_coh_notify_write_from_ppu(uint32_t ea)
 
 static void notify_spus(uint32_t line)
 {
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    const int hi = COH_CTX_HI();
+    for (int i = 0; i < hi; i++) {
         spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
         if (!c) continue;
         if (spu_resv_break(c, line)) {        /* lost: PUTLLC must fail */

@@ -24,6 +24,7 @@
 #include "spu_fastjmp.h"   /* PS3_SPU_FASTJMP: SPU_SETJMP / SPU_LONGJMP without the SEH unwind */
 #include "ps3emu/ps3_ftrace.h"
 #include "ps3emu/ps3_toggles.h"   /* PS3_TOGGLE_FILE: live knobs */
+#include "ps3emu/ps3_limits.h"    /* PS3_LIMITS telemetry */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -723,6 +724,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
 
     /* No slot yet: take one. The engine is initialized before the slot is
      * published, so it is never visible to anyone in a half-reset state. */
+    static ps3_lim s_lim_mfc = PS3_LIM_INIT("spu_mfc_ctx", SPU_MAX_CONTEXTS);
     mfc_engine* e = NULL;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (int i = 0; i < SPU_MAX_CONTEXTS && !e; i++) {
@@ -732,8 +734,10 @@ static mfc_engine* mfc_for(spu_context* ctx)
         __atomic_store_n(&sl->ctx, ctx, __ATOMIC_RELEASE);
         e = &sl->mfc;
         ctx->mfc_hint = (uint32_t)i + 1;
+        if ((long)i + 1 > s_lim_mfc.peak) ps3_lim_set(&s_lim_mfc, (long)i + 1);   /* highest slot used */
     }
     if (!e) {
+        ps3_lim_full(&s_lim_mfc, "an SPU context shares the fallback MFC engine");
         /* Out of slots: fall back to a shared engine (correct for single-SPU).
          * Reachable only with more than SPU_MAX_CONTEXTS contexts running at
          * the same time, which is more SPUs than the machine has -- and the
@@ -2353,8 +2357,13 @@ static void ovl_summary_invalidate(void);
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static _Atomic int s_ovl_src_count = 0;
 
+static ps3_lim s_lim_ovl = PS3_LIM_INIT("spu_ovl_sources", SPU_OVL_SRC_MAX);
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
+    if (s_ovl_src_count >= SPU_OVL_SRC_MAX)
+        ps3_lim_full(&s_lim_ovl, "overlay source 0x%08X (image %d) dropped: its code runs on the interpreter",
+                     content_ea, image_id);
+    else ps3_lim_set(&s_lim_ovl, s_ovl_src_count + 1);
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
@@ -2523,6 +2532,9 @@ static int spu_taskset_resident_image(const spu_context* ctx)
  * time -- match the first 16 bytes of the streamed content instead. */
 void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
 {
+    if (s_ovl_src_count >= SPU_OVL_SRC_MAX)
+        ps3_lim_full(&s_lim_ovl, "overlay signature (image %d) dropped: its code runs on the interpreter", image_id);
+    else ps3_lim_set(&s_lim_ovl, s_ovl_src_count + 1);
     if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
         s_ovl_src[s_ovl_src_count].src_ea = 0;
         s_ovl_src[s_ovl_src_count].image_id = image_id;
@@ -2736,6 +2748,38 @@ static inline int ovl_index_on(void)
     return __builtin_expect(v >= 0, 1) ? v : ovl_index_init();
 }
 
+/* (limits, 2026-11-09) All SPU_RESIDENT_CODE_SLOTS taken. A slot is freed only
+ * when a GET overwrites its span with different bytes; code a job's own stores
+ * (or a GET the zero-buffer rule lets through) wrote over stays registered, and
+ * the relocatable job modules (images 300+) take a new slot at every new
+ * local-store address they are streamed to. In a long session the 16 slots
+ * filled with dead spans and every later placement ran on the SPU interpreter
+ * ("no free resident code span", 36 times late in Sami's 53-minute city
+ * session). Now a slot whose image bytes are no longer in local store (a
+ * non-zero image word differs) is reclaimed for the new span: that code cannot
+ * run from its slot any more anyway. PS3_SPU_SLOT_RECLAIM=0 = the old refusal. */
+static ps3_lim s_lim_slots   = PS3_LIM_INIT("spu_code_slots", SPU_RESIDENT_CODE_SLOTS);
+static ps3_lim s_lim_reclaim = PS3_LIM_INIT("spu_slot_reclaims", 0);
+static int spu_slot_reclaim_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_SPU_SLOT_RECLAIM"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static int spu_slot_dead(const spu_context* ctx, unsigned slot)
+{
+    const uint32_t lsa = ctx->resident_code[slot].lsa, n = ctx->resident_code[slot].size;
+    if (lsa >= SPU_LS_SIZE || n > SPU_LS_SIZE - lsa) return 1;
+    const uint8_t* ls = ctx->ls + lsa;
+    const uint8_t* orig = vm_base + ctx->resident_code[slot].source_ea;
+    for (uint32_t k = 0; k + 4 <= n; k += 4) {
+        uint32_t o, l;
+        memcpy(&o, orig + k, 4); memcpy(&l, ls + k, 4);
+        if (o && o != l) return 1;
+    }
+    return 0;
+}
+
 /* One overlay source tried against a GET (the body of note_get's walk): 1 = it
  * hit (the GET is handled, note_get returns), 0 = try the next source. ea and lsa
  * are the GET's; a fixed-address lift that hits re-points them before it returns. */
@@ -2766,9 +2810,20 @@ static int ovl_try_source(spu_context* ctx, const spu_ovl_src* o, uint32_t ea, u
     if (hit) {
         if (o->span) {
             if (lsa + o->span > SPU_LS_SIZE) return 1;
+            int use = -1, busy = 0;
             for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
                 if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
-                    continue;
+                    { busy++; continue; }
+                if (use < 0) use = (int)slot;
+            }
+            if (use < 0 && spu_slot_reclaim_on()) {
+                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+                    if (spu_slot_dead(ctx, slot)) { use = (int)slot; busy--; break; }
+                if (use >= 0) ps3_lim_add(&s_lim_reclaim, 1);
+            }
+            if (busy + 1 > s_lim_slots.peak) ps3_lim_set(&s_lim_slots, busy + 1);   /* peak only: a hot path */
+            for (unsigned slot = (unsigned)(use < 0 ? SPU_RESIDENT_CODE_SLOTS : use);
+                 slot < SPU_RESIDENT_CODE_SLOTS; slot = SPU_RESIDENT_CODE_SLOTS) {
                 ctx->resident_code[slot].lsa = lsa;
                 ctx->resident_code[slot].size = o->span;
                 ctx->resident_code[slot].source_ea = ea;
@@ -2780,7 +2835,8 @@ static int ovl_try_source(spu_context* ctx, const spu_ovl_src* o, uint32_t ea, u
                             ctx->image_id, ea, lsa, o->span, o->image_id, slot); }
                 return 1;
             }
-            fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+            ps3_lim_full(&s_lim_slots, "no free resident code span for image %d (SPU img %d): it runs "
+                         "on the interpreter", o->image_id, ctx->image_id);
             return 1;
         }
         if (ctx->resident_ovl != o->image_id) {

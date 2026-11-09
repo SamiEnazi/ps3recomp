@@ -172,6 +172,7 @@ static void host_path(char* out, size_t cap, const char* guest)
 }
 
 /* ---- fd / dir handle tables ---- */
+#include "ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
 #define FS_MAX 256
 static_assert(FS_MAX == LANG_FD_MAX, "ppu_fs_lang.h keeps per-fd state for every descriptor");
 static FILE* g_files[FS_MAX];
@@ -180,14 +181,20 @@ static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */  
 static DIR*  g_dirs[FS_MAX];
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
+/* PS3_LIMITS: open descriptors (the highest one in use) and a full table. */
+static ps3_lim s_lim_fds = PS3_LIM_INIT("fs_fds", FS_MAX - 3);
 static int fd_alloc_file(FILE* f)
 {
-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
+    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) {
+        g_files[i] = f; if (i - 2 > s_lim_fds.peak) ps3_lim_set(&s_lim_fds, i - 2); return i; }
+    ps3_lim_full(&s_lim_fds, "cellFsOpen: no descriptor -> EIO");
     return -1;
 }
 static int fd_alloc_dir(DIR* d)
 {
-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_dirs[i] = d; return i; }
+    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) {
+        g_dirs[i] = d; if (i - 2 > s_lim_fds.peak) ps3_lim_set(&s_lim_fds, i - 2); return i; }
+    ps3_lim_full(&s_lim_fds, "cellFsOpendir: no descriptor");
     return -1;
 }
 

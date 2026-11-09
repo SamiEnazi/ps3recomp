@@ -29,6 +29,7 @@ static PPU_TLS int     s_exit_done = 0;
 #include "../platform/host_qos.h"       /* PS3_QOS: guest threads at USER_INTERACTIVE */
 #include "../platform/host_place.h"     /* PS3_CPU_PLACE: guest threads on chosen cores */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
+#include "ps3emu/ps3_limits.h"           /* PS3_LIMITS telemetry */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
@@ -84,6 +85,56 @@ static void table_unlock(void)
 #endif
 }
 
+/* (limits, 2026-11-09) The thread table and the guest stack region as gauges,
+ * and the stacks of finished threads kept for the next create of the same size.
+ * vm_stack_allocate is a bump allocator that never frees: every create took a
+ * new 20-68 KB from the 256 MB region (a few MB an hour of play -- not a wall
+ * in any session yet, but the console gives a dead thread's stack back).
+ * PS3_STACK_REUSE=0 = the old never-reused stacks. All under the table lock. */
+static ps3_lim s_lim_threads  = PS3_LIM_INIT("ppu_threads", PPU_THREAD_MAX);
+static ps3_lim s_lim_stack_kb = PS3_LIM_INIT("ppu_stack_kb", VM_STACK_REGION / 1024u);
+#define STACK_POOL_MAX 64
+static struct { uint32_t addr, size; } s_stack_pool[STACK_POOL_MAX];
+static int s_stack_pool_n;
+static int stack_reuse_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_STACK_REUSE"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static void stack_note_locked(void)
+{
+    int n = 0;
+    for (int i = 0; i < PPU_THREAD_MAX; i++) n += g_ppu_threads[i].state != PPU_THREAD_STATE_FREE;
+    ps3_lim_set(&s_lim_threads, n);
+    ps3_lim_set(&s_lim_stack_kb, (long)((g_vm_stack_alloc.next_addr - VM_STACK_BASE) / 1024u));
+}
+/* A freed slot's stack goes to the pool (its record in the slot is cleared by
+ * the next create's memset). */
+static void stack_pool_put_locked(ppu_thread_info* t)
+{
+    if (!t->stack_addr || !stack_reuse_on()) return;
+    if (s_stack_pool_n < STACK_POOL_MAX) {
+        s_stack_pool[s_stack_pool_n].addr = t->stack_addr;
+        s_stack_pool[s_stack_pool_n].size = VM_ALIGN_UP(t->stack_size, vm_host_page_size());
+        s_stack_pool_n++;
+    }
+    t->stack_addr = 0;
+}
+static uint32_t stack_pool_get_locked(uint32_t size)
+{
+    if (!stack_reuse_on()) return 0;
+    size = VM_ALIGN_UP(size, vm_host_page_size());
+    for (int i = 0; i < s_stack_pool_n; i++) {
+        if (s_stack_pool[i].size != size) continue;
+        const uint32_t a = s_stack_pool[i].addr;
+        s_stack_pool[i] = s_stack_pool[--s_stack_pool_n];
+        memset(vm_to_host(a), 0, size);      /* as fresh as a new one */
+        return a;
+    }
+    return 0;
+}
+
 /* A guest stack for a host thread that runs guest code outside any guest
  * thread (callbacks into guest code: ppu_guest_call). Returns the usable top,
  * or 0. Taken from the same region as thread stacks, under the same lock. */
@@ -91,6 +142,8 @@ uint32_t sys_ppu_thread_alloc_stack(uint32_t size)
 {
     table_lock();
     uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, size);
+    if (!base) ps3_lim_full(&s_lim_stack_kb, "callback stack of 0x%X", size);
+    stack_note_locked();
     table_unlock();
     return base ? base + size : 0;
 }
@@ -223,6 +276,7 @@ static void* ppu_host_thread_proc(void* param)
     if (info->state == PPU_THREAD_STATE_DETACHED) {
         /* Detached threads self-clean */
         info->state = PPU_THREAD_STATE_FREE;
+        stack_pool_put_locked(info);   /* its guest code has ended */
     } else {
         info->state = PPU_THREAD_STATE_FINISHED;
     }
@@ -403,6 +457,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
 
     int slot = find_free_slot();
     if (slot < 0) {
+        ps3_lim_full(&s_lim_threads, "sys_ppu_thread_create -> EAGAIN");
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
@@ -410,9 +465,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     ppu_thread_info* t = &g_ppu_threads[slot];
     memset(t, 0, sizeof(*t));
 
-    /* Allocate guest stack */
-    uint32_t stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
+    /* Allocate guest stack (a finished thread's of the same size first) */
+    uint32_t stack_addr = stack_pool_get_locked(stack_size);
+    if (!stack_addr) stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
     if (stack_addr == 0) {
+        ps3_lim_full(&s_lim_stack_kb, "sys_ppu_thread_create stack 0x%X -> ENOMEM", stack_size);
         table_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
@@ -501,6 +558,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
                                   _initflag, (unsigned*)&t->host_tid);
     if (t->host_thread == NULL) {
         t->state = PPU_THREAD_STATE_FREE;
+        stack_pool_put_locked(t);
         CloseHandle(t->finish_event);
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
@@ -546,6 +604,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     }
     if (rc != 0) {
         t->state = PPU_THREAD_STATE_FREE;
+        stack_pool_put_locked(t);
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
         table_unlock();
@@ -553,6 +612,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     }
 #endif
 
+    stack_note_locked();
     table_unlock();
     return CELL_OK;
 }
@@ -631,6 +691,7 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
         t->exit_status = (int64_t)status;
         if (t->state == PPU_THREAD_STATE_DETACHED) {
             t->state = PPU_THREAD_STATE_FREE;
+            stack_pool_put_locked(t);  /* it never returns to guest code */
         } else {
             t->state = PPU_THREAD_STATE_FINISHED;
         }
@@ -764,6 +825,8 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     pthread_cond_destroy(&t->finish_cond);
 #endif
     t->state = PPU_THREAD_STATE_FREE;
+    stack_pool_put_locked(t);
+    stack_note_locked();
     table_unlock();
 
     return CELL_OK;
@@ -811,6 +874,7 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         pthread_cond_destroy(&t->finish_cond);
 #endif
         t->state = PPU_THREAD_STATE_FREE;
+        stack_pool_put_locked(t);
     } else {
         t->state = PPU_THREAD_STATE_DETACHED;
         t->joinable = 0;

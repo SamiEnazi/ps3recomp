@@ -8118,6 +8118,7 @@ static int vk_pl_cmp(const void* a, const void* b)
     const float x = *(const float*)a, y = *(const float*)b;
     return (x > y) - (x < y);
 }
+#include "ps3emu/ps3_limits.h"   /* PS3_LIMITS: rtlim= on HITCH lines, RTLIMIT lines */
 u32 rsx_vulkan_backend_guest_draws(void);
 void cellGcm_hattr_take(unsigned long long* drain_ns, unsigned long long* sema_ns, unsigned long long* gaveup);
 /* (perf, 2026-11-09) What the RSX thread spent the frame on, for the HITCH line
@@ -8158,6 +8159,8 @@ static void vk_playlog_attr(FILE* f, double ms)
             h.tex_new, h.tex_reup, h.tex_evict, h.tex_bytes / 1048576.0, h.tex_ns / 1e6,
             h.hash_ns / 1e6, h.mod_n, h.mod_ns / 1e6, cached,
             pipes, pipe_ns / 1e6, spv_n, spv_ns / 1e6, alloc);
+    { char lim[256];   /* runtime limits hit since the last line (ps3_limits.h) */
+      if (ps3_limits_take_events(lim, sizeof lim)) fprintf(f, "\trtlim=%s", lim); }
     (void)ms;
 }
 static void vk_playlog_frame(void)
@@ -8197,6 +8200,11 @@ static void vk_playlog_frame(void)
     }
     if (s_pl.mark) { fprintf(s_pl.f, "MARK	%.2f\n", now - s_pl.t0); s_pl.mark = 0; }
     if (now - s_pl.sec_start < 1.0 || !s_pl.n) return;
+    if (ps3_limits_pending()) {   /* a runtime limit hit without a slow frame: RTLIMIT <t> <names> */
+        char lim[256];
+        if (ps3_limits_take_events(lim, sizeof lim))
+            fprintf(s_pl.f, "RTLIMIT\t%.2f\t%s\n", now - s_pl.t0, lim);
+    }
     u32 c17 = 0, c25 = 0, c33 = 0, c50 = 0;
     for (u32 i = 0; i < s_pl.n; i++) {
         const float d = s_pl.dt[i];

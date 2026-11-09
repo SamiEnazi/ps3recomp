@@ -23,6 +23,11 @@ void (*g_spurs_kernel_hook)(uint32_t) = 0;
 sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 sys_event_port_info  g_sys_event_ports[SYS_EVENT_PORT_MAX];
 sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+static ps3_lim s_lim_evq = PS3_LIM_INIT("event_queue", SYS_EVENT_QUEUE_MAX);
+static ps3_lim s_lim_port = PS3_LIM_INIT("event_port", SYS_EVENT_PORT_MAX);
+static ps3_lim s_lim_flag = PS3_LIM_INIT("event_flag", SYS_EVENT_FLAG_MAX);
+static ps3_lim s_lim_evq_depth = PS3_LIM_INIT("event_queue_depth", SYS_EVENT_QUEUE_BUF_MAX);
 
 /* Table lock for allocation */
 #ifdef _WIN32
@@ -109,11 +114,12 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
     for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
         if (!g_sys_event_queues[i].active) { slot = i; break; }
     }
-    if (slot < 0) { evt_table_unlock(); return 0; }
+    if (slot < 0) { ps3_lim_full(&s_lim_evq, "queue_create_direct -> 0"); evt_table_unlock(); return 0; }
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
     memset(q, 0, sizeof(*q));
     q->active   = 1;
+    PS3_LIM_COUNT(s_lim_evq, g_sys_event_queues, SYS_EVENT_QUEUE_MAX, active);
     q->key      = key;
     q->capacity = size;
     q->type     = SYS_PPU_QUEUE;
@@ -155,6 +161,7 @@ int64_t sys_event_queue_create(ppu_context* ctx)
         if (!g_sys_event_queues[i].active) { slot = i; break; }
     }
     if (slot < 0) {
+        ps3_lim_full(&s_lim_evq, "sys_event_queue_create -> EAGAIN");
         evt_table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
@@ -162,6 +169,7 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     sys_event_queue_info* q = &g_sys_event_queues[slot];
     memset(q, 0, sizeof(*q));
     q->active   = 1;
+    PS3_LIM_COUNT(s_lim_evq, g_sys_event_queues, SYS_EVENT_QUEUE_MAX, active);
     q->key      = key;
     q->capacity = size;
     q->head     = 0;
@@ -728,6 +736,9 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 #endif
 
     if (q->count >= q->capacity) {
+        /* EBUSY to the sender, as on the console (127 events at most there too) */
+        ps3_lim_full(&s_lim_evq_depth, "queue %d (key 0x%llX) full at %d events",
+                     (int)(q - g_sys_event_queues) + 1, (unsigned long long)q->key, q->capacity);
 #ifdef _WIN32
         LeaveCriticalSection(&q->lock);
 #else
@@ -739,6 +750,7 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
     q->buffer[q->tail] = *evt;
     q->tail = (q->tail + 1) % q->capacity;
     q->count++;
+    if (q->count > s_lim_evq_depth.peak) ps3_lim_set(&s_lim_evq_depth, q->count);
 
 #ifdef _WIN32
     WakeConditionVariable(&q->not_empty);
@@ -776,6 +788,7 @@ int64_t sys_event_port_create(ppu_context* ctx)
         if (!g_sys_event_ports[i].active) { slot = i; break; }
     }
     if (slot < 0) {
+        ps3_lim_full(&s_lim_port, "sys_event_port_create -> EAGAIN");
         evt_table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
@@ -783,6 +796,7 @@ int64_t sys_event_port_create(ppu_context* ctx)
     sys_event_port_info* p = &g_sys_event_ports[slot];
     memset(p, 0, sizeof(*p));
     p->active = 1;
+    PS3_LIM_COUNT(s_lim_port, g_sys_event_ports, SYS_EVENT_PORT_MAX, active);
     p->type   = port_type;
     p->name   = name;
     p->connected_queue = 0;
@@ -1079,6 +1093,7 @@ int64_t sys_event_flag_create(ppu_context* ctx)
         if (!g_sys_event_flags[i].active) { slot = i; break; }
     }
     if (slot < 0) {
+        ps3_lim_full(&s_lim_flag, "sys_event_flag_create -> EAGAIN");
         evt_table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
@@ -1086,6 +1101,7 @@ int64_t sys_event_flag_create(ppu_context* ctx)
     sys_event_flag_info* f = &g_sys_event_flags[slot];
     memset(f, 0, sizeof(*f));
     f->active  = 1;
+    PS3_LIM_COUNT(s_lim_flag, g_sys_event_flags, SYS_EVENT_FLAG_MAX, active);
     f->pattern = init_pattern;
 
     if (attr_addr != 0) {

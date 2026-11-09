@@ -5,6 +5,7 @@
  */
 
 #include "sys_memory.h"
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
 #include <stdio.h>
 #include <string.h>
 
@@ -80,6 +81,87 @@ static void bump_lock(void)   { pthread_mutex_lock(&s_bump_mtx); }
 static void bump_unlock(void) { pthread_mutex_unlock(&s_bump_mtx); }
 #endif
 
+/* (limits, 2026-11-09) Freed blocks are handed out again. The window used to be
+ * a pure bump allocator: sys_memory_free only dropped the bookkeeping, so the
+ * address space (and the committed pages under it) of every freed block was
+ * gone for good, and a title that allocates and frees in a loop -- level or
+ * district streaming -- runs into the end of the 256 MB window with most of it
+ * free, where the console would have given the memory back. A freed range is
+ * kept (merged with its neighbours, address-ordered) and the lowest one that
+ * fits takes the next allocation, zeroed like a fresh one. PS3_MEM_REUSE=0 =
+ * the old bump-only window. Under the bump lock. */
+#define MEM_FREE_MAX 256
+static struct { uint32_t addr, size; } s_mem_free[MEM_FREE_MAX];
+static int      s_mem_free_n;
+static uint32_t s_mem_free_bytes;
+static ps3_lim  s_lim_mem_inuse  = PS3_LIM_INIT("mem_inuse_kb", 0);
+static ps3_lim  s_lim_mem_window = PS3_LIM_INIT("mem_window_kb", 0);
+static ps3_lim  s_lim_mem_allocs = PS3_LIM_INIT("mem_allocs", SYS_MEMORY_ALLOC_MAX);
+static ps3_lim  s_lim_mem_frees  = PS3_LIM_INIT("mem_frees", 0);
+static ps3_lim  s_lim_mem_reused = PS3_LIM_INIT("mem_reused_kb", 0);
+static ps3_lim  s_lim_mem_flist  = PS3_LIM_INIT("mem_freelist", MEM_FREE_MAX);
+static int mem_reuse_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_MEM_REUSE"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static void mem_note_locked(void)
+{
+    int n = 0;
+    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) n += g_sys_mem_allocs[i].active != 0;
+    if (!s_lim_mem_inuse.cap) {
+        s_lim_mem_inuse.cap  = (long)(sys_mem_user_total() / 1024u);
+        s_lim_mem_window.cap = (long)((SYS_MEM_ALLOC_END - SYS_MEM_ALLOC_BASE) / 1024u);
+    }
+    ps3_lim_set(&s_lim_mem_allocs, n);
+    ps3_lim_set(&s_lim_mem_inuse, (long)(s_total_allocated / 1024u));
+    ps3_lim_set(&s_lim_mem_window, g_sys_mem_bump_ptr ?
+                (long)((g_sys_mem_bump_ptr - SYS_MEM_ALLOC_BASE - s_mem_free_bytes) / 1024u) : 0);
+    ps3_lim_set(&s_lim_mem_flist, s_mem_free_n);
+}
+static void mem_free_put_locked(uint32_t a, uint32_t sz)
+{
+    if (!sz) return;
+    if (s_mem_free_n == MEM_FREE_MAX) {
+        ps3_lim_full(&s_lim_mem_flist, "freed 0x%08X+0x%X not kept (the old leak)", a, sz);
+        return;
+    }
+    int i = s_mem_free_n;
+    while (i > 0 && s_mem_free[i - 1].addr > a) { s_mem_free[i] = s_mem_free[i - 1]; i--; }
+    s_mem_free[i].addr = a; s_mem_free[i].size = sz;
+    s_mem_free_n++;
+    s_mem_free_bytes += sz;
+    /* merge with the next, then with the previous */
+    if (i + 1 < s_mem_free_n && s_mem_free[i].addr + s_mem_free[i].size == s_mem_free[i + 1].addr) {
+        s_mem_free[i].size += s_mem_free[i + 1].size;
+        memmove(&s_mem_free[i + 1], &s_mem_free[i + 2], (size_t)(s_mem_free_n - i - 2) * sizeof s_mem_free[0]);
+        s_mem_free_n--;
+    }
+    if (i > 0 && s_mem_free[i - 1].addr + s_mem_free[i - 1].size == s_mem_free[i].addr) {
+        s_mem_free[i - 1].size += s_mem_free[i].size;
+        memmove(&s_mem_free[i], &s_mem_free[i + 1], (size_t)(s_mem_free_n - i - 1) * sizeof s_mem_free[0]);
+        s_mem_free_n--;
+    }
+}
+/* The lowest freed range that holds `size` at `align`; 0 = none. */
+static uint32_t mem_free_get_locked(uint32_t size, uint32_t align)
+{
+    for (int i = 0; i < s_mem_free_n; i++) {
+        const uint32_t lo = s_mem_free[i].addr, end = lo + s_mem_free[i].size;
+        const uint32_t a = VM_ALIGN_UP(lo, align);
+        if (a < lo || a + size < a || a + size > end) continue;
+        /* take [a, a+size); the head [lo, a) and the tail [a+size, end) go back */
+        memmove(&s_mem_free[i], &s_mem_free[i + 1], (size_t)(s_mem_free_n - i - 1) * sizeof s_mem_free[0]);
+        s_mem_free_n--;
+        s_mem_free_bytes -= end - lo;
+        mem_free_put_locked(lo, a - lo);
+        mem_free_put_locked(a + size, end - (a + size));
+        return a;
+    }
+    return 0;
+}
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -139,27 +221,36 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     if (g_sys_mem_bump_ptr == 0)
         g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
 
-    /* Align bump pointer */
-    g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
-
-    /* Check if we have room */
-    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
-        bump_unlock();
-        return (int64_t)(int32_t)CELL_ENOMEM;
-    }
-
     /* Find a free allocation slot */
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (!g_sys_mem_allocs[i].active) { slot = i; break; }
     }
     if (slot < 0) {
+        ps3_lim_full(&s_lim_mem_allocs, "sys_memory_allocate 0x%X -> ENOMEM", size);
         bump_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
-    uint32_t alloc_addr = g_sys_mem_bump_ptr;
-    g_sys_mem_bump_ptr += size;
+    /* A freed range first (PS3_MEM_REUSE) */
+    uint32_t alloc_addr = mem_reuse_on() ? mem_free_get_locked(size, alignment) : 0;
+    if (alloc_addr) {
+        memset(vm_to_host(alloc_addr), 0, size);    /* still committed: zero it as a fresh commit is */
+        ps3_lim_add(&s_lim_mem_reused, (long)(size / 1024u));
+    } else {
+        /* Align bump pointer */
+        g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
+
+        /* Check if we have room */
+        if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
+            ps3_lim_full(&s_lim_mem_window, "sys_memory_allocate 0x%X -> ENOMEM (%u KB in use, %u KB freed)",
+                         size, s_total_allocated / 1024u, s_mem_free_bytes / 1024u);
+            bump_unlock();
+            return (int64_t)(int32_t)CELL_ENOMEM;
+        }
+        alloc_addr = g_sys_mem_bump_ptr;
+        g_sys_mem_bump_ptr += size;
+    }
     s_total_allocated += size;
 
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
@@ -168,6 +259,7 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     a->size         = size;
     a->container_id = 0;
     a->page_size    = alignment;  /* 0x100000 (1M) or 0x10000 (64K) */
+    mem_note_locked();
 
     bump_unlock();
 
@@ -196,13 +288,19 @@ int64_t sys_memory_free(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
 
+    bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
             s_total_allocated -= g_sys_mem_allocs[i].size;
             g_sys_mem_allocs[i].active = 0;
+            if (mem_reuse_on()) mem_free_put_locked(addr, g_sys_mem_allocs[i].size);
+            ps3_lim_add(&s_lim_mem_frees, 1);
+            mem_note_locked();
+            bump_unlock();
             return CELL_OK;
         }
     }
+    bump_unlock();
 
     return (int64_t)(int32_t)CELL_EINVAL;
 }
@@ -219,7 +317,7 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
     fprintf(stderr, "[sys_memory] get_user_memory_size()\n");
     if (out_addr != 0) {
         uint32_t total = SYS_MEM_USER_TOTAL;
-        uint32_t avail = total - s_total_allocated;
+        uint32_t avail = total > s_total_allocated ? total - s_total_allocated : 0;
         write_be32(out_addr + 0, total);
         write_be32(out_addr + 4, avail);
     }

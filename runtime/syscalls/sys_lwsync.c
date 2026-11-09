@@ -62,8 +62,11 @@ typedef struct {
 } lwcond;
 
 #define LW_MAX 1024
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
 static lwmutex s_mtx[LW_MAX];
 static lwcond  s_cnd[LW_MAX];
+static ps3_lim s_lim_lwm = PS3_LIM_INIT("lwmutex", LW_MAX);
+static ps3_lim s_lim_lwc = PS3_LIM_INIT("lwcond", LW_MAX);
 static SRWLOCK s_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_destroy_cv = CONDITION_VARIABLE_INIT;
 static uint64_t s_order;
@@ -191,10 +194,12 @@ static int64_t sys_lwmutex_create(ppu_context* ctx)
         m->in_use = 1;
         m->id = 0x95000000u | (n & 0xFFFF);
         m->protocol = protocol;
+        PS3_LIM_COUNT(s_lim_lwm, s_mtx, LW_MAX, in_use);
         ReleaseSRWLockExclusive(&s_lock);
         wr32(out, m->id);
         return CELL_OK;
     }
+    ps3_lim_full(&s_lim_lwm, "_sys_lwmutex_create -> EAGAIN");
     ReleaseSRWLockExclusive(&s_lock);
     return (int32_t)CELL_EAGAIN;
 }
@@ -287,10 +292,12 @@ static int64_t sys_lwcond_create(ppu_context* ctx)
         c->id = 0x97000000u | (n & 0xFFFF);
         c->protocol = protocol;
         c->lwmutex_id = mid;
+        PS3_LIM_COUNT(s_lim_lwc, s_cnd, LW_MAX, in_use);
         ReleaseSRWLockExclusive(&s_lock);
         wr32(out, c->id);
         return CELL_OK;
     }
+    ps3_lim_full(&s_lim_lwc, "_sys_lwcond_create -> EAGAIN");
     ReleaseSRWLockExclusive(&s_lock);
     return (int32_t)CELL_EAGAIN;
 }

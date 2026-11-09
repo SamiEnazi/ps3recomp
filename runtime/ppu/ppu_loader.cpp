@@ -42,6 +42,7 @@
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
+#include "ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 /* VSCR at thread start: NJ = 1 like the PS3 (see ppu_vscr_default in
  * runtime/ppu/ppu_context.h, which this TU cannot include: ppu_recomp.h
@@ -852,11 +853,40 @@ static volatile LONG g_resv_locks[PPU_RESV_LOCKS];
  * vm_write* reads g_resv_store_active directly (a hot global) so the default-off
  * path costs one predictable branch. */
 extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
+/* (limits, 2026-11-09) A context is registered ONCE. Guest thread contexts live
+ * in the thread table's slots (sys_ppu_thread.c), so a slot reused by a new
+ * thread brings back an address already here; appending it again filled the
+ * 128 entries after ~127 thread starts (Sami's 53-minute session started 55
+ * threads: Game State Thread, Bink IO/Snd per movie), and from then on a thread
+ * in a never-used slot was not registered at all -- other threads' stwcx no
+ * longer broke its reservations (ABA on the guest's lock-free lists) -- while
+ * every stwcx walked a growing list of duplicates. PS3_RESV_REG_DEDUP=0 = old. */
+static ps3_lim s_lim_resv = PS3_LIM_INIT("ppu_resv_ctx", PPU_RESV_MAX);
 extern "C" void ppu_resv_register(ppu_context* c)
 {
     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
+    static int dedup = -1;
+    if (dedup < 0) { const char* e = getenv("PS3_RESV_REG_DEDUP"); dedup = !(e && e[0] == '0'); }
+    if (dedup) {
+        static SRWLOCK reg_lock = SRWLOCK_INIT;
+        AcquireSRWLockExclusive(&reg_lock);
+        long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+        for (long i = 0; i < n; i++)
+            if (g_resv_ctxs[i] == c) { ReleaseSRWLockExclusive(&reg_lock); return; }
+        if (n < PPU_RESV_MAX) {
+            g_resv_ctxs[n] = c;                       /* the entry first, then the count */
+            _InterlockedExchange(&g_resv_ctx_n, n + 1);
+            ps3_lim_set(&s_lim_resv, n + 1);
+        } else {
+            ps3_lim_full(&s_lim_resv, "thread %llu's reservations are not broken by other threads",
+                         (unsigned long long)c->thread_id);
+        }
+        ReleaseSRWLockExclusive(&reg_lock);
+        return;
+    }
     long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
-    if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
+    if (i < PPU_RESV_MAX) { g_resv_ctxs[i] = c; ps3_lim_set(&s_lim_resv, i + 1); }
+    else ps3_lim_full(&s_lim_resv, "thread %llu not registered", (unsigned long long)c->thread_id);
 }
 /* Where every guest thread is, as a GUEST address.
  *

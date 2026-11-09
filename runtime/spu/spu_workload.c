@@ -5,6 +5,7 @@
  * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
+#include "ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
 #include "../memory/guest_mem_atomic.h"
 #include "../../include/ps3emu/log_first.h"   /* PS3_LOG_FIRST */
 #include "spu_workload.h"
@@ -896,6 +897,8 @@ void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
         if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; return; }
+    static ps3_lim s_lim_parked = PS3_LIM_INIT("spu_parked_tasks", SPU_PARKED_MAX);
+    ps3_lim_full(&s_lim_parked, "taskset 0x%08X task %u not recorded: its wake is a 1 s poll", taskset_ea, taskId);
 }
 
 void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
@@ -923,6 +926,8 @@ void spu_ef_bits_post(uint32_t obj, uint16_t bits)
         if (s_efbits_obj[i] == obj) { s_efbits_val[i] |= bits; return; }
     for (int i = 0; i < SPU_EFBITS_MAX; i++)
         if (s_efbits_obj[i] == 0) { s_efbits_val[i] = bits; s_efbits_obj[i] = obj; return; }
+    static ps3_lim s_lim_efbits = PS3_LIM_INIT("spu_ef_bits", SPU_EFBITS_MAX);
+    ps3_lim_full(&s_lim_efbits, "event bits 0x%04X for object 0x%08X dropped", bits, obj);
 }
 
 /* Take (and clear) whatever is owed to `obj`. 0 = nothing pending. */
@@ -953,6 +958,8 @@ void spu_taskset_latch_wake(uint32_t taskset_ea)
         if (s_wake_latch[i] == taskset_ea) return;          /* already latched */
     for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
         if (s_wake_latch[i] == 0) { s_wake_latch[i] = taskset_ea; return; }
+    static ps3_lim s_lim_latch = PS3_LIM_INIT("spu_wake_latch", SPU_WAKE_LATCH_MAX);
+    ps3_lim_full(&s_lim_latch, "taskset 0x%08X wake not latched", taskset_ea);
 }
 
 /* Consume a latched wake for this taskset. Returns 1 if one was pending. */

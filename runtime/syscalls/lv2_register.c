@@ -3003,6 +3003,7 @@ LV2_HLE_BRIDGE(hle_sys_spu_image_open,   sys_spu_image_open_handler)
 
 void lv2_init_syscalls(void)
 {
+    { extern void ps3_limits_init(void); ps3_limits_init(); }   /* PS3_LIMITS telemetry */
     lv2_register_all_syscalls(&g_lv2_syscalls);
 
     ps3_hle_register_ctx(ps3_compute_nid("sys_spu_image_import"),

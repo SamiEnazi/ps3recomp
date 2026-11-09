@@ -14,6 +14,8 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_semaphore_info g_sys_semaphores[SYS_SEMAPHORE_MAX];
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+static ps3_lim s_lim_sem = PS3_LIM_INIT("semaphore", SYS_SEMAPHORE_MAX);
 
 #ifdef _WIN32
 static CRITICAL_SECTION s_sem_table_lock;
@@ -231,6 +233,7 @@ int64_t sys_semaphore_create(ppu_context* ctx)
         if (!g_sys_semaphores[i].active) { slot = i; break; }
     }
     if (slot < 0) {
+        ps3_lim_full(&s_lim_sem, "sys_semaphore_create -> EAGAIN");
         sem_table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
@@ -238,6 +241,7 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     sys_semaphore_info* s = &g_sys_semaphores[slot];
     memset(s, 0, sizeof(*s));
     s->active    = 1;
+    PS3_LIM_COUNT(s_lim_sem, g_sys_semaphores, SYS_SEMAPHORE_MAX, active);
     s->value     = initial;
     s->max_value = max_val;
 

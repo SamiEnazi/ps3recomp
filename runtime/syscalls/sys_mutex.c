@@ -13,6 +13,8 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+static ps3_lim s_lim_mutex = PS3_LIM_INIT("mutex", SYS_MUTEX_MAX);
 
 #ifdef _WIN32
 static CRITICAL_SECTION s_mtx_table_lock;
@@ -78,6 +80,7 @@ int64_t sys_mutex_create(ppu_context* ctx)
 
     int slot = mtx_find_free();
     if (slot < 0) {
+        ps3_lim_full(&s_lim_mutex, "sys_mutex_create -> EAGAIN");
         mtx_table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
@@ -85,6 +88,7 @@ int64_t sys_mutex_create(ppu_context* ctx)
     sys_mutex_info* m = &g_sys_mutexes[slot];
     memset(m, 0, sizeof(*m));
     m->active = 1;
+    PS3_LIM_COUNT(s_lim_mutex, g_sys_mutexes, SYS_MUTEX_MAX, active);
 
     /* Read attributes from guest memory */
     if (attr_addr != 0) {

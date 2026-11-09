@@ -18,6 +18,8 @@ struct sys_cond_waiter {
 
 sys_cond_info g_sys_conds[SYS_COND_MAX];
 uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+static ps3_lim s_lim_cond = PS3_LIM_INIT("cond", SYS_COND_MAX);
 
 #ifdef _WIN32
 static SRWLOCK s_table_lock = SRWLOCK_INIT;
@@ -84,6 +86,7 @@ int64_t sys_cond_create(ppu_context* ctx)
         if (attr) memcpy(c->name, (uint8_t*)vm_to_host(attr) + 8, 8);
         c->active = 1;
         g_cond_id_addr[i + 1] = out;
+        PS3_LIM_COUNT(s_lim_cond, g_sys_conds, SYS_COND_MAX, active);
         if (out) {
             uint8_t* p = vm_to_host(out);
             uint32_t id = i + 1;
@@ -98,6 +101,7 @@ int64_t sys_cond_create(ppu_context* ctx)
         table_unlock();
         return CELL_OK;
     }
+    ps3_lim_full(&s_lim_cond, "sys_cond_create -> EAGAIN");
     table_unlock();
     return (int32_t)CELL_EAGAIN;
 }

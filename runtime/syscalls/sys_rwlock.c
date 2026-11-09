@@ -10,6 +10,8 @@
  * Globals
  * -----------------------------------------------------------------------*/
 sys_rwlock_info g_sys_rwlocks[SYS_RWLOCK_MAX];
+#include "../../include/ps3emu/ps3_limits.h"   /* PS3_LIMITS telemetry */
+static ps3_lim s_lim_rw = PS3_LIM_INIT("rwlock", SYS_RWLOCK_MAX);
 
 #ifndef _WIN32
 /* The write lock's owner, or 0. Only the owner ever writes it, and only
@@ -52,12 +54,15 @@ int64_t sys_rwlock_create(ppu_context* ctx)
     for (int i = 0; i < SYS_RWLOCK_MAX; i++) {
         if (!g_sys_rwlocks[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        ps3_lim_full(&s_lim_rw, "sys_rwlock_create -> EAGAIN");
         return (int64_t)(int32_t)CELL_EAGAIN;
+    }
 
     sys_rwlock_info* r = &g_sys_rwlocks[slot];
     memset(r, 0, sizeof(*r));
     r->active = 1;
+    PS3_LIM_COUNT(s_lim_rw, g_sys_rwlocks, SYS_RWLOCK_MAX, active);
 
     if (attr_addr != 0) {
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
