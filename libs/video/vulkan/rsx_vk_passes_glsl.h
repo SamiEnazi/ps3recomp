@@ -62,7 +62,7 @@ static const char kVkPassVS[] =
 QDEF \
 "float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }\n" \
 "struct GLight { vec4 pos_type; vec4 col_inner; vec4 oacbn; vec4 dir; };\n" \
-"layout(std140, set = 0, binding = 0) uniform GLParams { vec4 m[4]; vec4 misc; GLight l[128]; } p;\n" \
+"layout(std140, set = 0, binding = 0) uniform GLParams { vec4 m[4]; vec4 misc; GLight l[512]; } p;\n" \
 "layout(set = 0, binding = 1) uniform sampler2D nt;\n" \
 "layout(set = 0, binding = 2) uniform sampler2D zt;\n" \
 "layout(location = 0) out vec4 o_diff;\n" \
@@ -81,7 +81,7 @@ QDEF \
 "    float s = exp2(nr.a * (8.0 / 255.0) - 0.88896);\n" \
 "    vec3 V = -normalize(P);\n" \
 "    vec3 acc = vec3(0.0); float sp = 0.0;\n" \
-"    int n = min(int(p.misc.y), 128);\n" \
+"    int n = min(int(p.misc.y), 512);\n" \
 "    for (int k = 0; k < n; k++) {\n" \
 "        GLight L = p.l[k];\n" \
 "        vec3 Lv = L.pos_type.xyz - P; float d = length(Lv); vec3 l = Lv / d;\n" \

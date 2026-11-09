@@ -718,11 +718,16 @@ static void vk_destroy_image(vk_image* im)
      * (or finish the batch now if the list is full). */
     if ((s_batch.recording || vk_fif_busy()) && (im->view || im->img)) {
         if (s_batch.n_dead_img >= vk_dead_img_cap()) {
+            rsx_lim_event(RSX_LIM_VK_DEAD_IMG, 0, "released-image list full: the frame waits for the GPU");
             if (s_batch.recording) vk_batch_flush();
             else vk_fif_wait_other();
         }
         if ((s_batch.recording || vk_fif_busy()) &&
             s_batch.n_dead_img < vk_dead_img_cap()) {
+            if (s_batch.n_dead_img + 1u > g_rsx_lim[RSX_LIM_VK_DEAD_IMG].peak) {
+                rsx_lim_cap(RSX_LIM_VK_DEAD_IMG, vk_dead_img_cap());
+                rsx_lim_use(RSX_LIM_VK_DEAD_IMG, s_batch.n_dead_img + 1u);
+            }
             s_batch.dead_img[s_batch.n_dead_img++] = *im;
             memset(im, 0, sizeof *im);
             return;
@@ -740,6 +745,7 @@ static void vk_destroy_image_now(vk_image* im)
             s_imgpool_n--;
         }
         s_imgpool[s_imgpool_n++] = *im;
+        if (s_imgpool_n > g_rsx_lim[RSX_LIM_VK_IMGPOOL].peak) { rsx_lim_cap(RSX_LIM_VK_IMGPOOL, VK_IMG_POOL); rsx_lim_use(RSX_LIM_VK_IMGPOOL, s_imgpool_n); }
         memset(im, 0, sizeof *im);
         return;
     }
@@ -974,6 +980,11 @@ static int vk_submit_and_wait_at(int line)
 {
     const int was_batch = s_batch.recording;
     if (was_batch) vk_flush_note(line, s_batch.draws);
+    if (was_batch) {   /* (rsx5) PS3RECOMP_LIMITS: the frame's batch submitted and waited on */
+        char why[96];
+        snprintf(why, sizeof why, "the frame waits for the GPU mid-frame (rsx_vulkan_backend.c:%d)", line);
+        rsx_lim_event(RSX_LIM_VK_MIDFLUSH, 0, why);
+    }
     vk_batch_end_pass();
     vk_gprof_stamp(GP_END, 0, 0);
     s_batch.recording = 0;                  /* even on failure: never append to a dead buffer */
@@ -999,6 +1010,13 @@ static void vk_batch_completed(void)
 {
     vk_gprof_collect();
     {
+        /* (rsx5) PS3RECOMP_LIMITS: what this batch used of the arenas and sets */
+        rsx_lim_cap(RSX_LIM_VK_ARENA_V, s_batch.varena.size >> 20); rsx_lim_use(RSX_LIM_VK_ARENA_V, s_batch.vcur >> 20);
+        rsx_lim_cap(RSX_LIM_VK_ARENA_I, s_batch.iarena.size >> 20); rsx_lim_use(RSX_LIM_VK_ARENA_I, s_batch.icur >> 20);
+        rsx_lim_cap(RSX_LIM_VK_ARENA_U, s_batch.uarena.size >> 20); rsx_lim_use(RSX_LIM_VK_ARENA_U, s_batch.ucur >> 20);
+        rsx_lim_cap(RSX_LIM_VK_ARENA_S, s_batch.sarena.size >> 20); rsx_lim_use(RSX_LIM_VK_ARENA_S, s_batch.scur >> 20);
+        rsx_lim_cap(RSX_LIM_VK_ARENA_G, s_batch.garena.size >> 20); rsx_lim_use(RSX_LIM_VK_ARENA_G, s_batch.gcur >> 20);
+        rsx_lim_cap(RSX_LIM_VK_DSETS, VK_BATCH_SETS); rsx_lim_use(RSX_LIM_VK_DSETS, s_batch.dsets);
         s_batch.flushes++;
         s_batch.flushed_draws += s_batch.draws;
         if (s_batch.draws > s_batch.max_draws) s_batch.max_draws = s_batch.draws;
@@ -1166,11 +1184,14 @@ static void vk_batch_retire_fb(VkFramebuffer fb)
     if (!fb) return;
     if (!s_batch.recording && !vk_fif_busy()) { pvkDestroyFramebuffer(s_vk.device, fb, NULL); return; }
     if (s_batch.n_dead_fb >= VK_BATCH_DEAD_FB) {
+        rsx_lim_event(RSX_LIM_VK_DEAD_FB, 0, "released-framebuffer list full: the frame waits for the GPU");
         if (s_batch.recording) vk_batch_flush();   /* frees the list */
         else vk_fif_wait_other();
     }
-    if ((s_batch.recording || vk_fif_busy()) && s_batch.n_dead_fb < VK_BATCH_DEAD_FB)
+    if ((s_batch.recording || vk_fif_busy()) && s_batch.n_dead_fb < VK_BATCH_DEAD_FB) {
         s_batch.dead_fb[s_batch.n_dead_fb++] = fb;
+        if (s_batch.n_dead_fb > g_rsx_lim[RSX_LIM_VK_DEAD_FB].peak) { rsx_lim_cap(RSX_LIM_VK_DEAD_FB, VK_BATCH_DEAD_FB); rsx_lim_use(RSX_LIM_VK_DEAD_FB, s_batch.n_dead_fb); }
+    }
     else pvkDestroyFramebuffer(s_vk.device, fb, NULL);
 }
 
@@ -4034,6 +4055,7 @@ static u32 vk_eng_alloc(void)
         if (s_eobj[i].kind == VK_ENG_FREE) return i;
     }
     { static int said; if (!said++) VK_LOG("engine: object table full (%d)\n", VK_ENG_MAX_OBJ); }
+    rsx_lim_event(RSX_LIM_VK_OBJ, 0, "object table full: a texture/target/copy is not made");
     return 0;
 }
 
@@ -4241,6 +4263,7 @@ static VkDescriptorSet vk_fbfin_set(const u32* rt, u32 n)
         if (k == n) return s_ropt.e[i].set;
     }
     if (s_ropt.ne == VK_FBFIN_SETS) {
+        rsx_lim_event(RSX_LIM_VK_FBFIN, 0, "input-attachment sets used up: flush, wait and reset");
         vk_batch_flush();
         vk_fif_wait_other();
         pvkResetDescriptorPool(s_vk.device, s_ropt.pool, 0);
@@ -4334,11 +4357,26 @@ static int vk_eng_init(void* user, u32 width, u32 height)
     return s_vk.device ? 0 : -1;
 }
 
+/* the colour copies (vk_eng_color_snapshot): here so a release can drop its own */
+#define VK_CSNAP_MAX      64u
+#define VK_TAG_CSNAP      0xC5000000u       /* a colour copy                      */
+static struct { u32 src, dst; } s_csnap[VK_CSNAP_MAX];
+static u32 s_csnap_count;
 static void vk_eng_release(void* user, u32 handle)
 {
     (void)user;
     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
     s_eobj_gen++;
+    /* (rsx5) a released target's colour copy goes with it: its entry used to
+     * stay, so recycled targets used the table up (64) and leaked a copy each */
+    if (s_eobj[handle].kind == VK_ENG_COLOR && s_eobj[handle].tag != VK_TAG_CSNAP)
+        for (u32 i = 0; i < s_csnap_count; i++)
+            if (s_csnap[i].src == handle) {
+                const u32 d = s_csnap[i].dst;
+                s_csnap[i].src = s_csnap[i].dst = 0;
+                if (d && d < VK_ENG_MAX_OBJ && s_eobj[d].kind == VK_ENG_COLOR && s_eobj[d].tag == VK_TAG_CSNAP)
+                    vk_eng_release(user, d);
+            }
     if (s_eobj[handle].kind == VK_ENG_COLOR)
         for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
             if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
@@ -5256,9 +5294,9 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
  * pipeline in play, and inFAMOUS 2 has used 512 by the time its first level
  * loads -- at 512 every later pipeline failed silently and the level's
  * draws were dropped ("pipeline"), leaving a black world. */
-#define VK_ENG_MAX_PIPE   8192
+#define VK_ENG_MAX_PIPE   32768   /* (rsx5) was 8192, as the engine's table */
 #define VK_ENG_TOPOLOGIES 5
-#define VK_ENG_FB_CACHE   64
+#define VK_ENG_FB_CACHE   256   /* (rsx5) was 64: when full every framebuffer is dropped (the open pass ends) */
 
 typedef struct vk_eng_pipe {
     int                 used;
@@ -5333,7 +5371,7 @@ static struct {
     u32          warned;
 } s_e2;
 
-#define VK_ENG_SAMP_CACHE 256   /* [postfx] room for samplers of a live anisotropy change */
+#define VK_ENG_SAMP_CACHE 1024  /* [postfx] room for samplers of a live anisotropy change; (rsx5) was 256 */
 static struct { u64 key; VkSampler s; } s_esamp[VK_ENG_SAMP_CACHE];
 static u32 s_esamp_count;
 
@@ -5559,8 +5597,10 @@ static u32 vk_eng_pipeline_create_body(void* user, const char* vs_hlsl, const ch
         static int said;
         if (!said++) VK_LOG("engine: all %u pipeline slots in use -- new pipelines fail, their draws are dropped\n",
                             (unsigned)VK_ENG_MAX_PIPE);
+        rsx_lim_event(RSX_LIM_VK_PIPE, 0, "pipeline slots used up: the draw is dropped");
         return 0;
     }
+    if (slot + 1u > g_rsx_lim[RSX_LIM_VK_PIPE].peak) { rsx_lim_cap(RSX_LIM_VK_PIPE, VK_ENG_MAX_PIPE); rsx_lim_use(RSX_LIM_VK_PIPE, slot + 1u); }
     vk_eng_pipe* P = &s_epipe[slot];
     memset(P, 0, sizeof *P);
     /* FUNC_ADD_SIGNED lanes (see vk_eng_sblend_hlsl). A lane whose source
@@ -6053,7 +6093,10 @@ static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, V
     if (last < s_e2.fb_count && !memcmp(s_e2.fb[last].key, key, sizeof key)) return s_e2.fb[last].fb;
     for (u32 i = 0; i < s_e2.fb_count; i++)
         if (!memcmp(s_e2.fb[i].key, key, sizeof key)) { last = i; return s_e2.fb[i].fb; }
-    if (s_e2.fb_count >= VK_ENG_FB_CACHE) vk_eng_drop_framebuffers();
+    if (s_e2.fb_count >= VK_ENG_FB_CACHE) {
+        rsx_lim_event(RSX_LIM_VK_FB, 1, "framebuffer cache full: every framebuffer dropped and made again");
+        vk_eng_drop_framebuffers();
+    }
     VkImageView views[RSX_BE_MAX_COLOR_TARGETS + 1];
     for (u32 i = 0; i < n; i++) views[i] = s_eobj[rt[i]].im.view;
     views[n] = dview;
@@ -6112,7 +6155,11 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
                   | ((u64)(lo >> 16) << 16) | ((u64)(hi >> 16) << 32)
                   | ((u64)aniso << 48);    /* [postfx] a new level keys new samplers */
     for (u32 i = 0; i < s_esamp_count; i++) if (s_esamp[i].key == key) return s_esamp[i].s;
-    if (s_esamp_count >= VK_ENG_SAMP_CACHE) return s_vk.sampler;
+    if (s_esamp_count >= VK_ENG_SAMP_CACHE) {
+        rsx_lim_event(RSX_LIM_VK_SAMP, 0, "sampler table full: the default sampler (wrong filter/wrap) is used");
+        return s_vk.sampler;
+    }
+    rsx_lim_cap(RSX_LIM_VK_SAMP, VK_ENG_SAMP_CACHE); rsx_lim_use(RSX_LIM_VK_SAMP, s_esamp_count + 1u);
     float min_lod = d->min_lod, max_lod = d->mip_present ? d->max_lod : d->min_lod;
     if (max_lod < min_lod) max_lod = min_lod;
     VkSamplerCreateInfo sci = {
@@ -6377,6 +6424,10 @@ static int vk_batch_reserve(VkDeviceSize vb, VkDeviceSize ib, VkDeviceSize ub,
         const int ov_v = rec && s_batch.varena.buf && v + vb > s_batch.varena.size;
         const int ov_i = rec && s_batch.iarena.buf && i + (ib ? ib : 4u) > s_batch.iarena.size;
         const int ov_u = rec && s_batch.uarena.buf && u + ub > s_batch.uarena.size;
+        if (rec && s_batch.dsets >= VK_BATCH_SETS) rsx_lim_event(RSX_LIM_VK_DSETS, 0, "descriptor sets of one batch used up: mid-frame wait");
+        if (ov_v) rsx_lim_event(RSX_LIM_VK_ARENA_V, 0, "vertex arena full mid-frame: wait, then it grows");
+        if (ov_i) rsx_lim_event(RSX_LIM_VK_ARENA_I, 0, "index arena full mid-frame: wait, then it grows");
+        if (ov_u) rsx_lim_event(RSX_LIM_VK_ARENA_U, 0, "uniform arena full mid-frame: wait, then it grows");
         vk_batch_flush();                       /* idle from here: arenas may grow */
         if (vk_batch_arena_grow(&s_batch.varena, vb, ov_v, 512ull << 20, 32u << 20,
                                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, "vertex") ||
@@ -6472,7 +6523,7 @@ static u32 vk_eng_vbuf_create(void* user, const void* data, u32 bytes)
     u32 h;
     if (s_vb.nfree_h) h = s_vb.free_h[--s_vb.nfree_h];
     else if (s_vb.next_h < VK_VB_HANDLES) h = s_vb.next_h++;
-    else return 0;
+    else { rsx_lim_event(RSX_LIM_VK_VB, 0, "persistent buffer handles used up: geometry staged every frame"); return 0; }
     u32 chunk, off;
     if (s_vb.fl_n[c]) {
         const u64 b = s_vb.fl[c][--s_vb.fl_n[c]];
@@ -6486,6 +6537,7 @@ static u32 vk_eng_vbuf_create(void* user, const void* data, u32 bytes)
                 !nb->coherent) {
                 if (s_vb.nchunks < VK_VB_CHUNKS) vk_destroy_buffer(nb);
                 if (!(s_e2.warned & 0x200u)) { VK_LOG("engine: persistent vertex buffers full (%u chunks)\n", s_vb.nchunks); s_e2.warned |= 0x200u; }
+                rsx_lim_event(RSX_LIM_VK_VB, 0, "persistent buffer memory full: geometry staged every frame");
                 s_vb.free_h[s_vb.nfree_h++] = h;
                 return 0;
             }
@@ -6498,6 +6550,7 @@ static u32 vk_eng_vbuf_create(void* user, const void* data, u32 bytes)
     memcpy((u8*)s_vb.chunk[chunk].ptr + off, data, bytes);
     s_vb.ent[h] = (vk_vb_ent){ chunk, off, c, 1u };
     s_vb.live++; s_vb.live_bytes += vk_vb_class_size(c);
+    if (s_vb.live > g_rsx_lim[RSX_LIM_VK_VB].peak) { rsx_lim_cap(RSX_LIM_VK_VB, VK_VB_HANDLES - 1u); rsx_lim_use(RSX_LIM_VK_VB, s_vb.live); }
     return h;
 }
 static void vk_vb_free_now(u32 h)
@@ -6921,10 +6974,14 @@ enum { VK_PASS_LIGHT, VK_PASS_SSAO_HD, VK_PASS_SSAO_AO, VK_PASS_SSAO_BLUR_H, VK_
 #define VK_PASS_TEXTURES  3u                /* bindings 1..3: MSL texture(0..2) */
 #define VK_SSAO_UBO_BYTES 512u              /* the engine's bound (s_gs.consts) */
 #define VK_PASS_SPV_WORDS 16384u
-#define VK_CSNAP_MAX      64u
 #define VK_ZRGBA_MAX      32u
 #define VK_ZRGBA_SETS     64u              /* depth decodes (and [res] snapshot passes) one batch can hold */
-#define VK_TAG_CSNAP      0xC5000000u       /* a colour copy                      */
+/* (rsx5) The GPU light and SSAO passes: constant buffers and set groups a
+ * batch can hold. With one, a second light pass in a frame's batch flushed and
+ * waited for the GPU (5-10 ms: the fight's 13 + 1 ms frame pairs, ~3 a second
+ * in the walk). PS3RECOMP_VK_PASS_RING=1 = one (the old flush). */
+#define VK_PASS_RING      4u
+/* VK_TAG_CSNAP (a colour copy) and VK_CSNAP_MAX: defined above vk_eng_release (rsx5) */
 #define VK_TAG_PASS       0xA0000000u       /* a light or SSAO output             */
 #define VK_TAG_ZRGBA      0x5A000000u       /* | depth handle: a depth decode     */
 
@@ -6940,6 +6997,9 @@ static struct {
     VkDescriptorSet       zset[VK_ZRGBA_SETS];     /* the depth decode's, one per decode in a batch */
     VkRenderPass          rp_light, rp_rgba8, rp_r8, rp_r32f;
     vk_buffer             light_ubo, ssao_ubo;
+    /* (rsx5) VK_PASS_RING: the 2nd.. light / SSAO pass of one batch */
+    VkDescriptorSet       xset[VK_PASS_RING - 1][VK_PASS_COUNT];
+    vk_buffer             xlight_ubo[VK_PASS_RING - 1], xssao_ubo[VK_PASS_RING - 1];
     u32                   light_out[2], light_w, light_h;
     VkFramebuffer         light_fb;
     vk_image              ssao_hd, ssao_a, ssao_b; /* R32F half depth, two R8 AO planes */
@@ -6963,9 +7023,17 @@ static struct {
 static struct {
     VkDescriptorSet set[VK_PASS_COUNT], zset[VK_ZRGBA_SETS];
     vk_buffer       light_ubo, ssao_ubo, tone_ubo;
+    VkDescriptorSet xset[VK_PASS_RING - 1][VK_PASS_COUNT];
+    vk_buffer       xlight_ubo[VK_PASS_RING - 1], xssao_ubo[VK_PASS_RING - 1];
 } s_lp_park[VK_FIF_MAX];
 static void vk_lp_swap(u32 out, u32 in)
 {
+    memcpy(s_lp_park[out].xset, s_lp.xset, sizeof s_lp.xset);
+    memcpy(s_lp_park[out].xlight_ubo, s_lp.xlight_ubo, sizeof s_lp.xlight_ubo);
+    memcpy(s_lp_park[out].xssao_ubo, s_lp.xssao_ubo, sizeof s_lp.xssao_ubo);
+    memcpy(s_lp.xset, s_lp_park[in].xset, sizeof s_lp.xset);
+    memcpy(s_lp.xlight_ubo, s_lp_park[in].xlight_ubo, sizeof s_lp.xlight_ubo);
+    memcpy(s_lp.xssao_ubo, s_lp_park[in].xssao_ubo, sizeof s_lp.xssao_ubo);
     memcpy(s_lp_park[out].set, s_lp.set, sizeof s_lp.set);
     memcpy(s_lp_park[out].zset, s_lp.zset, sizeof s_lp.zset);
     s_lp_park[out].light_ubo = s_lp.light_ubo; s_lp_park[out].ssao_ubo = s_lp.ssao_ubo;
@@ -6976,8 +7044,6 @@ static void vk_lp_swap(u32 out, u32 in)
     s_lp.tone_ubo = s_lp_park[in].tone_ubo;
 }
 
-static struct { u32 src, dst; } s_csnap[VK_CSNAP_MAX];
-static u32 s_csnap_count;
 static struct { u32 depth, w, h, dst; } s_zrgba[VK_ZRGBA_MAX];
 static u32 s_zrgba_count;
 
@@ -7000,6 +7066,17 @@ static VkShaderModule vk_pass_module(const char* glsl, int stage, const char* wh
     return m;
 }
 
+/* (rsx5) PS3RECOMP_VK_PASS_RING (1..VK_PASS_RING, default VK_PASS_RING). */
+static u32 vk_pass_ring(void)
+{
+    static u32 n;
+    if (__builtin_expect(!n, 0)) {
+        const char* e = getenv("PS3RECOMP_VK_PASS_RING");
+        const long v = e && *e ? atol(e) : (long)VK_PASS_RING;
+        n = v < 1 ? 1u : v > (long)VK_PASS_RING ? VK_PASS_RING : (u32)v;
+    }
+    return n;
+}
 /* What every pass shares: the vertex stage, one set layout (binding 0 the
  * constants, 1..3 the textures, all fragment-stage), its pipeline layout, a
  * set per pass, and the two constant buffers. Tried once. */
@@ -7025,11 +7102,11 @@ static int vk_pass_init(void)
     VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                         .setLayoutCount = 1, .pSetLayouts = &s_lp.set_layout };
     if (pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_lp.pipe_layout) != VK_SUCCESS) return -1;
-    VkDescriptorPoolSize ps[2] = {   /* a set group per frame-in-flight slot */
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (VK_PASS_COUNT + VK_ZRGBA_SETS) * VK_FIF_MAX },
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (VK_PASS_COUNT + VK_ZRGBA_SETS) * VK_PASS_TEXTURES * VK_FIF_MAX } };
+    VkDescriptorPoolSize ps[2] = {   /* a set group per frame-in-flight slot (+ the VK_PASS_RING groups) */
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (VK_PASS_COUNT * VK_PASS_RING + VK_ZRGBA_SETS) * VK_FIF_MAX },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, (VK_PASS_COUNT * VK_PASS_RING + VK_ZRGBA_SETS) * VK_PASS_TEXTURES * VK_FIF_MAX } };
     VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                       .maxSets = (VK_PASS_COUNT + VK_ZRGBA_SETS) * VK_FIF_MAX,
+                                       .maxSets = (VK_PASS_COUNT * VK_PASS_RING + VK_ZRGBA_SETS) * VK_FIF_MAX,
                                        .poolSizeCount = 2, .pPoolSizes = ps };
     if (pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_lp.pool) != VK_SUCCESS) return -1;
     VkDescriptorSetLayout layouts[VK_PASS_COUNT];
@@ -7067,7 +7144,22 @@ static int vk_pass_init(void)
                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_lp_park[o].ssao_ubo.coherent ||
           vk_create_host_buffer(&s_lp_park[o].tone_ubo, 64, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
           !s_lp_park[o].tone_ubo.coherent)
-          return -1; }
+          return -1;
+      /* (rsx5) VK_PASS_RING: the extra light / SSAO groups, both slots */
+      for (u32 r = 0; r + 1u < VK_PASS_RING; r++) {
+          VkDescriptorSetAllocateInfo x1 = dai; x1.pSetLayouts = layouts;
+          if (pvkAllocateDescriptorSets(s_vk.device, &x1, s_lp.xset[r]) != VK_SUCCESS ||
+              pvkAllocateDescriptorSets(s_vk.device, &x1, s_lp_park[o].xset[r]) != VK_SUCCESS) return -1;
+          if (vk_create_host_buffer(&s_lp.xlight_ubo[r], sizeof(rsx_gpu_light_params), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
+              !s_lp.xlight_ubo[r].coherent ||
+              vk_create_host_buffer(&s_lp.xssao_ubo[r], VK_SSAO_UBO_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
+              !s_lp.xssao_ubo[r].coherent ||
+              vk_create_host_buffer(&s_lp_park[o].xlight_ubo[r], sizeof(rsx_gpu_light_params), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
+              !s_lp_park[o].xlight_ubo[r].coherent ||
+              vk_create_host_buffer(&s_lp_park[o].xssao_ubo[r], VK_SSAO_UBO_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
+              !s_lp_park[o].xssao_ubo[r].coherent)
+              return -1;
+      } }
     s_lp.ok = 1;
     return 0;
 }
@@ -7301,8 +7393,12 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
             for (u32 i = 0; i < s_csnap_count && slot == VK_CSNAP_MAX; i++)
                 if (!s_csnap[i].src) slot = i;
             if (slot == VK_CSNAP_MAX) {
-                if (s_csnap_count >= VK_CSNAP_MAX) return 0;
+                if (s_csnap_count >= VK_CSNAP_MAX) {
+                    rsx_lim_event(RSX_LIM_VK_CSNAP, 0, "colour-copy table full: a draw that reads its own target reads it live");
+                    return 0;
+                }
                 slot = s_csnap_count++;
+                rsx_lim_cap(RSX_LIM_VK_CSNAP, VK_CSNAP_MAX); rsx_lim_use(RSX_LIM_VK_CSNAP, s_csnap_count);
             }
         }
         if (!(dst = vk_pass_color(user, s->gw, s->gh, s->scaled, VK_TAG_CSNAP))) return 0;   /* [res] its image is s's size */
@@ -7379,20 +7475,29 @@ static u32 vk_eng_light_pass(void* user, u32 normals, u32 depth, u32 w, u32 h,
      * waits for it. Its one UBO and descriptor set may not be rewritten while
      * a recorded pass still reads them -- a second light pass in one batch
      * flushes first (the depth-RGBA8 pass's rule). Unbatched: as before. */
-    if (s_batch.recording && s_batch.light_pending) vk_batch_flush();
-    const size_t cap = (size_t)s_lp.light_ubo.size;
-    memset(s_lp.light_ubo.ptr, 0, cap);
-    memcpy(s_lp.light_ubo.ptr, params, param_bytes < cap ? param_bytes : cap);
+    /* (rsx5) VK_PASS_RING: the k-th light pass of the batch takes the k-th
+     * buffer and set (every pass begins behind a full barrier, so the shared
+     * outputs are ordered); only past the ring does it flush as before. */
+    u32 lk = 0;
+    if (s_batch.recording) {
+        lk = (u32)s_batch.light_pending;
+        if (lk >= vk_pass_ring()) { vk_batch_flush(); lk = 0; }
+    }
+    vk_buffer* const lubo = lk ? &s_lp.xlight_ubo[lk - 1u] : &s_lp.light_ubo;
+    const VkDescriptorSet lset = lk ? s_lp.xset[lk - 1u][VK_PASS_LIGHT] : s_lp.set[VK_PASS_LIGHT];
+    const size_t cap = (size_t)lubo->size;
+    memset(lubo->ptr, 0, cap);
+    memcpy(lubo->ptr, params, param_bytes < cap ? param_bytes : cap);
     /* [res] u, v = px / size: the scaled size (Metal's eng_light_pass) */
     if (lsc && param_bytes >= offsetof(rsx_gpu_light_params, height) + sizeof(float) &&
         cap >= offsetof(rsx_gpu_light_params, height) + sizeof(float)) {
-        rsx_gpu_light_params* gp = (rsx_gpu_light_params*)s_lp.light_ubo.ptr;
+        rsx_gpu_light_params* gp = (rsx_gpu_light_params*)lubo->ptr;
         gp->width = (float)lw; gp->height = (float)lh;
     }
-    vk_pass_write_set(s_lp.set[VK_PASS_LIGHT], &s_lp.light_ubo, nv, zv, VK_NULL_HANDLE);
+    vk_pass_write_set(lset, lubo, nv, zv, VK_NULL_HANDLE);
     if (vk_begin()) return 0;
-    vk_pass_record(rp, s_lp.light_fb, pipe, s_lp.set[VK_PASS_LIGHT], lw, lh);
-    if (s_batch.recording) s_batch.light_pending = 1;
+    vk_pass_record(rp, s_lp.light_fb, pipe, lset, lw, lh);
+    if (s_batch.recording) s_batch.light_pending = (int)lk + 1;
     else if (vk_submit_and_wait()) return 0;
     *spec_out = s_lp.light_out[1];
     return s_lp.light_out[0];
@@ -7493,9 +7598,16 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
     }
     /* Batched: recorded into the frame's batch, as the light pass (one UBO,
      * five sets: a second SSAO in one batch flushes first). */
-    if (s_batch.recording && s_batch.ssao_pending) vk_batch_flush();
-    memset(s_lp.ssao_ubo.ptr, 0, VK_SSAO_UBO_BYTES);
-    memcpy(s_lp.ssao_ubo.ptr, consts, const_bytes < VK_SSAO_UBO_BYTES ? const_bytes : VK_SSAO_UBO_BYTES);
+    /* (rsx5) VK_PASS_RING, as the light pass */
+    u32 sk = 0;
+    if (s_batch.recording) {
+        sk = (u32)s_batch.ssao_pending;
+        if (sk >= vk_pass_ring()) { vk_batch_flush(); sk = 0; }
+    }
+    vk_buffer* const subo = sk ? &s_lp.xssao_ubo[sk - 1u] : &s_lp.ssao_ubo;
+    VkDescriptorSet* const sset = sk ? s_lp.xset[sk - 1u] : s_lp.set;
+    memset(subo->ptr, 0, VK_SSAO_UBO_BYTES);
+    memcpy(subo->ptr, consts, const_bytes < VK_SSAO_UBO_BYTES ? const_bytes : VK_SSAO_UBO_BYTES);
     /* [light] The Lighting page (ps3_lightfx.h): the strength rides after the
      * game's 320 bytes (the block's `lfx`); PS3RECOMP_SSAO >= 1 runs the
      * full-res chain instead of the game's five passes. A pipeline that
@@ -7504,13 +7616,13 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
     const int lfx_str = ps3_lightfx_get(PS3_LFX_SSAO_STRENGTH);
     if (const_bytes <= 320u) {
         const float lv[4] = { (float)lfx_str / 100.0f, (float)lfx_q, 0.0f, 0.0f };
-        memcpy((u8*)s_lp.ssao_ubo.ptr + 320, lv, sizeof lv);
+        memcpy((u8*)subo->ptr + 320, lv, sizeof lv);
     }
     /* [res] the block's `res` (rsx_vk_passes_glsl.h, offset 336): xy = the
      * scale between the depth / normals the passes read and the job's pixels
      * (the MSL's `rs`), 1 unscaled -- written after the game's bytes always */
     { const float rv[4] = { ssc ? s_res.s : 1.0f, ssc ? s_res.s : 1.0f, 0.0f, 0.0f };
-      memcpy((u8*)s_lp.ssao_ubo.ptr + 336, rv, sizeof rv); }
+      memcpy((u8*)subo->ptr + 336, rv, sizeof rv); }
     if (ssc) {   /* the strength's scaled upsample, as p_upx below */
         if (lfx_str != 100 && const_bytes <= 320u)
             p_upscs = vk_pass_pipeline(VK_PASS_SSAO_UPSCS, kVkSsaoUpScsFS, "SSAO upsample (scaled, strength)", rp_out, 1);
@@ -7530,11 +7642,11 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
                 { VK_PASS_SSAO_BLUR_H, l_bh, rp_ao,  s_lp.lfx_fb[2],  fa,  fhd },
                 { VK_PASS_SSAO_BLUR_V, l_bv, rp_out, s_lp.ssao_fb[3], fb,  fhd } };
             for (u32 k = 0; k < 4; k++)
-                vk_pass_write_set(s_lp.set[ls[k].set], &s_lp.ssao_ubo, ls[k].t0, ls[k].t1, VK_NULL_HANDLE);
+                vk_pass_write_set(sset[ls[k].set], subo, ls[k].t0, ls[k].t1, VK_NULL_HANDLE);
             if (vk_begin()) return 0;
             for (u32 k = 0; k < 4; k++)
-                vk_pass_record(ls[k].rp, ls[k].fb, ls[k].pipe, s_lp.set[ls[k].set], ow, oh);
-            if (s_batch.recording) { s_batch.ssao_pending = 1; return s_lp.ssao_out; }
+                vk_pass_record(ls[k].rp, ls[k].fb, ls[k].pipe, sset[ls[k].set], ow, oh);
+            if (s_batch.recording) { s_batch.ssao_pending = (int)sk + 1; return s_lp.ssao_out; }
             return vk_submit_and_wait() ? 0 : s_lp.ssao_out;
         }
     }
@@ -7550,11 +7662,11 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
         { VK_PASS_SSAO_UP,     ssc ? (p_upscs ? p_upscs : p_upsc) : (p_upx ? p_upx : p_up),   /* [res] */
                                rp_out, s_lp.ssao_fb[3], ow, oh, a, hd, zv } };
     for (u32 k = 0; k < 5; k++)
-        vk_pass_write_set(s_lp.set[steps[k].set], &s_lp.ssao_ubo, steps[k].t0, steps[k].t1, steps[k].t2);
+        vk_pass_write_set(sset[steps[k].set], subo, steps[k].t0, steps[k].t1, steps[k].t2);
     if (vk_begin()) return 0;
     for (u32 k = 0; k < 5; k++)
-        vk_pass_record(steps[k].rp, steps[k].fb, steps[k].pipe, s_lp.set[steps[k].set], steps[k].w, steps[k].h);
-    if (s_batch.recording) { s_batch.ssao_pending = 1; return s_lp.ssao_out; }
+        vk_pass_record(steps[k].rp, steps[k].fb, steps[k].pipe, sset[steps[k].set], steps[k].w, steps[k].h);
+    if (s_batch.recording) { s_batch.ssao_pending = (int)sk + 1; return s_lp.ssao_out; }
     return vk_submit_and_wait() ? 0 : s_lp.ssao_out;
 }
 
@@ -7599,8 +7711,12 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
         }
     if (!dst) {
         if (!(dst = vk_pass_color(user, gw, gh, z->scaled, tag))) return 0;
-        if (slot == VK_ZRGBA_MAX)
+        if (slot == VK_ZRGBA_MAX) {
+            if (s_zrgba_count >= VK_ZRGBA_MAX)
+                rsx_lim_event(RSX_LIM_VK_ZRGBA, 1, "depth-decode table full: an entry is reused (decoded again next time)");
             slot = s_zrgba_count < VK_ZRGBA_MAX ? s_zrgba_count++ : depth % VK_ZRGBA_MAX;
+            rsx_lim_cap(RSX_LIM_VK_ZRGBA, VK_ZRGBA_MAX); rsx_lim_use(RSX_LIM_VK_ZRGBA, s_zrgba_count);
+        }
         s_zrgba[slot].depth = depth; s_zrgba[slot].w = gw; s_zrgba[slot].h = gh; s_zrgba[slot].dst = dst;
     }
 
@@ -7755,6 +7871,7 @@ static void vk_eng5_shutdown(void)
         vk_destroy_buffer(&s_lp.light_ubo);
         vk_destroy_buffer(&s_lp.ssao_ubo);
         vk_destroy_buffer(&s_lp.tone_ubo);
+        for (u32 r = 0; r + 1u < VK_PASS_RING; r++) { vk_destroy_buffer(&s_lp.xlight_ubo[r]); vk_destroy_buffer(&s_lp.xssao_ubo[r]); }
         if (s_lp.pool)        pvkDestroyDescriptorPool(d, s_lp.pool, NULL);
         if (s_lp.pipe_layout) pvkDestroyPipelineLayout(d, s_lp.pipe_layout, NULL);
         if (s_lp.set_layout)  pvkDestroyDescriptorSetLayout(d, s_lp.set_layout, NULL);
@@ -8099,7 +8216,13 @@ static struct {
     double draw_sum;                    /* guest draws of the frames in dt[] */
     int    mark;
     double hitch_s;                     /* PS3RECOMP_PLAYLOG_HITCH_MS (default 50) */
+    int    lim_pending;                 /* (rsx5) a limit event this second: one LIMIT line */
 } s_pl;
+/* (rsx5) the session's limits summary, last in the play log */
+static void vk_pl_atexit(void)
+{
+    if (s_pl.state == 1 && s_pl.f) { fputs("LIMITS\t", s_pl.f); rsx_lim_summary(s_pl.f, "session (peak/cap, !full ~live evictions)"); }
+}
 static double vk_pl_now(void)
 {
 #ifdef _WIN32
@@ -8149,15 +8272,24 @@ static void vk_playlog_attr(FILE* f, double ms)
     const unsigned long long fl_n = s_ha.flush_n, fl_ns = s_ha.flush_ns, fif = s_ha.fif_ns;
     const int fl_line = s_ha.flush_line;
     memset(&s_ha, 0, sizeof s_ha);
-    if (!f) return;
+    if (!f) {   /* (rsx5) a frame that was not slow: its limit events go on the second's LIMIT line */
+        char lim0[256];
+        if (rsx_lim_take_frame(lim0, sizeof lim0)[0]) s_pl.lim_pending = 1;
+        return;
+    }
+    /* (rsx5) PS3RECOMP_LIMITS: the structures that overflowed or evicted live
+     * entries since the last present (lim=name:count,...; empty = none) */
+    char lim[256];
+    rsx_lim_take_frame(lim, sizeof lim);
+    if (lim[0]) s_pl.lim_pending = 1;
     fprintf(f, "\tdraws=%u\tdrain=%.1f\tsema=%.1f/%llu\tflush=%llu/%.1f@%d\tfif=%.1f"
                "\ttex=%llu+%llu/%llu,%.1fMB,%.1f\thash=%.1f\tmod=%llu/%.1f\ttexc=%llu"
-               "\tpipe=%llu/%.1f\tspv=%llu/%.1f\talloc=%llu",
+               "\tpipe=%llu/%.1f\tspv=%llu/%.1f\talloc=%llu\tlim=%s",
             rsx_vulkan_backend_guest_draws(), drain / 1e6, sema / 1e6, gaveup,
             fl_n, fl_ns / 1e6, fl_line, fif / 1e6,
             h.tex_new, h.tex_reup, h.tex_evict, h.tex_bytes / 1048576.0, h.tex_ns / 1e6,
             h.hash_ns / 1e6, h.mod_n, h.mod_ns / 1e6, cached,
-            pipes, pipe_ns / 1e6, spv_n, spv_ns / 1e6, alloc);
+            pipes, pipe_ns / 1e6, spv_n, spv_ns / 1e6, alloc, lim);
     (void)ms;
 }
 static void vk_playlog_frame(void)
@@ -8172,6 +8304,7 @@ static void vk_playlog_frame(void)
             s_pl.hitch_s = (hm && atof(hm) > 0.0) ? atof(hm) / 1000.0 : 0.050;
             fprintf(s_pl.f, "#t_s	fps	p50_ms	p99_ms	max_ms	n17	n25	n33	n50	draws_per_frame\n");
             fflush(s_pl.f);
+            atexit(vk_pl_atexit);
         }
     }
     if (s_pl.state != 1) return;
@@ -8197,6 +8330,11 @@ static void vk_playlog_frame(void)
     }
     if (s_pl.mark) { fprintf(s_pl.f, "MARK	%.2f\n", now - s_pl.t0); s_pl.mark = 0; }
     if (now - s_pl.sec_start < 1.0 || !s_pl.n) return;
+    if (s_pl.lim_pending) {   /* (rsx5) the counts so far of every structure that hit a wall */
+        s_pl.lim_pending = 0;
+        fprintf(s_pl.f, "LIMIT\t%.2f\t", now - s_pl.t0);
+        rsx_lim_summary(s_pl.f, "events (peak/cap, !full ~live evictions)");
+    }
     u32 c17 = 0, c25 = 0, c33 = 0, c50 = 0;
     for (u32 i = 0; i < s_pl.n; i++) {
         const float d = s_pl.dt[i];
@@ -8287,6 +8425,14 @@ void rsx_vulkan_backend_present(void)
     if (s_vk.eng_active) rsx_draw_engine_present();
     else                 vk_cb_present(&s_vk, 0);
     vk_sc_tick();                    /* save the pipeline cache once a burst ends */
+    { static u32 nf;                 /* (rsx5) PS3RECOMP_LIMITS: the object table's use (a scan) */
+      if (++nf % 120u == 0u) {
+          u32 live = 0;
+          for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) live += s_eobj[i].kind != VK_ENG_FREE;
+          rsx_lim_cap(RSX_LIM_VK_OBJ, VK_ENG_MAX_OBJ - 1u); rsx_lim_use(RSX_LIM_VK_OBJ, live);
+          rsx_lim_cap(RSX_LIM_VK_FB, VK_ENG_FB_CACHE); rsx_lim_use(RSX_LIM_VK_FB, s_e2.fb_count);
+      } }
+    rsx_lim_frame();
     vk_playlog_frame();
 }
 

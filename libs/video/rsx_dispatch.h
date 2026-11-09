@@ -83,8 +83,14 @@ extern "C" {
  * batches (UI quads, debug geometry); 64 KB is several hundred vertices of
  * a fat format. Overruns are counted, not silently truncated -- half a
  * vertex stream is worse than no draw. */
-#define RSX_DSP_INLINE_MAX_BYTES 65536
-#define RSX_DSP_IMM_MAX 256       /* immediate-mode vertices per BEGIN/END */
+/* (rsx5) The INLINE_ARRAY stream and the immediate-mode vertices of one
+ * BEGIN/END: 64 KB / 256 vertices before. The limits audit found inFAMOUS 2's
+ * city drawing immediate-mode pairs past 256 vertices (~80k vertices a second
+ * dropped); the hardware has no such bound. The runtime caps
+ * PS3RECOMP_DSP_INLINE_KB (default 256) and PS3RECOMP_DSP_IMM_MAX (default
+ * 4096) run with less (64 / 256 = before). */
+#define RSX_DSP_INLINE_MAX_BYTES (256 * 1024)
+#define RSX_DSP_IMM_MAX 4096      /* immediate-mode vertices per BEGIN/END */
 
 typedef struct rsx_dispatch rsx_dispatch;
 
@@ -115,6 +121,11 @@ extern u32 g_rsx_dsp_tex_gen;
 /* (rsx5) rsx_dispatch.c: bumped by every write that changes a vertex texture
  * register (0x0900..0x097F) or USER_CLIP_PLANE_CONTROL (0x1478). */
 extern u32 g_rsx_dsp_misc_gen;
+/* (rsx5) PS3RECOMP_LIMITS: what 0 = an INLINE_ARRAY past the inline cap
+ * (the stream is dropped whole); 1 = an immediate-mode DRAW (no array packet)
+ * lost vertices past the cap, n = the vertices it had; 2 = an immediate-mode
+ * draw's vertex count (n, for the peak; no event). NULL: none. */
+extern void (*g_rsx_dsp_limit_hook)(int what, u32 n);
 
 struct rsx_dispatch {
     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
@@ -167,6 +178,11 @@ struct rsx_dispatch {
      * (PS3RECOMP_DSP_SEEN=1 counts again), saving a read-modify-write of a
      * second cache line on every register write. rsx_dispatch_init clears it. */
     u32 no_seen;
+    /* (rsx5) the current INLINE_ARRAY stream overflowed: its remaining words
+     * are dropped (cleared at BEGIN_END(prim)) */
+    u32 inline_ovf;
+    /* (rsx5) immediate-mode vertices of the current pair past the cap */
+    u32 imm_drop_draw;
 };
 
 /* ---- lifecycle -------------------------------------------------------- */

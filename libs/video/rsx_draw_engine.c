@@ -190,7 +190,7 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_ZDEPTHS    64
 #define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define ENG_MAX_VTEXTURES  64
-#define ENG_MAX_PIPELINES  8192
+#define ENG_MAX_PIPELINES  32768   /* (rsx5) was 8192: the opening fight alone builds ~1200; pipelines are never evicted */
 #define ENG_MAX_BATCHES    256
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
@@ -313,7 +313,15 @@ typedef struct {
     u8 wt_ok;                   /* rsx_wtrack: the span was armed and the upload matches it */
     u64 wt_stamp;               /* ... the page versions it was armed with */
     u8 modded;                  /* PS3_MODS: the upload was a pack's replacement */
+    u32 ws_frame;               /* (rsx5) PS3RECOMP_LIMITS: the last frame that bound it */
 } eng_texture;
+/* (rsx5) PS3RECOMP_LIMITS: textures bound this frame (the working set the
+ * cache must hold), and PS3RECOMP_ENG_TEX_RETRY (default 1; 0 = never, as
+ * before): an entry whose texture could not be made (handle 0 -- the backend's
+ * object table or memory was full at the time) is retried after 60 frames
+ * instead of sampling black for the rest of the session. */
+static u32 s_tex_ws;
+static int s_tex_retry = -1;
 
 /* rsx_button_icons: the glyph set of this frame, and whether the upload
  * that just ran was the prompt atlas. */
@@ -330,6 +338,96 @@ static u64 s_slot_hash;
 static u64 s_upload_hash;
 static int s_upload_hash_ok;
 rsx_hattr g_rsx_hattr;
+
+/* ---- PS3RECOMP_LIMITS (rsx_draw_engine.h) ---------------------------------- */
+rsx_lim g_rsx_lim[RSX_LIM_COUNT] = {
+    [RSX_LIM_TEXCACHE] = { "texcache" },           [RSX_LIM_TEXEVICT_RECENT] = { "tex_evict_recent" },
+    [RSX_LIM_SURFACES] = { "targets" },            [RSX_LIM_ZDEPTHS] = { "depths" },
+    [RSX_LIM_PIPELINES] = { "eng_pipelines" },     [RSX_LIM_VCACHE] = { "vcache" },
+    [RSX_LIM_VCACHE_MB] = { "vcache_mb" },         [RSX_LIM_ICACHE] = { "icache" },
+    [RSX_LIM_ICACHE_MB] = { "icache_mb" },         [RSX_LIM_DRAW_REFS] = { "draw_refs" },
+    [RSX_LIM_DRAW_BATCHES] = { "draw_batches" },   [RSX_LIM_INLINE] = { "inline_bytes" },
+    [RSX_LIM_IMM] = { "imm_verts" },               [RSX_LIM_GPU_LIGHTS] = { "gpu_lights" },
+    [RSX_LIM_DROPS] = { "draws_dropped" },         [RSX_LIM_VK_OBJ] = { "vk_objects" },
+    [RSX_LIM_VK_PIPE] = { "vk_pipelines" },        [RSX_LIM_VK_FB] = { "vk_framebuffers" },
+    [RSX_LIM_VK_SAMP] = { "vk_samplers" },         [RSX_LIM_VK_DSETS] = { "vk_dsets_batch" },
+    [RSX_LIM_VK_DEAD_IMG] = { "vk_dead_img" },     [RSX_LIM_VK_DEAD_FB] = { "vk_dead_fb" },
+    [RSX_LIM_VK_DEAD_BUF] = { "vk_dead_buf" },     [RSX_LIM_VK_VB] = { "vk_vbufs" },
+    [RSX_LIM_VK_ARENA_V] = { "arena_v_mb" },       [RSX_LIM_VK_ARENA_I] = { "arena_i_mb" },
+    [RSX_LIM_VK_ARENA_U] = { "arena_u_mb" },       [RSX_LIM_VK_ARENA_S] = { "arena_s_mb" },
+    [RSX_LIM_VK_ARENA_G] = { "arena_g_mb" },       [RSX_LIM_VK_CSNAP] = { "vk_csnap_batch" },
+    [RSX_LIM_VK_ZRGBA] = { "vk_zrgba_batch" },     [RSX_LIM_VK_FBFIN] = { "vk_fbfin_sets" },
+    [RSX_LIM_VK_TQ_RING] = { "tq_ring_kb" },       [RSX_LIM_VK_MIDFLUSH] = { "midframe_waits" },
+    [RSX_LIM_VK_IMGPOOL] = { "vk_imgpool" },
+    [RSX_LIM_GCM_IOMAP] = { "gcm_io_maps" },       [RSX_LIM_GCM_REFQ] = { "gcm_ref_queue" },
+    [RSX_LIM_GCM_UPLOADS] = { "gcm_uploads" },     [RSX_LIM_GCM_TABLES] = { "gcm_tables" },
+};
+static volatile long s_lim_any;
+void rsx_lim_event(int id, int kind, const char* what)
+{
+    if (id < 0 || id >= RSX_LIM_COUNT) return;
+    rsx_lim* l = &g_rsx_lim[id];
+    const unsigned long long n = kind ? ++l->evict : ++l->full;
+    l->frame_ev++;
+    s_lim_any = 1;
+    /* nothing silent, nothing flooding: the 1st, 2nd, 3rd, then every power of two */
+    if (n <= 3u || (n & (n - 1u)) == 0u)
+        fprintf(stderr, "[limits] %s %s #%llu%s%s (use %llu, peak %llu, cap %llu)\n", l->name,
+                kind ? "evicted a live entry" : "FULL", n, what ? ": " : "", what ? what : "",
+                l->cur, l->peak, l->cap);
+}
+const char* rsx_lim_take_frame(char* buf, unsigned n)
+{
+    if (!n) return "";
+    buf[0] = 0;
+    if (!s_lim_any) return buf;
+    s_lim_any = 0;
+    unsigned p = 0;
+    for (int i = 0; i < RSX_LIM_COUNT; i++) {
+        if (!g_rsx_lim[i].frame_ev) continue;
+        const int w = snprintf(buf + p, n - p, "%s%s:%llu", p ? "," : "", g_rsx_lim[i].name, g_rsx_lim[i].frame_ev);
+        g_rsx_lim[i].frame_ev = 0;
+        if (w < 0 || (unsigned)w >= n - p) { buf[p] = 0; break; }
+        p += (unsigned)w;
+    }
+    return buf;
+}
+void rsx_lim_summary(FILE* f, const char* why)
+{
+    if (!f) return;
+    char line[3072]; int p = snprintf(line, sizeof line, "[limits] %s:", why ? why : "summary");
+    for (int i = 0; i < RSX_LIM_COUNT && p > 0 && p < (int)sizeof line - 64; i++) {
+        const rsx_lim* l = &g_rsx_lim[i];
+        if (!l->peak && !l->full && !l->evict) continue;
+        p += snprintf(line + p, sizeof line - (size_t)p, " %s=%llu/", l->name, l->peak);
+        p += l->cap ? snprintf(line + p, sizeof line - (size_t)p, "%llu", l->cap)
+                    : snprintf(line + p, sizeof line - (size_t)p, "-");
+        if (l->full)  p += snprintf(line + p, sizeof line - (size_t)p, "!%llu", l->full);
+        if (l->evict) p += snprintf(line + p, sizeof line - (size_t)p, "~%llu", l->evict);
+    }
+    fprintf(f, "%s\n", line);
+    fflush(f);
+}
+static void eng_dsp_limit(int what, u32 n)
+{
+    if (what == 2) { if (n > g_rsx_lim[RSX_LIM_IMM].peak) rsx_lim_use(RSX_LIM_IMM, n); return; }
+    if (what == 1) rsx_lim_event(RSX_LIM_IMM, 0, "an immediate-mode draw had more vertices than the cap: the rest are not drawn");
+    else           rsx_lim_event(RSX_LIM_INLINE, 0, "an inline vertex stream past the cap: the draw is dropped");
+}
+static void rsx_lim_atexit(void) { rsx_lim_summary(stderr, "at exit (peak/cap, !full ~live evictions)"); }
+void rsx_lim_frame(void)
+{
+    static int on = -1;
+    static unsigned long long last;
+    extern unsigned long long ps3_ms_now(void);
+    if (__builtin_expect(on < 0, 0)) { const char* e = getenv("PS3RECOMP_LIMITS"); on = e && *e && *e != '0'; }
+    if (!on) return;
+    const unsigned long long now = ps3_ms_now();
+    if (!last) { last = now; return; }
+    if (now - last < 5000u) return;
+    last = now;
+    rsx_lim_summary(stderr, "5s (peak/cap, !full ~live evictions)");
+}
 /* Non-zero: eng_texture_upload refills this 2D texture in place instead of
  * creating one (the atlas redraw when the backend has no object to spare). */
 static u32 s_upload_into;
@@ -1078,6 +1176,7 @@ static u32 eng_surface_get_kq(u32 location, u32 offset, u32 want_w, u32 want_h,
         slot = 0;
         for (u32 i = 1; i < g.n_surfaces; i++)
             if (g.surfaces[i].stamp < g.surfaces[slot].stamp) slot = i;
+        rsx_lim_event(RSX_LIM_SURFACES, 1, "render-target table full: the least recently bound target is replaced (its pixels are lost)");
     }
 
     u32 seed_row = 0;
@@ -1193,14 +1292,30 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
             break;
         }
     }
+    int zevict = 0;
     if (slot == ENG_MAX_ZDEPTHS) {
-        if (g.n_zdepths >= ENG_MAX_ZDEPTHS) return ENG_INVALID;
-        slot = g.n_zdepths;
+        if (g.n_zdepths >= ENG_MAX_ZDEPTHS) {
+            /* (rsx5) PS3RECOMP_ENG_ZDEPTH_EVICT (default 1; 0 = as before): the
+             * table never let a buffer go, so after 64 distinct depth addresses
+             * in a session every new one drew with the shared scratch depth for
+             * good. Now the least recently written one makes room. */
+            static int ev = -1;
+            if (ev < 0) { const char* e = getenv("PS3RECOMP_ENG_ZDEPTH_EVICT"); ev = !(e && *e == '0'); }
+            if (!ev) {
+                rsx_lim_event(RSX_LIM_ZDEPTHS, 0, "depth-target table full: drawn with the scratch depth");
+                return ENG_INVALID;
+            }
+            slot = 0;
+            for (u32 i = 1; i < g.n_zdepths; i++)
+                if (g.zdepths[i].stamp < g.zdepths[slot].stamp) slot = i;
+            zevict = 1;
+            rsx_lim_event(RSX_LIM_ZDEPTHS, 1, "depth-target table full: the least recently written one is replaced");
+        } else slot = g.n_zdepths;
     }
 
     const u32 handle = g.be->depth_target_create(g.be->user, want_w, want_h);
     if (!handle)
-        return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
+        return (!zevict && slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
 
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
@@ -2496,6 +2611,8 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
 
     /* The span (a mip-chain walk) is kept with the entry: the key holds
      * everything it depends on except the level count, which is checked. */
+    if (__builtin_expect(s_tex_retry < 0, 0)) { const char* r = getenv("PS3RECOMP_ENG_TEX_RETRY"); s_tex_retry = !(r && *r == '0'); }
+    u32 retry_index = ~0u;
     for (u32 p = eng_tkey(location, offset, fmt, w, h, pitch, remap, (u32)(cube != 0), depth);
          s_tidx[p]; p = (p + 1) & (ENG_TIDX_SIZE - 1u)) {
         eng_texture* e = &g.textures[s_tidx[p] - 1];
@@ -2504,6 +2621,11 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
             e->pitch != pitch || e->remap != remap ||
             e->cubemap != (u32)(cube != 0) || e->depth != depth)
             continue;
+        if (e->ws_frame != g.frames) { e->ws_frame = g.frames; s_tex_ws++; }
+        if (!e->handle && s_tex_retry && g.frames - e->last_hash_frame >= 60u) {
+            retry_index = s_tidx[p] - 1u;     /* made again in this slot, below */
+            break;
+        }
         if (e->levels != levels) {
             e->levels = levels;
             e->span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
@@ -2630,15 +2752,24 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     u32 index;
     u32 evicted = 0;
     int appended = 0;
-    if (g.n_textures < eng_tex_cap()) {
+    if (retry_index != ~0u) {
+        index = retry_index;                  /* its own failed entry: nothing to release */
+    } else if (g.n_textures < eng_tex_cap()) {
         index = g.n_textures++;
         appended = 1;
+        s_tex_ws++;
     } else {
         index = 0;
         for (u32 i = 1; i < g.n_textures; i++)
             if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
                 index = i;
         evicted = g.textures[index].handle;
+        s_tex_ws++;
+        /* (rsx5) PS3RECOMP_LIMITS: the victim was bound in the last ~2 s --
+         * the cache is smaller than what the scene uses (the 1024-entry
+         * slideshow): it will come back and push another out. */
+        if (g.textures[index].ws_frame + 120u >= g.frames)
+            rsx_lim_event(RSX_LIM_TEXEVICT_RECENT, 1, "texture cache evicted a texture bound in the last 120 frames (too small for the scene)");
     }
 
     eng_texture e;
@@ -2648,6 +2779,7 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     e.remap = remap; e.cubemap = (u32)(cube != 0); e.depth = depth;
     e.levels = levels; e.span = span;
     e.last_hash_frame = g.frames;
+    e.ws_frame = g.frames;
     e.last_full_frame = g.frames - (index & 7u);   /* staggered: not all due on one frame */
     e.last_use_serial = ++g.texture_use_serial;
     const uint64_t ft_u0 = ps3_ft_now();
@@ -2665,6 +2797,8 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap, depth);
     s_upload_hash_ok = 0;
+    if (!e.handle)
+        rsx_lim_event(RSX_LIM_TEXCACHE, 0, "a texture could not be made: it samples black (retried after 60 frames)");
     { const uint64_t ft_u1 = ps3_ft_now();
       g_rsx_hattr.tex_new++; g_rsx_hattr.tex_evict += evicted != 0; g_rsx_hattr.tex_bytes += span;
       g_rsx_hattr.hash_ns += ft_h1 - ft_u0; g_rsx_hattr.tex_ns += ft_u1 - ft_h1; }
@@ -3635,7 +3769,10 @@ key_done:;
             return g.pipelines[i].handle;
         }
     }
-    if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
+    if (g.n_pipelines >= ENG_MAX_PIPELINES) {
+        rsx_lim_event(RSX_LIM_PIPELINES, 0, "engine pipeline table full: the draw is dropped");
+        return 0;
+    }
 
     const uint64_t ft_c0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     u32 handle = 0;
@@ -3797,6 +3934,7 @@ key_done:;
                 (unsigned long long)key, fixed ? "built-in" : "guest",
                 vi, fi, nconst, handle ? "ok" : "FAILED (draw dropped)"); }
 
+    rsx_lim_use(RSX_LIM_PIPELINES, (unsigned long long)g.n_pipelines + 1u);
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].handle = handle;
     g.pipelines[g.n_pipelines].fixed = (u8)fixed;
@@ -3870,9 +4008,10 @@ static int dc_reserve_refs(u64 need)
     if (next > 0xFFFFFFFFull) next = need;
     rsx_vertex_ref* r = (rsx_vertex_ref*)realloc(dc.refs,
                                                  (size_t)next * sizeof(*r));
-    if (!r) return 0;
+    if (!r) { rsx_lim_event(RSX_LIM_DRAW_REFS, 0, "vertex reference list could not grow: draw dropped"); return 0; }
     dc.refs = r;
     dc.cap_refs = (u32)next;
+    rsx_lim_use(RSX_LIM_DRAW_REFS, next);
     return 1;
 }
 
@@ -3892,7 +4031,7 @@ static int dc_reserve_verts(u64 bytes)
     u64 next = dc.verts_cap ? dc.verts_cap : (1u << 20);
     while (next < bytes) next *= 2u;
     u8* v = (u8*)realloc(dc.verts, (size_t)next);
-    if (!v) return 0;
+    if (!v) { rsx_lim_event(RSX_LIM_DRAW_REFS, 0, "vertex staging could not grow: draw dropped"); return 0; }
     dc.verts = v;
     dc.verts_cap = next;
     return 1;
@@ -3902,9 +4041,9 @@ static int dc_reserve_indices(u32 count)
 {
     if (count <= g.index_cap) return 1;
     u32 next = g.index_cap ? g.index_cap : 4096u;
-    while (next < count) next *= 2u;
+    while (next < count) { if (next >= 0x80000000u) { next = count; break; } next *= 2u; }   /* (rsx5) no wrap to 0 */
     u32* p = (u32*)realloc(g.indices, (size_t)next * sizeof(u32));
-    if (!p) return 0;
+    if (!p) { rsx_lim_event(RSX_LIM_DRAW_REFS, 0, "index list could not grow: draw dropped"); return 0; }
     g.indices = p;
     g.index_cap = next;
     return 1;
@@ -4157,6 +4296,7 @@ static int eng_vc_prune(void)
     { static int n = 0; if (PS3_LOG_FIRST(n, 16))
         fprintf(stderr, "[rsx engine] vertex cache full: kept %u recent keys (%.0f MB resident), frame %u\n",
                 kept, s_vc_bytes / 1e6, g.frames); }
+    if (kept > ENG_VC_SIZE / 2u) rsx_lim_event(RSX_LIM_VCACHE, 1, "vertex cache full of recent keys: starts over");
     return kept <= ENG_VC_SIZE / 2u;
 }
 
@@ -4365,6 +4505,7 @@ static void eng_ic_prune(void)
     if (kept > ENG_IC_SIZE / 2u) {
         { static int n = 0; if (PS3_LOG_FIRST(n, 16))
             fprintf(stderr, "[rsx engine] index cache: %u keys -> start over (frame %u)\n", kept, g.frames); }
+        rsx_lim_event(RSX_LIM_ICACHE, 1, "index cache full of recent keys: starts over");
         eng_ic_clear();
     }
 }
@@ -4439,6 +4580,9 @@ static void eng_ic_after_draw(eng_ic_entry* e, u64 content, u32 n_draw)
 {
     if (e->skip_until > g.frames) return;
     if (e->seen && e->content == content && e->seen_frame != g.frames) {
+        if (!e->ibuf && s_ic_ranged && !dc.n_cuts && dc.refs_remapped && dc.n_refs &&
+            s_ic_bytes + (u64)n_draw * 4u > ENG_IC_BUDGET)
+            rsx_lim_event(RSX_LIM_ICACHE_MB, 0, "index cache byte budget: a list stays uncached (rebuilt every draw)");
         if (!e->ibuf && s_ic_ranged && !dc.n_cuts && dc.refs_remapped && dc.n_refs &&
             s_ic_bytes + (u64)n_draw * 4u <= ENG_IC_BUDGET) {
             e->ibuf = g.be->vbuf_create(g.be->user, g.indices, n_draw * 4u);
@@ -4731,6 +4875,7 @@ static int eng_batch_merge(eng_batch* b, u32 n, u32 first, u32 count)
 static void eng_batch_lost(void)
 {
     s_batch_lost++;
+    rsx_lim_event(RSX_LIM_DRAW_BATCHES, 0, "a draw's packet past the per-draw table: dropped");
     static int n = 0;
     if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[rsx engine] draw has more than %u packets: packet dropped (%u so far)\n",
@@ -4746,6 +4891,7 @@ static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 c
     dc.arr[dc.n_arr].first = first;
     dc.arr[dc.n_arr].count = count;
     dc.n_arr++;
+    if (dc.n_arr > g_rsx_lim[RSX_LIM_DRAW_BATCHES].peak) rsx_lim_use(RSX_LIM_DRAW_BATCHES, dc.n_arr);
 }
 
 /* INLINE_ARRAY delivers one finished stream rather than a (first, count)
@@ -4765,7 +4911,8 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
     dc.inl = data;
     dc.inl_bytes = bytes;
     dc.n_packets++;
-    if (dc.n_arr >= ENG_MAX_BATCHES) return;
+    if (bytes > g_rsx_lim[RSX_LIM_INLINE].peak) rsx_lim_use(RSX_LIM_INLINE, bytes);
+    if (dc.n_arr >= ENG_MAX_BATCHES) { eng_batch_lost(); return; }   /* (rsx5) counted like the others */
     dc.arr[dc.n_arr].first = 0;
     dc.arr[dc.n_arr].count = bytes / stride;
     dc.n_arr++;
@@ -4782,6 +4929,7 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
     dc.idx[dc.n_idx].first = first;
     dc.idx[dc.n_idx].count = count;
     dc.n_idx++;
+    if (dc.n_idx > g_rsx_lim[RSX_LIM_DRAW_BATCHES].peak) rsx_lim_use(RSX_LIM_DRAW_BATCHES, dc.n_idx);
 }
 
 /* Which texture units this draw binds, and from where: a unit naming a
@@ -4856,7 +5004,11 @@ void rsx_draw_engine_gpu_light_data(const void* frame_be, const void* lights_be,
     const u8* f = (const u8*)frame_be;
     const u8* l = (const u8*)lights_be;
     if (!f || (!l && count)) return;
-    if (count > RSX_GPU_LIGHT_MAX) count = RSX_GPU_LIGHT_MAX;
+    rsx_lim_use(RSX_LIM_GPU_LIGHTS, count);
+    if (count > RSX_GPU_LIGHT_MAX) {
+        rsx_lim_event(RSX_LIM_GPU_LIGHTS, 0, "more lights than the GPU light pass holds: the rest are not lit");
+        count = RSX_GPU_LIGHT_MAX;
+    }
     rsx_gpu_light_params p;
     memset(&p, 0, sizeof p);
     for (int i = 0; i < 16; i++) p.m[i] = eng_bef(f + 0x10 + i * 4);
@@ -5448,8 +5600,12 @@ static u32 sink_bind_vertex_textures(
 
 /* PS3RECOMP_ENG_DROPLOG=1: name each draw sink_end drops (first 6 per
  * reason), with the primitive, packet/vertex counts and target address. */
+static u32 s_drops_frame;   /* (rsx5) PS3RECOMP_LIMITS: draws dropped this frame */
 static void eng_drop(const char* why, u32 prim)
 {
+    s_drops_frame++;
+    if (!strcmp(why, "reserve_indices") || !strcmp(why, "n0"))
+        rsx_lim_event(RSX_LIM_DROPS, 0, why);
     static int on = -1; static u32 from;
     if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_DROPLOG"); on = e ? 1 : 0; from = e ? (u32)atoi(e) : 0; }
     if (!on || g.frames < from) return;   /* =<frame>: start counting there */
@@ -6475,6 +6631,15 @@ static u64 eng_ds_now(void);
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    /* (rsx5) PS3RECOMP_LIMITS: this frame's uses */
+    rsx_lim_use(RSX_LIM_DROPS, s_drops_frame); s_drops_frame = 0;
+    rsx_lim_use(RSX_LIM_TEXCACHE, s_tex_ws); s_tex_ws = 0;
+    rsx_lim_use(RSX_LIM_SURFACES, g.n_surfaces);
+    rsx_lim_use(RSX_LIM_ZDEPTHS, g.n_zdepths);
+    rsx_lim_use(RSX_LIM_VCACHE, s_vc_used);
+    rsx_lim_use(RSX_LIM_VCACHE_MB, s_vc_bytes >> 20);
+    rsx_lim_use(RSX_LIM_ICACHE, s_ic_used);
+    rsx_lim_use(RSX_LIM_ICACHE_MB, s_ic_bytes >> 20);
     /* PS3_TOGGLE_FILE runs: the Lighting page's names from the toggle file,
      * once a presented frame (one load and out otherwise). Here, not in
      * sink_flip: inFAMOUS 2 presents through rsx_draw_engine_present (the
@@ -6733,6 +6898,21 @@ int rsx_draw_engine_init(u32 width, u32 height)
     eng_fxres_init();
     ps3_setting_register("PS3RECOMP_FX_RES", eng_fxres_apply);
     eng_texpack_register();
+    /* PS3RECOMP_LIMITS: the engine's capacities, and the one line at exit */
+    rsx_lim_cap(RSX_LIM_TEXCACHE, eng_tex_cap());
+    rsx_lim_cap(RSX_LIM_SURFACES, ENG_MAX_SURFACES);
+    rsx_lim_cap(RSX_LIM_ZDEPTHS, ENG_MAX_ZDEPTHS);
+    rsx_lim_cap(RSX_LIM_PIPELINES, ENG_MAX_PIPELINES);
+    rsx_lim_cap(RSX_LIM_VCACHE, ENG_VC_SIZE / 4u * 3u);
+    rsx_lim_cap(RSX_LIM_VCACHE_MB, ENG_VC_BUDGET >> 20);
+    rsx_lim_cap(RSX_LIM_ICACHE, ENG_IC_SIZE / 4u * 3u);
+    rsx_lim_cap(RSX_LIM_ICACHE_MB, ENG_IC_BUDGET >> 20);
+    rsx_lim_cap(RSX_LIM_DRAW_BATCHES, ENG_MAX_BATCHES);
+    rsx_lim_cap(RSX_LIM_INLINE, RSX_DSP_INLINE_MAX_BYTES);
+    rsx_lim_cap(RSX_LIM_IMM, RSX_DSP_IMM_MAX);
+    rsx_lim_cap(RSX_LIM_GPU_LIGHTS, RSX_GPU_LIGHT_MAX);
+    { static int reg; if (!reg) { reg = 1; atexit(rsx_lim_atexit); } }
+    g_rsx_dsp_limit_hook = eng_dsp_limit;
     g.ready = 1;
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
             g.width, g.height);

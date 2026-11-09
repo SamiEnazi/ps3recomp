@@ -156,6 +156,7 @@ u32 g_rsx_dsp_tex_gen = 1;
  * the draw engine re-derives its vertex-texture mask and user-clip key only
  * when it moved (PS3RECOMP_ENG_MISCGEN). Conservative like the texture one. */
 u32 g_rsx_dsp_misc_gen = 1;
+void (*g_rsx_dsp_limit_hook)(int what, u32 n);
 static inline void tex_gen_note(u32 idx, u32 old, u32 arg)
 {
     if (old != arg) {
@@ -295,6 +296,27 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
  * of every width. Packing follows libgcm's cellGcmSetVertexData* helpers:
  * 4UB is x | y<<8 | z<<16 | w<<24, 2S/4S are x | y<<16 per dword. */
 static float imm_bits_f(u32 v) { float f; memcpy(&f, &v, 4); return f; }
+/* (rsx5) the runtime caps (rsx_dispatch.h) */
+static u32 dsp_imm_cap(void)
+{
+    static u32 cap;
+    if (__builtin_expect(!cap, 0)) {
+        const char* e = getenv("PS3RECOMP_DSP_IMM_MAX");
+        const long v = e && *e ? atol(e) : (long)RSX_DSP_IMM_MAX;
+        cap = v < 16 ? 16u : v > (long)RSX_DSP_IMM_MAX ? RSX_DSP_IMM_MAX : (u32)v;
+    }
+    return cap;
+}
+static u32 dsp_inline_cap(void)
+{
+    static u32 cap;
+    if (__builtin_expect(!cap, 0)) {
+        const char* e = getenv("PS3RECOMP_DSP_INLINE_KB");
+        const long v = e && *e ? atol(e) : (long)(RSX_DSP_INLINE_MAX_BYTES / 1024);
+        cap = v < 4 ? 4096u : v > (long)(RSX_DSP_INLINE_MAX_BYTES / 1024) ? RSX_DSP_INLINE_MAX_BYTES : (u32)v * 1024u;
+    }
+    return cap;
+}
 
 static void imm_store(rsx_dispatch* rsx, u32 attr, u32 dword, u32 dwords_per_vertex,
                       const float* v, u32 first, u32 n, u32 size)
@@ -313,7 +335,11 @@ static void imm_store(rsx_dispatch* rsx, u32 attr, u32 dword, u32 dwords_per_ver
     if (attr != 0) return;
     if (++rsx->imm_a0_dw < dwords_per_vertex) return;
     rsx->imm_a0_dw = 0;
-    if (rsx->imm_n >= RSX_DSP_IMM_MAX) { rsx->imm_dropped++; return; }
+    if (rsx->imm_n >= dsp_imm_cap()) {
+        rsx->imm_dropped++;
+        rsx->imm_drop_draw++;            /* (rsx5) reported at BEGIN_END(0) if the pair draws them */
+        return;
+    }
     memcpy(rsx->imm_vert[rsx->imm_n++], rsx->imm_val, sizeof rsx->imm_val);
 }
 
@@ -383,7 +409,12 @@ static void imm_flush_as_inline(rsx_dispatch* rsx)
     for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) if (rsx->imm_mask & (1u << a)) k++;
     const u32 stride = 16u * k;
     u32 n = rsx->imm_n;
-    if (n * stride > RSX_DSP_INLINE_MAX_BYTES) n = RSX_DSP_INLINE_MAX_BYTES / stride;
+    if (g_rsx_dsp_limit_hook) g_rsx_dsp_limit_hook(2, n + rsx->imm_drop_draw);   /* (rsx5) peak */
+    if (g_rsx_dsp_limit_hook && rsx->imm_drop_draw) g_rsx_dsp_limit_hook(1, n + rsx->imm_drop_draw);
+    if (n * stride > dsp_inline_cap()) {
+        n = dsp_inline_cap() / stride;
+        if (g_rsx_dsp_limit_hook) g_rsx_dsp_limit_hook(1, rsx->imm_n);
+    }
     u32 saved[RSX_DSP_NUM_VERTEX_ATTR];
     for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
         saved[a] = rsx->regs[(M_VTXFMT >> 2) + a];
@@ -507,6 +538,8 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->in_begin_end = 1;
             rsx->current_primitive = arg;
             rsx->inline_len = 0;
+            rsx->inline_ovf = 0;
+            rsx->imm_drop_draw = 0;
             rsx->imm_mask = 0; rsx->imm_a0_dw = 0; rsx->imm_n = 0;
             rsx->pair_packets = 0;
             if (rsx->sink.begin)
@@ -556,7 +589,11 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * between them and counted an empty group. */
     case M_INLINE_ARRAY:
         rsx->pair_packets++;
-        if (rsx->inline_len + 4u <= RSX_DSP_INLINE_MAX_BYTES) {
+        /* (rsx5) a stream that overflowed is dropped whole: the words after
+         * the overflow used to start a new stream at offset 0 -- a torn,
+         * misaligned mesh drawn instead of nothing */
+        if (rsx->inline_ovf) break;
+        if (rsx->inline_len + 4u <= dsp_inline_cap()) {
             rsx->inline_data[rsx->inline_len + 0] = (u8)(arg >> 24);
             rsx->inline_data[rsx->inline_len + 1] = (u8)(arg >> 16);
             rsx->inline_data[rsx->inline_len + 2] = (u8)(arg >> 8);
@@ -567,6 +604,8 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
              * and count it instead of drawing something half-read. */
             rsx->inline_len = 0;
             rsx->inline_dropped++;
+            rsx->inline_ovf = 1;
+            if (g_rsx_dsp_limit_hook) g_rsx_dsp_limit_hook(0, dsp_inline_cap());
         }
         break;
 
