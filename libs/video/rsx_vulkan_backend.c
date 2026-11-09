@@ -3496,6 +3496,16 @@ static void vk_window_open(const char* title)
         vk_window_drop(why);
         return;
     }
+#ifdef _WIN32
+    /* Keep the display and the PC awake while the game runs, as the D3D12 and
+     * null backends do. SDL's screen-saver suspend alone did not: on 2026-11-09
+     * the display went to sleep during game runs, and a player on a controller
+     * gives Windows no input at all (pad input does not reset the idle timer),
+     * so the screen could turn off mid-game. PS3RECOMP_KEEP_AWAKE=0 = SDL's only. */
+    { const char* ka = getenv("PS3RECOMP_KEEP_AWAKE");
+      if (!ka || ka[0] != '0')
+          SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED); }
+#endif
     unsigned n = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
         !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {
