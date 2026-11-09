@@ -444,12 +444,14 @@ static void toggle_fullscreen(void)
     s_ui_stale = true;
 }
 
-/* The menu's pages: the five settings pages, then Cheats when the title has any. */
-static int tab_count(void) { return 5 + (vk_overlay_cheats_count() > 0 ? 1 : 0); }
+/* The menu's pages: the settings pages, then Cheats (always the last one) when the title
+ * has any. A new settings page goes before it: TAB_CHEATS is the number of settings pages. */
+enum { TAB_CHEATS = 5 };
+static int tab_count(void) { return TAB_CHEATS + (vk_overlay_cheats_count() > 0 ? 1 : 0); }
 
 static int tab_from_name(const char* e)
 {
-    static const char* const names[] = { "display", "graphics", "audio", "controls", "hud", "cheats" };
+    static const char* const names[TAB_CHEATS + 1] = { "display", "graphics", "audio", "controls", "hud", "cheats" };
     if (!e || !*e) return -1;
     if (e[0] >= '0' && e[0] <= '9') { const int t = atoi(e); return t >= 0 && t < tab_count() ? t : 0; }
     for (int i = 0; i < tab_count(); i++) if (!SDL_strcasecmp(e, names[i])) return i;
@@ -1400,7 +1402,7 @@ static void draw_menu(double now)
                                                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
         ImGui::End(); return;
     }
-    static const char* const names[6] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Cheats" };
+    static const char* const names[TAB_CHEATS + 1] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Cheats" };
     if (ImGui::BeginTabBar("tabs")) {
         for (int i = 0; i < tab_count(); i++) {
             const ImGuiTabItemFlags f = (s_tab_want == i) ? ImGuiTabItemFlags_SetSelected : 0;
@@ -1408,7 +1410,7 @@ static void draw_menu(double now)
                 s_tab = i;
                 ImGui::BeginChild("page", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() * 1.4f));
                 switch (i) { case 0: tab_display(); break; case 1: tab_graphics(); break; case 2: tab_audio(); break;
-                             case 3: tab_controls(now); break; case 5: vk_overlay_cheats_page(combo_w()); break;
+                             case 3: tab_controls(now); break; case TAB_CHEATS: vk_overlay_cheats_page(combo_w()); break;
                              default: tab_hud(); break; }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
@@ -1422,8 +1424,9 @@ static void draw_menu(double now)
     ImGui::SameLine();
     if (ImGui::Button("Quit game")) s_quit_ask = 1;
     ImGui::SameLine();
-    hint(s_ini_path[0] ? "Changes apply at once where they can and are saved."
-                       : "Changes apply at once (not saved: PS3_OVERLAY_INI is empty).");
+    hint(s_tab == TAB_CHEATS ? "Cheats apply at once and are never saved."
+         : s_ini_path[0] ? "Changes apply at once where they can and are saved."
+                         : "Changes apply at once (not saved: PS3_OVERLAY_INI is empty).");
     quit_confirm();
     ImGui::End();
 }
