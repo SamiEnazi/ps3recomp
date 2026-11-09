@@ -112,6 +112,9 @@ typedef struct rsx_dispatch_sink {
 
 /* (rsx3) rsx_dispatch.c: bumped by every write that changes a texture unit register. */
 extern u32 g_rsx_dsp_tex_gen;
+/* (rsx5) rsx_dispatch.c: bumped by every write that changes a vertex texture
+ * register (0x0900..0x097F) or USER_CLIP_PLANE_CONTROL (0x1478). */
+extern u32 g_rsx_dsp_misc_gen;
 
 struct rsx_dispatch {
     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
@@ -158,6 +161,12 @@ struct rsx_dispatch {
      * seed), so a consumer that derived something from the transform
      * program can tell it is still the same without comparing the words. */
     u32 vp_gen;
+
+    /* (rsx5) Nonzero: seen[] is not counted. Its only reader is the live-draw
+     * path's own dispatcher; the draw engine's instance sets this
+     * (PS3RECOMP_DSP_SEEN=1 counts again), saving a read-modify-write of a
+     * second cache line on every register write. rsx_dispatch_init clears it. */
+    u32 no_seen;
 };
 
 /* ---- lifecycle -------------------------------------------------------- */

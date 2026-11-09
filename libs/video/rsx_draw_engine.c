@@ -32,6 +32,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stddef.h>   /* offsetof: the fast pipeline key */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -533,6 +534,37 @@ static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
     for (u32 i = 0; i < n; i++) { hash ^= p[i]; hash *= 1099511628211ull; }
     return hash;
 }
+/* (rsx5) PS3RECOMP_ENG_FASTKEY: the pipeline key's hash, eight bytes a step.
+ * Each step is a bijection of the running hash for a given word and of the
+ * word for a given hash (xor, odd multiply, xor-shift), as FNV-1a's is per
+ * byte; the segment length goes in first so conditional segments cannot run
+ * together. */
+static int s_fastkey = -1;
+static inline int eng_fastkey_on(void)
+{
+    if (__builtin_expect(s_fastkey < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_FASTKEY");
+        s_fastkey = !(e && *e == '0');
+    }
+    return s_fastkey;
+}
+static inline u64 eng_kmix(u64 h, u64 v)
+{
+    h = (h ^ v) * 0xFF51AFD7ED558CCDull;
+    return h ^ (h >> 31);
+}
+static u64 eng_khash(const void* data, u32 n, u64 h)
+{
+    const u8* p = (const u8*)data;
+    h = eng_kmix(h, 0x9E3779B97F4A7C15ull ^ n);
+    for (; n >= 8u; n -= 8u, p += 8) { u64 v; memcpy(&v, p, 8); h = eng_kmix(h, v); }
+    if (n) { u64 v = 0; memcpy(&v, p, n); h = eng_kmix(h, v); }
+    return h;
+}
+_Static_assert(sizeof(rsx_be_render_state) % 4u == 0u &&
+               offsetof(rsx_be_render_state, alpha_ref_raw) == 8u &&
+               offsetof(rsx_be_render_state, blend_enable) == 16u,
+               "rsx_be_render_state: the fast key hashes it as two runs of u32 fields");
 
 /* ---- render state -------------------------------------------------------- */
 
@@ -987,6 +1019,27 @@ static u32 eng_surface_get_kq(u32 location, u32 offset, u32 want_w, u32 want_h,
     const u32 want_kq = force_kq ? force_kq : eng_fxres_kq(location, offset, want_w, want_h);
     u32 reuse = ENG_INVALID;
 
+    /* (rsx5) PS3RECOMP_ENG_SURF_MEMO (default 1; 0 = the scan only): the four
+     * targets found last are tried first. A live (address, size, format) has
+     * exactly one target (only the creation below adds one, after the scan
+     * found none), so a hit is the entry the scan would return; a changed
+     * effects scale goes the whole way. The scan touched every target's entry
+     * per bind, ~0.8% of the RSX thread in the city. */
+    static int memo_on = -1;
+    static u32 memo[4], memo_i;
+    if (__builtin_expect(memo_on < 0, 0)) { const char* e = getenv("PS3RECOMP_ENG_SURF_MEMO"); memo_on = !(e && *e == '0'); }
+    if (memo_on)
+        for (u32 k = 0; k < 4u; k++) {
+            const u32 i = memo[k];
+            if (i < g.n_surfaces && g.surfaces[i].handle && g.surfaces[i].location == location &&
+                g.surfaces[i].offset == offset && g.surfaces[i].w == want_w &&
+                g.surfaces[i].h == want_h && g.surfaces[i].fmt == want_fmt &&
+                (g.surfaces[i].kq ? g.surfaces[i].kq : 4u) == want_kq) {
+                g.surfaces[i].stamp = ++s_surf_clock;
+                return i;
+            }
+        }
+
     /* One target per (address, size, format). Reallocating the address's
      * target whenever a pass declared a different clip (a 1280x180 strip, a
      * 256x256 tile over a 1280x720 G-buffer) threw away contents a later pass
@@ -997,6 +1050,7 @@ static u32 eng_surface_get_kq(u32 location, u32 offset, u32 want_w, u32 want_h,
             g.surfaces[i].h == want_h && g.surfaces[i].fmt == want_fmt) {
             if ((g.surfaces[i].kq ? g.surfaces[i].kq : 4u) != want_kq) { reuse = i; break; }   /* PS3RECOMP_FX_RES changed */
             g.surfaces[i].stamp = ++s_surf_clock;
+            if (memo_on) memo[memo_i++ & 3u] = i;
             return i;
         }
 
@@ -1055,6 +1109,7 @@ static u32 eng_surface_get_kq(u32 location, u32 offset, u32 want_w, u32 want_h,
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s -> h%u\n",
                 location, offset, want_w, want_h, (int)want_fmt,
                 seed ? " (seeded from guest memory)" : "", handle); }
+    if (memo_on) memo[memo_i++ & 3u] = slot;
     return slot;
 }
 static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
@@ -2682,18 +2737,35 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
 
 /* ---- pipelines ----------------------------------------------------------- */
 
+/* (rsx5) PS3RECOMP_ENG_MISCGEN (default 1; 0 = read the registers every time). */
+static int s_miscgen_on = -1;
+static inline int eng_miscgen_on(void)
+{
+    if (__builtin_expect(s_miscgen_on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_MISCGEN");
+        s_miscgen_on = !(e && *e == '0');
+    }
+    return s_miscgen_on;
+}
 static u32 eng_vtex_mask(void)
 {
     /* The three fields rsx_dsp_get_vertex_texture would decode (enable =
      * CONTROL0 bit 31, width/height = IMAGE_RECT) read directly: this runs
      * twice a draw and the full decode (a memset and eleven fields per unit)
      * showed in the RSX thread's profile. */
+    /* (rsx5) PS3RECOMP_ENG_MISCGEN: no vertex texture register changed since
+     * the last call (g_rsx_dsp_misc_gen) -> the same mask, without the eight
+     * reads of rarely written (so rarely cached) register lines. */
+    static u32 m_gen, m_val;
+    const u32 now = __atomic_load_n(&g_rsx_dsp_misc_gen, __ATOMIC_RELAXED);
+    if (eng_miscgen_on() && m_gen == now) return m_val;
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
         const u32 base = 0x0900u + u * 0x20u;    /* NV4097_SET_VERTEX_TEXTURE_OFFSET + unit block */
         const u32 ctl0 = rsx_dsp_reg(&g.rsx, base + 0x0Cu), rect = rsx_dsp_reg(&g.rsx, base + 0x18u);
         if ((ctl0 >> 31) && (rect >> 16) && (rect & 0xFFFFu)) mask |= 1u << u;
     }
+    m_gen = now; m_val = mask;
     return mask;
 }
 
@@ -2740,6 +2812,14 @@ static u32 eng_cube_mask(const rsx_dsp_texture tex[RSX_DSP_NUM_TEXTURES])
  * means an identical size, since the size is found by scanning those bytes
  * for the end flag. */
 #define ENG_PROG_MEMO 8
+/* (rsx5) PS3RECOMP_ENG_VP_MEMO (1..32, default 32; 8 = the size before): how
+ * many vertex programs are kept. The city's frame cycles through more than
+ * eight, so the table missed and re-analysed (size walk, copy, hash, input and
+ * constant analyses) a program it had seen a moment before. A lookup compares
+ * only entries at the same start, and two different programs differ in their
+ * first bytes, so a bigger table costs little. */
+#define ENG_VP_MEMO_MAX 32u
+static u32 s_vp_cap;
 
 typedef struct {
     u32 start, instrs;          /* instrs == 0: unused entry */
@@ -2764,10 +2844,19 @@ typedef struct {
     u32 sampled_units, gamma_cand, expand_cand;
     u32 used;
     u8* bytes;
+    /* (rsx5) PS3RECOMP_ENG_FP_KPATCH: the 16-byte blocks that are inline
+     * constant payloads (block index = byte offset / 16, in program order =
+     * constants.values order), and whether a payload-only change may be
+     * refreshed in place (kp_ok: no branch instruction, so every microcode
+     * walk -- size, constants, structural hash, the unit masks -- splits the
+     * program into the same instruction and payload blocks). */
+    int kp_ok;
+    u32 kp_n;
+    u16* kp_blk;
     rsx_fp_constant_block constants;
 } eng_fp_memo;
 
-static eng_vp_memo s_vp_memo[ENG_PROG_MEMO];
+static eng_vp_memo s_vp_memo[ENG_VP_MEMO_MAX];
 /* PS3RECOMP_ENG_VP_GEN: the entry the last lookup found, and the dispatcher's
  * vp_gen and program start it was found under. */
 static eng_vp_memo* s_vpgen_memo;
@@ -2779,7 +2868,22 @@ static void eng_vpgen_set(int id, int v) { (void)id; __atomic_store_n(&s_vpgen_o
  * old table missed and re-analysed (copy, structural hash, constants, three
  * microcode walks) on many draws. The lookup scans compact key arrays, not the
  * 32 KB entries. */
-#define ENG_FP_MEMO_MAX 64u
+/* (rsx5) PS3RECOMP_ENG_FP_KPATCH (default 1; 0 = the memo as before, cap 8):
+ * inFAMOUS 2 patches the inline constants of a fragment program in place
+ * between draws (same address, same microcode, other constant values). Each
+ * such draw missed the memo and re-ran the whole analysis -- a 32 KB clear in
+ * rsx_fp_collect_constants, the structural hash a byte at a time, four more
+ * microcode walks: ~9% of the RSX thread in the city dock view -- and every
+ * patched copy took another slot (why a bigger memo was slower). Now an entry
+ * whose instruction blocks are unchanged takes the new constant values in
+ * place (everything else the memo derives depends on the instruction blocks
+ * alone) when no entry matches exactly, so a program has one entry however
+ * its constants move, and the memo keeps 128 programs. (A first version kept
+ * one entry per ADDRESS: the city puts several programs at one address in
+ * turn, and re-analysing on every switch made it slower than before.) */
+#define ENG_FP_MEMO_MAX 128u
+static int s_fp_kpatch = -1;
+static u8 s_fp_hint[256];                       /* (kpatch) key hash -> slot + 1 */
 static eng_fp_memo s_fp_memo[ENG_FP_MEMO_MAX];
 static u64 s_fp_key[ENG_FP_MEMO_MAX];           /* loc << 32 | off */
 static u32 s_fp_sz[ENG_FP_MEMO_MAX];            /* 0: unused */
@@ -2790,10 +2894,74 @@ static u64 ds_memo_hit[2], ds_memo_miss[2];     /* drawstats: vp, fp */
 
 static u64 eng_fnv1a(const void* data, u32 n, u64 hash);
 
+/* (rsx5, PS3RECOMP_ENG_FP_KPATCH) Find the inline-constant payload blocks of
+ * a freshly analysed entry (its bytes = the program). The walk is
+ * rsx_fp_collect_constants' (an instruction with a CONST source -- register
+ * type 2 in DWORD1..3 -- pulls the next 16 bytes in as its payload; DWORD0
+ * bit 0 ends the program); the unit-mask walks also skip a payload only when
+ * DWORD2 bit 31 (a branch) is clear, so a program with a branch is left to
+ * the full analysis. kp_ok only when the walk ends exactly at the analysed
+ * size with one payload per collected constant. */
+static void eng_fp_kp_scan(eng_fp_memo* m)
+{
+    m->kp_ok = 0; m->kp_n = 0;
+    if (!m->constants_ok || !m->structural || !m->bytes) return;
+    const u8* p = m->bytes;
+    const u32 size = m->size, cap = m->constants.count;
+    if (cap) {
+        u16* b = (u16*)realloc(m->kp_blk, cap * sizeof(u16));
+        if (!b) return;
+        m->kp_blk = b;
+    }
+    u32 n = 0;
+    for (u32 off = 0; off + 16u <= size;) {
+        const u32 w0 = rsx_fp_read_word(p + off), w1 = rsx_fp_read_word(p + off + 4),
+                  w2 = rsx_fp_read_word(p + off + 8), w3 = rsx_fp_read_word(p + off + 12);
+        if (w2 >> 31) return;
+        off += 16u;
+        if ((w1 & 3u) == 2u || (w2 & 3u) == 2u || (w3 & 3u) == 2u) {
+            if (off + 16u > size || n >= cap || off / 16u > 0xFFFFu) return;
+            m->kp_blk[n++] = (u16)(off / 16u);
+            off += 16u;
+        }
+        if (w0 & 1u) {
+            if (off == size && n == cap) { m->kp_n = n; m->kp_ok = 1; }
+            return;
+        }
+    }
+}
+/* The entry's program again, at `uc` (m->size bytes): if every block that is
+ * not a constant payload is unchanged, take the payloads' new values (as
+ * rsx_fp_collect_constants reads them) into the entry and its bytes, and say
+ * yes; else no (a different program: the full analysis). */
+static int eng_fp_kp_refresh(eng_fp_memo* m, const u8* uc)
+{
+    if (!m->kp_ok) return 0;
+    const u32 nb = m->size / 16u;
+    u32 k = 0;
+    for (u32 b = 0; b < nb; b++) {
+        if (k < m->kp_n && m->kp_blk[k] == b) { k++; continue; }
+        u64 a0, a1, b0, b1;
+        memcpy(&a0, m->bytes + b * 16u, 8); memcpy(&a1, m->bytes + b * 16u + 8u, 8);
+        memcpy(&b0, uc + b * 16u, 8);       memcpy(&b1, uc + b * 16u + 8u, 8);
+        if ((a0 ^ b0) | (a1 ^ b1)) return 0;
+    }
+    for (k = 0; k < m->kp_n; k++) {
+        const u32 o = (u32)m->kp_blk[k] * 16u;
+        u8 t[16];
+        memcpy(t, uc + o, 16);              /* one read: the values and the memo bytes agree */
+        if (!memcmp(m->bytes + o, t, 16)) continue;
+        for (u32 c = 0; c < 4u; c++)
+            m->constants.values[k][c] = rsx_fp_sanitize_constant_word(rsx_fp_read_word(t + c * 4u));
+        memcpy(m->bytes + o, t, 16);
+    }
+    return 1;
+}
+
 static u32 eng_memo_victim_vp(void)
 {
     u32 v = 0;
-    for (u32 i = 1; i < ENG_PROG_MEMO; i++)
+    for (u32 i = 1; i < s_vp_cap; i++)
         if (s_vp_memo[i].used < s_vp_memo[v].used) v = i;
     return v;
 }
@@ -2816,7 +2984,12 @@ static const eng_vp_memo* eng_vp_current(void)
         return s_vpgen_memo;
     }
     s_vpgen_memo = NULL;
-    for (u32 i = 0; i < ENG_PROG_MEMO; i++) {
+    if (__builtin_expect(!s_vp_cap, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_VP_MEMO");
+        const long n = e ? strtol(e, NULL, 10) : (long)ENG_VP_MEMO_MAX;
+        s_vp_cap = n < 1 ? 1u : n > (long)ENG_VP_MEMO_MAX ? ENG_VP_MEMO_MAX : (u32)n;
+    }
+    for (u32 i = 0; i < s_vp_cap; i++) {
         eng_vp_memo* m = &s_vp_memo[i];
         if (m->instrs && m->start == start && !memcmp(m->bytes, uc, m->instrs * 16u)) {
             m->used = ++s_memo_clock;
@@ -2833,7 +3006,9 @@ static const eng_vp_memo* eng_vp_current(void)
     m->instrs = instrs;
     memcpy(m->bytes, uc, instrs * 16u);
     m->used = ++s_memo_clock;
-    m->hash = eng_fnv1a(uc, instrs * 16u, 1469598103934665603ull);
+    /* (rsx5, PS3RECOMP_ENG_FASTKEY) only the pipeline key reads it */
+    m->hash = eng_fastkey_on() ? eng_khash(uc, instrs * 16u, 1469598103934665603ull)
+                               : eng_fnv1a(uc, instrs * 16u, 1469598103934665603ull);
 
     m->input_mask = 0xFFFFu;
     rsx_vp_input_analysis analysis = { 0xFFFFu, 0 };
@@ -2863,11 +3038,47 @@ static const eng_fp_memo* eng_fp_current(void)
     u32 loc = 0;
     const u32 off = rsx_dsp_fragment_program(&g.rsx, &loc);
     if (__builtin_expect(!s_fp_cap, 0)) {
+        const char* k = getenv("PS3RECOMP_ENG_FP_KPATCH");
+        s_fp_kpatch = !(k && *k == '0');
         const char* e = getenv("PS3RECOMP_ENG_FP_MEMO");
-        const long n = e ? strtol(e, NULL, 10) : 8L;   /* rsx3: 64 measured WORSE (same-address programs with patched constants pile up and are all compared) */
+        /* rsx3: 64 measured WORSE without kpatch (same-address programs with
+         * patched constants piled up and were all compared); with kpatch they
+         * share one entry per program. */
+        const long n = e ? strtol(e, NULL, 10) : (s_fp_kpatch ? (long)ENG_FP_MEMO_MAX : 8L);
         s_fp_cap = n < 1 ? 1u : n > (long)ENG_FP_MEMO_MAX ? ENG_FP_MEMO_MAX : (u32)n;
+        fprintf(stderr, "[rsx engine] fragment program memo: %u entries, constant refresh in place %s (PS3RECOMP_ENG_FP_KPATCH)\n",
+                s_fp_cap, s_fp_kpatch ? "on" : "off");
     }
     const u64 key = ((u64)loc << 32) | off;
+    if (s_fp_kpatch) {
+        /* An address can hold several programs in turn (each keeps its own
+         * entry, as before); a program whose constants alone changed is
+         * refreshed in place instead of taking another entry. First the entry
+         * the address hit last, then every entry of the address exactly, then
+         * a constant refresh of one of them. */
+        const u32 h = (u32)((key * 0x9E3779B97F4A7C15ull) >> 56);
+        const u32 hs = s_fp_hint[h];
+        const u32 first = (hs && hs <= s_fp_cap && s_fp_sz[hs - 1] && s_fp_key[hs - 1] == key) ? hs - 1u : ~0u;
+        /* order: `first` exactly; the others exactly; `first` refreshed; the others refreshed */
+        for (int pass = 0; pass < 4; pass++) {
+            const int refresh = pass >= 2, only_first = !(pass & 1);
+            if (only_first && first == ~0u) continue;
+            for (u32 i = only_first ? first : 0u; i < s_fp_cap; i++) {
+                if (!only_first && i == first) continue;
+                if (s_fp_sz[i] && s_fp_key[i] == key) {
+                    eng_fp_memo* m = &s_fp_memo[i];
+                    const u8* uc = eng_guest_ptr(NULL, loc, off, m->size);
+                    if (uc && (refresh ? eng_fp_kp_refresh(m, uc) : !memcmp(m->bytes, uc, m->size))) {
+                        s_fp_use[i] = m->used = ++s_memo_clock;
+                        s_fp_hint[h] = (u8)(i + 1);
+                        ds_memo_hit[1]++;
+                        return m;
+                    }
+                }
+                if (only_first) break;
+            }
+        }
+    } else
     for (u32 i = 0; i < s_fp_cap; i++) {
         if (!s_fp_sz[i] || s_fp_key[i] != key) continue;
         eng_fp_memo* m = &s_fp_memo[i];
@@ -2905,6 +3116,11 @@ static const eng_fp_memo* eng_fp_current(void)
     m->sampled_units = rsx_fp_texture_units(uc, size);
     m->gamma_cand = rsx_fp_texture_gamma_units(uc, size, all);
     m->expand_cand = rsx_fp_texture_expand_units(uc, size, all);
+    m->kp_ok = 0; m->kp_n = 0;
+    if (s_fp_kpatch) {
+        eng_fp_kp_scan(m);
+        s_fp_hint[(u32)((key * 0x9E3779B97F4A7C15ull) >> 56)] = (u8)(v + 1);
+    }
     return m;
 }
 
@@ -3069,12 +3285,16 @@ static u32 eng_user_clip_key(void)
     static int on = -1;
     if (on < 0) { const char* e = getenv("PS3RECOMP_ENG_USER_CLIP"); on = e ? atoi(e) : 1; }
     if (!on) return 0;
+    static u32 m_gen, m_val;   /* (rsx5) PS3RECOMP_ENG_MISCGEN, as eng_vtex_mask */
+    const u32 now = __atomic_load_n(&g_rsx_dsp_misc_gen, __ATOMIC_RELAXED);
+    if (eng_miscgen_on() && m_gen == now) return m_val;
     const u32 ctl = rsx_dsp_reg(&g.rsx, 0x1478u);
     u32 key = 0;
     for (u32 p = 0; p < 6; p++) {
         const u32 op = (ctl >> (p * 4u)) & 0xFu;
         if (op == 1u || op == 2u) key |= op << (p * 2u);
     }
+    m_gen = now; m_val = key;
     return key;
 }
 
@@ -3116,6 +3336,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed)
 {
     *out_fixed = 1;
+    (void)eng_fastkey_on();   /* s_fastkey read below */
     const eng_vp_memo* vp = NULL;
     const eng_fp_memo* fp = NULL;
     /* No resident program pair means the built-in one; see kEngFixedVS. */
@@ -3288,7 +3509,13 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         kmemo.fp_ctrl_key == fp_ctrl_key && kmemo.cube_mask == cube_mask && kmemo.vol_mask == vol_mask &&
         kmemo.vtex_mask == vtex_mask && kmemo.layout_mask == layout->mask &&
         kmemo.layout_stride == layout->stride && kmemo.rt_count == rt_count &&
-        kmemo.rt_fmt == rt_fmt && !memcmp(&kmemo.rs, rs, sizeof *rs) &&
+        kmemo.rt_fmt == rt_fmt &&
+        /* (rsx5, FASTKEY) the alpha reference and its format are not key
+         * inputs: a fade animating the reference keeps the memo */
+        (s_fastkey ? (!memcmp(&kmemo.rs, rs, offsetof(rsx_be_render_state, alpha_ref_raw)) &&
+                      !memcmp(&kmemo.rs.blend_enable, &rs->blend_enable,
+                              sizeof *rs - offsetof(rsx_be_render_state, blend_enable)))
+                   : !memcmp(&kmemo.rs, rs, sizeof *rs)) &&
         kmemo.shadow_mask == shadow_mask && kmemo.srgb_output == srgb_output &&
         kmemo.gamma_units == gamma_units && kmemo.ucp == ucp && kmemo.dbz == dbz &&
         kmemo.shade_bf == shade_bf && kmemo.fx_off == fx_off &&
@@ -3303,40 +3530,54 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         goto key_done;
     }
     key = 1469598103934665603ull;
+    /* (rsx5) PS3RECOMP_ENG_FASTKEY (default 1; 0 = FNV-1a a byte at a time,
+     * as before): the same inputs in the same order, mixed eight bytes at a
+     * step (eng_khash). The key only indexes this run's pipeline table
+     * (g.pipelines; the disk caches key on the shader text), so the function
+     * may change. The byte-serial FNV over ~250 bytes -- the render state
+     * alone is 31 fields -- was ~1000 cycles a key-memo miss. */
+#define ENG_KH(ptr, n) (key = s_fastkey ? eng_khash((ptr), (u32)(n), key) : eng_fnv1a((ptr), (u32)(n), key))
     if (fixed) {
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
-        key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
+        ENG_KH(&fixed_tag, sizeof fixed_tag);
     } else {
-        key = eng_fnv1a(&vp->hash, sizeof vp->hash, key);
-        key = eng_fnv1a(&fp->structural, sizeof fp->structural, key);
-        key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
-        if (srgb_output) key = eng_fnv1a(&srgb_output, sizeof srgb_output, key);
-        if (gamma_units) key = eng_fnv1a(gamma_masks, sizeof gamma_masks, key);
-        if (expand_units) key = eng_fnv1a(expand_masks, sizeof expand_masks, key);
-        key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
-        if (vol_mask) key = eng_fnv1a(&vol_mask, sizeof vol_mask, key);
+        ENG_KH(&vp->hash, sizeof vp->hash);
+        ENG_KH(&fp->structural, sizeof fp->structural);
+        ENG_KH(&fp_ctrl_key, sizeof fp_ctrl_key);
+        if (srgb_output) ENG_KH(&srgb_output, sizeof srgb_output);
+        if (gamma_units) ENG_KH(gamma_masks, sizeof gamma_masks);
+        if (expand_units) ENG_KH(expand_masks, sizeof expand_masks);
+        ENG_KH(&cube_mask, sizeof cube_mask);
+        if (vol_mask) ENG_KH(&vol_mask, sizeof vol_mask);
         if (shadow_mask) {
-            key = eng_fnv1a(&shadow_mask, sizeof shadow_mask, key);
-            key = eng_fnv1a(shadow, sizeof shadow, key);
+            ENG_KH(&shadow_mask, sizeof shadow_mask);
+            ENG_KH(shadow, sizeof shadow);
         }
-        key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
-        if (ucp) key = eng_fnv1a(&ucp, sizeof ucp, key);
+        ENG_KH(&vtex_mask, sizeof vtex_mask);
+        if (ucp) ENG_KH(&ucp, sizeof ucp);
         if (s_fbf.cand) {   /* PS3RECOMP_ENG_FBFETCH */
-            key = eng_fnv1a(&s_fbf.cand, sizeof s_fbf.cand, key);
-            key = eng_fnv1a(s_fbf.att, sizeof s_fbf.att, key);
-            key = eng_fnv1a(s_fbf.sel, sizeof s_fbf.sel, key);
+            ENG_KH(&s_fbf.cand, sizeof s_fbf.cand);
+            ENG_KH(s_fbf.att, sizeof s_fbf.att);
+            ENG_KH(s_fbf.sel, sizeof s_fbf.sel);
         }
-        if (dbz) { const u32 tag = 0x5A424400u | dbz; key = eng_fnv1a(&tag, sizeof tag, key); }
-        if (shade_bf) { const u32 tag = 0x53424631u; key = eng_fnv1a(&tag, sizeof tag, key); }   /* "SBF1" */
-        if (fx_off) { const u32 tag = 0x46584F00u | fx_off; key = eng_fnv1a(&tag, sizeof tag, key); }   /* "FXO" */
+        if (dbz) { const u32 tag = 0x5A424400u | dbz; ENG_KH(&tag, sizeof tag); }
+        if (shade_bf) { const u32 tag = 0x53424631u; ENG_KH(&tag, sizeof tag); }   /* "SBF1" */
+        if (fx_off) { const u32 tag = 0x46584F00u | fx_off; ENG_KH(&tag, sizeof tag); }   /* "FXO" */
     }
-    key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
-    key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
-    key = eng_fnv1a(&rt_fmt, sizeof rt_fmt, key);
+    ENG_KH(&layout->mask, sizeof layout->mask);
+    ENG_KH(&layout->stride, sizeof layout->stride);
+    ENG_KH(&rt_fmt, sizeof rt_fmt);
     /* How many colour attachments the pass will have is pipeline identity:
      * a host API matches the two against each other. */
-    key = eng_fnv1a(&rt_count, sizeof rt_count, key);
-    key = rsx_draw_engine_hash_render_state(rs, key);
+    ENG_KH(&rt_count, sizeof rt_count);
+#undef ENG_KH
+    if (s_fastkey) {
+        /* rsx_draw_engine_hash_render_state's fields: all but the alpha
+         * reference and its format (all u32, no padding: two runs) */
+        key = eng_khash(rs, (u32)offsetof(rsx_be_render_state, alpha_ref_raw), key);
+        key = eng_khash(&rs->blend_enable, (u32)(sizeof *rs - offsetof(rsx_be_render_state, blend_enable)), key);
+    } else
+        key = rsx_draw_engine_hash_render_state(rs, key);
     kmemo.valid = 1; kmemo.fixed = fixed; kmemo.vp_hash = in_vp; kmemo.fp_struct = in_fp;
     kmemo.fp_ctrl_key = fp_ctrl_key; kmemo.cube_mask = cube_mask; kmemo.vol_mask = vol_mask; kmemo.vtex_mask = vtex_mask;
     kmemo.layout_mask = layout->mask; kmemo.layout_stride = layout->stride;
@@ -3917,6 +4158,13 @@ static int eng_vc_prune(void)
 
 /* Key, then (unless the key is resting) the content hash of the spans. NULL:
  * this draw is not cached. */
+/* (rsx5) PS3RECOMP_WTRACK_ARM_SEEN, eng_vc_probe / eng_ic_probe. */
+static int eng_wt_arm_seen(void)
+{
+    static int on = -1;
+    if (__builtin_expect(on < 0, 0)) { const char* e = getenv("PS3RECOMP_WTRACK_ARM_SEEN"); on = !(e && *e == '0'); }
+    return on;
+}
 static eng_vc_entry* eng_vc_probe(const rsx_vertex_layout_plan* layout, u64* content)
 {
     const rsx_vertex_fetch_plan* pl = &dc.fetch_plan;
@@ -3986,7 +4234,13 @@ static eng_vc_entry* eng_vc_probe(const rsx_vertex_layout_plan* layout, u64* con
         wt_clean = wt_clean && st == e->wt_stamp;
         if (wt_clean && wt == 1) { *content = e->wt_content; ds_vc_wt_clean++; return e; }
     }
-    u64 st = 0; int armed = wt && !wt_clean;
+    /* (rsx5) PS3RECOMP_WTRACK_ARM_SEEN (default 1; 0 = arm at every unclean
+     * probe, as before): a span is protected only once its entry has been seen
+     * before. Most first sightings never come back -- vertices the SPUs (Edge)
+     * write into a ring at a new address each frame -- and protecting them cost
+     * a VirtualProtect each, plus a write fault on every later SPU store into
+     * those pages. A span that does recur is hashed once more and armed then. */
+    u64 st = 0; int armed = wt && !wt_clean && (e->seen || !eng_wt_arm_seen());
     if (armed) for (u32 k = 0; k < nm; k++) armed &= rsx_wt_arm(ms[k], mn[k], &st);
     u64 c = 0x51ED270B27A3F5E1ull;
     for (u32 k = 0; k < nm; k++) {
@@ -4155,7 +4409,7 @@ static eng_ic_entry* eng_ic_probe(const rsx_dsp_index_array* ia, u32 ia_loc, int
         wt_clean = wt_clean && st == e->wt_stamp;
         if (wt_clean && wt == 1) { *content = e->wt_content; ds_ic_wt_clean++; return e; }
     }
-    u64 st = 0; int armed = wt && !wt_clean;
+    u64 st = 0; int armed = wt && !wt_clean && (e->seen || !eng_wt_arm_seen());   /* (rsx5) as eng_vc_probe */
     u64 c = 0x2B992DDFA23249D6ull;
     if (armed)
         for (u32 b = 0; b < dc.n_idx; b++) {
@@ -4895,6 +5149,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     const u32 fp_reads = eng_bind_unread() ? 0xFFFFu : eng_fp_tex_mask();
     const rsx_dsp_texture* units = eng_draw_textures();
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+        /* (rsx5) the skip test before the copy of the decoded unit (same
+         * test, same code after it): copying all sixteen units' state per
+         * draw to look at two fields of each was ~1% of the RSX thread */
+        if (!units[u].enabled || !(fp_reads >> u & 1u)) continue;
         rsx_dsp_texture t = units[u];
         /* A unit left enabled by an earlier draw but not sampled by this
          * program is skipped (as upstream's sink_bind_textures does): binding
@@ -5243,6 +5501,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
     eng_vertex_layout(&layout);
     if (ds_tl) ds.ns_layout += eng_ds_now() - ds_tl;
     dc_fetch(&layout, rebuild);
+    /* (rsx5, PS3RECOMP_ENG_PREFETCH) the backend's entries for the resident
+     * buffers this draw will name, while the rest of the draw is prepared */
+    if (g.be->vbuf_prefetch && eng_prefetch_on()) {
+        if (dc.vbuf) g.be->vbuf_prefetch(g.be->user, dc.vbuf);
+        if (s_ic_hit && s_ic_cur && s_ic_cur->ibuf) g.be->vbuf_prefetch(g.be->user, s_ic_cur->ibuf);
+    }
     const u64 ds_t0 = eng_ds_enabled() ? eng_ds_now() : 0;
     u64 ds_m = ds_t0;   /* stage marks within the rest of sink_end */
 #define DS_MARK(field) do { if (ds_t0) { const u64 _t = eng_ds_now(); ds.field += _t - ds_m; ds_m = _t; } } while (0)
@@ -6453,6 +6717,9 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.inline_array     = sink_inline_array;
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
+    /* (rsx5) PS3RECOMP_DSP_SEEN=1: count rsx_dispatch.seen[] again (nothing on
+     * this path reads it; see rsx_dispatch.h no_seen). */
+    { const char* e = getenv("PS3RECOMP_DSP_SEEN"); g.rsx.no_seen = !(e && *e == '1'); }
     s_vpgen_memo = NULL;   /* PS3RECOMP_ENG_VP_GEN: vp_gen starts over */
     /* The game's post effects the PC menu turns off (ENG_DOF_BLEND_FP). */
     ps3_setting_register("PS3RECOMP_DOF", eng_fx_dof_apply);

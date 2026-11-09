@@ -151,16 +151,26 @@ static void mark_class(rsx_dispatch* rsx, u32 method, u32 count, u8 klass)
  * units again only when it moved (PS3RECOMP_ENG_TEXGEN). Conservative by design:
  * a bump without a real change only costs a decode. */
 u32 g_rsx_dsp_tex_gen = 1;
+/* (rsx5) Bumped whenever a write changes a vertex texture unit's register
+ * (SET_VERTEX_TEXTURE_*, 0x0900..0x097F) or USER_CLIP_PLANE_CONTROL (0x1478):
+ * the draw engine re-derives its vertex-texture mask and user-clip key only
+ * when it moved (PS3RECOMP_ENG_MISCGEN). Conservative like the texture one. */
+u32 g_rsx_dsp_misc_gen = 1;
 static inline void tex_gen_note(u32 idx, u32 old, u32 arg)
 {
-    if (old != arg && ((idx - (M_TEX_SIZE1 >> 2)) < 16u || (idx - (M_TEX_OFFSET >> 2)) < RSX_DSP_NUM_TEXTURES * 8u))
-        g_rsx_dsp_tex_gen++;
+    if (old != arg) {
+        if ((idx - (M_TEX_SIZE1 >> 2)) < 16u || (idx - (M_TEX_OFFSET >> 2)) < RSX_DSP_NUM_TEXTURES * 8u)
+            g_rsx_dsp_tex_gen++;
+        else if ((idx - (0x0900u >> 2)) < (0x80u >> 2) || idx == (0x1478u >> 2))
+            g_rsx_dsp_misc_gen++;
+    }
 }
 
 void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
 {
     memset(rsx, 0, sizeof(*rsx));
     g_rsx_dsp_tex_gen++;
+    g_rsx_dsp_misc_gen++;
     if (sink)
         rsx->sink = *sink;
 
@@ -257,6 +267,7 @@ void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)
         count = RSX_DSP_NUM_REGS;
     memcpy(rsx->regs, regs, count * sizeof(u32));
     g_rsx_dsp_tex_gen++;
+    g_rsx_dsp_misc_gen++;
 }
 
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -445,7 +456,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             if (s_ed_n < 24) { s_ed_m[s_ed_n] = method; s_ed_a[s_ed_n] = arg; } s_ed_n++;
         }
     }
-    rsx->seen[idx]++;
+    if (!rsx->no_seen) rsx->seen[idx]++;
     tex_gen_note(idx, rsx->regs[idx], arg);
     rsx->regs[idx] = arg;
 
@@ -623,9 +634,10 @@ static __attribute__((noinline)) void burst_const_run(rsx_dispatch* rsx, u32 m, 
 {
     const u32 idx0 = m >> 2, w0 = (m - M_VP_UPLOAD_CONST) >> 2;
     const u32 base = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+    const int cs = !rsx->no_seen;
     for (u32 k = 0; k < n; k++) {
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[k], __ATOMIC_RELAXED));
-        rsx->seen[idx0 + k]++;
+        if (cs) rsx->seen[idx0 + k]++;
         rsx->regs[idx0 + k] = arg;
         const u32 word = w0 + k, slot = base + (word >> 2);
         if (slot < RSX_DSP_NUM_CONSTANTS)
@@ -637,9 +649,10 @@ static __attribute__((noinline)) void burst_inst_run(rsx_dispatch* rsx, u32 m, c
 {
     const u32 idx0 = m >> 2;
     u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+    const int cs = !rsx->no_seen;
     for (u32 k = 0; k < n; k++) {
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[k], __ATOMIC_RELAXED));
-        rsx->seen[idx0 + k]++;
+        if (cs) rsx->seen[idx0 + k]++;
         rsx->regs[idx0 + k] = arg;
         const u32 lane = (((m - M_VP_UPLOAD_INST) >> 2) + k) & 3u;
         const u32 pos = *load * 4u + lane;
@@ -647,8 +660,13 @@ static __attribute__((noinline)) void burst_inst_run(rsx_dispatch* rsx, u32 m, c
         if (lane == 3u) (*load)++;
     }
 }
+/* (rsx5) PS3RECOMP_DSP_LEAN_BURST (default 1; 0 = every header through the
+ * window-testing loop): rsx_dispatch_burst's loop for headers clear of the
+ * upload windows. Read with the other switches on the first (slow) burst. */
+static int s_burst_lean = -1;
 static __attribute__((noinline)) void burst_slow(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count)
 {
+    if (s_burst_lean < 0) { const char* e = getenv("PS3RECOMP_DSP_LEAN_BURST"); s_burst_lean = !(e && *e == '0'); }
     if (s_ed_on < 0) ed_init();
     if (s_clog_lo == -2) clog_init();
     if (!s_plain_ready) plain_init();
@@ -669,6 +687,25 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
         return;
     }
     u32 i = 0;
+    const int cs = !rsx->no_seen;
+    /* (rsx5) A header clear of both upload windows -- most of them -- in one
+     * loop without the two per-word window tests (the same per-word actions
+     * as the loop below takes for such words). */
+    {
+        const u32 hi = incr ? method + (count - 1u) * 4u : method;
+        if (s_burst_lean > 0 && (hi < M_VP_UPLOAD_CONST || method >= M_VP_UPLOAD_CONST + 32u * 4u) &&
+            (hi < M_VP_UPLOAD_INST || method >= M_VP_UPLOAD_INST + 32u * 4u)) {
+            /* scalar on purpose: a vectorised loop would make every call save XMM registers (rsx3) */
+#pragma clang loop vectorize(disable) interleave(disable)
+            for (; i < count; i++) {
+                const u32 m = incr ? method + i * 4u : method;
+                const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
+                if (s_plain[m >> 2]) { if (cs) rsx->seen[m >> 2]++; tex_gen_note(m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
+                else dispatch_method_cold(rsx, m, arg);
+            }
+            return;
+        }
+    }
     while (i < count) {
         const u32 m = incr ? method + i * 4u : method;
         if (incr && s_clog_lo < 0 && m >= M_VP_UPLOAD_CONST && m < M_VP_UPLOAD_CONST + 32u * 4u) {
@@ -686,7 +723,7 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
             continue;
         }
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
-        if (s_plain[m >> 2]) { rsx->seen[m >> 2]++; tex_gen_note(m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
+        if (s_plain[m >> 2]) { if (cs) rsx->seen[m >> 2]++; tex_gen_note(m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
         else dispatch_method_cold(rsx, m, arg);
         i++;
     }

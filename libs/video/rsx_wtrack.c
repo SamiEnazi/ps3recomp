@@ -26,7 +26,12 @@ extern uint8_t* vm_base;
 #define WT_PAGE   (1u << WT_SHIFT)
 #define WT_PAGES  (1u << (32u - WT_SHIFT))   /* the 4 GB guest space */
 #define WT_REST   240u                       /* frames a hot page is left alone */
-#define WT_HOT_GAP 4u                        /* faults this close together count toward "hot" */
+/* Faults this close together (frames) count toward "hot".
+ * (rsx5) PS3RECOMP_WTRACK_HOT_GAP (default 16; 4 = before), read at init: a
+ * page the SPUs rewrite on a cycle longer than 4 frames (edge2: Edge job 223's
+ * vertex output) never counted as hot, so it was protected, faulted on and
+ * protected again for ever. Resting a page only means its spans are hashed. */
+static uint32_t s_hot_gap = 16u;
 
 /* Per-page state (lazily committed zero pages: only pages in use cost):
  * ver   bumped after every unprotect (fault or kernel write);
@@ -64,11 +69,11 @@ static LONG CALLBACK wt_veh(EXCEPTION_POINTERS* ep)
     InterlockedIncrement(&s_ver[P]);
     __atomic_fetch_and(&s_prot[P], (char)~1, __ATOMIC_SEQ_CST);
     InterlockedIncrement(&s_faults);
-    /* Hot page: three faults with no more than WT_HOT_GAP frames between
+    /* Hot page: three faults with no more than s_hot_gap frames between
      * them (double-buffered data is written every other frame, a ring of
      * dynamic buffers every third or fourth). */
     const uint32_t f = (uint32_t)s_frame;
-    if (s_lastf[P] && f - s_lastf[P] <= WT_HOT_GAP) { if (++s_streak[P] >= 3u) { s_rest[P] = f + WT_REST; s_streak[P] = 0; InterlockedIncrement(&s_rests); } }
+    if (s_lastf[P] && f - s_lastf[P] <= s_hot_gap) { if (++s_streak[P] >= 3u) { s_rest[P] = f + WT_REST; s_streak[P] = 0; InterlockedIncrement(&s_rests); } }
     else s_streak[P] = 1;
     s_lastf[P] = f;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -90,6 +95,7 @@ int rsx_wt_mode(void)
     if (__builtin_expect(s_mode >= 0, 1)) return s_mode;
     const char* e = getenv("PS3RECOMP_WTRACK");
     int m = e ? atoi(e) : 1;
+    { const char* g = getenv("PS3RECOMP_WTRACK_HOT_GAP"); if (g && *g) { long v = atol(g); s_hot_gap = v < 1 ? 1u : v > 240 ? 240u : (uint32_t)v; } }
     if (m < 0 || m > 2) m = 1;
     if (m && vm_base) {
         s_ver = (volatile LONG*)wt_zalloc((size_t)WT_PAGES * 4u);

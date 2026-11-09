@@ -6533,6 +6533,14 @@ static void vk_eng_vbuf_release(void* user, u32 h)
     }
     vk_vb_free_now(h);
 }
+/* (rsx5) rsx_draw_backend.vbuf_prefetch: the handle's entry, which vk_vb_get
+ * reads when the draw is recorded -- a cache miss per draw (two with an index
+ * list) in the city, ~1.5% of the RSX thread. */
+static void vk_eng_vbuf_prefetch(void* user, u32 h)
+{
+    (void)user;
+    if (h && h < VK_VB_HANDLES && s_vb.ent) __builtin_prefetch(&s_vb.ent[h], 0, 3);
+}
 /* The persistent buffer and offset behind a handle holding at least `bytes`. */
 static int vk_vb_get(u32 h, VkDeviceSize bytes, VkBuffer* buf, VkDeviceSize* off)
 {
@@ -7813,6 +7821,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .vbuf_release         = vk_eng_vbuf_release,
     .draw_vbuf            = vk_eng_draw_vbuf,
     .draw_vbuf_ib         = vk_eng_draw_vbuf_ib,
+    .vbuf_prefetch        = vk_eng_vbuf_prefetch,
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
     .present              = vk_eng_present,

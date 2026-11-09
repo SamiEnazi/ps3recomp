@@ -327,6 +327,10 @@ typedef struct rsx_draw_backend {
      * engine's resident index lists (PS3RECOMP_ENG_ICACHE). */
     void (*draw_vbuf_ib)(void* user, rsx_topology topology, u32 vbuf,
                          u32 vertex_count, u32 stride, u32 ibuf, u32 index_count);
+    /* Optional (rsx5). A hint: the draw being prepared will name this
+     * persistent buffer (draw_vbuf / draw_vbuf_ib); the backend may prefetch
+     * its bookkeeping. No effect on what is drawn (PS3RECOMP_ENG_PREFETCH). */
+    void (*vbuf_prefetch)(void* user, u32 vbuf);
 } rsx_draw_backend;
 
 /* The light pass's constants, as the backend's shader reads them. */
