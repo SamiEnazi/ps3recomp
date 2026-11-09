@@ -455,4 +455,39 @@ static const char kVkDepthRgba8FS[] =
 "    o = vec4(float((v >> 8) & 255u), float(v & 255u), float(sv & 255u), float((v >> 16) & 255u)) / 255.0;\n"
 "}\n";
 
+/* [res] PS3RECOMP_VK_ZDIRECT (default on): the depth target itself sampled
+ * through a depth-aspect view (and its stencil through a stencil-aspect
+ * view), instead of copying it through a buffer into the R32F / R8 scratch
+ * first -- the same values (a D32 depth reads back as the float the copy
+ * held, the stencil as the byte), no copies. kVkDepthRgba8DFS is
+ * kVkDepthRgba8FS reading them; kVkDepthRgba8DnFS has no stencil aspect
+ * (b = 0, as the R8 stand-in held); kVkDepthR32FS is depth_snapshot's copy as
+ * a pass into an R32F target. t0 (binding 1) the depth view, t1 (binding 2)
+ * the stencil view. */
+static const char kVkDepthRgba8DFS[] =
+"#version 450\n"
+"layout(set = 0, binding = 1) uniform sampler2D zt;\n"
+"layout(set = 0, binding = 2) uniform usampler2D st;\n"
+"layout(location = 0) out vec4 o;\n"
+"void main() {\n"
+"    ivec2 px = ivec2(gl_FragCoord.xy);\n"
+"    uint v = uint(clamp(texelFetch(zt, px, 0).r, 0.0, 1.0) * 16777215.0);\n"
+"    uint sv = texelFetch(st, px, 0).r & 255u;\n"
+"    o = vec4(float((v >> 8) & 255u), float(v & 255u), float(sv), float((v >> 16) & 255u)) / 255.0;\n"
+"}\n";
+static const char kVkDepthRgba8DnFS[] =
+"#version 450\n"
+"layout(set = 0, binding = 1) uniform sampler2D zt;\n"
+"layout(location = 0) out vec4 o;\n"
+"void main() {\n"
+"    ivec2 px = ivec2(gl_FragCoord.xy);\n"
+"    uint v = uint(clamp(texelFetch(zt, px, 0).r, 0.0, 1.0) * 16777215.0);\n"
+"    o = vec4(float((v >> 8) & 255u), float(v & 255u), 0.0, float((v >> 16) & 255u)) / 255.0;\n"
+"}\n";
+static const char kVkDepthR32FS[] =
+"#version 450\n"
+"layout(set = 0, binding = 1) uniform sampler2D zt;\n"
+"layout(location = 0) out float o;\n"
+"void main() { o = texelFetch(zt, ivec2(gl_FragCoord.xy), 0).r; }\n";
+
 #endif /* PS3RECOMP_RSX_VK_PASSES_GLSL_H */

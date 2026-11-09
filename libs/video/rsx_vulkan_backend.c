@@ -3980,6 +3980,13 @@ typedef struct vk_eng_obj {
      * scaled: the image is vk_res_px() of gw x gh (else gw, gh == w, h). */
     u32      gw, gh;
     u8       scaled;
+    /* [res] DEPTH, PS3RECOMP_VK_ZDIRECT: depth- and stencil-aspect views of
+     * the target itself (zv.view, sv.view; 0 when not sampleable), which the
+     * depth decodes and snapshots read instead of a buffer copy. COLOR:
+     * serial, so the input-attachment sets (vk_fbfin_set) never name a slot
+     * reused by a newer target. */
+    vk_image zv, sv;
+    u32      serial;
 } vk_eng_obj;
 /* [res] v (guest pixels) in this object's image pixels */
 static u32 vk_res_obj_px(const vk_eng_obj* o, u32 v) { return (o && o->scaled) ? vk_res_px(v) : v; }
@@ -4135,6 +4142,134 @@ static int vk_lfx_apply_tmid(const char* v)     { ps3_lightfx_set(PS3_LFX_TONE_M
 static int vk_lfx_apply_thi(const char* v)      { ps3_lightfx_set(PS3_LFX_TONE_HIGHLIGHTS, v); return 1; }
 static int vk_lfx_apply_clarity(const char* v)  { ps3_lightfx_set(PS3_LFX_CLARITY, v); return 1; }
 
+/* ---- [res] GPU savings (2026-11-09), read once at the engine's init --------
+ * PS3RECOMP_VK_ZDIRECT (default on; 0 = the copies): the engine's depth
+ *   targets are sampleable and carry depth- and stencil-aspect views; the
+ *   depth-as-RGBA8 decode reads them in its one pass and the R32F depth
+ *   snapshot is a pass reading the depth view -- instead of depth -> buffer ->
+ *   R32F image (+ stencil -> buffer -> R8) for every decode and snapshot, the
+ *   bulk of the 1080p GPU growth. Same values (rsx_vk_passes_glsl.h).
+ * PS3RECOMP_VK_FBF=input|copy (default input): the engine's framebuffer fetch
+ *   (decals that read the G-buffer they draw into) through Vulkan input
+ *   attachments: every engine render pass declares its colour attachments as
+ *   input attachments with a by-region self-dependency, the program reads the
+ *   attachment of its own pixel (set 1, vk_fbfin_set), and a by-region barrier
+ *   before each such draw makes the draws before it visible -- the semantics of
+ *   the copy taken before each draw, without the full-target copies and the
+ *   pass break each one cost. copy = vk_res_fbf_rewrite's copies (as before). */
+#define VK_FBFIN_SETS 256u
+static struct {
+    int  init, zdirect, fbf_in;
+    VkDescriptorSetLayout lay;          /* set 1: input attachments 0..3 (bindings k and 16 + k) */
+    VkPipelineLayout      pl;           /* { the guest set layout, lay } */
+    VkDescriptorPool      pool;
+    u32  ne, serial;
+    struct { u32 n, h[RSX_BE_MAX_COLOR_TARGETS], ser[RSX_BE_MAX_COLOR_TARGETS]; VkDescriptorSet set; } e[VK_FBFIN_SETS];
+} s_ropt;
+static void vk_ropt_init(void)
+{
+    if (s_ropt.init || !s_vk.device) return;
+    s_ropt.init = 1;
+    const char* z = getenv("PS3RECOMP_VK_ZDIRECT");
+    s_ropt.zdirect = !(z && z[0] == '0');
+    if (s_ropt.zdirect) {
+        VkFormatProperties fp;
+        pvkGetPhysicalDeviceFormatProperties(s_vk.phys, s_vk.depth_format, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) s_ropt.zdirect = 0;
+    }
+    const char* f = getenv("PS3RECOMP_VK_FBF");
+    s_ropt.fbf_in = !(f && !strcmp(f, "copy")) && s_g.on && s_g.set_layout;
+    if (s_ropt.fbf_in) {
+        /* glslang adds the texture register shift (RSX_SPIRV_TEXTURE_BINDING) to
+         * a subpass input's explicit [[vk::binding]] (iomapper: a subpass input is
+         * a texture type): both numbers are declared, the shader uses one */
+        VkDescriptorSetLayoutBinding b[2 * RSX_BE_MAX_COLOR_TARGETS];
+        for (u32 k = 0; k < RSX_BE_MAX_COLOR_TARGETS; k++) {
+            b[2 * k]     = (VkDescriptorSetLayoutBinding){ k, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1,
+                                                           VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+            b[2 * k + 1] = (VkDescriptorSetLayoutBinding){ RSX_SPIRV_TEXTURE_BINDING + k,
+                                                           VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1,
+                                                           VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+        }
+        VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                                .bindingCount = 2 * RSX_BE_MAX_COLOR_TARGETS, .pBindings = b };
+        const VkDescriptorSetLayout sl[2] = { s_g.set_layout, VK_NULL_HANDLE };
+        VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, VK_FBFIN_SETS * 2u * RSX_BE_MAX_COLOR_TARGETS };
+        VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                           .maxSets = VK_FBFIN_SETS, .poolSizeCount = 1, .pPoolSizes = &ps };
+        int ok = pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_ropt.lay) == VK_SUCCESS;
+        if (ok) {
+            VkDescriptorSetLayout sl2[2] = { sl[0], s_ropt.lay };
+            VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                                .setLayoutCount = 2, .pSetLayouts = sl2 };
+            ok = pvkCreatePipelineLayout(s_vk.device, &plci, NULL, &s_ropt.pl) == VK_SUCCESS &&
+                 pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_ropt.pool) == VK_SUCCESS;
+        }
+        if (!ok) {
+            if (s_ropt.pool) pvkDestroyDescriptorPool(s_vk.device, s_ropt.pool, NULL);
+            if (s_ropt.pl)   pvkDestroyPipelineLayout(s_vk.device, s_ropt.pl, NULL);
+            if (s_ropt.lay)  pvkDestroyDescriptorSetLayout(s_vk.device, s_ropt.lay, NULL);
+            s_ropt.pool = VK_NULL_HANDLE; s_ropt.pl = VK_NULL_HANDLE; s_ropt.lay = VK_NULL_HANDLE;
+            s_ropt.fbf_in = 0;
+        }
+    }
+    VK_LOG("engine: depth read in place %s (PS3RECOMP_VK_ZDIRECT), framebuffer fetch through %s (PS3RECOMP_VK_FBF)\n",
+           s_ropt.zdirect ? "on" : "off", s_ropt.fbf_in ? "input attachments" : "copies");
+}
+static void vk_ropt_shutdown(void)
+{
+    if (s_vk.device && (s_ropt.pool || s_ropt.pl || s_ropt.lay)) {
+        if (pvkDeviceWaitIdle) pvkDeviceWaitIdle(s_vk.device);
+        if (s_ropt.pool) pvkDestroyDescriptorPool(s_vk.device, s_ropt.pool, NULL);
+        if (s_ropt.pl)   pvkDestroyPipelineLayout(s_vk.device, s_ropt.pl, NULL);
+        if (s_ropt.lay)  pvkDestroyDescriptorSetLayout(s_vk.device, s_ropt.lay, NULL);
+    }
+    memset(&s_ropt, 0, sizeof s_ropt);
+}
+/* Set 1 of a draw that reads its own targets (input mode): the targets'
+ * views as input attachments 0..n-1. Made once per target set and never
+ * rewritten; a slot reused by a newer target has another serial, so it gets a
+ * new set. A full pool: everything that may name its sets is waited for, then
+ * it starts over. Called outside a render pass (it may flush). */
+static VkDescriptorSet vk_fbfin_set(const u32* rt, u32 n)
+{
+    if (!s_ropt.pool || !n || n > RSX_BE_MAX_COLOR_TARGETS) return VK_NULL_HANDLE;
+    for (u32 i = 0; i < s_ropt.ne; i++) {
+        if (s_ropt.e[i].n != n) continue;
+        u32 k = 0;
+        while (k < n && s_ropt.e[i].h[k] == rt[k] && s_ropt.e[i].ser[k] == s_eobj[rt[k]].serial) k++;
+        if (k == n) return s_ropt.e[i].set;
+    }
+    if (s_ropt.ne == VK_FBFIN_SETS) {
+        vk_batch_flush();
+        vk_fif_wait_other();
+        pvkResetDescriptorPool(s_vk.device, s_ropt.pool, 0);
+        s_ropt.ne = 0;
+    }
+    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                        .descriptorPool = s_ropt.pool, .descriptorSetCount = 1,
+                                        .pSetLayouts = &s_ropt.lay };
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkDescriptorImageInfo ii[RSX_BE_MAX_COLOR_TARGETS];
+    VkWriteDescriptorSet w[2 * RSX_BE_MAX_COLOR_TARGETS];
+    for (u32 k = 0; k < n; k++) {
+        ii[k] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, s_eobj[rt[k]].im.view, VK_IMAGE_LAYOUT_GENERAL };
+        for (u32 j = 0; j < 2; j++)
+            w[2 * k + j] = (VkWriteDescriptorSet){ .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+                                                   .dstBinding = j ? RSX_SPIRV_TEXTURE_BINDING + k : k,
+                                                   .descriptorCount = 1,
+                                                   .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+                                                   .pImageInfo = &ii[k] };
+    }
+    pvkUpdateDescriptorSets(s_vk.device, 2 * n, w, 0, NULL);
+    s_ropt.e[s_ropt.ne].n = n;
+    for (u32 k = 0; k < n; k++) { s_ropt.e[s_ropt.ne].h[k] = rt[k]; s_ropt.e[s_ropt.ne].ser[k] = s_eobj[rt[k]].serial; }
+    s_ropt.e[s_ropt.ne++].set = set;
+    return set;
+}
+/* ---- [res] GPU savings end ---- */
+
 /* [res] the session's internal resolution, read once at the engine's init
  * (the vtable path never scales: vk_res_off when the engine does not start). */
 static void vk_res_off(void)
@@ -4186,6 +4321,7 @@ static int vk_eng_init(void* user, u32 width, u32 height)
 {
     (void)user; (void)width; (void)height;
     vk_res_init();                                  /* [res] */
+    vk_ropt_init();                                 /* [res] the GPU savings' switches */
     ps3_setting_register("PS3RECOMP_SSAO", vk_lfx_apply_ssao);
     ps3_setting_register("PS3RECOMP_SSAO_STRENGTH", vk_lfx_apply_strength);
     ps3_setting_register("PS3RECOMP_LIGHT_DITHER", vk_lfx_apply_dither);
@@ -4212,6 +4348,10 @@ static void vk_eng_release(void* user, u32 handle)
     /* A depth target's snapshots are the engine's to release (E4). */
     if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
+    /* [res] a depth target's own views (PS3RECOMP_VK_ZDIRECT): view-only
+     * images, so vk_destroy_image defers them like the image itself */
+    if (s_eobj[handle].zv.view) vk_destroy_image(&s_eobj[handle].zv);
+    if (s_eobj[handle].sv.view) vk_destroy_image(&s_eobj[handle].sv);
     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
 }
@@ -4222,6 +4362,7 @@ static void vk_eng_shutdown(void* user)
     vk_eng5_shutdown();
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
+    vk_ropt_shutdown();                             /* [res] */
 }
 
 static void vk_eng_submit_and_wait(void* user, u32 reason)
@@ -4251,12 +4392,14 @@ static u32 vk_eng_color_target_make(void* user, rsx_be_format fmt, u32 gw, u32 g
     vk_eng_obj* o = &s_eobj[hd];
     if (vk_create_image(&o->im, vf, w, h,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        (s_ropt.fbf_in ? VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT : 0u),   /* [res] */
                         VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_COLOR; o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h;
     o->gw = gw; o->gh = gh; o->scaled = (u8)scaled;
+    o->serial = ++s_ropt.serial;                    /* [res] vk_fbfin_set's key */
     /* UNDEFINED -> GENERAL, then the guest's own bytes when the engine could
      * resolve them, else transparent black so the contents are defined. */
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
@@ -4306,12 +4449,24 @@ static u32 vk_eng_depth_target_create(void* user, u32 gw, u32 gh)
     vk_eng_obj* o = &s_eobj[hd];
     if (vk_create_image(&o->im, s_vk.depth_format, w, h,
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        (s_ropt.zdirect ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u),           /* [res] */
                         VK_DS_ASPECT)) {
         vk_destroy_image(&o->im); return 0;
     }
     o->kind = VK_ENG_DEPTH; o->fmt = s_vk.depth_format; o->w = w; o->h = h;
     o->gw = gw; o->gh = gh; o->scaled = (u8)scaled;
+    if (s_ropt.zdirect) {   /* [res] the views the decodes and snapshots read (PS3RECOMP_VK_ZDIRECT) */
+        VkImageViewCreateInfo vci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = o->im.img,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = s_vk.depth_format,
+            .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 } };
+        if (pvkCreateImageView(s_vk.device, &vci, NULL, &o->zv.view) != VK_SUCCESS) o->zv.view = VK_NULL_HANDLE;
+        if (o->zv.view && (VK_DS_ASPECT & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (pvkCreateImageView(s_vk.device, &vci, NULL, &o->sv.view) != VK_SUCCESS) o->sv.view = VK_NULL_HANDLE;
+        }
+    }
     /* Far plane, for the reason the display depth starts there. */
     if (vk_begin()) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, VK_DS_ASPECT, VK_IMAGE_LAYOUT_UNDEFINED);
@@ -5038,6 +5193,8 @@ static int vk_eng_copy_stencil(const vk_eng_obj* z, VkImage dst, VkImageLayout d
     return rc;
 }
 
+/* [res] PS3RECOMP_VK_ZDIRECT: the snapshot as a pass (defined with the E5 passes) */
+static u32 vk_eng_depth_snapshot_pass(void* user, const vk_eng_obj* z, u32 gw, u32 gh, u32 w, u32 h);
 static int vk_eng_depth_copyable(void)
 {
     if (s_vk.depth_format == VK_FORMAT_D32_SFLOAT ||
@@ -5059,6 +5216,12 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     w = vk_res_obj_px(z, gw); h = vk_res_obj_px(z, gh);
     if (w > z->w) w = z->w;
     if (h > z->h) h = z->h;
+    /* [res] PS3RECOMP_VK_ZDIRECT: one pass reading the depth view instead
+     * of the buffer round trip (0 when it cannot run: the copy below) */
+    if (s_ropt.zdirect && z->zv.view) {
+        const u32 ps = vk_eng_depth_snapshot_pass(user, z, gw, gh, w, h);
+        if (ps) return ps;
+    }
 
     const u32 snap = vk_eng_alloc();
     if (!snap) return 0;
@@ -5121,6 +5284,9 @@ typedef struct vk_eng_pipe {
     u32                 fbf_mask;
     u8                  fbf_att[16];
     u8                  res_wpos;
+    /* [res] PS3RECOMP_VK_FBF=input: the program reads its targets as input
+     * attachments (set 1) instead of copies (fbf_mask is then 0) */
+    u8                  fbf_in;
 } vk_eng_pipe;
 
 /* Bit u set for each "<kind> rsx_tex<u>" declaration in the program text. */
@@ -5206,6 +5372,24 @@ static VkRenderPass vk_eng_render_pass(u32 n)
     VkRenderPassCreateInfo rci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
                                    .attachmentCount = n + 1, .pAttachments = att,
                                    .subpassCount = 1, .pSubpasses = &sub };
+    /* [res] PS3RECOMP_VK_FBF=input: the colour attachments are also input
+     * attachments 0..n-1 (GENERAL, as everything here), and the subpass
+     * depends on itself by region -- what lets a draw read, after a barrier,
+     * what the draws before it wrote at its pixel (vk_eng_draw_ex_body). Every
+     * engine pass has it, so every engine pipeline is compatible with it. */
+    VkAttachmentReference iref[RSX_BE_MAX_COLOR_TARGETS];
+    const VkSubpassDependency self = {
+        .srcSubpass = 0, .dstSubpass = 0,
+        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+        .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT };
+    if (s_ropt.fbf_in) {
+        for (u32 i = 0; i < n; i++) iref[i] = (VkAttachmentReference){ i, VK_IMAGE_LAYOUT_GENERAL };
+        sub.inputAttachmentCount = n; sub.pInputAttachments = iref;
+        rci.dependencyCount = 1; rci.pDependencies = &self;
+    }
     if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &s_e2.rp[n]) != VK_SUCCESS)
         s_e2.rp[n] = VK_NULL_HANDLE;
     return s_e2.rp[n];
@@ -5506,6 +5690,29 @@ static char* vk_res_fbf_rewrite(const char* hlsl, u32* mask, u8 att[16])
     }
     return s;
 }
+/* [res] PS3RECOMP_VK_FBF=input: the engine's SubpassInput program as it is,
+ * its attachments placed in set 1 ([[vk::binding(K, 1)]]: binding 16 + K once
+ * glslang shifts it, which vk_ropt_init's layout also declares). NULL when the
+ * text is not the engine's form. */
+static char* vk_res_fbf_bind(const char* hlsl)
+{
+    const size_t len = strlen(hlsl);
+    char* s = (char*)malloc(len + 1);
+    if (!s) return NULL;
+    memcpy(s, hlsl, len + 1);
+    u32 total = 0;
+    for (u32 k = 0; k < RSX_BE_MAX_COLOR_TARGETS && s; k++) {
+        char from[112], to[144];
+        u32 n = 0;
+        snprintf(from, sizeof from, "[[vk::input_attachment_index(%u)]] SubpassInput<float4> _rsx_att%u;", k, k);
+        snprintf(to, sizeof to, "[[vk::input_attachment_index(%u)]] [[vk::binding(%u, 1)]] SubpassInput<float4> _rsx_att%u;",
+                 k, k, k);
+        s = vk_res_replace(s, from, to, &n);
+        total += n;
+    }
+    if (s && !total) { free(s); return NULL; }
+    return s;
+}
 static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                   const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
                                   u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
@@ -5513,8 +5720,18 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     char* fbf = NULL;
     u32 fbf_mask = 0;
     u8 fbf_att[16];
+    int fbf_in = 0;
     memset(fbf_att, 0, sizeof fbf_att);
-    if (ps_hlsl && strstr(ps_hlsl, "SubpassInput<")) {
+    if (ps_hlsl && strstr(ps_hlsl, "SubpassInput<") && s_ropt.fbf_in) {
+        /* [res] input attachments: no copies, the program as the engine wrote it */
+        if (!(fbf = vk_res_fbf_bind(ps_hlsl))) {
+            static int said;
+            if (said++ < 4) VK_LOG("engine: a framebuffer-fetch program this backend cannot bind: copies instead\n");
+            return 0;
+        }
+        ps_hlsl = fbf;
+        fbf_in = 1;
+    } else if (ps_hlsl && strstr(ps_hlsl, "SubpassInput<")) {
         if (!(fbf = vk_res_fbf_rewrite(ps_hlsl, &fbf_mask, fbf_att))) {
             static int said;   /* 0: the engine takes its copies instead */
             if (said++ < 4) VK_LOG("engine: a framebuffer-fetch program this backend cannot rewrite: copies instead\n");
@@ -5528,8 +5745,11 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
         P->fbf_mask = fbf_mask;
         memcpy(P->fbf_att, fbf_att, sizeof P->fbf_att);
         P->res_wpos = (ps_hlsl && strstr(ps_hlsl, "_rsx_wpos(")) ? 1u : 0u;
+        P->fbf_in = (u8)fbf_in;                     /* before any variant is built (they are built at draws) */
         if (fbf_mask) { static int said;
             if (said++ < 4) VK_LOG("engine: framebuffer fetch: units 0x%X read a copy of their own target at their own pixel\n", fbf_mask); }
+        if (fbf_in) { static int said;
+            if (said++ < 4) VK_LOG("engine: framebuffer fetch: a program reads its targets as input attachments\n"); }
     }
     free(fbf);
     return h;
@@ -5690,7 +5910,8 @@ static VkPipeline vk_eng_variant_ex(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx, in
         .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
-        .layout = s_g.pipe_layout, .renderPass = rp, .subpass = 0 };
+        .layout = (P->fbf_in && s_ropt.pl) ? s_ropt.pl : s_g.pipe_layout,   /* [res] set 1: input attachments */
+        .renderPass = rp, .subpass = 0 };
     if (vk_sc_create_pipeline(&gci, slotp, 0) != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
         *slotp = VK_NULL_HANDLE;
@@ -6350,6 +6571,7 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
                                 u32 vertex_count, u32 stride, const u32* indices, VkBuffer pib, VkDeviceSize pio,
                                 u32 index_count);
 static u32 vk_eng_color_snapshot(void* user, u32 surface);
+static VkDescriptorSet s_fbfin_cur;   /* [res] the input-attachment set of the draw being recorded */
 /* [res] a pipeline whose units read their own target (vk_res_fbf_rewrite):
  * each gets a copy of its attachment, taken before this draw, for the draw. */
 static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
@@ -6357,6 +6579,17 @@ static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer
                            u32 index_count)
 {
     const vk_eng_pipe* P = (s_e2.pipeline && s_e2.pipeline <= VK_ENG_MAX_PIPE) ? &s_epipe[s_e2.pipeline - 1] : NULL;
+    if (P && P->used && P->fbf_in) {
+        /* [res] input attachments: the set naming the bound targets, found
+         * (or made) here, outside any render pass; the body binds it and puts
+         * the by-region barrier in front of the draw */
+        s_fbfin_cur = vk_fbfin_set(s_eng_bound.rt, s_eng_bound.nrt);
+        if (s_fbfin_cur)
+            vk_eng_draw_ex_body(topology, vertices, pvb, pvo, vertex_count, stride, indices, pib, pio, index_count);
+        else if (!(s_res.warned & 8u)) { s_res.warned |= 8u; VK_LOG("engine: no input-attachment set for a draw: skipped\n"); }
+        s_fbfin_cur = VK_NULL_HANDLE;
+        return;
+    }
     if (!P || !P->used || !P->fbf_mask) {
         vk_eng_draw_ex_body(topology, vertices, pvb, pvo, vertex_count, stride, indices, pib, pio, index_count);
         return;
@@ -6577,6 +6810,19 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
     { const u32 dyn[2] = { (u32)ubase, (u32)(ubase + s_g.ps_off) };
       pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout,
                                0, 1, &set, 2, dyn); }
+    if (P->fbf_in && s_fbfin_cur && s_ropt.pl) {
+        /* [res] PS3RECOMP_VK_FBF=input: the targets as input attachments, and
+         * what the draws before this one wrote made visible at each pixel (the
+         * render pass's by-region self-dependency) -- what the copy taken
+         * before the draw gave, inside the pass */
+        pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_ropt.pl, 1, 1, &s_fbfin_cur, 0, NULL);
+        VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                               .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                               .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT };
+        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT,
+                              1, &mb, 0, NULL, 0, NULL);
+    }
     if (!known || s_ecs.vb != vbuf || s_ecs.vo != voff) pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &vbuf, &voff);
     if (has_idx && (!known || s_ecs.ib != ibuf || s_ecs.io != ioff))
         pvkCmdBindIndexBuffer(s_vk.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
@@ -6660,13 +6906,16 @@ enum { VK_PASS_LIGHT, VK_PASS_SSAO_HD, VK_PASS_SSAO_AO, VK_PASS_SSAO_BLUR_H, VK_
        VK_PASS_LFX_BLUR_H, VK_PASS_LFX_BLUR_V, VK_PASS_TONE,
        /* [res] the upsample at the scaled size (and with the strength) */
        VK_PASS_SSAO_UPSC, VK_PASS_SSAO_UPSCS,
+       /* [res] PS3RECOMP_VK_ZDIRECT: the depth decode reading the depth target
+        * in place (with / without a stencil aspect), the R32F snapshot pass */
+       VK_PASS_ZRGBA_D, VK_PASS_ZRGBA_DN, VK_PASS_ZR32,
        VK_PASS_COUNT };
 #define VK_PASS_TEXTURES  3u                /* bindings 1..3: MSL texture(0..2) */
 #define VK_SSAO_UBO_BYTES 512u              /* the engine's bound (s_gs.consts) */
 #define VK_PASS_SPV_WORDS 16384u
 #define VK_CSNAP_MAX      64u
 #define VK_ZRGBA_MAX      32u
-#define VK_ZRGBA_SETS     16u              /* depth decodes one batch can hold */
+#define VK_ZRGBA_SETS     64u              /* depth decodes (and [res] snapshot passes) one batch can hold */
 #define VK_TAG_CSNAP      0xC5000000u       /* a colour copy                      */
 #define VK_TAG_PASS       0xA0000000u       /* a light or SSAO output             */
 #define VK_TAG_ZRGBA      0x5A000000u       /* | depth handle: a depth decode     */
@@ -7321,8 +7570,15 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
     if (w > z->w) w = z->w;
     if (h > z->h) h = z->h;
     VkRenderPass rp = vk_pass_render_pass(&s_lp.rp_rgba8, VK_FORMAT_R8G8B8A8_UNORM, 1);
-    VkPipeline pipe = vk_pass_pipeline(VK_PASS_ZRGBA, kVkDepthRgba8FS, "depth-as-RGBA8", rp, 1);
+    /* [res] PS3RECOMP_VK_ZDIRECT: the pass reads the depth target's own views
+     * (the stencil one too when the format has stencil) -- no copies */
+    VkPipeline pipe = VK_NULL_HANDLE;
+    const int zd = s_ropt.zdirect && z->zv.view && (z->sv.view || !(VK_DS_ASPECT & VK_IMAGE_ASPECT_STENCIL_BIT));
+    if (zd) pipe = z->sv.view ? vk_pass_pipeline(VK_PASS_ZRGBA_D, kVkDepthRgba8DFS, "depth-as-RGBA8 (in place)", rp, 1)
+                              : vk_pass_pipeline(VK_PASS_ZRGBA_DN, kVkDepthRgba8DnFS, "depth-as-RGBA8 (in place, no stencil)", rp, 1);
+    if (!pipe) pipe = vk_pass_pipeline(VK_PASS_ZRGBA, kVkDepthRgba8FS, "depth-as-RGBA8", rp, 1);
     if (!pipe) return 0;
+    const int in_place = zd && pipe != s_lp.pipe[VK_PASS_ZRGBA];
 
     const u32 tag = VK_TAG_ZRGBA | depth;
     u32 dst = 0, slot = VK_ZRGBA_MAX;
@@ -7341,6 +7597,8 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
     }
 
     VkImageLayout zl = VK_IMAGE_LAYOUT_GENERAL;
+    VkImageView zview = VK_NULL_HANDLE, sview = VK_NULL_HANDLE;
+    if (in_place) { zview = z->zv.view; sview = z->sv.view; goto decode; }   /* [res] */
     if (!s_lp.zr32.img || s_lp.zr32_w < w || s_lp.zr32_h < h) {
         const u32 nw = w > s_lp.zr32_w ? w : s_lp.zr32_w, nh = h > s_lp.zr32_h ? h : s_lp.zr32_h;
         vk_destroy_image(&s_lp.zr32);
@@ -7359,9 +7617,10 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
         zl = VK_IMAGE_LAYOUT_UNDEFINED;
     }
     if (vk_eng_copy_depth(z, s_lp.zr32.img, zl, w, h)) return 0;
-    VkImageView sview = VK_NULL_HANDLE;
+    zview = s_lp.zr32.view;
     if (s_lp.zs8.img && !vk_eng_copy_stencil(z, s_lp.zs8.img, zl, w, h)) sview = s_lp.zs8.view;
 
+decode:;
     VkFramebuffer fb = vk_pass_framebuffer(rp, &s_eobj[dst].im.view, 1, w, h);
     if (!fb) return 0;
     /* Batched: a descriptor set may not be rewritten while a recorded pass
@@ -7370,7 +7629,7 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
      * one before by barriers); a full ring flushes. Unbatched: slot 0. */
     if (s_batch.recording && s_batch.zrgba_pending >= (int)VK_ZRGBA_SETS) vk_batch_flush();
     const VkDescriptorSet zset = s_lp.zset[s_batch.recording ? (u32)s_batch.zrgba_pending : 0u];
-    vk_pass_write_set(zset, &s_lp.ssao_ubo, s_lp.zr32.view, sview, VK_NULL_HANDLE);
+    vk_pass_write_set(zset, &s_lp.ssao_ubo, zview, sview, VK_NULL_HANDLE);
     int rc = vk_begin();
     if (!rc) {
         if (s_batch.recording) vk_barrier_all();
@@ -7384,6 +7643,46 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
     }
     pvkDestroyFramebuffer(s_vk.device, fb, NULL);
     return rc ? 0 : dst;
+}
+
+/* [res] PS3RECOMP_VK_ZDIRECT: vk_eng_depth_snapshot's R32F copy of the top-left
+ * w x h (image pixels) of depth target z, made by a pass that reads the depth
+ * view (kVkDepthR32FS) instead of depth -> buffer -> image: the same floats.
+ * A new texture every call, as the copy's (the engine owns and releases it);
+ * the decodes' set ring. 0 when the pass cannot run (the caller copies). */
+static u32 vk_eng_depth_snapshot_pass(void* user, const vk_eng_obj* z, u32 gw, u32 gh, u32 w, u32 h)
+{
+    if (!z || !z->zv.view || !w || !h || vk_pass_init()) return 0;
+    VkRenderPass rp = vk_pass_render_pass(&s_lp.rp_r32f, VK_FORMAT_R32_SFLOAT, 1);
+    VkPipeline pipe = vk_pass_pipeline(VK_PASS_ZR32, kVkDepthR32FS, "depth snapshot (in place)", rp, 1);
+    if (!pipe) return 0;
+    const u32 snap = vk_eng_alloc();
+    if (!snap) return 0;
+    vk_eng_obj* t = &s_eobj[snap];
+    if (vk_create_image(&t->im, VK_FORMAT_R32_SFLOAT, w, h,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) {
+        vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
+    }
+    t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = w; t->h = h;
+    t->gw = gw; t->gh = gh; t->scaled = z->scaled;
+    VkFramebuffer fb = vk_pass_framebuffer(rp, &t->im.view, 1, w, h);
+    if (!fb) { vk_eng_release(user, snap); return 0; }
+    if (s_batch.recording && s_batch.zrgba_pending >= (int)VK_ZRGBA_SETS) vk_batch_flush();
+    if (vk_begin()) { pvkDestroyFramebuffer(s_vk.device, fb, NULL); vk_eng_release(user, snap); return 0; }
+    vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    const VkDescriptorSet zset = s_lp.zset[s_batch.recording ? (u32)s_batch.zrgba_pending : 0u];
+    vk_pass_write_set(zset, &s_lp.ssao_ubo, z->zv.view, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    vk_pass_record(rp, fb, pipe, zset, w, h);
+    if (s_batch.recording) {                 /* stays in the batch; fb dies with it */
+        s_batch.zrgba_pending++;
+        vk_batch_retire_fb(fb);
+        return snap;
+    }
+    const int rc = vk_submit_and_wait();
+    pvkDestroyFramebuffer(s_vk.device, fb, NULL);
+    if (rc) { vk_eng_release(user, snap); return 0; }
+    return snap;
 }
 
 /* [light] PS3RECOMP_TONE_SHADOWS / _MIDTONES / _HIGHLIGHTS / PS3RECOMP_CLARITY
