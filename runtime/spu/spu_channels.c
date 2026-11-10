@@ -363,6 +363,14 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * stream is, so the only evidence is the DMA that writes it. NULL until
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+/* (critic2) memory the RSX reads (spu_dma.h spu_put_copy); NULL = none. */
+int (*g_spu_put_rsx_hook)(uint32_t ea, uint32_t size) = 0;
+/* A 128-byte reservation-line commit: top-down into RSX memory, as a PUT. */
+static inline void spu_line_copy(uint32_t ea, uint8_t* mem, const void* ls)
+{
+    if (g_spu_put_rsx_hook && g_spu_put_rsx_hook(ea & ~127u, MFC_ATOMIC_LINE)) gm_copy_to_desc(mem, ls, MFC_ATOMIC_LINE);
+    else gm_copy_to(mem, ls, MFC_ATOMIC_LINE);
+}
 
 void spu_halt(spu_context* ctx)
 {
@@ -1211,7 +1219,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
             gm_equal(mem, ctx->resv_line, MFC_ATOMIC_LINE)) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
-            gm_copy_to(mem, ls, MFC_ATOMIC_LINE);      /* commit local store */
+            spu_line_copy(ea, mem, ls);                 /* commit local store ((critic2) top-down for RSX memory) */
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to
@@ -1306,7 +1314,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
         spu_lockline_lock_mask(llm);
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
-        gm_copy_to(mem, ls, MFC_ATOMIC_LINE);          /* unconditional store */
+        spu_line_copy(ea, mem, ls);                     /* unconditional store ((critic2) top-down for RSX memory) */
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
          * bookkeeping below rather than after it. A peer left holding a

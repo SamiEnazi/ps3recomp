@@ -85,6 +85,27 @@ static inline void gm_copy_to(uint8_t* g, const void* src, size_t n)
     for (; i < n; i++) gm_store8(g + i, s[i]);
 }
 
+/* host -> guest, highest address first, each store a release (critic2,
+ * 2026-11-10). On Cell an SPU's DMA lands in whole 128-byte lines: the RSX
+ * never sees a line half written. gm_copy_to writes ascending doublewords, so
+ * the FIFO walker -- which waits on a word (a self-JUMP park at the write head
+ * an SPU appends to) and then reads UPWARD from it -- could see that word
+ * already new and the words after it still old, and decode stale ring words
+ * (the m16 Kuo-cutscene freezes). Written top-down with release stores, a
+ * reader that sees any new word sees every word above it new (x86 TSO keeps
+ * the store order, release keeps the compiler from reordering). */
+static inline void gm_copy_to_desc(uint8_t* g, const void* src, size_t n)
+{
+    const uint8_t* s = (const uint8_t*)src;
+    size_t i = n;
+    for (; i > 0 && (((uintptr_t)(g + i)) & 7u); i--) __atomic_store_n(g + i - 1, s[i - 1], __ATOMIC_RELEASE);
+    for (; i >= 8; i -= 8) {
+        uint64_t v; memcpy(&v, s + i - 8, 8);
+        __atomic_store_n((uint64_t*)(void*)(g + i - 8), v, __ATOMIC_RELEASE);
+    }
+    for (; i > 0; i--) __atomic_store_n(g + i - 1, s[i - 1], __ATOMIC_RELEASE);
+}
+
 /* A guest store of n bytes from a host buffer: one atomic access for the
  * natural sizes, a word-wise copy otherwise. */
 static inline void gm_store_bytes(uint8_t* g, const void* src, size_t n)

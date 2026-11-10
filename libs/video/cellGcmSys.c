@@ -512,7 +512,14 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
       void gcm_note_spu_put(u32 ea, u32 size);       /* defined with the walker */
       void gcm_forget_spu_blocks(void);
       gcm_forget_spu_blocks();
-      g_spu_put_hook = gcm_note_spu_put; }
+      g_spu_put_hook = gcm_note_spu_put;
+      /* (critic2) PS3RECOMP_SPU_PUT_DESC (default 1; 0 = ascending, as before):
+       * SPU PUTs and line commits into IO-mapped memory are written top-down
+       * (runtime/spu/spu_dma.h spu_put_copy, gm_copy_to_desc). */
+      extern int (*g_spu_put_rsx_hook)(u32 ea, u32 size);
+      int gcm_spu_put_is_rsx(u32 ea, u32 size);
+      const char* pd = getenv("PS3RECOMP_SPU_PUT_DESC");
+      g_spu_put_rsx_hook = (pd && *pd == '0') ? NULL : gcm_spu_put_is_rsx; }
 
     s_gcm_initialized = 1;
     return CELL_OK;
@@ -1730,6 +1737,20 @@ static u32 gcm_ea2io_range(u32 ea, u32* room)
         }
     }
     return 0xFFFFFFFFu;
+}
+
+/* (critic2) g_spu_put_rsx_hook: does [ea, ea+size) touch IO-mapped memory (what
+ * the RSX can read: the command ring, SPU-built command lists, vertex data)?
+ * Read from SPU threads; the table changes only on a map/unmap call, and a
+ * stale answer only picks the copy order. */
+int gcm_spu_put_is_rsx(u32 ea, u32 size)
+{
+    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+        const IoMapping* m = &s_io_mappings[i];
+        if (!m->active || !m->size) continue;
+        if (ea < m->ea + m->size && ea + size > m->ea) return 1;
+    }
+    return 0;
 }
 
 void gcm_forget_spu_blocks(void)

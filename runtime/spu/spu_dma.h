@@ -32,6 +32,17 @@ extern "C" {
 
 extern uint8_t* vm_base;
 
+/* (critic2) A PUT into memory the RSX reads (cellGcmSys installs the test:
+ * IO-mapped memory, PS3RECOMP_SPU_PUT_DESC=0 = never) is written top-down
+ * (gm_copy_to_desc), so the FIFO walker never decodes a command segment an SPU
+ * is still writing over the park it waited on. Any other PUT as before. */
+extern int (*g_spu_put_rsx_hook)(uint32_t ea, uint32_t size);
+static inline void spu_put_copy(uint32_t ea, uint8_t* g, const void* s, uint32_t n)
+{
+    if (n > 4u && g_spu_put_rsx_hook && g_spu_put_rsx_hook(ea, n)) gm_copy_to_desc(g, s, n);
+    else gm_copy_to(g, s, n);
+}
+
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
  * SPU / lv2-heap / stack pages are committed). A garbage EA must be treated
@@ -741,14 +752,14 @@ static inline int mfc_do_transfer_raw(spu_context* spu, uint32_t lsa, uint64_t e
                  * 128-byte line is written whole on Cell (mcx X8b). */
                 const uint64_t llm = spu_lockline_mask_range((uint32_t)ea, size);
                 spu_lockline_lock_mask(llm);
-                gm_copy_to((uint8_t*)ea_ptr, ls_ptr, size);
+                spu_put_copy((uint32_t)ea, (uint8_t*)ea_ptr, ls_ptr, size);   /* (critic2) */
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
                 spu_lockline_unlock_mask(llm);
             } else {
-                gm_copy_to((uint8_t*)ea_ptr, ls_ptr, size);
+                spu_put_copy((uint32_t)ea, (uint8_t*)ea_ptr, ls_ptr, size);   /* (critic2) */
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
                         const uint64_t llm = spu_lockline_mask_ea(a);
@@ -914,14 +925,14 @@ static inline int mfc_do_transfer_lean(spu_context* spu, uint32_t lsa, uint64_t 
         if (span_reserved) {
             const uint64_t llm = spu_lockline_mask_range((uint32_t)ea, size);
             spu_lockline_lock_mask(llm);
-            gm_copy_to((uint8_t*)ea_ptr, ls_ptr, size);
+            spu_put_copy((uint32_t)ea, (uint8_t*)ea_ptr, ls_ptr, size);   /* (critic2) */
             for (uint32_t a = a0; ; a += 128u) {
                 if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                 if (a == a1) break;
             }
             spu_lockline_unlock_mask(llm);
         } else {
-            gm_copy_to((uint8_t*)ea_ptr, ls_ptr, size);
+            spu_put_copy((uint32_t)ea, (uint8_t*)ea_ptr, ls_ptr, size);   /* (critic2) */
             for (uint32_t a = a0; ; a += 128u) {
                 if (spu_coh_is_reserved(a)) {
                     const uint64_t llm = spu_lockline_mask_ea(a);
