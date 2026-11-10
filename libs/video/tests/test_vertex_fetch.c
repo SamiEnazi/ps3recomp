@@ -86,13 +86,71 @@ static void random_plan(rsx_vertex_fetch_plan* plan, int use_inline,
     }
 }
 
+/* (rsx-vtx) Every 16-bit pattern (HALF, SNORM16, SINT16), every byte
+ * (UNORM8, UINT8) and a million CMP32 words through the consecutive fast path
+ * and the ordinary loop, sizes 1..4, a few strides: the same bytes. */
+static void exhaustive(void)
+{
+    enum { N = 65536 };
+    static u8 src[N * 24 + 64];   /* stride up to 16 + 8 */
+    static u8 a[N * 32], b[N * 32];
+    static rsx_vertex_ref refs[N];
+    const u32 types[] = { RSX_VTX_TYPE_HALF, RSX_VTX_TYPE_SNORM16, RSX_VTX_TYPE_SINT16,
+                          RSX_VTX_TYPE_UNORM8, RSX_VTX_TYPE_UINT8, RSX_VTX_TYPE_CMP32, RSX_VTX_TYPE_FLOAT };
+    int cases = 0;
+    for (u32 ti = 0; ti < sizeof types / sizeof types[0]; ti++)
+    for (u32 size = 1; size <= 4; size++)
+    for (u32 pad = 0; pad <= 8; pad += 4) {
+        const u32 type = types[ti];
+        const u32 esz = rsx_vertex_attrib_size(type, size);
+        const u32 stride = esz + pad;
+        const u32 count = (type == RSX_VTX_TYPE_UNORM8 || type == RSX_VTX_TYPE_UINT8) ? 256u : N;
+        /* element i: its first component carries pattern i, the others mixed */
+        for (u32 i = 0; i < count; i++) {
+            u8* e = src + (u64)i * stride;
+            for (u32 k = 0; k < stride; k++) e[k] = (u8)rnd();
+            if (type == RSX_VTX_TYPE_UNORM8 || type == RSX_VTX_TYPE_UINT8) {
+                for (u32 k = 0; k < size; k++) e[k] = (u8)(i + k * 85u);
+            } else if (type == RSX_VTX_TYPE_CMP32 || type == RSX_VTX_TYPE_FLOAT) {
+                /* random words (all CMP32 fields, every float class) */
+            } else {
+                e[0] = (u8)(i >> 8); e[1] = (u8)i;
+            }
+        }
+        rsx_vertex_fetch_plan plan;
+        memset(&plan, 0, sizeof plan);
+        rsx_vertex_layout_plan_init(&plan.layout, 1u | (1u << 3));   /* slot 0 = ATTR0, slot 1 = disabled ATTR3 */
+        rsx_vertex_fetch_attr* f = &plan.attr[0];
+        f->desc.type = type; f->desc.size = size; f->desc.stride = stride;
+        f->elem_size = esz; f->stride = stride;
+        f->stable_base = src; f->stable_first = 0; f->stable_last = count - 1u;
+        for (int k = 0; k < 4; k++) plan.attr[3].default_value[k] = (float)k;
+        for (u32 i = 0; i < count; i++) { refs[i].vertex_id = i; refs[i].base_index = 0; }
+        const u32 os = plan.layout.stride;
+        memset(a, 0xAB, (size_t)count * os);
+        memset(b, 0xCD, (size_t)count * os);
+        const int ra = rsx_vertex_fetch_all(&plan, refs, count, a);
+        const int rb = rsx_vertex_fetch_all_ex(&plan, refs, count, b, 1);
+        CHECK(ra == rb && ra, "exhaustive type %u size %u stride %u: verdicts %d %d", type, size, stride, ra, rb);
+        if (memcmp(a, b, (size_t)count * os) != 0) {
+            u32 off = 0;
+            while (a[off] == b[off]) off++;
+            CHECK(0, "exhaustive type %u size %u stride %u: vertex %u byte %u differs", type, size, stride,
+                  off / os, off % os);
+        }
+        cases++;
+    }
+    printf("test_vertex_fetch: exhaustive fast-path formats: %d cases\n", cases);
+}
+
 int main(void)
 {
+    exhaustive();
     enum { PLANS = 6000, MAXV = 200 };
     static rsx_vertex_ref refs[MAXV];
     static u8 a[MAXV * 16 * 16], b[MAXV * 16 * 16];
     static u8 inl[8192];
-    int ok_runs = 0, fail_runs = 0, inline_runs = 0, prepared = 0, consecutive_runs = 0;
+    int ok_runs = 0, fail_runs = 0, inline_runs = 0, prepared = 0, consecutive_runs = 0, fast_runs = 0;
 
     for (int n = 0; n < PLANS; n++) {
         for (int l = 0; l < 2; l++) {
@@ -140,6 +198,23 @@ int main(void)
         const int rb = rsx_vertex_fetch_all(&plan, refs, count, stride ? b : NULL);
 
         CHECK(ra == rb, "plan %d: fetch_one verdict %d, fetch_all %d", n, ra, rb);
+        /* (rsx-vtx) the consecutive fast path: same verdict, same bytes */
+        if (run && stride) {
+            static u8 c[MAXV * 16 * 16];
+            memset(c, 0xAB, sizeof c);
+            const int rc = rsx_vertex_fetch_all_ex(&plan, refs, count, c, 1);
+            CHECK(rc == rb, "plan %d: fetch_all verdict %d, fetch_all_ex %d", n, rb, rc);
+            if (rc && rb && memcmp(b, c, (size_t)count * stride) != 0) {
+                u32 off = 0;
+                while (b[off] == c[off]) off++;
+                const u32 slot = (off % stride) / 16u;
+                CHECK(0, "plan %d: fast path differs at vertex %u slot %u (attr %u type %u size %u)",
+                      n, off / stride, slot, plan.layout.attrs[slot],
+                      plan.attr[plan.layout.attrs[slot]].desc.type,
+                      plan.attr[plan.layout.attrs[slot]].desc.size);
+            }
+            fast_runs++;
+        }
         if (ra && rb) {
             ok_runs++;
             if (memcmp(a, b, (size_t)count * stride) != 0) {
@@ -157,8 +232,8 @@ int main(void)
     }
 
     printf("test_vertex_fetch: %d plans (%d succeeded, %d failed on both sides, %d prepared,"
-           " %d inline, %d consecutive), %d failure(s)\n", PLANS, ok_runs, fail_runs, prepared, inline_runs,
-           consecutive_runs, fails);
+           " %d inline, %d consecutive, %d fast-path), %d failure(s)\n", PLANS, ok_runs, fail_runs, prepared, inline_runs,
+           consecutive_runs, fast_runs, fails);
     if (ok_runs < PLANS / 4 || fail_runs < 50 || inline_runs < 200) {
         printf("FAIL: too few cases exercised a path\n");
         return 1;

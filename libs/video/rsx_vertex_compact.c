@@ -425,6 +425,101 @@ static inline const u8* rsx_fetch_source(
         memcpy(v, fetch->default_value, 16);                                 \
     }
 
+/* One slot of rsx_vertex_fetch_all: 0 exactly when some reference's
+ * fetch_one would fail on this attribute (an invalid ATTR0). */
+static int rsx_vertex_fetch_slot(
+    const rsx_vertex_fetch_plan* plan, u32 slot, const rsx_vertex_ref* refs,
+    u32 count, u8* out)
+{
+    const u32 ostride = plan->layout.stride;
+    const u32 attr = plan->layout.attrs[slot];
+    const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+    const u32 type = fetch->desc.type, size = fetch->desc.size;
+    if (!type || !size) {
+        for (u32 i = 0; i < count; i++)
+            memcpy(out + (u64)i * ostride + slot * 16u,
+                   fetch->default_value, 16);
+        return 1;
+    }
+    if (type == RSX_VTX_TYPE_FLOAT && size == 3) {
+        RSX_FETCH_LOOP({
+            const u32 a = rsx_be32(src), b = rsx_be32(src + 4),
+                      c = rsx_be32(src + 8);
+            memcpy(&v[0], &a, 4); memcpy(&v[1], &b, 4);
+            memcpy(&v[2], &c, 4); v[3] = 1.0f;
+        })
+    } else if (type == RSX_VTX_TYPE_FLOAT && size <= 4) {
+        RSX_FETCH_LOOP({
+            v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+            for (u32 k = 0; k < size; k++) {
+                const u32 w = rsx_be32(src + k * 4u);
+                memcpy(&v[k], &w, 4);
+            }
+        })
+    } else if (type == RSX_VTX_TYPE_CMP32) {
+        RSX_FETCH_LOOP({
+            const u32 word = rsx_be32(src);
+            s32 x = (s32)(word & 0x7FF);
+            s32 y = (s32)((word >> 11) & 0x7FF);
+            s32 z = (s32)((word >> 22) & 0x3FF);
+            if (x & 0x400) x -= 0x800;
+            if (y & 0x400) y -= 0x800;
+            if (z & 0x200) z -= 0x400;
+            v[0] = (float)x / 1023.0f;
+            v[1] = (float)y / 1023.0f;
+            v[2] = (float)z / 511.0f;
+            v[3] = 1.0f;
+        })
+    } else if (type == RSX_VTX_TYPE_HALF && size <= 4) {
+        RSX_FETCH_LOOP({
+            v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+            for (u32 k = 0; k < size; k++) {
+                const u16 h = rsx_be16(src + k * 2u);
+                const u32 sign = (u32)(h >> 15) << 31;
+                const u32 e = (h >> 10) & 0x1F, m = h & 0x3FF;
+                const u32 bits = e == 0 ? sign
+                    : e == 31 ? (sign | 0x7F800000u | (m << 13))
+                    : (sign | ((e + 112) << 23) | (m << 13));
+                memcpy(&v[k], &bits, 4);
+            }
+        })
+    } else if (type == RSX_VTX_TYPE_UNORM8 && size <= 4) {
+        RSX_FETCH_LOOP({
+            v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+            for (u32 k = 0; k < size; k++) v[k] = src[k] / 255.0f;
+        })
+    } else if (type == RSX_VTX_TYPE_SNORM16 && size <= 4) {
+        /* inFAMOUS 2's most common attribute (snorm16x3 positions and
+         * normals) used to take the per-element reference decoder. */
+        RSX_FETCH_LOOP({
+            v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+            for (u32 k = 0; k < size; k++)
+                v[k] = (s16)rsx_be16(src + k * 2u) / 32767.0f;
+        })
+    } else if (type == RSX_VTX_TYPE_SINT16 && size <= 4) {
+        RSX_FETCH_LOOP({
+            v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+            for (u32 k = 0; k < size; k++)
+                v[k] = (float)(s16)rsx_be16(src + k * 2u);
+        })
+    } else if (type == RSX_VTX_TYPE_UINT8 && size <= 4) {
+        RSX_FETCH_LOOP({
+            v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
+            for (u32 k = 0; k < size; k++) v[k] = (float)src[k];
+        })
+    } else {
+        /* Everything else, and any size the decoder clamps: the
+         * reference decoder itself, per element. */
+        RSX_FETCH_LOOP({
+            if (rsx_vertex_decode_element(type, size, src, v)) continue;
+            if (attr == 0) return 0;
+            memcpy(v, fetch->default_value, 16);
+        })
+    }
+    return 1;
+}
+#undef RSX_FETCH_LOOP
+
 int rsx_vertex_fetch_all(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
     u8* out)
@@ -436,95 +531,171 @@ int rsx_vertex_fetch_all(
         return 1;
     if (!out && ostride)
         return 0;
-    for (u32 slot = 0; slot < plan->layout.count; slot++) {
-        const u32 attr = plan->layout.attrs[slot];
-        const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
-        const u32 type = fetch->desc.type, size = fetch->desc.size;
-        if (!type || !size) {
-            for (u32 i = 0; i < count; i++)
-                memcpy(out + (u64)i * ostride + slot * 16u,
-                       fetch->default_value, 16);
-            continue;
-        }
-        if (type == RSX_VTX_TYPE_FLOAT && size == 3) {
-            RSX_FETCH_LOOP({
-                const u32 a = rsx_be32(src), b = rsx_be32(src + 4),
-                          c = rsx_be32(src + 8);
-                memcpy(&v[0], &a, 4); memcpy(&v[1], &b, 4);
-                memcpy(&v[2], &c, 4); v[3] = 1.0f;
-            })
-        } else if (type == RSX_VTX_TYPE_FLOAT && size <= 4) {
-            RSX_FETCH_LOOP({
-                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
-                for (u32 k = 0; k < size; k++) {
-                    const u32 w = rsx_be32(src + k * 4u);
-                    memcpy(&v[k], &w, 4);
-                }
-            })
-        } else if (type == RSX_VTX_TYPE_CMP32) {
-            RSX_FETCH_LOOP({
-                const u32 word = rsx_be32(src);
-                s32 x = (s32)(word & 0x7FF);
-                s32 y = (s32)((word >> 11) & 0x7FF);
-                s32 z = (s32)((word >> 22) & 0x3FF);
-                if (x & 0x400) x -= 0x800;
-                if (y & 0x400) y -= 0x800;
-                if (z & 0x200) z -= 0x400;
-                v[0] = (float)x / 1023.0f;
-                v[1] = (float)y / 1023.0f;
-                v[2] = (float)z / 511.0f;
-                v[3] = 1.0f;
-            })
-        } else if (type == RSX_VTX_TYPE_HALF && size <= 4) {
-            RSX_FETCH_LOOP({
-                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
-                for (u32 k = 0; k < size; k++) {
-                    const u16 h = rsx_be16(src + k * 2u);
-                    const u32 sign = (u32)(h >> 15) << 31;
-                    const u32 e = (h >> 10) & 0x1F, m = h & 0x3FF;
-                    const u32 bits = e == 0 ? sign
-                        : e == 31 ? (sign | 0x7F800000u | (m << 13))
-                        : (sign | ((e + 112) << 23) | (m << 13));
-                    memcpy(&v[k], &bits, 4);
-                }
-            })
-        } else if (type == RSX_VTX_TYPE_UNORM8 && size <= 4) {
-            RSX_FETCH_LOOP({
-                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
-                for (u32 k = 0; k < size; k++) v[k] = src[k] / 255.0f;
-            })
-        } else if (type == RSX_VTX_TYPE_SNORM16 && size <= 4) {
-            /* inFAMOUS 2's most common attribute (snorm16x3 positions and
-             * normals) used to take the per-element reference decoder. */
-            RSX_FETCH_LOOP({
-                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
-                for (u32 k = 0; k < size; k++)
-                    v[k] = (s16)rsx_be16(src + k * 2u) / 32767.0f;
-            })
-        } else if (type == RSX_VTX_TYPE_SINT16 && size <= 4) {
-            RSX_FETCH_LOOP({
-                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
-                for (u32 k = 0; k < size; k++)
-                    v[k] = (float)(s16)rsx_be16(src + k * 2u);
-            })
-        } else if (type == RSX_VTX_TYPE_UINT8 && size <= 4) {
-            RSX_FETCH_LOOP({
-                v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
-                for (u32 k = 0; k < size; k++) v[k] = (float)src[k];
+    for (u32 slot = 0; slot < plan->layout.count; slot++)
+        if (!rsx_vertex_fetch_slot(plan, slot, refs, count, out))
+            return 0;
+    return 1;
+}
+
+/* ---- consecutive fast path (rsx-vtx, PS3RECOMP_ENG_FETCH_FAST) -----------
+ *
+ * rsx_vertex_fetch_all for references that are one run of vertex ids with
+ * one base_index (refs[i].vertex_id == refs[0].vertex_id + i: the ranged
+ * remap's output, a draw-arrays batch). An ordinary attribute (frequency
+ * 0/1) whose stable span covers the run reads element e0 + i at
+ * stable_base + (e0 + i - stable_first) * stride -- what rsx_fetch_source
+ * finds for it -- so the loop has no per-vertex element index, range test or
+ * resolver call. The conversions are the same operations: the divisions of
+ * the normalised formats run four lanes at a time (SSE2 divps: every lane is
+ * the IEEE division the scalar divss does), UNORM8 reads a table built with
+ * the very division, HALF and FLOAT are the same integer bit moves. Anything
+ * else (a wrap of the 20-bit element index, a divider, no span, a size the
+ * decoder clamps, an inline stream) takes the attribute's ordinary loop.
+ * Bit-identical to rsx_vertex_fetch_all (tests/test_vertex_fetch.c). */
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h>
+#define RSX_FETCH_SSE2 1
+#endif
+
+static float s_u8n_tab[256];
+static volatile int s_u8n_ready;
+static void rsx_u8n_init(void)
+{
+    for (u32 i = 0; i < 256u; i++) {
+        const u8 b = (u8)i;
+        s_u8n_tab[i] = b / 255.0f;      /* the expression the loops use */
+    }
+    s_u8n_ready = 1;
+}
+
+#define RSX_FAST_LOOP(...)                                                   \
+    for (u32 i = 0; i < count; i++) {                                        \
+        const u8* src = base + (u64)i * sstride;                             \
+        u8* const vo = out + (u64)i * ostride + slot * 16u;                  \
+        __VA_ARGS__                                                          \
+    }
+
+/* 1 = the slot was filled, 0 = it has no fast form here (the caller runs the
+ * ordinary loop). Never fails a draw: a fast form only reads a stable span. */
+static int rsx_vertex_fetch_slot_fast(
+    const rsx_vertex_fetch_plan* plan, u32 slot, u32 e0, u32 count, u8* out)
+{
+    const u32 ostride = plan->layout.stride;
+    const u32 attr = plan->layout.attrs[slot];
+    const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+    const u32 type = fetch->desc.type, size = fetch->desc.size;
+    if (!type || !size || fetch->desc.frequency > 1 || !fetch->stable_base ||
+        e0 < fetch->stable_first || (u64)e0 + count - 1u > fetch->stable_last)
+        return 0;
+    const u32 sstride = fetch->stride;
+    const u8* const base = fetch->stable_base + (u64)(e0 - fetch->stable_first) * sstride;
+    if (type == RSX_VTX_TYPE_FLOAT && size <= 4) {
+        if (size == 3) {
+            RSX_FAST_LOOP({
+                const u32 w[4] = { rsx_be32(src), rsx_be32(src + 4), rsx_be32(src + 8), 0x3F800000u };
+                memcpy(vo, w, 16);
             })
         } else {
-            /* Everything else, and any size the decoder clamps: the
-             * reference decoder itself, per element. */
-            RSX_FETCH_LOOP({
-                if (rsx_vertex_decode_element(type, size, src, v)) continue;
-                if (attr == 0) return 0;
-                memcpy(v, fetch->default_value, 16);
+            RSX_FAST_LOOP({
+                u32 w[4] = { 0u, 0u, 0u, 0x3F800000u };
+                for (u32 k = 0; k < size; k++) w[k] = rsx_be32(src + k * 4u);
+                memcpy(vo, w, 16);
             })
         }
+        return 1;
+    }
+    if (type == RSX_VTX_TYPE_HALF && size <= 4) {
+        RSX_FAST_LOOP({
+            u32 w[4] = { 0u, 0u, 0u, 0x3F800000u };
+            for (u32 k = 0; k < size; k++) {
+                const u16 h = rsx_be16(src + k * 2u);
+                const u32 sign = (u32)(h >> 15) << 31;
+                const u32 e = (h >> 10) & 0x1F, m = h & 0x3FF;
+                w[k] = e == 0 ? sign
+                     : e == 31 ? (sign | 0x7F800000u | (m << 13))
+                     : (sign | ((e + 112) << 23) | (m << 13));
+            }
+            memcpy(vo, w, 16);
+        })
+        return 1;
+    }
+    if (type == RSX_VTX_TYPE_UNORM8 && size <= 4) {
+        if (!s_u8n_ready) rsx_u8n_init();
+        RSX_FAST_LOOP({
+            float f[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            for (u32 k = 0; k < size; k++) f[k] = s_u8n_tab[src[k]];
+            memcpy(vo, f, 16);
+        })
+        return 1;
+    }
+    if (type == RSX_VTX_TYPE_UINT8 && size <= 4) {
+        RSX_FAST_LOOP({
+            float f[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            for (u32 k = 0; k < size; k++) f[k] = (float)src[k];
+            memcpy(vo, f, 16);
+        })
+        return 1;
+    }
+    if (type == RSX_VTX_TYPE_SINT16 && size <= 4) {
+        RSX_FAST_LOOP({
+            float f[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            for (u32 k = 0; k < size; k++) f[k] = (float)(s16)rsx_be16(src + k * 2u);
+            memcpy(vo, f, 16);
+        })
+        return 1;
+    }
+#ifdef RSX_FETCH_SSE2
+    if (type == RSX_VTX_TYPE_SNORM16 && size <= 4) {
+        /* lanes past `size` divide 0 (+0.0f, the loop's clear); lane 3 is
+         * 1.0f unless the attribute has four components */
+        const __m128 d = _mm_set1_ps(32767.0f);
+        const __m128 keep = _mm_castsi128_ps(_mm_set_epi32(size >= 4 ? -1 : 0, -1, -1, -1));
+        const __m128 one_w = _mm_set_ps(size >= 4 ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f);
+        RSX_FAST_LOOP({
+            s32 q[4] = { 0, 0, 0, 0 };
+            for (u32 k = 0; k < size; k++) q[k] = (s16)rsx_be16(src + k * 2u);
+            const __m128 r = _mm_div_ps(_mm_cvtepi32_ps(_mm_loadu_si128((const __m128i*)q)), d);
+            _mm_storeu_ps((float*)vo, _mm_or_ps(_mm_and_ps(r, keep), one_w));
+        })
+        return 1;
+    }
+    if (type == RSX_VTX_TYPE_CMP32) {
+        /* (x / 1023, y / 1023, z / 511, 1 / 1) */
+        const __m128 d = _mm_set_ps(1.0f, 511.0f, 1023.0f, 1023.0f);
+        RSX_FAST_LOOP({
+            const u32 word = rsx_be32(src);
+            s32 x = (s32)(word & 0x7FF);
+            s32 y = (s32)((word >> 11) & 0x7FF);
+            s32 z = (s32)((word >> 22) & 0x3FF);
+            if (x & 0x400) x -= 0x800;
+            if (y & 0x400) y -= 0x800;
+            if (z & 0x200) z -= 0x400;
+            const __m128 r = _mm_div_ps(_mm_cvtepi32_ps(_mm_set_epi32(1, z, y, x)), d);
+            _mm_storeu_ps((float*)vo, r);
+        })
+        return 1;
+    }
+#endif
+    return 0;
+}
+#undef RSX_FAST_LOOP
+
+int rsx_vertex_fetch_all_ex(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out, int consecutive)
+{
+    if (!consecutive || !plan || !refs || !count || !plan->layout.stride || !out ||
+        plan->inline_data)
+        return rsx_vertex_fetch_all(plan, refs, count, out);
+    const u32 e0 = rsx_vertex_element_index(refs[0].vertex_id, refs[0].base_index, 0, 0);
+    /* past the 20-bit wrap the elements are not e0 + i any more */
+    const int run = (u64)e0 + count - 1u <= 0x000FFFFFu;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        if (run && rsx_vertex_fetch_slot_fast(plan, slot, e0, count, out)) continue;
+        if (!rsx_vertex_fetch_slot(plan, slot, refs, count, out)) return 0;
     }
     return 1;
 }
-#undef RSX_FETCH_LOOP
 
 static u64 rsx_vertex_remap_hash(u64 value)
 {

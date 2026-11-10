@@ -5889,6 +5889,9 @@ static struct {
     const u8*    vs_rows;
     u32          vs_first, vs_count, vs_tail_off, vs_tail_bytes;
     u8           vs_tail[64];
+    /* (rsx-vtx) PS3RECOMP_VK_CONST_REUSE: the rows' generation (vs_constants_gen,
+     * valid while vs_gen_ok) and the version of the PS bytes in the shadow */
+    u32          vs_gen, vs_gen_ok, ps_ver;
     u32          tex[RSX_BE_MAX_TEXTURES];
     rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES];
     u32          tex_mask;
@@ -6510,6 +6513,40 @@ static void vk_eng2_shutdown(void* user)
  * Batched, the same bytes also land in a CPU shadow of the whole file, which
  * each recorded draw copies into the uniform arena -- the whole file, so what
  * a draw sees past the bytes bound last is what the shared UBO would hold. */
+/* (rsx-vtx) PS3RECOMP_VK_CONST_REUSE (default 1; 0 = every draw copies its
+ * constants into a fresh window, as before). A batched draw used to copy the
+ * vertex rows its program reads, the viewport tail and the fragment block into
+ * a new window of the uniform arena -- write-combined memory, small unaligned
+ * copies, ~3% of the RSX thread in the city. The two blocks have their own
+ * dynamic offsets, so each is now kept apart: a draw whose rows have the
+ * generation the last copy had (no constant changed value since: rsx_dispatch
+ * const_gen), whose rows lie inside the rows copied then and whose tail is the
+ * same binds that window again; a draw whose fragment bytes are those of the
+ * last bind (compared with the shadow, which then is not rewritten) binds the
+ * last fragment window. Windows live as long as their arena: the memo holds
+ * while s_dset_gen (arena reset or slot swap) and the buffer are unchanged. */
+static int s_creuse_on = -1;
+static int vk_creuse_on(void)
+{
+    if (s_creuse_on < 0) { const char* e = getenv("PS3RECOMP_VK_CONST_REUSE"); s_creuse_on = !(e && e[0] == '0'); }
+    return s_creuse_on;
+}
+static struct {
+    u32 epoch;                    /* s_dset_gen of the windows below */
+    VkBuffer ubuf;
+    int vs_ok, ps_ok;
+    VkDeviceSize vs_base, ps_abs; /* the windows (dynamic offsets) */
+    const u8* vs_rows;
+    u32 vs_gen, vs_first, vs_count, vs_tail_off, vs_tail_bytes, vs_bytes;
+    u8 vs_tail[64];
+    u32 ps_ver, ps_len;
+    unsigned long long vs_hit, vs_miss, ps_hit, ps_miss;
+} s_cm;
+static void vk_eng_vs_constants_gen(void* user, u32 gen)
+{
+    (void)user;
+    s_e2.vs_gen = gen; s_e2.vs_gen_ok = 1;
+}
 static u8* vk_batch_shadow(void)
 {
     if (!s_batch.shadow && s_g.ubo.size) {
@@ -6530,6 +6567,7 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     else memcpy(s_g.ubo.ptr, data, bytes);
     s_e2.vs_bytes = bytes;
     s_e2.vs_ranged = 0;
+    s_e2.vs_gen_ok = 0;
 }
 /* rsx_draw_backend.bind_vs_constants_range (Metal: eng_bind_vs_constants_range):
  * only rows [first, first + count) and the viewport tail at the end of the
@@ -6544,17 +6582,19 @@ static void vk_eng_bind_vs_constants_range(void* user, const void* rows, u32 fir
 {
     (void)user;
     s_e2.vs_ranged = 0;
-    if (!s_g.on || !rows) { s_e2.vs_bytes = 0; return; }
+    if (!s_g.on || !rows) { s_e2.vs_bytes = 0; s_e2.vs_gen_ok = 0; return; }
     if (total_bytes > (u32)s_g.ps_off || tail_bytes > sizeof s_e2.vs_tail || tail_bytes > total_bytes ||
         first > total_bytes / 16u || count > total_bytes / 16u - first ||
         (first + count) * 16u > total_bytes - tail_bytes) {
         if (!(s_e2.warned & 0x100u)) { VK_LOG("engine: VS constant range %u+%u of %u B rejected\n", first, count, total_bytes); s_e2.warned |= 0x100u; }
         s_e2.vs_bytes = 0;
+        s_e2.vs_gen_ok = 0;
         return;
     }
     const u32 tail_off = total_bytes - tail_bytes;
     if (vk_batch_on() && vk_batch_shadow()) {
-        s_e2.vs_ranged = 1;
+        s_e2.vs_ranged = 1 + (s_e2.vs_gen_ok != 0);   /* (rsx-vtx) 2: vs_gen describes these rows */
+        s_e2.vs_gen_ok = 0;
         s_e2.vs_rows = (const u8*)rows;
         s_e2.vs_first = first; s_e2.vs_count = count;
         s_e2.vs_tail_off = tail_off; s_e2.vs_tail_bytes = tail_bytes;
@@ -6562,6 +6602,7 @@ static void vk_eng_bind_vs_constants_range(void* user, const void* rows, u32 fir
     } else {
         if (count) memcpy((u8*)s_g.ubo.ptr + first * 16u, (const u8*)rows + first * 16u, count * 16u);
         if (tail_bytes) memcpy((u8*)s_g.ubo.ptr + tail_off, tail, tail_bytes);
+        s_e2.vs_gen_ok = 0;
     }
     s_e2.vs_bytes = total_bytes;
 }
@@ -6571,7 +6612,15 @@ static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
     if (!s_g.on || !data) { s_e2.ps_bytes = 0; return; }
     const u32 cap = (u32)(s_g.ubo.size - s_g.ps_off);
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 4u)) { VK_LOG("engine: PS constants truncated\n"); s_e2.warned |= 4u; } }
-    if (vk_batch_on() && vk_batch_shadow()) memcpy(s_batch.shadow + s_g.ps_off, data, bytes);
+    if (vk_batch_on() && vk_batch_shadow()) {
+        /* (rsx-vtx) PS3RECOMP_VK_CONST_REUSE: the bytes the shadow holds already
+         * keep their version (and the window made from them) */
+        if (!(vk_creuse_on() && bytes == s_e2.ps_bytes && s_e2.ps_ver &&
+              !memcmp(s_batch.shadow + s_g.ps_off, data, bytes))) {
+            memcpy(s_batch.shadow + s_g.ps_off, data, bytes);
+            if (++s_e2.ps_ver == 0) s_e2.ps_ver = 1;
+        }
+    }
     else memcpy((u8*)s_g.ubo.ptr + s_g.ps_off, data, bytes);
     s_e2.ps_bytes = bytes;
 }
@@ -7258,6 +7307,7 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
     VkDeviceSize voff = 0, ioff = 0;
     VkDescriptorSet set = s_g.set;
     VkDeviceSize ubase = 0;                    /* the constant window: dynamic offsets */
+    VkDeviceSize ps_dyn = s_g.ps_off;          /* (rsx-vtx) the fragment block's own offset */
     if (batched) {
         VkDeviceSize uoff = 0;
         /* The VS file whole (programs index it freely) and the PS bytes bound
@@ -7279,6 +7329,8 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
             }
             lead = (VkDeviceSize)s_e2.vs_first * 16u / s_batch.ualign * s_batch.ualign;
         }
+        const u32 epoch0 = s_dset_gen;
+        const VkDeviceSize ucur0 = s_batch.ucur;
         if (vk_batch_reserve(vbytes, ibytes, ub - lead, &voff, &ioff, &uoff) ||
             !(set = vk_eng_batch_set(s_batch.uarena.buf)))
             return;
@@ -7292,13 +7344,53 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
                 if (s_batch.ucur < base + ub) s_batch.ucur = base + ub;
             }
             u8* u = (u8*)s_batch.uarena.ptr + base;
-            if (s_e2.vs_count)
-                memcpy(u + s_e2.vs_first * 16u, s_e2.vs_rows + s_e2.vs_first * 16u, s_e2.vs_count * 16u);
-            if (s_e2.vs_tail_bytes) memcpy(u + s_e2.vs_tail_off, s_e2.vs_tail, s_e2.vs_tail_bytes);
-            memcpy(u + s_g.ps_off, s_batch.shadow + s_g.ps_off, (size_t)(ub - s_g.ps_off));
-            uoff = base;
+            /* (rsx-vtx) PS3RECOMP_VK_CONST_REUSE: the last windows, when they
+             * hold what this draw would copy (see s_cm) */
+            const int cr = vk_creuse_on();
+            if (cr && (s_cm.epoch != s_dset_gen || s_cm.ubuf != s_batch.uarena.buf)) {
+                /* another arena (reset, slot swap, growth): its windows are gone */
+                s_cm.vs_ok = s_cm.ps_ok = 0;
+                s_cm.epoch = s_dset_gen; s_cm.ubuf = s_batch.uarena.buf;
+            }
+            const int epoch_ok = cr;
+            const VkDeviceSize ps_len = ub - s_g.ps_off;
+            const int vs_same = epoch_ok && s_cm.vs_ok && s_e2.vs_ranged == 2 && s_cm.vs_gen == s_e2.vs_gen &&
+                                s_cm.vs_rows == s_e2.vs_rows && s_cm.vs_bytes == s_e2.vs_bytes &&
+                                s_e2.vs_first >= s_cm.vs_first &&
+                                s_e2.vs_first + s_e2.vs_count <= s_cm.vs_first + s_cm.vs_count &&
+                                s_cm.vs_tail_off == s_e2.vs_tail_off && s_cm.vs_tail_bytes == s_e2.vs_tail_bytes &&
+                                !memcmp(s_cm.vs_tail, s_e2.vs_tail, s_e2.vs_tail_bytes);
+            const int ps_same = epoch_ok && s_cm.ps_ok && s_e2.ps_ver && s_cm.ps_ver == s_e2.ps_ver &&
+                                s_cm.ps_len == (u32)ps_len;
+            if (vs_same) {
+                uoff = s_cm.vs_base; s_cm.vs_hit++;
+            } else {
+                if (s_e2.vs_count)
+                    memcpy(u + s_e2.vs_first * 16u, s_e2.vs_rows + s_e2.vs_first * 16u, s_e2.vs_count * 16u);
+                if (s_e2.vs_tail_bytes) memcpy(u + s_e2.vs_tail_off, s_e2.vs_tail, s_e2.vs_tail_bytes);
+                uoff = base;
+                if (cr) {
+                    s_cm.vs_ok = s_e2.vs_ranged == 2;
+                    s_cm.vs_base = base; s_cm.vs_rows = s_e2.vs_rows; s_cm.vs_gen = s_e2.vs_gen;
+                    s_cm.vs_first = s_e2.vs_first; s_cm.vs_count = s_e2.vs_count; s_cm.vs_bytes = s_e2.vs_bytes;
+                    s_cm.vs_tail_off = s_e2.vs_tail_off; s_cm.vs_tail_bytes = s_e2.vs_tail_bytes;
+                    memcpy(s_cm.vs_tail, s_e2.vs_tail, s_e2.vs_tail_bytes);
+                    s_cm.vs_miss++;
+                }
+            }
+            if (ps_same) {
+                ps_dyn = s_cm.ps_abs; s_cm.ps_hit++;
+            } else {
+                memcpy(u + s_g.ps_off, s_batch.shadow + s_g.ps_off, (size_t)ps_len);
+                ps_dyn = base + s_g.ps_off;
+                if (cr) { s_cm.ps_ok = 1; s_cm.ps_abs = ps_dyn; s_cm.ps_ver = s_e2.ps_ver; s_cm.ps_len = (u32)ps_len; s_cm.ps_miss++; }
+            }
+            /* both windows reused: this draw's reservation goes back (nothing
+             * was reserved after it, and no flush came between) */
+            if (vs_same && ps_same && s_dset_gen == epoch0 && s_batch.ucur >= ucur0) s_batch.ucur = ucur0;
         } else {
             memcpy((u8*)s_batch.uarena.ptr + uoff, s_batch.shadow, (size_t)ub);
+            ps_dyn = uoff + s_g.ps_off;
         }
         ubase = uoff;
         vbuf = vertices ? s_batch.varena.buf : pvb;
@@ -7399,7 +7491,7 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
         pvkCmdSetDepthBias(s_vk.cmd, s_e2.bias_const, 0.0f, s_e2.bias_slope);
         bias_set = 1; s_ecs.bc = s_e2.bias_const; s_ecs.bs = s_e2.bias_slope;
     }
-    { const u32 dyn[2] = { (u32)ubase, (u32)(ubase + s_g.ps_off) };
+    { const u32 dyn[2] = { (u32)ubase, (u32)ps_dyn };
       pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout,
                                0, 1, &set, 2, dyn); }
     if (P->fbf_in && s_fbfin_cur && s_ropt.pl) {
@@ -8496,6 +8588,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .draw_vbuf            = vk_eng_draw_vbuf,
     .draw_vbuf_ib         = vk_eng_draw_vbuf_ib,
     .vbuf_prefetch        = vk_eng_vbuf_prefetch,
+    .vs_constants_gen     = vk_eng_vs_constants_gen,
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
     .present              = vk_eng_present,
