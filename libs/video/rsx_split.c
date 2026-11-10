@@ -113,7 +113,7 @@ extern void (*g_rsx_dsp_limit_hook)(int what, u32 n);
 static int sp_switch(void)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("PS3RECOMP_RSX_SPLIT"); on = !(e && *e == '0'); }
+    if (on < 0) { const char* e = getenv("PS3RECOMP_RSX_SPLIT"); on = (e && *e && *e != '0'); }   /* (next) default OFF: the critic measured it a net loss (semaphore stalls, sync points); =1 opts in */
     return on;
 }
 

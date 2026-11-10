@@ -656,7 +656,7 @@ static VkResult VKAPI_CALL tq_vkQueueSubmit(VkQueue q, u32 n, const VkSubmitInfo
 static int vk_bt_env(void)
 {
     static int v = -1;
-    if (v < 0) { const char* e = getenv("PS3RECOMP_VK_BT"); v = !(e && e[0] == '0'); }
+    if (v < 0) { const char* e = getenv("PS3RECOMP_VK_BT"); v = (e && e[0] && e[0] != '0'); }   /* (next) default OFF (critic: +sync points, slower present); =1 opts in */
     return v;
 }
 /* (rsx-par2) PS3_STALL_MS: the recording ring, for the [stall-rsx] line */

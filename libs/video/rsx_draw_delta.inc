@@ -197,7 +197,7 @@ static void dl_map_init(void)
 static void dl_init(void)
 {
     const char* e = getenv("PS3RECOMP_ENG_DELTA");
-    s_dl_on = !(e && *e == '0');
+    s_dl_on = (e && *e && *e != '0');   /* (next) default OFF until a game run with PS3RECOMP_ENG_DELTA_VERIFY=1 is clean; =1 opts in */
     { const char* l = getenv("PS3RECOMP_LIMITS");
       s_dl_stats = (l && *l && *l != '0') || getenv("PS3RECOMP_ENG_DRAWSTATS") || getenv("PS3RECOMP_ENG_DELTA_STATS"); }
     /* diagnostics that log from inside a stage a reused draw skips */
