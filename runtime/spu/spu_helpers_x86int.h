@@ -166,13 +166,18 @@ SPU__XI __m128i spu__xi_scale(__m128 f, int i8) {
 }
 SPU__XI u128 spu__xi_csflt(u128 a, int i8) {
     if (!SPU__RZ_ON || (i8 & 0xFF) > 155) return spu_csflt(a, i8);   /* a negative scale can overflow */
-    return spu__xs(spu__xi_scale(_mm_cvtepi32_ps(spu__xl(a)), i8));
+    __m128i x = spu__xl(a);
+    /* (critic) opaque to the compiler: a constant input would be converted at compile time
+     * with round-to-nearest, not the RZ MXCSR (0x7FFFFFFD, 155 -> 0x4F000000, not 0x4EFFFFFF) */
+    __asm__("" : "+x"(x));
+    return spu__xs(spu__xi_scale(_mm_cvtepi32_ps(x), i8));
 }
 SPU__XI u128 spu__xi_cuflt(u128 a, int i8) {
     if (!SPU__RZ_ON || (i8 & 0xFF) > 155) return spu_cuflt(a, i8);
     const __m128i x = spu__xl(a);
     const __m128i big = _mm_srai_epi32(x, 31);                     /* >= 2^31: convert x/2, then *2 */
-    const __m128i v = _mm_blendv_epi8(x, _mm_srli_epi32(x, 1), big);
+    __m128i v = _mm_blendv_epi8(x, _mm_srli_epi32(x, 1), big);
+    __asm__("" : "+x"(v));   /* (critic) no compile-time (round-to-nearest) conversion of a constant */
     const __m128i f = _mm_add_epi32(_mm_castps_si128(_mm_cvtepi32_ps(v)), _mm_and_si128(big, _mm_set1_epi32(1 << 23)));
     return spu__xs(spu__xi_scale(_mm_castsi128_ps(f), i8));
 }

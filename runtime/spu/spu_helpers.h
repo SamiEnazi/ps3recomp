@@ -1497,9 +1497,19 @@ SPU__X_INLINE u128 spu_spec_restore(const volatile spu_spec_sv* p) { u128 r; _mm
 /* The +0 rule in two operations: under FTZ a result is never denormal, so the only exponent-0
  * result is a zero and the per-op form's spu__xflush only ever changes -0 into +0. (In the
  * SPU_FLOAT_RZ=rn checker test FTZ is off; that mode is wrong on purpose either way.) */
+/* (critic, 2026-11-10) ...except when the compiler removed the operation: with the second
+ * operand a constant the lift made visible (il / ilhu in the same run, after dead-store
+ * removal), clang folds x + -0, x * 1.0 and x * -1.0 to x / -x, so a denormal x came out
+ * unflushed (0x000003F0 -> 0x000003F0, or 0x800003F0, where the per-op form gives +0); 19
+ * spec fm sites in the cpuint lift have such a +-1.0 operand. The full exponent-0 flush
+ * (two more operations) covers it. -DSPU_SPEC_OUT_OLD=1 = the old two-operation form. */
 SPU__X_INLINE __m128i spu__xsp_out(__m128i s, spu_spec_acc* acc) {
     *acc = _mm_max_epu32(*acc, _mm_and_si128(s, _mm_set1_epi32(0x7FFFFFFF)));
+#if defined(SPU_SPEC_OUT_OLD) && SPU_SPEC_OUT_OLD
     return _mm_andnot_si128(_mm_cmpeq_epi32(s, _mm_set1_epi32((int)0x80000000u)), s);
+#else
+    return spu__xflush(s);
+#endif
 }
 SPU__X_INLINE u128 spu__xsp_fa(u128 a, u128 b, uint32_t negb, spu_spec_acc* acc) {
     __m128 x = _mm_castsi128_ps(spu__xl(a));
