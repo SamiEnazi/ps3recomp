@@ -177,6 +177,9 @@ static struct { u32 unit; float mn, mx; } s_dbz;
  * that reads guest data declares them (rsx_vertex_fetch.h). */
 extern u8* vm_base;
 u32 cellGcmResolveLocated(int local, u32 offset);
+/* (rsx-vtx) bumped by cellGcmSys whenever an RSX offset may translate to
+ * another address (IO map / unmap, a local page recorded, init) */
+extern volatile u32 g_gcm_xlate_gen;
 /* Non-zero only when the offset's page is in the IO table, so a caller can
  * tell IO-mapped main memory from "assume VRAM". */
 u32 cellGcmResolveIO(u32 offset);
@@ -627,6 +630,12 @@ static struct {
     rsx_vertex_layout_plan layout;
     rsx_vertex_fetch_plan fetch_plan;
     int fetch_ok;
+    /* (rsx-vtx) refs are one run of vertex ids from refs[0] (one base): the
+     * fetch's fast path may read straight down the spans */
+    int consecutive;
+    /* (rsx-vtx) PS3RECOMP_ENG_PAIR_MEMO hit: fetch_plan was not prepared for
+     * this draw (the non-indexed refetch in sink_end prepares it) */
+    int plan_stale;
 
     /* INLINE_ARRAY stream for this group, when the vertices came down the
      * FIFO rather than from a vertex array. */
@@ -2550,8 +2559,10 @@ static inline u32 eng_tkey_of(const eng_texture* e)
     return eng_tkey(e->location, e->offset, e->format, e->width, e->height,
                     e->pitch, e->remap, e->cubemap, e->depth);
 }
+static u32 s_tex_tgen = 1;   /* (rsx-vtx) PS3RECOMP_ENG_TEX_MEMO: moves with every index change */
 static void eng_tidx_rebuild(void)
 {
+    s_tex_tgen++;
     memset(s_tidx, 0, sizeof s_tidx);
     for (u32 i = 0; i < g.n_textures; i++) {
         u32 p = eng_tkey_of(&g.textures[i]);
@@ -2566,12 +2577,14 @@ static void eng_tidx_rebuild(void)
  * tombstones. g.textures[i] must hold the key being inserted / removed. */
 static void eng_tidx_insert(u32 i)
 {
+    s_tex_tgen++;
     u32 p = eng_tkey_of(&g.textures[i]);
     while (s_tidx[p]) p = (p + 1) & (ENG_TIDX_SIZE - 1u);
     s_tidx[p] = i + 1;
 }
 static void eng_tidx_remove(u32 i)
 {
+    s_tex_tgen++;
     const u32 mask = ENG_TIDX_SIZE - 1u;
     u32 p = eng_tkey_of(&g.textures[i]);
     while (s_tidx[p] && s_tidx[p] != i + 1) p = (p + 1) & mask;
@@ -2629,6 +2642,7 @@ static u64 ds_th_ns, ds_th_bytes, ds_th_count, ds_th_changed;
 static u64 ds_th_wt_clean, ds_vc_wt_clean, ds_ic_wt_clean;   /* rsx_wtrack: checks skipped */
 /* Drawstats and state of the vertex cache (defined with it, below dc_reset). */
 static u64 ds_vc_hit, ds_vc_miss, ds_vc_skip, ds_vc_new, ds_vc_hashed, ds_vc_ns;
+static u64 ds_vc_lazy, ds_ic_lazy, ds_pair_hit, ds_pair_miss;   /* (rsx-vtx) */
 /* ... and of the resident index buffers (PS3RECOMP_ENG_ICACHE, below the vertex cache). */
 static u32 s_ic_used;
 static u64 s_ic_bytes;
@@ -2638,11 +2652,44 @@ static u64 s_vc_bytes;
 static int eng_ds_enabled(void);
 static u64 eng_ds_now(void);
 
+/* (rsx-vtx) PS3RECOMP_ENG_TEX_MEMO (default 1; 0 = the index probe every
+ * time): a unit binds the same texture draw after draw, and every bind probed
+ * the 64 KB index and compared the entry. A small direct-mapped memo keeps
+ * the entry a key found this frame; a bind of the same key in the same frame,
+ * with the index unchanged since (s_tex_tgen) and the entry already checked
+ * this frame (so the probe path would hash and upload nothing), returns its
+ * handle as the probe path would. Anything else takes the probe path. */
+typedef struct {
+    u32 location, offset, fmt, w, h, levels, pitch, remap, depth, cube;
+    u32 index, tgen, frame;
+} eng_tmemo;
+#define ENG_TMEMO 64u
+static eng_tmemo s_tmemo[ENG_TMEMO];
+static int s_tmemo_on = -1;
+static inline u32 eng_tmemo_slot(u32 location, u32 offset, u32 fmt, u32 w)
+{
+    return ((offset >> 7) ^ (offset >> 17) ^ (fmt * 13u) ^ w ^ (location << 5)) & (ENG_TMEMO - 1u);
+}
+
 static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                  u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
 {
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
     if (!depth) depth = 1;
+    if (__builtin_expect(s_tmemo_on < 0, 0)) { const char* m = getenv("PS3RECOMP_ENG_TEX_MEMO"); s_tmemo_on = !(m && *m == '0'); }
+    eng_tmemo* const tm = &s_tmemo[eng_tmemo_slot(location, offset, fmt, w)];
+    if (s_tmemo_on && tm->frame == g.frames && tm->tgen == s_tex_tgen && tm->index < g.n_textures &&
+        tm->offset == offset && tm->location == location && tm->fmt == fmt && tm->w == w && tm->h == h &&
+        tm->levels == levels && tm->pitch == pitch && tm->remap == remap && tm->depth == depth &&
+        tm->cube == (u32)(cube != 0)) {
+        eng_texture* e = &g.textures[tm->index];
+        if (e->handle && e->last_hash_frame == g.frames && e->ws_frame == g.frames && e->levels == levels &&
+            !(e->icon_atlas && e->icon_gen != s_icon_gen)) {
+            e->last_use_serial = ++g.texture_use_serial;
+            s_slot_hash = e->content_hash;
+            return e->handle;
+        }
+    }
 
     /* The span (a mip-chain walk) is kept with the entry: the key holds
      * everything it depends on except the level count, which is checked. */
@@ -2777,6 +2824,11 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
         }
         e->last_use_serial = ++g.texture_use_serial;
         s_slot_hash = e->content_hash;
+        if (s_tmemo_on) {   /* (rsx-vtx) PS3RECOMP_ENG_TEX_MEMO */
+            tm->location = location; tm->offset = offset; tm->fmt = fmt; tm->w = w; tm->h = h;
+            tm->levels = levels; tm->pitch = pitch; tm->remap = remap; tm->depth = depth;
+            tm->cube = (u32)(cube != 0); tm->index = s_tidx[p] - 1u; tm->tgen = s_tex_tgen; tm->frame = g.frames;
+        }
         return e->handle;
     }
 
@@ -3283,7 +3335,13 @@ static const eng_fp_memo* eng_fp_current(void)
     s_fp_key[v] = key; s_fp_sz[v] = size; s_fp_use[v] = m->used;
     m->structural = rsx_fp_structural_hash(uc, size, 1469598103934665603ull);
     m->constants.count = 0;
-    m->constants_ok = rsx_fp_collect_constants(uc, size, &m->constants) >= 0;
+    /* (rsx-vtx) PS3RECOMP_ENG_FPK_LEAN (default 1; 0 = clear the whole 32 KB
+     * block first, as before): a memo miss (new or re-uploaded program, ~170
+     * a city frame) cleared 32 KB it never reads past count. */
+    static int fpk_lean = -1;
+    if (fpk_lean < 0) { const char* le = getenv("PS3RECOMP_ENG_FPK_LEAN"); fpk_lean = !(le && *le == '0'); }
+    m->constants_ok = (fpk_lean ? rsx_fp_collect_constants_lean(uc, size, &m->constants)
+                                : rsx_fp_collect_constants(uc, size, &m->constants)) >= 0;
     m->tex_mask = rsx_fp_texture_mask(uc, size);
     static const u8 all[RSX_DSP_NUM_TEXTURES] = { 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1 };
     m->sampled_units = rsx_fp_texture_units(uc, size);
@@ -4114,7 +4172,7 @@ static void eng_ds_frame_end(u32 frame_draws)
 {
     static u32 wf;
     if (!eng_ds_enabled()) return;
-    if (frame_draws <= 1000) { memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss); ds_th_ns = ds_th_bytes = ds_th_count = ds_th_changed = 0; ds_th_wt_clean = ds_vc_wt_clean = ds_ic_wt_clean = 0; ds_vc_hit = ds_vc_miss = ds_vc_skip = ds_vc_new = ds_vc_hashed = ds_vc_ns = 0; ds_ic_hit = ds_ic_miss = ds_ic_new = ds_ic_hashed = 0; return; }
+    if (frame_draws <= 1000) { memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss); ds_th_ns = ds_th_bytes = ds_th_count = ds_th_changed = 0; ds_th_wt_clean = ds_vc_wt_clean = ds_ic_wt_clean = 0; ds_vc_hit = ds_vc_miss = ds_vc_skip = ds_vc_new = ds_vc_hashed = ds_vc_ns = 0; ds_ic_hit = ds_ic_miss = ds_ic_new = ds_ic_hashed = 0; ds_pair_hit = ds_pair_miss = ds_vc_lazy = ds_ic_lazy = 0; return; }
     if (wf++ % 30 == 0 && ds.draws) {
         const double us = 1e-3;
         fprintf(stderr,
@@ -4152,6 +4210,9 @@ static void eng_ds_frame_end(u32 frame_draws)
         fprintf(stderr, "[drawstats] index cache: %llu hits, %llu misses, %llu new; hashed %.1f MB; %u keys, %.1f MB resident\n",
                 (unsigned long long)ds_ic_hit, (unsigned long long)ds_ic_miss, (unsigned long long)ds_ic_new,
                 ds_ic_hashed / 1e6, s_ic_used, s_ic_bytes / 1e6);
+        fprintf(stderr, "[drawstats] (rsx-vtx) pair memo: %llu hits, %llu misses; first sightings not hashed: %llu vertex, %llu index\n",
+                (unsigned long long)ds_pair_hit, (unsigned long long)ds_pair_miss,
+                (unsigned long long)ds_vc_lazy, (unsigned long long)ds_ic_lazy);
         if (ds.span_draws)
             fprintf(stderr, "[drawstats] index ranges: %llu draws, span %.0f vs unique %.0f vertices"
                     " (%.2fx), refs %.0f; %llu draws (%.0f%%) dense (span <= 1.25 x unique)\n",
@@ -4165,7 +4226,7 @@ static void eng_ds_frame_end(u32 frame_draws)
                                             (unsigned long long)ds.fmt[t][z]);
         fprintf(stderr, "%s\n", line);
     }
-    memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss); ds_th_ns = ds_th_bytes = ds_th_count = ds_th_changed = 0; ds_th_wt_clean = ds_vc_wt_clean = ds_ic_wt_clean = 0; ds_vc_hit = ds_vc_miss = ds_vc_skip = ds_vc_new = ds_vc_hashed = ds_vc_ns = 0; ds_ic_hit = ds_ic_miss = ds_ic_new = ds_ic_hashed = 0;
+    memset(&ds, 0, sizeof ds); memset(ds_pk_ns, 0, sizeof ds_pk_ns); ds_pk_scanned = 0; memset(ds_memo_hit, 0, sizeof ds_memo_hit); memset(ds_memo_miss, 0, sizeof ds_memo_miss); ds_th_ns = ds_th_bytes = ds_th_count = ds_th_changed = 0; ds_th_wt_clean = ds_vc_wt_clean = ds_ic_wt_clean = 0; ds_vc_hit = ds_vc_miss = ds_vc_skip = ds_vc_new = ds_vc_hashed = ds_vc_ns = 0; ds_ic_hit = ds_ic_miss = ds_ic_new = ds_ic_hashed = 0; ds_pair_hit = ds_pair_miss = ds_vc_lazy = ds_ic_lazy = 0;
 }
 
 /* Turn this group's batches into a reference list, recording a CUT rather
@@ -4191,6 +4252,7 @@ typedef struct {
     u32 last_frame, seen_frame, skip_until;
     u8 seen, changes;
     u8 wt_ok;                    /* rsx_wtrack: spans armed, wt_content is their hash */
+    u8 unhashed;                 /* (rsx-vtx) PS3RECOMP_ENG_LAZY_HASH: seen once, bytes not hashed yet */
     u64 wt_stamp, wt_content;
 } eng_vc_entry;
 #define ENG_VC_SIZE   65536u
@@ -4344,6 +4406,26 @@ static int eng_wt_arm_seen(void)
     if (__builtin_expect(on < 0, 0)) { const char* e = getenv("PS3RECOMP_WTRACK_ARM_SEEN"); on = !(e && *e == '0'); }
     return on;
 }
+/* (rsx-vtx) PS3RECOMP_ENG_LAZY_HASH (default 1; 0 = hash at every sighting,
+ * as before): a key seen for the first time is not hashed. Most first
+ * sightings never come back -- skinned and Edge-culled vertices and their
+ * indices land at a new address every frame -- and their one hash bought
+ * nothing. The second sighting hashes (and, with rsx_wtrack, arms) as the
+ * first one did; a buffer becomes persistent one sighting later than before
+ * (the third: same bytes in two different frames after the first hash). */
+static int s_lazyhash_on = -1;
+static inline int eng_lazyhash_on(void)
+{
+    if (__builtin_expect(s_lazyhash_on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_LAZY_HASH");
+        s_lazyhash_on = !(e && e[0] == '0');
+    }
+    return s_lazyhash_on;
+}
+/* The merged spans the last eng_vc_probe hashed or queried (for the pair memo). */
+static u32 s_vcp_nm;
+static const u8* s_vcp_ms[RSX_DSP_NUM_VERTEX_ATTR];
+static u64 s_vcp_mn[RSX_DSP_NUM_VERTEX_ATTR];
 static eng_vc_entry* eng_vc_probe(const rsx_vertex_layout_plan* layout, u64* content)
 {
     const rsx_vertex_fetch_plan* pl = &dc.fetch_plan;
@@ -4392,6 +4474,8 @@ static eng_vc_entry* eng_vc_probe(const rsx_vertex_layout_plan* layout, u64* con
     if (!e) return NULL;
     ENG_CACHE_PREDICT(s_vc, s_vc_prev, e);
     if (e->skip_until > g.frames) { ds_vc_skip++; return NULL; }
+    s_vcp_nm = 0;
+    if (!e->seen && eng_lazyhash_on()) { e->unhashed = 1; *content = 0; ds_vc_lazy++; return e; }
     /* Hash the union of the attribute spans: interleaved attributes share one. */
     for (u32 i = 1; i < nr; i++)            /* insertion sort by start */
         for (u32 j = i; j > 0 && lo[j] < lo[j - 1]; j--) {
@@ -4404,6 +4488,8 @@ static eng_vc_entry* eng_vc_probe(const rsx_vertex_layout_plan* layout, u64* con
         for (i++; i < nr && lo[i] <= a1 + 64; i++) if (hi[i] > a1) a1 = hi[i];
         ms[nm] = a0; mn[nm] = (u64)(a1 - a0); nm++;
     }
+    s_vcp_nm = nm;
+    for (u32 k = 0; k < nm; k++) { s_vcp_ms[k] = ms[k]; s_vcp_mn[k] = mn[k]; }
     /* rsx_wtrack: spans whose pages stayed write-protected hash as they did. */
     const int wt = rsx_wt_mode();
     int wt_clean = 0;
@@ -4439,6 +4525,13 @@ static eng_vc_entry* eng_vc_probe(const rsx_vertex_layout_plan* layout, u64* con
 static void eng_vc_after_fetch(eng_vc_entry* e, u64 content, u32 stride)
 {
     const u32 bytes = dc.n_refs * stride;
+    if (e->unhashed) {                 /* (rsx-vtx) PS3RECOMP_ENG_LAZY_HASH */
+        /* seen once without a hash: this sighting's hash (the second
+         * sighting's) is the first one recorded */
+        if (e->seen) { e->unhashed = 0; e->content = content; }
+        e->seen = 1; e->seen_frame = g.frames; e->last_frame = g.frames;
+        return;
+    }
     if (e->seen && e->content == content && e->seen_frame != g.frames) {
         if (!e->vbuf) {
             while (s_vc_bytes + bytes > ENG_VC_BUDGET) {      /* evict the stale */
@@ -4482,9 +4575,21 @@ typedef struct {
     u32 last_frame, seen_frame, skip_until;
     u8 seen, changes;
     u8 wt_ok;                    /* rsx_wtrack: runs armed, wt_content is their hash */
+    u8 unhashed;                 /* (rsx-vtx) PS3RECOMP_ENG_LAZY_HASH: seen once, bytes not hashed yet */
     u16 next;                    /* PS3RECOMP_ENG_PREFETCH: the entry the next draw used, index + 1 */
     u64 wt_stamp, wt_content;
-} eng_ic_entry;
+    /* (rsx-vtx) PS3RECOMP_ENG_PAIR_MEMO: the vertex-cache entry an index-cache
+     * hit drew from last time, and what it took to find it (eng_pair_try). */
+    struct {
+        u64 sig;                 /* eng_pair_sig of that draw (0: none) */
+        u64 vkey;                /* the vertex-cache entry's key */
+        const u8* host[2];       /* its merged guest spans (host pointers) */
+        u32 len[2];
+        u32 xgen;                /* g_gcm_xlate_gen then */
+        u16 vidx;                /* its slot in s_vc */
+        u8 n;                    /* spans */
+    } pair;
+} __attribute__((aligned(64))) eng_ic_entry;
 #define ENG_IC_SIZE   16384u
 #define ENG_IC_BUDGET (128ull << 20)
 static eng_ic_entry s_ic[ENG_IC_SIZE];
@@ -4555,12 +4660,14 @@ static eng_ic_entry* eng_ic_probe(const rsx_dsp_index_array* ia, u32 ia_loc, int
     key = eng_vc_mix(key, ((u64)g.rsx.current_primitive << 32) | base_index);
     key = eng_vc_mix(key, restart_en ? restart_val : 0u);
     key = eng_vc_mix(key, dc.n_idx);
+    /* (rsx-vtx) each run mapped once: the loops below used to map it again */
+    const u8* runs[ENG_MAX_BATCHES];
     for (u32 b = 0; b < dc.n_idx; b++) {
         const u32 first = dc.idx[b].first, count = dc.idx[b].count;
         key = eng_vc_mix(key, ((u64)first << 32) | count);
         const u64 start = (u64)ia->offset + (u64)first * esz, bytes = (u64)count * esz;
         if (!count || start + bytes > 0x100000000ull) return NULL;
-        if (!eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes)) return NULL;
+        if (!(runs[b] = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes))) return NULL;
     }
     if (!key) key = 1;
     u32 p = (u32)(key ^ (key >> 32)) & (ENG_IC_SIZE - 1u);
@@ -4576,29 +4683,27 @@ static eng_ic_entry* eng_ic_probe(const rsx_dsp_index_array* ia, u32 ia_loc, int
     }
     if (!e) return NULL;
     ENG_CACHE_PREDICT(s_ic, s_ic_prev, e);
+    /* (rsx-vtx) PS3RECOMP_ENG_LAZY_HASH: not hashed at its first sighting */
+    if (!e->seen && eng_lazyhash_on()) { e->unhashed = 1; *content = 0; ds_ic_lazy++; return e; }
     /* The raw indices' hash -- or, rsx_wtrack, the one they had when their
      * pages were armed, while those stay unwritten. */
     const int wt = rsx_wt_mode();
     int wt_clean = 0;
     if (wt && e->wt_ok) {
         u64 st = 0; wt_clean = 1;
-        for (u32 b = 0; b < dc.n_idx && wt_clean; b++) {
-            const u64 start = (u64)ia->offset + (u64)dc.idx[b].first * esz, bytes = (u64)dc.idx[b].count * esz;
-            wt_clean = rsx_wt_query(eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes), (size_t)bytes, &st);
-        }
+        for (u32 b = 0; b < dc.n_idx && wt_clean; b++)
+            wt_clean = rsx_wt_query(runs[b], (size_t)dc.idx[b].count * esz, &st);
         wt_clean = wt_clean && st == e->wt_stamp;
         if (wt_clean && wt == 1) { *content = e->wt_content; ds_ic_wt_clean++; return e; }
     }
     u64 st = 0; int armed = wt && !wt_clean && (e->seen || !eng_wt_arm_seen());   /* (rsx5) as eng_vc_probe */
     u64 c = 0x2B992DDFA23249D6ull;
     if (armed)
-        for (u32 b = 0; b < dc.n_idx; b++) {
-            const u64 start = (u64)ia->offset + (u64)dc.idx[b].first * esz, bytes = (u64)dc.idx[b].count * esz;
-            armed &= rsx_wt_arm(eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes), (size_t)bytes, &st);
-        }
+        for (u32 b = 0; b < dc.n_idx; b++)
+            armed &= rsx_wt_arm(runs[b], (size_t)dc.idx[b].count * esz, &st);
     for (u32 b = 0; b < dc.n_idx; b++) {
-        const u64 start = (u64)ia->offset + (u64)dc.idx[b].first * esz, bytes = (u64)dc.idx[b].count * esz;
-        c = eng_hash_span(eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes), bytes, c);
+        const u64 bytes = (u64)dc.idx[b].count * esz;
+        c = eng_hash_span(runs[b], bytes, c);
         ds_ic_hashed += bytes;
     }
     if (wt_clean) {                               /* shadow mode */
@@ -4614,6 +4719,11 @@ static eng_ic_entry* eng_ic_probe(const rsx_dsp_index_array* ia, u32 ia_loc, int
 static void eng_ic_after_draw(eng_ic_entry* e, u64 content, u32 n_draw)
 {
     if (e->skip_until > g.frames) return;
+    if (e->unhashed) {                 /* (rsx-vtx) PS3RECOMP_ENG_LAZY_HASH, as eng_vc_after_fetch */
+        if (e->seen) { e->unhashed = 0; e->content = content; }
+        e->seen = 1; e->seen_frame = g.frames; e->last_frame = g.frames;
+        return;
+    }
     if (e->seen && e->content == content && e->seen_frame != g.frames) {
         if (!e->ibuf && s_ic_ranged && !dc.n_cuts && dc.refs_remapped && dc.n_refs &&
             s_ic_bytes + (u64)n_draw * 4u > ENG_IC_BUDGET)
@@ -4653,9 +4763,92 @@ static void dc_refs_fill(void)
     for (u32 i = 1; i < dc.n_refs; i++) { dc.refs[i].vertex_id = lo + i; dc.refs[i].base_index = dc.lazy_base; }
     dc.refs_lazy = 0;
 }
+/* ---- (rsx-vtx) PS3RECOMP_ENG_PAIR_MEMO ---------------------------------------
+ * An index-cache hit whose vertices come from the vertex cache (most of a
+ * city frame's draws) still decoded the attribute registers into a fetch
+ * plan, mapped every attribute's span, built the vertex-cache key, probed the
+ * 4 MB table and merged the spans -- all to find the same entry as last
+ * time. The index entry now remembers that entry together with a hash of
+ * everything the search reads: the layout, VERTEX_DATA_BASE_OFFSET, the
+ * divider operation, the element base, the run (lo, span) and each slot's
+ * format, offset and current-value registers. With the hash equal and no IO
+ * remap since (g_gcm_xlate_gen), the search would land on the same key, so the
+ * entry is taken directly; its spans' pages must still be unwritten
+ * (rsx_wtrack, as the probe's clean path asks) with the same version stamp.
+ * Anything else -- shadow tracking, a test reader, more than two spans, a
+ * changed register, a pruned table -- goes the whole way as before, which
+ * records the pair again. Default 1; 0 = the search every time. */
+static int s_pair_on = -1;
+static inline int eng_pair_on(void)
+{
+    if (__builtin_expect(s_pair_on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_PAIR_MEMO");
+        s_pair_on = !(e && e[0] == '0');
+    }
+    return s_pair_on && !s_guest_reader && rsx_wt_mode() == 1;
+}
+static u64 eng_pair_sig(const rsx_vertex_layout_plan* layout, u32 base_index, const eng_ic_entry* e)
+{
+    const u32* R = g.rsx.regs;
+    u64 h = eng_vc_mix(0x6C62272E07BB0142ull, ((u64)layout->mask << 32) | layout->stride);
+    h = eng_vc_mix(h, ((u64)R[0x1738u >> 2] << 32) | R[0x1FC0u >> 2]);   /* VERTEX_DATA_BASE_OFFSET, divider op */
+    h = eng_vc_mix(h, ((u64)base_index << 32) | e->lo);
+    h = eng_vc_mix(h, ((u64)layout->count << 32) | e->span);
+    for (u32 slot = 0; slot < layout->count; slot++) {
+        const u32 a = layout->attrs[slot] & 15u;
+        h = eng_vc_mix(h, ((u64)R[(0x1740u >> 2) + a] << 32) | R[(0x1680u >> 2) + a]);   /* VTXFMT, VTXBUF_OFFSET */
+        const u32* d = &R[(0x1C00u >> 2) + a * 4u];                                     /* VERTEX_DATA4F_M (current value) */
+        h = eng_vc_mix(h, ((u64)d[0] << 32) | d[1]);
+        h = eng_vc_mix(h, ((u64)d[2] << 32) | d[3]);
+    }
+    return h ? h : 1u;
+}
+/* The remembered vertex-cache entry when it still answers this draw, else NULL. */
+static eng_vc_entry* eng_pair_try(const eng_ic_entry* e, u64 sig, const rsx_vertex_layout_plan* layout)
+{
+    if (!e->pair.sig || e->pair.sig != sig ||
+        e->pair.xgen != __atomic_load_n(&g_gcm_xlate_gen, __ATOMIC_ACQUIRE))
+        return NULL;
+    eng_vc_entry* ve = &s_vc[e->pair.vidx];
+    if (ve->key != e->pair.vkey || !ve->vbuf || !ve->wt_ok || ve->unhashed || ve->skip_until > g.frames ||
+        ve->n != e->span || ve->stride != layout->stride || ve->content != ve->wt_content)
+        return NULL;
+    u64 st = 0;
+    for (u32 k = 0; k < e->pair.n; k++)
+        if (!rsx_wt_query(e->pair.host[k], e->pair.len[k], &st)) return NULL;
+    return st == ve->wt_stamp ? ve : NULL;
+}
+/* After the whole way found `ve` for an index-cache hit: remember it. */
+static void eng_pair_note(eng_ic_entry* e, const eng_vc_entry* ve, u64 sig, u32 xgen)
+{
+    e->pair.sig = 0;
+    if (!sig || !ve->wt_ok || !s_vcp_nm || s_vcp_nm > 2u || rsx_wt_mode() != 1) return;
+    for (u32 k = 0; k < s_vcp_nm; k++) {
+        if (s_vcp_mn[k] > 0xFFFFFFFFull) return;
+        e->pair.host[k] = s_vcp_ms[k]; e->pair.len[k] = (u32)s_vcp_mn[k];
+    }
+    e->pair.n = (u8)s_vcp_nm;
+    e->pair.vkey = ve->key;
+    e->pair.vidx = (u16)(ve - s_vc);
+    e->pair.xgen = xgen;
+    e->pair.sig = sig;
+}
+
+/* (rsx-vtx) PS3RECOMP_ENG_FETCH_FAST (default 1; 0 = rsx_vertex_fetch_all
+ * always): consecutive runs through rsx_vertex_fetch_all_ex. */
+static int s_fetch_fast = -1;
+static inline int eng_fetch_fast_on(void)
+{
+    if (__builtin_expect(s_fetch_fast < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_FETCH_FAST");
+        s_fetch_fast = !(e && e[0] == '0');
+    }
+    return s_fetch_fast;
+}
 static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
     s_ic_cur = NULL; s_ic_hit = 0; s_ic_ranged = 0; dc.refs_lazy = 0;
+    dc.consecutive = 0; dc.plan_stale = 0;
     /* PS3RECOMP_ENG_ICACHE: an index-only draw whose rebuilt list is resident
      * and whose vertices the vertex cache holds skips the index work. */
     if (dc.n_idx && !dc.n_arr && !dc.inl && dc.fetch_ok && allow_remap && layout->stride &&
@@ -4674,6 +4867,29 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
              * consecutive vertex ids from lo. */
             dc.n_refs = e->span; dc.n_source_refs = e->n_src; dc.refs_remapped = 1; dc.n_cuts = 0;
             dc.layout = *layout;
+            dc.consecutive = 1;
+            /* (rsx-vtx) PS3RECOMP_ENG_PAIR_MEMO: the vertex entry this index
+             * entry drew from last time, when nothing it was found by moved */
+            u64 psig = 0; u32 pxgen = 0;
+            if (eng_pair_on()) {
+                if (e->pair.sig) __builtin_prefetch(&s_vc[e->pair.vidx], 0, 3);
+                pxgen = __atomic_load_n(&g_gcm_xlate_gen, __ATOMIC_ACQUIRE);
+                psig = eng_pair_sig(layout, base_index, e);
+                eng_vc_entry* pv = eng_pair_try(e, psig, layout);
+                if (pv) {
+                    ENG_CACHE_PREDICT(s_vc, s_vc_prev, pv);
+                    dc.refs[0].vertex_id = e->lo; dc.refs[0].base_index = base_index;
+                    dc.refs_lazy = e->span > 1u; dc.lazy_base = base_index;
+                    dc.plan_stale = 1;
+                    pv->last_frame = g.frames;
+                    dc.vbuf = pv->vbuf; dc.vbuf_hit = 1; dc.n_verts = dc.n_refs;
+                    e->last_frame = g.frames;
+                    s_ic_hit = 1; ds_ic_hit++; ds_vc_hit++; ds_pair_hit++;
+                    if (eng_ds_enabled()) { ds.refs += dc.n_source_refs; ds.uniq += dc.n_refs; }
+                    return;
+                }
+                ds_pair_miss++;
+            }
             eng_plan_init(layout);
             rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, NULL, 0);
             /* PS3RECOMP_ENG_LAZY_REFS=1 (default off: no measured gain): the plan below reads only
@@ -4699,12 +4915,14 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                 ve->last_frame = g.frames;
                 dc.vbuf = ve->vbuf; dc.vbuf_hit = 1; dc.n_verts = dc.n_refs;
                 e->last_frame = g.frames;
+                if (psig) eng_pair_note(e, ve, psig, pxgen);
                 s_ic_hit = 1; ds_ic_hit++; ds_vc_hit++;
                 if (eng_ds_enabled()) { ds.refs += dc.n_source_refs; ds.uniq += dc.n_refs; }
                 return;
             }
             /* The vertices changed: the whole way, as if nothing were cached. */
             dc.n_refs = dc.n_source_refs = 0; dc.refs_remapped = 0; dc.refs_lazy = 0;
+            dc.consecutive = 0; e->pair.sig = 0;
         }
         if (s_ic_cur) ds_ic_miss++;
     }
@@ -4808,6 +5026,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     }
 
     if (dso) { t1 = eng_ds_now(); ds.ns_remap += t1 - t0; t0 = t1; }
+    dc.consecutive = consecutive;   /* (rsx-vtx) for the fetch below and the refetch in sink_end */
     dc.layout = *layout;
     eng_plan_init(layout);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
@@ -4838,9 +5057,11 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
         return;
     }
     /* Attribute by attribute with per-format loops; bit-identical to
-     * rsx_vertex_fetch_one per reference (tests/test_vertex_fetch.c). */
-    if (!rsx_vertex_fetch_all(&dc.fetch_plan, dc.refs, dc.n_refs,
-                              layout->stride ? dc.verts : NULL)) {
+     * rsx_vertex_fetch_one per reference (tests/test_vertex_fetch.c).
+     * (rsx-vtx) PS3RECOMP_ENG_FETCH_FAST: a consecutive run reads straight
+     * down the spans (rsx_vertex_fetch_all_ex). */
+    if (!rsx_vertex_fetch_all_ex(&dc.fetch_plan, dc.refs, dc.n_refs,
+                                 layout->stride ? dc.verts : NULL, consecutive && eng_fetch_fast_on())) {
         dc.fetch_ok = 0;
         return;
     }
@@ -5721,8 +5942,15 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * one that ended up non-indexed needs dc.verts after all. */
     if (dc.vbuf_hit && !indexed) {
         dc_refs_fill();
+        if (dc.plan_stale) {   /* (rsx-vtx) a PS3RECOMP_ENG_PAIR_MEMO hit skipped the plan */
+            eng_plan_init(&dc.layout);
+            rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, NULL, 0);
+            rsx_vertex_fetch_plan_prepare_ex(&dc.fetch_plan, dc.refs, dc.n_refs, 1);
+            dc.plan_stale = 0;
+        }
         if (!dc_reserve_verts((u64)dc.n_refs * dc.layout.stride) ||
-            !rsx_vertex_fetch_all(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts)) {
+            !rsx_vertex_fetch_all_ex(&dc.fetch_plan, dc.refs, dc.n_refs, dc.verts,
+                                     dc.consecutive && eng_fetch_fast_on())) {
             eng_drop("fetch", prim); return; }
         dc.vbuf = 0; dc.vbuf_hit = 0;
     }
@@ -6247,9 +6475,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
-    if (vpc_range)
+    if (vpc_range) {
+        if (g.be->vs_constants_gen) g.be->vs_constants_gen(g.be->user, g.rsx.const_gen);   /* (rsx-vtx) */
         g.be->bind_vs_constants_range(g.be->user, g.rsx.constants, g.vpc_lo,
                                       g.vpc_n, xf, sizeof xf, ENG_VP_CB_BYTES);
+    }
     else
         g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);

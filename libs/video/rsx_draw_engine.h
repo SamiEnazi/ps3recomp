@@ -391,6 +391,11 @@ typedef struct rsx_draw_backend {
      * persistent buffer (draw_vbuf / draw_vbuf_ib); the backend may prefetch
      * its bookkeeping. No effect on what is drawn (PS3RECOMP_ENG_PREFETCH). */
     void (*vbuf_prefetch)(void* user, u32 vbuf);
+    /* Optional (rsx-vtx). Called before bind_vs_constants_range with the
+     * generation of the rows it will name (rsx_dispatch.const_gen): an equal
+     * generation means the same row contents as at an earlier bind, so a
+     * backend may keep using the copy it made then (PS3RECOMP_VK_CONST_REUSE). */
+    void (*vs_constants_gen)(void* user, u32 gen);
 } rsx_draw_backend;
 
 /* The light pass's constants, as the backend's shader reads them. */

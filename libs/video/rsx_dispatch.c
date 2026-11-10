@@ -285,6 +285,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     if (count > max_words)
         count = max_words;
     memcpy(rsx->constants, words, count * sizeof(u32));
+    rsx->const_gen++;   /* (rsx-vtx) */
 }
 
 
@@ -513,8 +514,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
-        if (slot < RSX_DSP_NUM_CONSTANTS)
+        if (slot < RSX_DSP_NUM_CONSTANTS) {
+            if (rsx->constants[slot][word & 3] != arg) rsx->const_gen++;   /* (rsx-vtx) */
             rsx->constants[slot][word & 3] = arg;
+        }
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
         { if (s_clog_lo == -2) clog_init();
@@ -674,14 +677,18 @@ static __attribute__((noinline)) void burst_const_run(rsx_dispatch* rsx, u32 m, 
     const u32 idx0 = m >> 2, w0 = (m - M_VP_UPLOAD_CONST) >> 2;
     const u32 base = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
     const int cs = !rsx->no_seen;
+    u32 chg = 0;   /* (rsx-vtx) const_gen: any word that changed value */
     for (u32 k = 0; k < n; k++) {
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[k], __ATOMIC_RELAXED));
         if (cs) rsx->seen[idx0 + k]++;
         rsx->regs[idx0 + k] = arg;
         const u32 word = w0 + k, slot = base + (word >> 2);
-        if (slot < RSX_DSP_NUM_CONSTANTS)
+        if (slot < RSX_DSP_NUM_CONSTANTS) {
+            chg |= rsx->constants[slot][word & 3] ^ arg;
             rsx->constants[slot][word & 3] = arg;
+        }
     }
+    if (chg) rsx->const_gen++;
 }
 /* A run of words in the transform-program upload window. */
 static __attribute__((noinline)) void burst_inst_run(rsx_dispatch* rsx, u32 m, const u32* be_words, u32 n)

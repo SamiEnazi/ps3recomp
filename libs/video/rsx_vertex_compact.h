@@ -144,6 +144,16 @@ int rsx_vertex_fetch_all(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
     u8* out);
 
+/* (rsx-vtx) rsx_vertex_fetch_all, told whether refs[i].vertex_id ==
+ * refs[0].vertex_id + i with one base_index (what the ranged remap leaves):
+ * then the ordinary attributes whose stable span covers the run are read
+ * straight down the span, without a per-vertex element index or resolver.
+ * Same output bit for bit and the same verdict; consecutive == 0 is
+ * rsx_vertex_fetch_all itself. */
+int rsx_vertex_fetch_all_ex(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out, int consecutive);
+
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
  * remains valid until the next call using the same remap object. */

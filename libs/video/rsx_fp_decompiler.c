@@ -183,13 +183,33 @@ u32 rsx_fp_sanitize_constant_word(u32 w)
     return 0;
 }
 
+static int fp_collect_constants_impl(
+    const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out);
+
 int rsx_fp_collect_constants(
     const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out)
 {
     if (!ucode || !out)
         return -1;
     memset(out, 0, sizeof(*out));
+    return fp_collect_constants_impl(ucode, max_bytes, out);
+}
 
+/* (rsx-vtx) The same walk and values without the clear of the whole 32 KB
+ * block: past `count` the block keeps what it held, which no reader looks at
+ * (every reader stops at count). */
+int rsx_fp_collect_constants_lean(
+    const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out)
+{
+    if (!ucode || !out)
+        return -1;
+    out->count = 0;
+    return fp_collect_constants_impl(ucode, max_bytes, out);
+}
+
+static int fp_collect_constants_impl(
+    const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out)
+{
     u32 off = 0;
     while (off + 16 <= max_bytes) {
         const u32 w0 = rsx_fp_read_word(ucode + off + 0);

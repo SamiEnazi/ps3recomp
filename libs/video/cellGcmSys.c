@@ -141,6 +141,12 @@ static CellGcmConfig s_config;
 /* Offset pages (1MB) known to be LOCAL-memory-derived (set by
  * cellGcmAddressToOffset when the guest converts a localAddress-range EA). */
 static u8 s_local_offset_page[1024];
+/* (rsx-vtx) Moves on whenever an RSX offset may translate to another address:
+ * the IO tables written or cleared, a local page recorded, an init. The draw
+ * engine's pair memo (PS3RECOMP_ENG_PAIR_MEMO) keeps translated pointers only
+ * while it stands still. */
+volatile u32 g_gcm_xlate_gen = 1;
+static inline void gcm_xlate_moved(void) { __atomic_fetch_add(&g_gcm_xlate_gen, 1u, __ATOMIC_RELEASE); }
 
 /* Command buffer control */
 static CellGcmControl s_control;
@@ -358,6 +364,7 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
         s_io_address_table[ea_page + i] = (u16)(io_page + i);
         s_ea_address_table[io_page + i] = (u16)(ea_page + i);
     }
+    gcm_xlate_moved();
 }
 
 /* Clear offset table entries for an IO mapping */
@@ -371,6 +378,7 @@ static void clear_offset_table(u32 ea, u32 io, u32 size)
         s_io_address_table[ea_page + i] = 0xFFFF;
         s_ea_address_table[io_page + i] = 0xFFFF;
     }
+    gcm_xlate_moved();
 }
 
 /* Find an IO mapping by EA */
@@ -439,6 +447,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
+    gcm_xlate_moved();
 
     /*
      * Populate a plausible configuration.
@@ -458,6 +467,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
      * producing plausible-but-wrong offsets instead of a translation failure. */
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
+    gcm_xlate_moved();
     s_current_display_buffer_id = 0;
     s_flip_handler = NULL;
     s_vblank_handler = NULL;
@@ -3357,7 +3367,9 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
     if (address >= s_config.localAddress &&
         address < s_config.localAddress + s_config.localSize) {
         u32 loff = address - s_config.localAddress;
-        if ((loff >> 20) < sizeof(s_local_offset_page)) s_local_offset_page[loff >> 20] = 1;
+        if ((loff >> 20) < sizeof(s_local_offset_page)) {
+            if (!s_local_offset_page[loff >> 20]) { s_local_offset_page[loff >> 20] = 1; gcm_xlate_moved(); }
+        }
         else rsx_lim_event(RSX_LIM_GCM_TABLES, 0, "local-memory page past 1 GB not recorded");
         vm_write32(off_ea, loff);
         return CELL_OK;
@@ -3980,6 +3992,7 @@ void cellGcmTerminate(void)
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
+    gcm_xlate_moved();
 
     s_flip_handler     = NULL;
     s_vblank_handler   = NULL;
@@ -3994,6 +4007,7 @@ void cellGcmTerminate(void)
      * producing plausible-but-wrong offsets instead of a translation failure. */
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
+    gcm_xlate_moved();
     s_current_display_buffer_id = 0;
     s_last_flip_time = 0;
 }

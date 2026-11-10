@@ -183,6 +183,10 @@ struct rsx_dispatch {
     u32 inline_ovf;
     /* (rsx5) immediate-mode vertices of the current pair past the cap */
     u32 imm_drop_draw;
+    /* (rsx-vtx) Bumped whenever a word of constants[] changes value (the
+     * upload window, a seed): two equal readings mean an unchanged constant
+     * file (the Vulkan backend's PS3RECOMP_VK_CONST_REUSE). */
+    u32 const_gen;
 };
 
 /* ---- lifecycle -------------------------------------------------------- */
