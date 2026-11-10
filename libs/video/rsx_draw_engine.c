@@ -6055,6 +6055,14 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                        (int)t.cubemap, t.remap & 0x1FFFFu,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
         if (!textures[u]) s_tex_volatile = 1;   /* (rnd1) a failed texture may be made at the next bind */
+        /* (critic) a GPU light / SSAO output address whose pass declined just
+         * now (no port params yet, no sequence, a pass that returned 0) got the
+         * guest buffer instead; the pass may succeed at the next draw with the
+         * same registers, so that binding must not be reused (PS3RECOMP_ENG_DELTA) */
+        else if ((t.location == RSX_LOCATION_MAIN && eng_gpu_light_on() &&
+                  (t.offset == s_gl.diff_off || t.offset == s_gl.spec_off)) ||
+                 (s_gs.on > 0 && t.location == RSX_LOCATION_LOCAL && t.offset == s_gs.off))
+            s_tex_volatile = 1;
         /* PS3_MODS_DUMP: the effects draws' textures (fx_textures.txt). */
         if (__builtin_expect(s_mods.dump_dir[0] != 0, 0) && textures[u] && n_targets &&
             eng_fxres_listed(g.surfaces[target_slots[0]].offset, g.surfaces[target_slots[0]].w,
