@@ -3335,7 +3335,13 @@ static const eng_fp_memo* eng_fp_current(void)
     s_fp_key[v] = key; s_fp_sz[v] = size; s_fp_use[v] = m->used;
     m->structural = rsx_fp_structural_hash(uc, size, 1469598103934665603ull);
     m->constants.count = 0;
-    m->constants_ok = rsx_fp_collect_constants(uc, size, &m->constants) >= 0;
+    /* (rsx-vtx) PS3RECOMP_ENG_FPK_LEAN (default 1; 0 = clear the whole 32 KB
+     * block first, as before): a memo miss (new or re-uploaded program, ~170
+     * a city frame) cleared 32 KB it never reads past count. */
+    static int fpk_lean = -1;
+    if (fpk_lean < 0) { const char* le = getenv("PS3RECOMP_ENG_FPK_LEAN"); fpk_lean = !(le && *le == '0'); }
+    m->constants_ok = (fpk_lean ? rsx_fp_collect_constants_lean(uc, size, &m->constants)
+                                : rsx_fp_collect_constants(uc, size, &m->constants)) >= 0;
     m->tex_mask = rsx_fp_texture_mask(uc, size);
     static const u8 all[RSX_DSP_NUM_TEXTURES] = { 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1 };
     m->sampled_units = rsx_fp_texture_units(uc, size);
