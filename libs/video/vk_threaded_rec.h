@@ -31,6 +31,7 @@
 #ifndef PS3RECOMP_VK_THREADED_REC_H
 #define PS3RECOMP_VK_THREADED_REC_H
 
+#include "rsx_split.h"          /* (rsx-par2) rsx_diag_*: PS3_STALL_MS sees the worker */
 #ifdef _WIN32
 #include <intrin.h>
 #pragma comment(lib, "synchronization.lib")   /* WaitOnAddress / WakeByAddressSingle */
@@ -95,6 +96,7 @@ static DWORD WINAPI tq_worker(LPVOID arg)
 {
     (void)arg;
     t_tq_worker = 1;
+    rsx_diag_thread_here(RSX_DIAG_WORKER);   /* (rsx-par2) PS3_STALL_MS sees this thread */
     u64 r = s_tq_r;
     for (;;) {
         const LONG bell = __atomic_load_n(&s_tq_bell, __ATOMIC_ACQUIRE);   /* before w: a ring after this is seen */
@@ -176,19 +178,28 @@ static void tq_wake_force(void)
 static unsigned long long s_tqw_ns;
 
 /* Make every recorded call reach the driver before returning. */
+/* (rsx-par2) until the worker has run everything published when called: r
+ * reaching w OR PASSING it. It used to wait for r == w, which only the producer
+ * itself can rely on (nothing is published while it waits); a call from any
+ * other thread (PS3RECOMP_VK_BT's image_load from the texture-pack preload
+ * thread) saw r jump past w while the producer kept recording, and spun for
+ * ever -- holding the pack entry the engine thread was waiting for: the hang of
+ * cv-B1-fight (2026-11-10). r and w only grow, so >= is right for everyone. */
 static void vk_tq_sync(void)
 {
     if (!s_tq.running || t_tq_worker || s_tq_nodrain) return;
     const u64 w = __atomic_load_n(&s_tq_w, __ATOMIC_ACQUIRE);
-    if (__atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) == w) return;
+    if (__atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) >= w) return;
     s_tq.n_syncs++;
     const u64 tw0 = ps3_ft_now();
+    rsx_diag_wait("vk_tq_sync: the recording worker runs what was recorded");
     tq_ring();
     u32 spins = 0;
-    while (__atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) != w) {
+    while (__atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) < w) {
         _mm_pause();
         if (++spins > 20000u) { SwitchToThread(); spins = 0; tq_ring(); }
     }
+    rsx_diag_wait(NULL);
     s_tqw_ns += ps3_ft_now() - tw0;
     if (s_tq.err != VK_SUCCESS) {
         fprintf(stderr, "[RSX vulkan] threaded recording: op %u failed (VkResult %d)\n",
@@ -203,12 +214,14 @@ static void vk_tq_present_wait(u64 seq)
 {
     if (!s_tq.running || __atomic_load_n(&s_tq_pres_done, __ATOMIC_ACQUIRE) >= seq) return;
     const u64 tw0 = ps3_ft_now();
+    rsx_diag_wait("vk_tq_present_wait: the worker submits the previous present");
     tq_ring();
     u32 spins = 0;
     while (__atomic_load_n(&s_tq_pres_done, __ATOMIC_ACQUIRE) < seq) {
         _mm_pause();
         if (++spins > 20000u) { SwitchToThread(); spins = 0; tq_ring(); }
     }
+    rsx_diag_wait(NULL);
     s_tqw_ns += ps3_ft_now() - tw0;
 }
 
@@ -225,8 +238,10 @@ static u8* tq_alloc(u32 op, u32 bytes, VkCommandBuffer cb)
         s_tq.n_full++;
         rsx_lim_event(RSX_LIM_VK_TQ_RING, 0, "recording ring full: the RSX thread waits for the recording worker");   /* (rsx5) */
         const u64 tw0 = ps3_ft_now();
+        rsx_diag_wait("tq_alloc: recording ring full");
         tq_ring();
         while (pos + fill + bytes - __atomic_load_n(&s_tq_r, __ATOMIC_ACQUIRE) > TQ_RING_BYTES) _mm_pause();
+        rsx_diag_wait(NULL);
         s_tqw_ns += ps3_ft_now() - tw0;
     }
     if (fill) {
@@ -644,6 +659,13 @@ static int vk_bt_env(void)
     if (v < 0) { const char* e = getenv("PS3RECOMP_VK_BT"); v = !(e && e[0] == '0'); }
     return v;
 }
+/* (rsx-par2) PS3_STALL_MS: the recording ring, for the [stall-rsx] line */
+static int vk_tq_diag(char* buf, int size)
+{
+    return snprintf(buf, (size_t)size, " tq: w=%llu r=%llu wlocal=%llu sleep=%ld direct=%d presents %llu/%llu;",
+                    (unsigned long long)s_tq_w, (unsigned long long)s_tq_r, (unsigned long long)s_tq.wlocal,
+                    (long)s_tq_sleep, s_tq.direct, (unsigned long long)s_tq_pres_done, (unsigned long long)s_tq_pres_sent);
+}
 static void vk_tq_install(void)
 {
     const char* e = getenv("PS3RECOMP_VK_THREADED");
@@ -700,6 +722,7 @@ static void vk_tq_install(void)
     TQ_FNS(TQ_SWAP)
 #undef TQ_SWAP
     s_tq.running = 1;
+    g_rsx_diag_backend = vk_tq_diag;          /* (rsx-par2) */
     s_tq.on = 1;
     fprintf(stderr, "[RSX vulkan] threaded command recording on (PS3RECOMP_VK_THREADED=0 = off, %u MB ring; worker hosttid=%lu, producer hosttid=%lu)\n",
             TQ_RING_BYTES >> 20, (unsigned long)GetThreadId(s_tq.thread), (unsigned long)GetCurrentThreadId());

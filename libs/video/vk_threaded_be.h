@@ -151,10 +151,14 @@ static u32 bt_light_pass(void* u, u32 normals, u32 depth, u32 w, u32 h, const vo
 static u32 bt_ssao_pass(void* u, u32 depth, u32 normals, const void* consts, u32 const_bytes,
                         u32 full_w, u32 full_h, u32 half_w, u32 half_h)
 { (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.ssao_pass(s_bt_real.user, depth, normals, consts, const_bytes, full_w, full_h, half_w, half_h); }
+/* (rsx-par2) image_load / image_save are file + PNG code that touch no backend
+ * state, and the texture-pack preload thread calls image_load: straight
+ * through, from whatever thread (no drain -- see vk_tq_sync -- and no touch of
+ * the producer's bind memory). */
 static int bt_image_load(void* u, const char* path, u8** rgba, u32* w, u32* h)
-{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.image_load(s_bt_real.user, path, rgba, w, h); }
+{ (void)u; return s_bt_real.image_load(s_bt_real.user, path, rgba, w, h); }
 static int bt_image_save(void* u, const char* path, const u8* rgba, u32 w, u32 h, u32 row_bytes)
-{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.image_save(s_bt_real.user, path, rgba, w, h, row_bytes); }
+{ (void)u; return s_bt_real.image_save(s_bt_real.user, path, rgba, w, h, row_bytes); }
 
 /* ---- the engine's thread, no drain ---------------------------------------- */
 static u32 bt_vbuf_create(void* u, const void* data, u32 bytes) { (void)u; return s_bt_real.vbuf_create(s_bt_real.user, data, bytes); }

@@ -119,6 +119,113 @@ static int sp_switch(void)
 
 static inline u64 sp_load_r(void) { return (u64)__atomic_load_n(&s_sp_r, __ATOMIC_ACQUIRE); }
 
+
+/* ---- (rsx-par2) PS3_STALL_MS: the RSX side's threads -------------------------
+ * Each thread that matters registers itself (rsx_diag_thread_here) and marks
+ * its long waits (rsx_diag_wait). The stall thread then prints, per thread,
+ * the marked wait and its age, the host RIP and the first return addresses on
+ * its stack that fall in the exe's code (exe+offset, resolved offline with the
+ * PDB). The target is suspended only for the register read and an 8 KB stack
+ * copy: nothing that takes a lock or allocates runs while it is stopped. */
+static const char* const s_diag_name[RSX_DIAG_N] = { "walker", "rsx_exec", "rsx_vk_record" };
+static struct { HANDLE h; DWORD tid; const char* volatile what; volatile ULONGLONG since; } s_diag[RSX_DIAG_N];
+static __declspec(thread) int t_diag_who = -1;
+int (*g_rsx_diag_backend)(char* buf, int size);   /* rsx_split.h */
+
+void rsx_diag_thread_here(int who)
+{
+    if (who < 0 || who >= RSX_DIAG_N || s_diag[who].h) { if (who >= 0 && who < RSX_DIAG_N) t_diag_who = who; return; }
+    HANDLE h = NULL;
+    if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0)) {
+        s_diag[who].tid = GetCurrentThreadId();
+        __atomic_store_n(&s_diag[who].h, h, __ATOMIC_RELEASE);
+    }
+    t_diag_who = who;
+}
+void rsx_diag_wait(const char* what)
+{
+    const int who = t_diag_who;
+    if (who < 0) return;
+    if (what) s_diag[who].since = GetTickCount64();
+    __atomic_store_n(&s_diag[who].what, what, __ATOMIC_RELEASE);
+}
+
+static uintptr_t s_exe_lo, s_exe_hi, s_exe_base;
+static void diag_exe_range(void)
+{
+    if (s_exe_hi) return;
+    const u8* b = (const u8*)GetModuleHandleA(NULL);
+    if (!b) return;
+    const IMAGE_DOS_HEADER* d = (const IMAGE_DOS_HEADER*)(const void*)b;
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(const void*)(b + d->e_lfanew);
+    const IMAGE_SECTION_HEADER* sh = IMAGE_FIRST_SECTION(nt);
+    uintptr_t lo = ~(uintptr_t)0, hi = 0;
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (sh[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            const uintptr_t a = (uintptr_t)b + sh[i].VirtualAddress;
+            if (a < lo) lo = a;
+            if (a + sh[i].Misc.VirtualSize > hi) hi = a + sh[i].Misc.VirtualSize;
+        }
+    s_exe_base = (uintptr_t)b; s_exe_lo = lo; s_exe_hi = hi;
+}
+static int diag_addr(char* buf, int size, uintptr_t a)
+{
+    if (a >= s_exe_lo && a < s_exe_hi) return snprintf(buf, (size_t)size, "exe+%llX", (unsigned long long)(a - s_exe_base));
+    HMODULE m = NULL; char nm[64] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)a, &m) && m) {
+        char path[MAX_PATH];
+        if (GetModuleFileNameA(m, path, sizeof path)) { const char* s = strrchr(path, '\\'); snprintf(nm, sizeof nm, "%s", s ? s + 1 : path); }
+    }
+    return snprintf(buf, (size_t)size, "%s+%llX", nm, (unsigned long long)(a - (uintptr_t)m));
+}
+
+int rsx_stall_snapshot(char* buf, int size)
+{
+    if (size < 256) return 0;
+    diag_exe_range();
+    static uint64_t stk[1024];
+    int k = snprintf(buf, (size_t)size, "split: %s owner=%d wl=%llu pub=%llu w=%llu r=%llu rc=%llu label_pos=%llu bsleep=%ld await=%ld;",
+                     s_sp.inited ? "on" : "off", s_sp.owner, (unsigned long long)s_sp.wl, (unsigned long long)s_sp.pub,
+                     (unsigned long long)s_sp_w, (unsigned long long)s_sp_r, (unsigned long long)s_sp.rc,
+                     (unsigned long long)s_sp.label_pos, (long)s_sp_bsleep, (long)s_sp_await);
+    if (g_rsx_diag_backend && k < size - 200) k += g_rsx_diag_backend(buf + k, size - k - 100);
+    const ULONGLONG now = GetTickCount64();
+    for (int who = 0; who < RSX_DIAG_N && k < size - 200; who++) {
+        HANDLE h = __atomic_load_n(&s_diag[who].h, __ATOMIC_ACQUIRE);
+        if (!h) continue;
+        const char* what = __atomic_load_n(&s_diag[who].what, __ATOMIC_ACQUIRE);
+        k += snprintf(buf + k, (size_t)(size - k), " %s(tid %lu): wait=%s", s_diag_name[who], (unsigned long)s_diag[who].tid,
+                      what ? what : "-");
+        if (what) k += snprintf(buf + k, (size_t)(size - k), " for %llu ms", (unsigned long long)(now - s_diag[who].since));
+        if (s_diag[who].tid == GetCurrentThreadId()) { k += snprintf(buf + k, (size_t)(size - k), ";"); continue; }
+        CONTEXT c; memset(&c, 0, sizeof c);
+        c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        SIZE_T got = 0;
+        if (SuspendThread(h) == (DWORD)-1) { k += snprintf(buf + k, (size_t)(size - k), " (no suspend);"); continue; }
+        const BOOL ok = GetThreadContext(h, &c);
+        if (ok) ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)c.Rsp, stk, sizeof stk, &got);
+        ResumeThread(h);
+        if (!ok) { k += snprintf(buf + k, (size_t)(size - k), " (no context);"); continue; }
+        k += snprintf(buf + k, (size_t)(size - k), " rip=");
+        k += diag_addr(buf + k, size - k, (uintptr_t)c.Rip);
+        k += snprintf(buf + k, (size_t)(size - k), " stack=");
+        int n = 0;
+        uintptr_t last = 0;
+        for (size_t i = 0; i < got / 8 && n < 8 && k < size - 40; i++) {
+            const uintptr_t a = (uintptr_t)stk[i];
+            if (a < s_exe_lo || a >= s_exe_hi || a == last) continue;
+            last = a;
+            k += snprintf(buf + k, (size_t)(size - k), "%s", n ? "<" : "");
+            k += diag_addr(buf + k, size - k, a);
+            n++;
+        }
+        k += snprintf(buf + k, (size_t)(size - k), ";");
+    }
+    return k;
+}
+
 /* ---- the walker's side ------------------------------------------------- */
 
 static void sp_publish(void)
@@ -136,6 +243,7 @@ static void sp_wait_r(u64 target)
     if (r >= target) { s_sp.rc = r; return; }
     s_sp.n_wait++;
     const u64 t0 = __rdtsc(), spin = s_sp.ticks_us * 20u;
+    rsx_diag_wait("sp_wait_r: the split ring (rsx_exec runs the queue)");
     for (;;) {
         r = sp_load_r();
         if (r >= target) break;
@@ -148,6 +256,7 @@ static void sp_wait_r(u64 target)
         }
         InterlockedExchange(&s_sp_await, 0);
     }
+    rsx_diag_wait(NULL);
     s_sp.wait_ticks += __rdtsc() - t0;
     s_sp.rc = r;
 }
@@ -325,6 +434,7 @@ static DWORD WINAPI sp_exec_thread(LPVOID arg)
     (void)arg;
     /* the draw engine's thread: the RSX role (PS3_CPU_PLACE / PS3_HIGHQOS / PS3_PLACE_PRIO) */
     ps3_host_place_self_once(PS3_PLACE_RSX);
+    rsx_diag_thread_here(RSX_DIAG_EXEC);       /* (rsx-par2) PS3_STALL_MS sees this thread */
     rsx_dispatch* e = rsx_draw_engine_dsp();
     /* the walker writes s_sp all the time: what this thread needs of it, once */
     const u8* const ring = s_sp.ring;
@@ -339,6 +449,7 @@ static DWORD WINAPI sp_exec_thread(LPVOID arg)
                 w = (u64)__atomic_load_n(&s_sp_w, __ATOMIC_ACQUIRE);
             }
             if (w == r) {
+                rsx_diag_wait("idle: no records");
                 InterlockedExchange(&s_sp_bsleep, 1);
                 w = (u64)__atomic_load_n(&s_sp_w, __ATOMIC_ACQUIRE);
                 if (w == r) {
@@ -346,6 +457,7 @@ static DWORD WINAPI sp_exec_thread(LPVOID arg)
                     WaitOnAddress((volatile VOID*)&s_sp_w, &seen, sizeof seen, 100);
                 }
                 InterlockedExchange(&s_sp_bsleep, 0);
+                rsx_diag_wait(NULL);
                 continue;
             }
         }
@@ -534,6 +646,10 @@ void rsx_split_sync(void)
 }
 
 #else   /* not Windows: one thread, as before */
+int (*g_rsx_diag_backend)(char* buf, int size);
+void rsx_diag_thread_here(int who) { (void)who; }
+void rsx_diag_wait(const char* what) { (void)what; }
+int  rsx_stall_snapshot(char* buf, int size) { (void)buf; (void)size; return 0; }
 int  rsx_split_drain_begin(void) { return 0; }
 void rsx_split_release(void) {}
 void rsx_split_burst(u32 method, int incr, const u32* be_words, u32 count) { (void)method; (void)incr; (void)be_words; (void)count; }

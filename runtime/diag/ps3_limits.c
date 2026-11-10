@@ -162,6 +162,7 @@ int ppu_stall_snapshot(char* buf, int size);
 int spu_stall_snapshot(char* buf, int size);
 int gcm_stall_snapshot(char* buf, int size);
 int ppu_stall_host_where(char* buf, int size);
+int rsx_stall_snapshot(char* buf, int size);   /* (rsx-par2) libs/video/rsx_split.c */
 
 static double lim_ms(void)
 {
@@ -208,6 +209,9 @@ static void* stall_thread(void* p)
                                          k += gcm_stall_snapshot(buf + k, (int)sizeof buf - k - 200); }
         if (k < (int)sizeof buf - 200) k += ppu_stall_host_where(buf + k, (int)sizeof buf - k - 2);
         fprintf(stderr, "%s\n", buf);
+        /* (rsx-par2) the walker, rsx_exec and the recording worker: waits, RIPs, stacks, rings */
+        { static char rb[3072];
+          if (rsx_stall_snapshot(rb, (int)sizeof rb) > 0) fprintf(stderr, "[stall-rsx] t=%.2fs %s\n", (now - t0) / 1000.0, rb); }
         fflush(stderr);
         lines++;
         next = next < 2.5 * thr ? 2.5 * thr : next < 5 * thr ? 5 * thr : next + 1000.0;

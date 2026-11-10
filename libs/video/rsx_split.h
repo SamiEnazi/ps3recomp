@@ -48,6 +48,17 @@ void gcm_split_run(u32 kind, u32 a, u32 b, u32 c);
  * between drains finds it idle. NULL = nothing. */
 extern void (*g_rsx_drain_end_hook)(void);
 
+/* (rsx-par2) PS3_STALL_MS (runtime/diag/ps3_limits.c): the RSX side's threads in
+ * the [stall-rsx] line -- what each one says it waits on (and for how long),
+ * its host RIP and the first return addresses on its stack (exe+offset: map
+ * them with the exe's PDB), plus the split ring and the recording ring. */
+enum { RSX_DIAG_WALKER = 0, RSX_DIAG_EXEC, RSX_DIAG_WORKER, RSX_DIAG_N };
+void rsx_diag_thread_here(int who);        /* the calling thread is `who` */
+void rsx_diag_wait(const char* what);      /* the calling thread waits on `what` from now; NULL = no longer */
+int  rsx_stall_snapshot(char* buf, int size);
+/* The Vulkan backend's recording ring, for the line (set by vk_tq_install). */
+extern int (*g_rsx_diag_backend)(char* buf, int size);
+
 #ifdef __cplusplus
 }
 #endif

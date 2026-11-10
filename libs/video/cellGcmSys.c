@@ -2091,6 +2091,7 @@ void cellGcm_rsx_process_fifo(void)
      * the RSX role, once per thread (a guest thread that drains is already
      * placed and keeps its own role). */
     ps3_host_place_self_once(PS3_PLACE_RSX);
+    { static int reg; if (!reg) { reg = 1; rsx_diag_thread_here(RSX_DIAG_WALKER); } }   /* (rsx-par2) PS3_STALL_MS */
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     s_drain_in_ms = ps3_ms_now();
 #if !defined(_WIN32)

@@ -21,6 +21,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "rsx_split.h"          /* (rsx-par2) rsx_diag_wait: PS3_STALL_MS */
 
 #include "rsx_button_icons.h"   /* prompt glyphs that follow the controller */
 #include "rsx_fp_decompiler.h"
@@ -2259,7 +2260,12 @@ static int eng_mod_take(eng_mod_entry* m, const u8** kept, u8** own, u32* pw, u3
         const int st = __atomic_load_n(&m->st, __ATOMIC_ACQUIRE);
         if (st == 2) { *kept = m->px; *pw = m->pw; *ph = m->ph; return 1; }
         if (st == 3) return 0;
-        if (st == 1) { usleep(200); continue; }           /* the preload thread is on it */
+        if (st == 1) {                                    /* the preload thread is on it */
+            rsx_diag_wait("eng_mod_take: the texture-pack preload thread decodes this entry");
+            usleep(200);
+            rsx_diag_wait(NULL);
+            continue;
+        }
         int zero = 0;
         if (!__atomic_compare_exchange_n(&m->st, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
         u8* px = NULL; u32 w = 0, h = 0;
