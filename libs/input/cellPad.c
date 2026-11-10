@@ -2113,6 +2113,85 @@ static void pad_trace_packet(u32 port, const CellPadData* d)
  * were fixed.) These used to be redeclared here with a 64-bit address
  * parameter, which conflicts with the header now that it is included. */
 
+/* ---- The test drivers' files, off the guest's thread (limits, 2026-11-10) --
+ * PAD_FILE (tools/fast_driver.ps1's presses), PAD_SCRIPT_WAIT and the route
+ * anchor were read on every pad poll: fopen/access on the game's MAIN thread
+ * ~170 times a second. On this PC every ~16 s one of those opens blocked in
+ * NtCreateFile for 150-1000 ms (a file-system filter scanning the file), and
+ * the whole frame waited inside cellPadGetData -- the fight and city tests'
+ * "game-side" hitches, caught by PS3_STALL_MS (main: hle=cellPadGetData,
+ * rip=ntdll ZwCreateFile). A watcher thread now does the file work every 4 ms
+ * and the poll reads its results from memory. Players never set these
+ * variables; the tests measured stalls Sami's game does not have.
+ * PS3_PAD_FILE_THREAD=0 = the old reads on the polling thread. */
+#ifdef _WIN32
+#define PAD_WATCH_PATHS 4
+static struct { const char* volatile path; volatile LONG exists; } s_pw[PAD_WATCH_PATHS];
+static volatile LONG   s_pw_n, s_pw_started;
+static const char* volatile s_pf_watch;          /* PAD_FILE */
+static volatile LONG64 s_pf_pending;             /* (polls << 32) | mask; 0 = none */
+static int pad_watch_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3_PAD_FILE_THREAD"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static DWORD WINAPI pad_watch_main(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        const LONG n = s_pw_n;
+        for (LONG i = 0; i < n && i < PAD_WATCH_PATHS; i++) {
+            const char* path = s_pw[i].path;
+            if (path && !s_pw[i].exists && GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+                InterlockedExchange(&s_pw[i].exists, 1);
+        }
+        const char* pf = s_pf_watch;
+        if (pf && !s_pf_pending) {
+            FILE* f = fopen(pf, "rb");
+            if (f) {
+                char buf[64]; buf[0] = 0;
+                unsigned m = 0; int polls = 0;
+                if (fgets(buf, sizeof buf, f)) {
+                    char* rest;
+                    m = (unsigned)strtoul(buf, &rest, 0);
+                    polls = (int)strtol(rest, 0, 0);
+                }
+                fclose(f);
+                if (m) {
+                    InterlockedExchange64(&s_pf_pending, ((LONG64)(polls > 0 ? polls : 40) << 32) | (LONG64)m);
+                    FILE* w = fopen(pf, "wb"); if (w) fclose(w);   /* taken: empty it, as before */
+                }
+            }
+        }
+        Sleep(4);
+    }
+}
+static void pad_watch_start(void)
+{
+    if (InterlockedCompareExchange(&s_pw_started, 1, 0) == 0) {
+        HANDLE h = CreateThread(NULL, 64u * 1024u, pad_watch_main, NULL, 0, NULL);
+        if (h) { SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL); CloseHandle(h); }
+    }
+}
+/* Does `path` exist? From the watcher (lags by at most a few ms). */
+static int pad_file_exists(const char* path)
+{
+    if (!pad_watch_on()) return access(path, F_OK) == 0;
+    LONG n = s_pw_n;
+    for (LONG i = 0; i < n && i < PAD_WATCH_PATHS; i++)
+        if (s_pw[i].path == path) return s_pw[i].exists != 0;
+    const LONG i = InterlockedIncrement(&s_pw_n) - 1;
+    if (i >= PAD_WATCH_PATHS) return access(path, F_OK) == 0;
+    s_pw[i].path = path;
+    pad_watch_start();
+    return access(path, F_OK) == 0;   /* the first call answers itself */
+}
+#else
+static int pad_watch_on(void) { return 0; }
+static int pad_file_exists(const char* path) { return access(path, F_OK) == 0; }
+#endif
+
 /* PS3_PAD_RECORD=<file> / PS3_PAD_REPLAY=<file> -- a recorded route (testspeed, 2026-11-08).
  * Sami drives a route through New Marais once; tests replay it. Time-indexed, not frame-indexed:
  * the game moves with a variable dt, so a slower or faster build covers the same distance in the
@@ -2177,7 +2256,7 @@ static void pad_route_apply(u32 port_no, CellPadData* data)
     }
     if (!s_mode) return;
     if (!s_t0) {
-        if (s_anchor && access(s_anchor, F_OK) != 0) return;
+        if (s_anchor && !pad_file_exists(s_anchor)) return;
         s_t0 = pad_route_us();
         printf("[cellPad] pad route: anchor reached, %s starts\n", s_mode == 1 ? "recording" : "replay"); fflush(stdout);
     }
@@ -2368,7 +2447,7 @@ skip_inject: ;
       }
       if (s_sc && port_no == 0) {
           double now = (double)(GetTickCount64() - t0) / 1000.0;
-          if (wait_path && !t_world && access(wait_path, F_OK) == 0) {
+          if (wait_path && !t_world && pad_file_exists(wait_path)) {
               t_world = GetTickCount64();
               printf("[cellPad] PAD_SCRIPT: world clock starts at t=%.1fs\n", now); }
           const double now_world = t_world ? (double)(GetTickCount64() - t_world) / 1000.0 : -1.0;
@@ -2430,7 +2509,15 @@ skip_inject: ;
                       s_pf = (e && *e) ? 1 : 0;
                       if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
       if (s_pf && port_no == 0) {
-          if (held_n <= 0) {
+#ifdef _WIN32
+          if (held_n <= 0 && pad_watch_on()) {   /* the watcher read the file (see pad_watch_main) */
+              if (!s_pf_watch) { s_pf_watch = pf_path; pad_watch_start(); }
+              const LONG64 v = InterlockedExchange64(&s_pf_pending, 0);
+              if (v) { held_mask = (unsigned)(v & 0xFFFFFFFF); held_n = (int)(v >> 32);
+                       printf("[cellPad] PAD_FILE press 0x%04X\n", held_mask); fflush(stdout); }
+          }
+#endif
+          if (held_n <= 0 && !pad_watch_on()) {
               FILE* f = fopen(pf_path, "rb");
               if (f) {
                   char buf[64]; buf[0] = 0;
