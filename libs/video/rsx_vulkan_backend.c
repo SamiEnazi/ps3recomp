@@ -8774,6 +8774,11 @@ static int s_vk_holding;   /* the shutdown hold loop is running: Esc ends it (pu
 void rsx_vulkan_backend_shutdown(void)
 {
     vk_tq_stop();                        /* PS3RECOMP_VK_THREADED: drain, real entry points back */
+#ifdef _WIN32
+    if (s_bt_on)                         /* (rsx-par) PS3RECOMP_VK_BT */
+        VK_LOG("backend thread: %llu binds not resent, surface views %llu from the memo / %llu asked\n",
+               (unsigned long long)s_bt_dedup_n, (unsigned long long)s_bt_sv_hit, (unsigned long long)s_bt_sv_miss);
+#endif
     if (rsx_get_backend() == &s_vulkan_backend) rsx_set_backend(NULL);
     if (s_vk.eng_active) { rsx_draw_engine_shutdown(); s_vk.eng_active = 0; }
     rsx_draw_engine_set_backend(NULL);

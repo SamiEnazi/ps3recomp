@@ -36,8 +36,8 @@
  *    targets, pipeline, viewport, scissor, stencil, bias, textures and the
  *    fragment constants). Those entry points only store what they are given,
  *    and nothing else writes that state but pipeline_release and the draw's
- *    own save/restore; so every other call, and the end of every drain (the
- *    frame loop may touch the backend), forgets what was sent
+ *    own save/restore; so every other call but the releases, and the end of
+ *    every drain (the frame loop may touch the backend), forgets what was sent
  *    (PS3RECOMP_VK_BT_DEDUP=0: send everything).
  *  - At the end of every FIFO drain the ring is drained (g_rsx_drain_end_hook),
  *    so the present path, the window pump and the overlay -- which touch the
@@ -162,21 +162,23 @@ static void bt_vbuf_prefetch(void* u, u32 vbuf) { (void)u; (void)vbuf; }
 
 /* ---- queued calls ----------------------------------------------------------- */
 typedef struct { u32 h; } bt_a_u32;
-#define BT_RELEASE(name)                                                                     \
+/* A release changes no bound state (the next bind sets the same handles it
+ * would have set), except pipeline_release, which unbinds a bound pipeline. */
+#define BT_RELEASE(name, forget)                                                                     \
     static void bt_x_##name(const u8* p) { BT_A(bt_a_u32, p); s_bt_real.name(s_bt_real.user, a->h); } \
     static void bt_##name(void* u, u32 h)                                                    \
     {                                                                                        \
         (void)u;                                                                             \
-        bt_sv_forget(h); bt_forget();                                                        \
+        bt_sv_forget(h); if (forget) bt_forget();                                                   \
         bt_a_u32* a = (bt_a_u32*)bt_rec(bt_x_##name, sizeof *a);                             \
         if (!a) { s_bt_real.name(s_bt_real.user, h); return; }                               \
         a->h = h; bt_commit(a);                                                              \
     }
-BT_RELEASE(texture_release)
-BT_RELEASE(color_target_release)
-BT_RELEASE(depth_target_release)
-BT_RELEASE(vbuf_release)
-BT_RELEASE(pipeline_release)
+BT_RELEASE(texture_release, 0)
+BT_RELEASE(color_target_release, 0)
+BT_RELEASE(depth_target_release, 0)
+BT_RELEASE(vbuf_release, 0)
+BT_RELEASE(pipeline_release, 1)
 #undef BT_RELEASE
 
 static void bt_x_bind_pipeline(const u8* p) { BT_A(bt_a_u32, p); s_bt_real.bind_pipeline(s_bt_real.user, a->h); }
