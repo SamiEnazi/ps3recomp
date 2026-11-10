@@ -24,6 +24,15 @@ computes -- only the order and number of tests change.
                     the same bit (see header_preamble).
   PPU_VM_RUNS_LOADS=1  ppu_nv_dirty's access runs for loads (see _RUNS_C);
                     PPU_VM_RUNS_VERIFY=1 = the check build of it.
+  PPU_ST_PMAP=1     (ppu-mem; needs PPU_MM) a store takes the fast path on one byte of a
+                    page map (g_ppu_st_pmap: in range, no line of the page ever reserved),
+                    else the PPU_MM store path as before (see _mm_block).
+  PPU_MOVBE=1       (ppu-mem; needs PPU_MM) the PPU_MM fast paths' guest accesses as one
+                    volatile access of their width, no alignment split (MOVBE on x86).
+  PPU_TOC_FOLD=1    (ppu-mem; needs PPU_ST_PMAP) loads of the TOC entries (r2 + d) are the
+                    entry's value from the ELF, while the runtime vouches for it per entry
+                    (g_ppu_toc_dirty: checked against guest memory at start, set by any
+                    store into the TOC); else the load (see toc_setup).
 
 Two run-time switches for a title's own code (cheats agent, 2026-11-09), each read from a
 file of title knowledge kept with the title, not here (both unset = the lift as before):
@@ -195,13 +204,292 @@ static inline int vm_mm_resv(const ppu_mm* m, uint32_t ea)
 """
 
 
+# PPU_ST_PMAP / PPU_MOVBE / PPU_TOC_FOLD (ppu-mem, 2026-11-10): the PPU_MM accessors.
+#
+# PPU_ST_PMAP. A guest store's fast path used to be a range compare, the reservation bit
+# of its line (shift, load, bt), the store, the compiler fence and the bit again: ~20
+# instructions, five loads. Now one byte per 4 KB guest page (g_ppu_st_pmap, 1 MiB,
+# runtime/spu/spu_coherency.c) says "fast" (== 1) only for a page inside the inline range
+# (0x10000 .. the end of the mapping, minus one page so no fast store can run past it, all
+# of it 0 while a memory diagnostic is armed) none of whose lines was ever reserved. The
+# store reads that byte, stores, fences, reads it again: if it is no longer 1 the page got
+# its first reserved line meanwhile and the out-of-line ppu_store_pm_recheck re-checks the
+# line's bit and notifies, as vm_mm_after would have. Any other byte value takes the old
+# PPU_MM path (range, bit, store, fence, bit), unchanged.
+# Why it is the same protocol: coh_mark_line sets the page's "reserved" bit (2) BEFORE the
+# line's bitmap bit and both before its process-wide barrier (FlushProcessWriteBuffers), and
+# neither is ever cleared. So a page byte of 1 means no line of the page was reserved when
+# it was read (bit set => page byte set), and the re-read after the store has the same
+# property the bitmap re-check had: if it still reads 1, it ran before the barrier reached
+# this thread, so the store did too and the marking SPU/PPU sees it in its snapshot; if it
+# reads != 1, the re-check of the line's bit (set before the barrier as well) decides the
+# notify exactly as before. The page map is filled once (runtime ppu_run, before any guest
+# code) by compare-and-swap from 0, so a mark that came first is never overwritten.
+#
+# PPU_MOVBE. The fast paths read and write guest memory with one volatile access of the
+# access width through an alignment-1 type: x86 performs it as a single instruction
+# (MOVBE for the byte-swapped ones) -- single-copy atomic when aligned, as on Cell, which is
+# all the aligned __atomic form gave -- and the aligned/unaligned split (a test per access)
+# goes away. Volatile also keeps the compiler from merging, splitting, eliding or hoisting
+# the access out of a loop, the reason they were atomics.
+_MM_ACC_START = "static inline uint8_t vm_read8_mm(const ppu_mm* m, uint64_t a)\n{\n"
+_MM_ACC_END = "    (vm_write64)(a, v);\n}\n"
+_MM_ACC_NEED = ("vm_read16_mm(", "vm_read32_mm(", "vm_read64_mm(", "#define VM_MM_ST(", "vm_write8_mm(",
+                "vm_write16_mm(", "vm_write32_mm(", "vm_write64_mm(", "ea != m->poll", "vm_mm_st_ok(m, ea, ",
+                "vm_mm_after(m, ea, ")
+_TOC: dict = {}     # toc_setup: base, lo, hi, image (bytes of [lo, hi)), fold switch
+
+
+def _mm_block(movbe: bool, pmap: bool, toc: bool) -> str:
+    L = []
+    W = {8: "uint8_t", 16: "uint16_t", 32: "uint32_t", 64: "uint64_t"}
+    if movbe:
+        L.append("/* PPU_MOVBE (ppu-mem): one volatile access of the width, alignment 1 (see ppu_fastpath.py) */")
+        for w in (16, 32, 64):
+            L.append("typedef uint%d_t __attribute__((aligned(1))) ppu_u%du;" % (w, w))
+        L.append("#define VM_MM_ST(T, m, ea, val) do { typedef T __attribute__((aligned(1))) _ppu_stu; "
+                 "*(volatile _ppu_stu*)((m)->vb + (uint32_t)(ea)) = (val); } while (0)")
+    else:
+        L.append("#define VM_MM_ST(T, m, ea, val) do { uint8_t* _p = (m)->vb + (uint32_t)(ea); T _v = (val); \\\n"
+                 "    if (!((uintptr_t)_p & (sizeof(T) - 1))) __atomic_store_n((T*)_p, _v, __ATOMIC_RELAXED); \\\n"
+                 "    else memcpy(_p, &_v, sizeof(T)); } while (0)")
+    for w in (8, 16, 32, 64):
+        T, n = W[w], w // 8
+        poll = " && __builtin_expect(ea != m->poll, 1)" if w == 32 else ""
+        L.append("static inline %s vm_read%d_mm(const ppu_mm* m, uint64_t a)\n{\n    const uint32_t ea = (uint32_t)a;" % (T, w))
+        if movbe:
+            acc = ("*(volatile const uint8_t*)(m->vb + ea)" if w == 8 else
+                   "__builtin_bswap%d(*(volatile const ppu_u%du*)(m->vb + ea))" % (w, w))
+            L.append("    if (__builtin_expect(vm_mm_in(m, ea, %d), 1)%s) return %s;" % (n, poll, acc))
+        elif w == 8:
+            L.append("    if (__builtin_expect(vm_mm_in(m, ea, 1), 1)) return __atomic_load_n(m->vb + ea, __ATOMIC_RELAXED);")
+        else:
+            L.append("    if (__builtin_expect(vm_mm_in(m, ea, %d), 1)%s) {   /* aligned: single-copy atomic, as on Cell */" % (n, poll))
+            L.append("        %s v;" % T)
+            L.append("        if (!(ea & %du)) v = __atomic_load_n((const %s*)(m->vb + ea), __ATOMIC_RELAXED);" % (n - 1, T))
+            L.append("        else memcpy(&v, m->vb + ea, %d);" % n)
+            L.append("        return __builtin_bswap%d(v); }" % w)
+        L.append("    return (vm_read%d)(a);   /* the out-of-line accessor, not the macro */\n}" % w)
+    if pmap:
+        L.append("/* PPU_ST_PMAP (ppu-mem): one byte per 4 KB guest page, 1 = the store fast path (see ppu_fastpath.py) */")
+        L.append("#ifdef __cplusplus\nextern \"C\" {\n#endif")
+        L.append("extern unsigned char g_ppu_st_pmap[1u << 20];")
+        L.append("void ppu_store_pm_recheck(uint32_t ea, uint32_t n);")
+        if toc:
+            L.append("void ppu_toc_write_hit(uint32_t ea, uint32_t n);")
+        L.append("#ifdef __cplusplus\n}\n#endif")
+        L.append("static inline int vm_pm_fast(uint32_t ea)\n{\n"
+                 "    return __atomic_load_n(&g_ppu_st_pmap[ea >> 12], __ATOMIC_RELAXED) == 1u;\n}")
+        if toc:   # a store that may touch a folded TOC entry says so first (its page is never fast)
+            L.append("#define PPU_PM_WATCH(ea, n) do { if (__builtin_expect((uint32_t)(ea) - (PPU_TOC_LO - (n) + 1u) < "
+                     "(PPU_TOC_HI - PPU_TOC_LO + (n) - 1u), 0)) ppu_toc_write_hit((uint32_t)(ea), (n)); } while (0)")
+        else:
+            L.append("#define PPU_PM_WATCH(ea, n) ((void)0)")
+    for w in (8, 16, 32, 64):
+        T, n = W[w], w // 8
+        v = "v" if w == 8 else "__builtin_bswap%d(v)" % w
+        st = ("__atomic_store_n(m->vb + ea, v, __ATOMIC_RELAXED)" if (w == 8 and not movbe) else
+              "VM_MM_ST(%s, m, ea, %s)" % (T, v))
+        L.append("static inline void vm_write%d_mm(const ppu_mm* m, uint64_t a, %s v)\n{\n    const uint32_t ea = (uint32_t)a;" % (w, T))
+        if pmap:
+            L.append("    if (__builtin_expect(vm_pm_fast(ea), 1)) {")
+            L.append("        %s;" % st)
+            L.append("        __atomic_signal_fence(__ATOMIC_SEQ_CST);   /* store, then re-check: see spu_coh_reserve */")
+            L.append("        if (__builtin_expect(!vm_pm_fast(ea), 0)) ppu_store_pm_recheck(ea, %d);" % n)
+            L.append("        return; }")
+            L.append("    PPU_PM_WATCH(ea, %du);" % n)
+        L.append("    if (vm_mm_st_ok(m, ea, %d)) { %s; vm_mm_after(m, ea, %d); return; }" % (n, st, n))
+        L.append("    (vm_write%d)(a, v);   /* the out-of-line accessor, not the macro */\n}" % w)
+    return "\n".join(L) + "\n"
+
+
+def _toc_header() -> str:
+    t = _TOC
+    return ("/* PPU_TOC_FOLD (ppu-mem): the TOC entries' values from the ELF, while g_ppu_toc_ok[k] (one byte per\n"
+            " * 4-byte entry: set at start where memory matches the lift, cleared by any store into the entry)\n"
+            " * says so -- see ppu_fastpath.py */\n"
+            "#define PPU_TOC_BASE 0x%08Xull\n#define PPU_TOC_LO 0x%08Xu\n#define PPU_TOC_HI 0x%08Xu\n"
+            "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+            "extern unsigned char g_ppu_toc_ok[];\n"
+            "int ppu_toc_fold_register(uint32_t lo, uint32_t n, const unsigned char* image, uint64_t toc);\n"
+            "#ifdef __cplusplus\n}\n#endif\n"
+            "#define PPU_TOC_OK(k) (__atomic_load_n(&g_ppu_toc_ok[k], __ATOMIC_RELAXED) != 0)\n"
+            "#define PPU_TOC_LD32(r, d, k, val) (((r) == PPU_TOC_BASE && PPU_TOC_OK(k)) ? (uint32_t)(val) : vm_read32((r) + (d)))\n"
+            "#define PPU_TOC_LD64(r, d, k, val) (((r) == PPU_TOC_BASE && PPU_TOC_OK(k) && PPU_TOC_OK((k) + 1)) ? "
+            "(uint64_t)(val) : vm_read64((r) + (d)))\n" % (t["base"], t["lo"], t["hi"]))
+
+
 def header_preamble(text: str) -> str:
     """The lifted code's header (ppu_recomp.h) with the switched-on rewrites."""
     if _on("PPU_ST_LEAN"):
         if _RESV_OLD not in text:
             raise RuntimeError("PPU_ST_LEAN needs PPU_MM=1 (or the lifter's vm_mm_resv changed; update ppu_fastpath.py)")
         text = text.replace(_RESV_OLD, _RESV_NEW)
+    movbe, pmap, toc = _on("PPU_MOVBE"), _on("PPU_ST_PMAP"), _toc_on()
+    if movbe or pmap:
+        i = text.find(_MM_ACC_START)
+        j = text.find(_MM_ACC_END, i) if i >= 0 else -1
+        if i < 0 or j < 0 or not all(s in text[i:j] for s in _MM_ACC_NEED):
+            raise RuntimeError("PPU_ST_PMAP / PPU_MOVBE need PPU_MM=1 (or the lifter's PPU_MM accessors changed; "
+                               "update ppu_fastpath.py)")
+        text = text[:i] + (_toc_header() if toc else "") + _mm_block(movbe, pmap, toc) + text[j + len(_MM_ACC_END):]
     return text
+
+
+# PPU_TOC_FOLD: what is proven at lift time (toc_setup) and what the runtime guards.
+#  - The module has one TOC (the lifter's toc_base) and the ELF's .toc section sits at
+#    toc_base - 0x8000 (the ABI's convention); only 4/8-byte loads of r2 + d that land inside
+#    that section, aligned, are folded, and only while r2 == toc_base (compared per load).
+#  - No instruction of the EBOOT can write the TOC or hand its address on: no store has r2
+#    as its base or index, no instruction other than a load computes a register other than r2
+#    from r2 (an `addi rX, r2, d` would be the address of an entry), r2's value is stored only
+#    to the stack (`std r2, N(r1)`, the ABI's TOC save), and no word of the loaded image (code,
+#    data, the TOC itself) holds an address inside the TOC. Any exception found turns the
+#    folding off for the lift (and says which). inFAMOUS 2 v1.04: none in 1.89M lifted
+#    instructions; 87,309 32-bit and 131 64-bit TOC loads folded.
+#  - At run time every entry starts "dirty" (fold off) until ppu_run compared guest memory
+#    with the lifted image (patches applied to the ELF image, e.g. from RPCS3's patch.yml,
+#    keep their entries dirty); the TOC's pages are never on the store fast path, and every
+#    lifted store into [lo, hi) and the runtime's out-of-line stores mark the entries they
+#    touch dirty before they store. A memory diagnostic armed (vm_inline_ok 0) keeps them all
+#    dirty, so the diagnostics see every TOC read.
+_RE_TOC_LD = re.compile(r"\bvm_read(32|64)\((r2|ctx->gpr\[2\]) \+ (-?(?:0x[0-9A-Fa-f]+|\d+))\)")
+_TOC_LOADS = {"lbz", "lhz", "lha", "lwz", "lwa", "ld", "lfs", "lfd", "lbzx", "lhzx", "lhax", "lwzx", "lwax", "ldx",
+              "lfsx", "lfdx", "lwarx", "ldarx", "lvx", "lvxl", "lvlx", "lvrx", "lwbrx", "lhbrx", "ldbrx"}
+_GPR_FIRST_STORES = {"stb", "sth", "stw", "std", "stbu", "sthu", "stwu", "stdu", "stbx", "sthx", "stwx", "stdx",
+                     "stbux", "sthux", "stwux", "stdux", "stmw", "stswi", "stswx", "stwcx.", "stdcx.", "stwbrx",
+                     "sthbrx", "stdbrx"}
+
+
+def _toc_on() -> bool:
+    return _on("PPU_TOC_FOLD") and bool(_TOC.get("fold"))
+
+
+def toc_setup(toc_base: int, elf_path: str, insns, bounds=None) -> None:
+    """PPU_TOC_FOLD: find the TOC section, prove the EBOOT never writes it (see above), keep its bytes.
+    `insns`: the decoded executable segments; `bounds`: the lifted functions' [start, end) -- only
+    their instructions run as lifted code (literal pools and data in the segment are skipped)."""
+    _TOC.clear()
+    if not _on("PPU_TOC_FOLD"):
+        return
+    if not (_on("PPU_ST_PMAP") and _on("PPU_MM")):
+        raise RuntimeError("PPU_TOC_FOLD needs PPU_ST_PMAP=1 and PPU_MM=1 (its stores' watch is the page map)")
+    import struct
+    if not toc_base:
+        print("  PPU_TOC_FOLD: no single TOC -> off")
+        return
+    b = open(elf_path, "rb").read()
+    if b[:4] != b"\x7fELF" or b[4] != 2 or b[5] != 2:
+        print("  PPU_TOC_FOLD: not a big-endian ELF64 -> off")
+        return
+    shoff, = struct.unpack_from(">Q", b, 0x28)
+    shentsize, shnum = struct.unpack_from(">HH", b, 0x3A)
+    lo = hi = None
+    for i in range(shnum):
+        _nm, ty, fl, addr, off, sz = struct.unpack_from(">IIQQQQ", b, shoff + i * shentsize)
+        if ty == 1 and (fl & 2) and addr == toc_base - 0x8000 and 0 < sz <= 0x10000:   # PROGBITS, ALLOC
+            lo, hi, data = addr, addr + sz, b[off:off + sz]
+            break
+    if lo is None:
+        print(f"  PPU_TOC_FOLD: no section at TOC-0x8000 (0x{toc_base - 0x8000:X}) -> off")
+        return
+    bad = []
+    if bounds:
+        import bisect
+        bs = []
+        for s, e in sorted(bounds):          # merged: ranges nest (tail entries) and touch
+            if bs and s <= bs[-1][1]:
+                bs[-1][1] = max(bs[-1][1], e)
+            else:
+                bs.append([s, e])
+        starts = [s for s, _e in bs]
+
+        def lifted(a):
+            k = bisect.bisect_right(starts, a) - 1
+            return k >= 0 and a < bs[k][1]
+        insns = [i for i in insns if lifted(i.addr)]
+    for ins in insns:
+        ops = [t.strip() for t in re.split(r"[,()]", ins.operands or "") if t.strip()]
+        if "r2" not in ops:
+            continue
+        mn = ins.mnemonic
+        if mn.startswith("lf") or mn.startswith("stf") or mn.startswith("lv") or mn.startswith("stv"):
+            ops = ops[1:]          # the first operand is an FPR / VR (printed as rN): not r2
+            if "r2" not in ops:
+                continue
+            if mn.startswith("l"):
+                continue           # r2 as a load's base or index
+            bad.append(ins)        # an FP/vector store with r2 as base or index
+            continue
+        if mn in _TOC_LOADS:
+            continue               # r2 as base/index of a load, or as its target
+        if mn in _GPR_FIRST_STORES or mn.startswith("st"):
+            if ops[0] == "r2" and "r2" not in ops[1:] and ops[-1] == "r1" and mn in ("std", "stw"):
+                continue           # the TOC save on the stack
+            bad.append(ins)
+            continue
+        if mn.startswith("mt"):
+            bad.append(ins)        # r2 into CTR / LR / an SPR
+            continue
+        if mn in ("dcbz", "dcbt", "dcbtst", "dcbf", "dcbst", "icbi", "dcba"):
+            if mn == "dcbz":
+                bad.append(ins)
+            continue
+        if mn.startswith("cmp") or mn in ("tw", "td", "twi", "tdi"):
+            continue               # compares and traps read r2 and write no GPR
+        if ops[0] == "r2":
+            continue               # an instruction computing r2 itself (crt0's li/oris/ori r2)
+        bad.append(ins)            # r2 flows into another register (or CTR/LR, or memory)
+    # No word of the loaded image (code, read-only data, data, the TOC itself) holds an address
+    # inside the TOC: no static pointer to an entry exists for code to store through.
+    phoff, = struct.unpack_from(">Q", b, 0x20)
+    phentsize, phnum = struct.unpack_from(">HH", b, 0x36)
+    into = []
+    for i in range(phnum):
+        pt, _pf, off, va, _pa, fsz, _msz, _al = struct.unpack_from(">IIQQQQQQ", b, phoff + i * phentsize)
+        if pt != 1 or not fsz:
+            continue
+        seg = b[off:off + fsz]
+        for k in range((-va) & 3, len(seg) - 3, 4):
+            w = int.from_bytes(seg[k:k + 4], "big")
+            if lo <= w < hi:
+                into.append(va + k)
+    if bad or into:
+        print(f"  PPU_TOC_FOLD: off -- {len(bad)} instruction(s) could write or leak the TOC "
+              f"({', '.join('%08X %s %s' % (i.addr, i.mnemonic, i.operands) for i in bad[:6])}), "
+              f"{len(into)} word(s) of the image point into it ({', '.join('%08X' % a for a in into[:6])})")
+        return
+    _TOC.update(base=toc_base, lo=lo, hi=hi, image=data, fold=True)
+    print(f"  PPU_TOC_FOLD: TOC 0x{toc_base:08X}, entries 0x{lo:08X}..0x{hi:08X} ({len(data)} bytes); "
+          f"no store or address computation off r2 in {len(insns)} instructions")
+
+
+def _toc_sub(m) -> str:
+    t = _TOC
+    w, reg, d = int(m.group(1)), m.group(2), int(m.group(3), 0)
+    a = (t["base"] + d) & 0xFFFFFFFF
+    n = w // 8
+    if a % n or a < t["lo"] or a + n > t["hi"]:
+        return m.group(0)
+    k = (a - t["lo"]) >> 2
+    v = int.from_bytes(t["image"][a - t["lo"]:a - t["lo"] + n], "big")
+    STATS["toc%d" % w] = STATS.get("toc%d" % w, 0) + 1
+    return ("PPU_TOC_LD32(%s, %s, %d, 0x%08Xu)" if w == 32 else "PPU_TOC_LD64(%s, %s, %d, 0x%016Xull)") % (reg, m.group(3), k, v)
+
+
+def trailer_lines() -> list:
+    """Lines for the end of the last chunk: the TOC image PPU_TOC_FOLD lifted against."""
+    if not _toc_on():
+        return []
+    t, img = _TOC, _TOC["image"]
+    out = ["", "/* PPU_TOC_FOLD: the TOC bytes the folded loads assume; ppu_run compares them with guest memory */",
+           "static const unsigned char s_ppu_toc_image[%d] = {" % len(img)]
+    for k in range(0, len(img), 32):
+        out.append("    " + ",".join("0x%02X" % c for c in img[k:k + 32]) + ",")
+    out.append("};")
+    out.append("static const int s_ppu_toc_reg = ppu_toc_fold_register(0x%08Xu, %du, s_ppu_toc_image, PPU_TOC_BASE);"
+               % (t["lo"], len(img)))
+    return out
 
 
 def source_preamble(text: str) -> str:
@@ -464,6 +752,8 @@ def rewrite_body(lines: list) -> list:
     if _patches():   # the instruction slots this chunk lifted: the runtime can tell they exist
         slots = sorted({int(s) for ln in lines if "g_ppu_patch[" in ln for s in _RE_PATCH_SLOT.findall(ln)})
         lines = lines + ["static const int s_ppu_patch_reg_%d = ppu_patch_register(%d);" % (s, s) for s in slots]
+    if _toc_on():   # PPU_TOC_FOLD: TOC entry loads -> the entry's value while the runtime vouches for it
+        lines = [_RE_TOC_LD.sub(_toc_sub, ln) if "vm_read" in ln and "2" in ln else ln for ln in lines]
     if not _on("PPU_VMX_SSE"):
         return lines
     out = []

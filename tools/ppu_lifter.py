@@ -4498,7 +4498,8 @@ class PPULifter:
         lines = self._preamble_lines()
         for func in emit_funcs:
             lines += self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
-        lines += self._table_lines()
+        import ppu_fastpath   # PPU_TOC_FOLD's image registration (ppu-mem): [] when off
+        lines += self._table_lines() + ppu_fastpath.trailer_lines()
         return "\n".join(lines)
 
     def write_source_files(self, out_dir: str, base: str = "ppu_recomp",
@@ -4545,7 +4546,11 @@ class PPULifter:
             cur_len += len(deflines)
 
         # Final chunk carries the function table.
-        flush(cur, self._table_lines())
+        import ppu_fastpath   # PPU_TOC_FOLD's image registration (ppu-mem): [] when off
+        flush(cur, self._table_lines() + ppu_fastpath.trailer_lines())
+        fs = {k: v for k, v in ppu_fastpath.STATS.items() if k.startswith("toc")}
+        if fs:
+            print("  PPU_TOC_FOLD: folded loads " + ", ".join("%s %d" % kv for kv in sorted(fs.items())), flush=True)
         return written
 
 
@@ -5715,6 +5720,10 @@ def main() -> None:
         print(f"  Generated {total_mid} mid-function tail-entry wrappers total")
 
     os.makedirs(args.output, exist_ok=True)
+
+    import ppu_fastpath   # PPU_TOC_FOLD (ppu-mem): the TOC proof + image, before the header and chunks
+    ppu_fastpath.toc_setup(0 if args.raw else getattr(lifter, "toc_base", 0), args.input, all_insns,
+                           [(f.start_addr, f.end_addr) for f in lifter.functions])
 
     header_path = os.path.join(args.output, args.header_name)
     with open(header_path, "w") as f:
