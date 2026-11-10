@@ -233,6 +233,35 @@ static struct { int v; char pad[60]; } __attribute__((aligned(64))) s_coh_armed_
 int* const           g_spu_coh_armed  = &s_coh_armed_line.v;
 unsigned char* const g_spu_coh_bitmap = s_coh_bitmap;
 
+/* The lifted code's store page map (PPU_ST_PMAP, ppu-mem 2026-11-10; tools/ppu_fastpath.py):
+ * one byte per 4 KB guest page. 1 = the store fast path (filled once by spu_coh_pmap_init,
+ * by CAS from 0); bit 1 (2) = a line of the page has been reserved, set by coh_mark_line
+ * before the line's bit and before its barrier, never cleared; 4 = a page the TOC folding
+ * watches. Anything but exactly 1 sends a store down the old path (range, line bit, store,
+ * re-check). All zero until the fill, so before it every store is careful. */
+__attribute__((aligned(64))) unsigned char g_ppu_st_pmap[1u << 20];
+
+void spu_coh_pmap_init(uint32_t lo, uint32_t hi, uint32_t wlo, uint32_t whi)
+{
+    /* fast: pages wholly at or above lo whose last byte + 7 is still below hi (no fast
+     * store of up to 8 bytes can run past the inline range) */
+    const uint32_t p0 = (uint32_t)(((uint64_t)lo + 4095u) >> 12);
+    const uint32_t p1 = hi > 4096u + 7u ? (hi - 7u) >> 12 : 0u;
+    uint32_t nfast = 0, nwatch = 0, nresv = 0;
+    for (uint32_t p = p0; p < p1; p++) {
+        const uint64_t a = (uint64_t)p << 12;
+        const int watched = whi > wlo && a < whi && a + 4096u > wlo;
+        unsigned char z = 0;
+        if (__atomic_compare_exchange_n(&g_ppu_st_pmap[p], &z, (unsigned char)(watched ? 4u : 1u), 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
+            watched ? nwatch++ : nfast++;
+        else
+            nresv++;                       /* a reservation got there first: stays careful */
+    }
+    fprintf(stderr, "[ppu-mem] store page map: %u fast pages (0x%08X..0x%08X), %u watched, %u reserved first\n",
+            nfast, p0 << 12, p1 << 12, nwatch, nresv);
+}
+
 /* The SPU contexts that have reserved a line. (limits, 2026-11-09) Was 8, and
  * inFAMOUS 2 runs 7 SPU contexts at once (the SPURS group's 5 + two one-SPU
  * groups): one more -- a transient job context -- and the 9th "will not
@@ -330,6 +359,12 @@ static void coh_mark_line(uint32_t ea)
         (__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_ACQUIRE) & bit) &&
         __atomic_load_n(&s_coh_armed, __ATOMIC_ACQUIRE))
         return;
+    /* PPU_ST_PMAP: the page's "reserved line" bit first -- the lifted store fast path reads
+     * only that byte, so it has to be set before the barrier below like the line's bit. A
+     * marked line has its page marked (this runs before every first bit), so the early
+     * return above is right for it too. */
+    { unsigned char* pm = &g_ppu_st_pmap[ea >> 12];
+      if (!(__atomic_load_n(pm, __ATOMIC_ACQUIRE) & 2u)) __atomic_fetch_or(pm, (unsigned char)2u, __ATOMIC_SEQ_CST); }
     const unsigned char was = __atomic_fetch_or(&s_coh_bitmap[line >> 3], bit, __ATOMIC_SEQ_CST);
     __atomic_store_n(&s_coh_armed, 1, __ATOMIC_SEQ_CST);
     if (!(was & bit)) spu_process_barrier();

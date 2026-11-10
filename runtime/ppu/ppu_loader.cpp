@@ -1108,8 +1108,11 @@ extern "C" void ppu_resv_line_note(uint64_t ea)
     t_resv_noted = 1;
 }
 
+/* PPU_TOC_FOLD (ppu-mem): the runtime's guest stores clear a folded TOC entry first (below). */
+static inline void ppu_toc_note_write(uint32_t ea, uint32_t n);
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 {
+    ppu_toc_note_write((uint32_t)ea, 4);
     uint32_t exp_raw = __builtin_bswap32(expected);
     uint32_t new_raw = __builtin_bswap32(val);
     if (resv_off())
@@ -1204,6 +1207,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 }
 extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
 {
+    ppu_toc_note_write((uint32_t)ea, 8);
     uint64_t exp_raw = __builtin_bswap64(expected);
     uint64_t new_raw = __builtin_bswap64(val);
     if (resv_off())
@@ -1748,6 +1752,7 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
         const uint32_t _ca = (uint32_t)(a);                                  \
+        ppu_toc_note_write(_ca, (uint32_t)(n));   /* PPU_TOC_FOLD: first */  \
         if (spu_coh_is_reserved(_ca)) {                                        \
             const uint64_t _llm = spu_lockline_mask_range(_ca, (uint32_t)(n)); \
             spu_lockline_lock_mask(_llm);                                     \
@@ -2209,6 +2214,223 @@ extern "C" void ppu_store_coh_notify(uint32_t ea, uint32_t n)
     spu_lockline_unlock_mask(m);
 }
 
+/* PPU_ST_PMAP (ppu-mem, 2026-11-10; tools/ppu_fastpath.py): a fast-path store's page got its
+ * first reserved line between the store's two reads of the page byte. The line's own bit
+ * decides, as the re-check of vm_mm_after would have (bit alone: PPU_ST_LEAN's reasoning). */
+extern "C" unsigned char* const g_spu_coh_bitmap;
+extern "C" void ppu_store_pm_recheck(uint32_t ea, uint32_t n)
+{
+    const uint32_t line = ea >> 7;
+    if ((__atomic_load_n(&g_spu_coh_bitmap[line >> 3], __ATOMIC_SEQ_CST) >> (line & 7)) & 1u)
+        ppu_store_coh_notify(ea, n);
+}
+
+/* PPU_TOC_FOLD (ppu-mem, 2026-11-10; tools/ppu_fastpath.py): a lift folds its TOC entry loads
+ * to the values the ELF holds, each guarded by g_ppu_toc_ok[k] (one byte per 4-byte entry).
+ * All 0 (= load from memory) until ppu_run compared guest memory with the lifted image entry
+ * by entry (ppu_mem_fast_init); any store that may touch an entry clears its byte FIRST --
+ * the lifted stores in the careful path (the TOC's pages are never fast), the out-of-line
+ * accessors, the store-conditionals and the natives -- so a folded load either ran before
+ * that store or reads memory. PS3_TOC_FOLD=0 at run time: every entry stays 0. */
+#define PPU_TOC_MAX_ENTRIES 16384u                 /* a 64 KB TOC window */
+extern "C" { unsigned char g_ppu_toc_ok[PPU_TOC_MAX_ENTRIES]; }
+static uint32_t s_toc_lo = 0, s_toc_n = 0;         /* registered range, bytes */
+static const unsigned char* s_toc_img = nullptr;
+static uint64_t s_toc_base = 0;
+extern "C" int ppu_toc_fold_register(uint32_t lo, uint32_t n, const unsigned char* image, uint64_t toc)
+{
+    if (!n || (n & 3u) || n / 4u > PPU_TOC_MAX_ENTRIES || s_toc_n) return 0;   /* one image, in bounds */
+    s_toc_img = image; s_toc_base = toc;
+    s_toc_lo = lo;
+    __atomic_store_n(&s_toc_n, n, __ATOMIC_SEQ_CST);
+    return 1;
+}
+extern "C" void ppu_toc_write_hit(uint32_t ea, uint32_t n)
+{
+    const uint32_t lo = s_toc_lo, tn = __atomic_load_n(&s_toc_n, __ATOMIC_ACQUIRE);
+    if (!tn || !n) return;
+    const uint64_t a0 = ea, a1 = (uint64_t)ea + n;
+    if (a1 <= lo || a0 >= (uint64_t)lo + tn) return;
+    const uint32_t k0 = a0 > lo ? (uint32_t)(a0 - lo) >> 2 : 0u;
+    const uint32_t k1 = (uint32_t)(((a1 < (uint64_t)lo + tn ? a1 : (uint64_t)lo + tn) - lo + 3u) >> 2);
+    int was = 0;
+    for (uint32_t k = k0; k < k1; k++)
+        was |= __atomic_exchange_n(&g_ppu_toc_ok[k], (unsigned char)0, __ATOMIC_SEQ_CST);
+    static std::atomic<int> said{0};
+    if (was && said.fetch_add(1, std::memory_order_relaxed) < 8)
+        fprintf(stderr, "[ppu-mem] TOC entry 0x%08X (+%u) written: its folded loads read memory from now on\n", ea, n);
+}
+/* The runtime's own guest stores (out-of-line accessors, store-conditionals, natives). */
+static inline void ppu_toc_note_write(uint32_t ea, uint32_t n)
+{
+    if (__builtin_expect(ea - (s_toc_lo - n + 1u) < s_toc_n + n - 1u, 0)) ppu_toc_write_hit(ea, n);
+}
+
+/* Both, before any guest code runs (ppu_run). */
+extern "C" void spu_coh_pmap_init(uint32_t lo, uint32_t hi, uint32_t wlo, uint32_t whi);
+extern "C" uint32_t ppu_hle_inject_base;
+static void ppu_mem_fast_init(void)
+{
+    static int done = 0;
+    if (done++) return;
+    const uint32_t hi = (ppu_vm_size != 0 && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;
+    const uint32_t tlo = s_toc_lo, tn = __atomic_load_n(&s_toc_n, __ATOMIC_ACQUIRE);
+    if (tn) {
+        const char* e = getenv("PS3_TOC_FOLD");
+        const uint32_t poll = ppu_hle_inject_base + 0x2008u;
+        if (e && e[0] == '0')
+            fprintf(stderr, "[ppu-mem] TOC folding off (PS3_TOC_FOLD=0)\n");
+        else if (!vm_inline_ok)
+            fprintf(stderr, "[ppu-mem] TOC folding off: a memory diagnostic is armed\n");
+        else if (!vm_base || tlo < 0x10000u || (uint64_t)tlo + tn > hi || (poll + 4u > tlo && poll < tlo + tn))
+            fprintf(stderr, "[ppu-mem] TOC folding off: 0x%08X+%u is outside the inline range or holds the "
+                            "gcm poll word 0x%08X\n", tlo, tn, poll);
+        else {
+            uint32_t ok = 0, diff = 0;
+            for (uint32_t k = 0; k < tn / 4u; k++) {
+                if (memcmp(vm_base + tlo + 4u * k, s_toc_img + 4u * k, 4) == 0) {
+                    __atomic_store_n(&g_ppu_toc_ok[k], (unsigned char)1, __ATOMIC_RELAXED);
+                    ok++;
+                } else if (diff++ < 8) {
+                    uint32_t m, l; memcpy(&m, vm_base + tlo + 4u * k, 4); memcpy(&l, s_toc_img + 4u * k, 4);
+                    fprintf(stderr, "[ppu-mem] TOC entry 0x%08X differs from the lift (0x%08X, lifted 0x%08X): "
+                                    "read from memory\n", tlo + 4u * k, __builtin_bswap32(m), __builtin_bswap32(l));
+                }
+            }
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            fprintf(stderr, "[ppu-mem] TOC 0x%08llX: %u entries folded, %u read from memory\n",
+                    (unsigned long long)s_toc_base, ok, diff);
+        }
+    }
+    const char* p = getenv("PS3_ST_PMAP");
+    if (p && p[0] == '0')
+        fprintf(stderr, "[ppu-mem] store page map off (PS3_ST_PMAP=0): every store takes the careful path\n");
+    else if (vm_inline_ok)
+        spu_coh_pmap_init(0x10000u, hi, tn ? tlo : 0u, tn ? tlo + tn : 0u);
+}
+
+/* The guest address space reservation, with the hot parts in large pages (PS3_LARGE_PAGES;
+ * ppu-mem, 2026-11-10). ~30% of the main thread's lifted samples sit right after a guest
+ * load: the game's own pointer chasing over a heap far larger than the 4 KB-page TLB reach
+ * (2048 entries = 8 MB). 2 MB pages cover the ELF, the main stack and the sys_memory heap
+ * with a few hundred entries. Windows gives large pages only to an account holding "Lock
+ * pages in memory" (SeLockMemoryPrivilege: secpol.msc > Local Policies > User Rights
+ * Assignment, add the user, log off and on), only committed and locked at allocation, and
+ * only at 2 MB-aligned addresses -- so the 4 GB window is laid out piece by piece: the
+ * large ranges committed up front, the rest reserved as before (committed on first touch
+ * by the host's handler). Anything missing -- the switch, the privilege, enough contiguous
+ * physical memory, the address range -- gives the plain reservation, as before.
+ *   PS3_LARGE_PAGES=1                 the ELF + data (0..16 MB), the main stack's 4 MB below
+ *                                     0x10000000 and the first 224 MB of the heap (0x40000000)
+ *   PS3_LARGE_PAGES=lo-hi[,lo-hi...]  hex guest ranges (rounded out to 2 MB)
+ * Pages in these ranges cannot be write-protected one by one, so PS3RECOMP_WTRACK falls back
+ * to hashing for resources there (rsx_wt_arm reports them unprotected). Off (unset/0) = the
+ * old reservation. */
+#ifdef _WIN32
+static int ppu_lock_memory_privilege(void)
+{
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return 0;
+    TOKEN_PRIVILEGES tp = {};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    int ok = LookupPrivilegeValueA(nullptr, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid) &&
+             AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
+    CloseHandle(tok);
+    return ok;
+}
+static uint8_t* ppu_vm_reserve_large(uint64_t size, const char* spec)
+{
+    const uint64_t lp = GetLargePageMinimum();
+    if (!lp || (lp & (lp - 1))) { fprintf(stderr, "[ppu-mem] large pages: not supported here\n"); return nullptr; }
+    if (!ppu_lock_memory_privilege()) {
+        fprintf(stderr, "[ppu-mem] large pages: this account lacks \"Lock pages in memory\" (SeLockMemoryPrivilege) "
+                        "-- 4 KB pages\n");
+        return nullptr;
+    }
+    enum { MAXR = 16 };
+    uint64_t lo[MAXR], hi[MAXR]; int n = 0;
+    if (!strcmp(spec, "1")) {
+        lo[0] = 0x00000000ull; hi[0] = 0x01000000ull;
+        lo[1] = 0x0FC00000ull; hi[1] = 0x10000000ull;
+        lo[2] = 0x40000000ull; hi[2] = 0x4E000000ull;
+        n = 3;
+    } else {
+        for (const char* s = spec; *s && n < MAXR; ) {
+            char* q; const uint64_t a = strtoull(s, &q, 16);
+            if (*q != '-') break;
+            const uint64_t b = strtoull(q + 1, &q, 16);
+            if (b > a) { lo[n] = a; hi[n] = b; n++; }
+            s = *q == ',' ? q + 1 : q;
+            if (*q != ',') break;
+        }
+    }
+    /* rounded out to large pages, sorted, merged, inside the window */
+    for (int i = 0; i < n; i++) { lo[i] &= ~(lp - 1); hi[i] = (hi[i] + lp - 1) & ~(lp - 1); if (hi[i] > size) hi[i] = size & ~(lp - 1); }
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++)
+        if (lo[j] < lo[i]) { uint64_t t = lo[i]; lo[i] = lo[j]; lo[j] = t; t = hi[i]; hi[i] = hi[j]; hi[j] = t; }
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (hi[i] <= lo[i]) continue;
+        if (m && lo[i] <= hi[m - 1]) { if (hi[i] > hi[m - 1]) hi[m - 1] = hi[i]; continue; }
+        lo[m] = lo[i]; hi[m] = hi[i]; m++;
+    }
+    if (!m) { fprintf(stderr, "[ppu-mem] large pages: no range in PS3_LARGE_PAGES=%s\n", spec); return nullptr; }
+    for (int attempt = 0; attempt < 4; attempt++) {
+        /* a free, large-page-aligned window of the size: find one, give it back, take it in pieces */
+        uint8_t* probe = (uint8_t*)VirtualAlloc(nullptr, (SIZE_T)(size + lp), MEM_RESERVE, PAGE_NOACCESS);
+        if (!probe) break;
+        uint8_t* base = (uint8_t*)(((uintptr_t)probe + lp - 1) & ~(uintptr_t)(lp - 1));
+        VirtualFree(probe, 0, MEM_RELEASE);
+        void* got[2 * MAXR + 1]; int ng = 0, bad = 0;
+        uint64_t at = 0, big = 0;
+        for (int i = 0; i <= m && !bad; i++) {
+            const uint64_t a = i < m ? lo[i] : size;
+            if (a > at) {   /* the gap before: reserved, committed on demand as before */
+                void* r = VirtualAlloc(base + at, (SIZE_T)(a - at), MEM_RESERVE, PAGE_READWRITE);
+                if (r != base + at) { bad = 1; if (r) VirtualFree(r, 0, MEM_RELEASE); break; }
+                got[ng++] = r;
+            }
+            if (i == m) break;
+            void* r = VirtualAlloc(base + lo[i], (SIZE_T)(hi[i] - lo[i]), MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+                                   PAGE_READWRITE);
+            if (r != base + lo[i]) {
+                if (r) VirtualFree(r, 0, MEM_RELEASE);
+                fprintf(stderr, "[ppu-mem] large pages: 0x%08llX..0x%08llX not available (error %lu)\n",
+                        (unsigned long long)lo[i], (unsigned long long)hi[i], (unsigned long)GetLastError());
+                bad = 2; break;
+            }
+            got[ng++] = r; big += hi[i] - lo[i];
+            at = hi[i];
+        }
+        if (!bad) {
+            fprintf(stderr, "[ppu-mem] large pages: %llu MB of guest memory in %llu KB pages (%d range(s))\n",
+                    (unsigned long long)(big >> 20), (unsigned long long)(lp >> 10), m);
+            return base;
+        }
+        for (int k = 0; k < ng; k++) VirtualFree(got[k], 0, MEM_RELEASE);
+        if (bad == 2) break;   /* no physical memory for it: retrying will not help */
+    }
+    fprintf(stderr, "[ppu-mem] large pages: could not lay out the guest window -- 4 KB pages\n");
+    return nullptr;
+}
+#endif
+/* The host's guest-window reservation (the port's alloc_guest_vm): large pages when asked
+ * for and possible, else exactly the old VirtualAlloc(MEM_RESERVE). */
+extern "C" uint8_t* ppu_vm_reserve(uint64_t size)
+{
+#ifdef _WIN32
+    const char* e = getenv("PS3_LARGE_PAGES");
+    if (e && e[0] && strcmp(e, "0")) {
+        if (uint8_t* b = ppu_vm_reserve_large(size, e)) return b;
+    }
+    return (uint8_t*)VirtualAlloc(nullptr, (SIZE_T)size, MEM_RESERVE, PAGE_READWRITE);
+#else
+    (void)size;
+    return nullptr;
+#endif
+}
+
 /* See the note on the forward declaration above ppu_stwcx32. */
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
 {
@@ -2510,6 +2732,7 @@ extern "C" int ppu_native_memcpy(ppu_context* ctx)
         const uint32_t poll = ppu_hle_inject_base + 0x2008u;
         if (poll + 4 > s && poll < (uint64_t)s + n) return 0;
         if (ppu_native_resv(d, n)) return 0;
+        ppu_toc_note_write(d, (uint32_t)n);   /* PPU_TOC_FOLD: first */
         memcpy(vm_base + d, vm_base + s, (size_t)n);
         ppu_native_after(d, n);
     }
@@ -2524,6 +2747,7 @@ extern "C" int ppu_native_memset(ppu_context* ctx)
     if (!ppu_native_on() || n >= 0x80000000ull || (uint64_t)(uint32_t)ctx->gpr[3] != ctx->gpr[3]) return 0;
     if (n) {
         if (!ppu_native_span(d, n) || ppu_native_resv(d, n)) return 0;
+        ppu_toc_note_write(d, (uint32_t)n);   /* PPU_TOC_FOLD: first */
         memset(vm_base + d, (int)(uint8_t)ctx->gpr[4], (size_t)n);
         ppu_native_after(d, n);
     }
@@ -4474,6 +4698,9 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
      * function entered before the first out-of-line access (which used to
      * decide it) would keep the slow path for as long as it runs. */
     (void)vm_diag();
+    /* ...and with it the store page map and the TOC folding's check (PPU_ST_PMAP /
+     * PPU_TOC_FOLD lifts; ppu-mem), still before any guest code. */
+    ppu_mem_fast_init();
     /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
      * (stderr); with a redirected block-buffered stdout, printf lines sat in
      * the buffer for minutes and were LOST when the run was killed -- which
