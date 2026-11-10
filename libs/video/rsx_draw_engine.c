@@ -524,6 +524,27 @@ static struct {
     const rsx_fp_constant_block* fp_constants;
 } g;
 
+/* (rnd1) PS3RECOMP_ENG_DELTA (rsx_draw_delta.inc, included before sink_end):
+ * what the stages below report to it. s_dl_bump_rec: eng_surface_get_kq notes
+ * the target slots whose stamp it moved (the draw's target lookup replays them
+ * when it is reused); s_dl_zgen: a depth target was made or replaced;
+ * s_tex_volatile: the draw's textures came from a path whose result depends on
+ * what was drawn before (depth / colour copies, framebuffer fetch, the GPU light
+ * passes), so the next draw binds them again; s_dl_ev: an engine event that
+ * ends every reuse (clear, write-back, present). */
+static int s_dl_bump_rec;
+static u32 s_dl_bumps[8], s_dl_nbumps;
+static u32 s_dl_zgen;
+static int s_dl_surf_fail;   /* a target or depth lookup could not make its object (retried next draw) */
+static int s_tex_volatile;
+static u32 s_dl_ev;
+static inline void dl_note_bump(u32 slot)
+{
+    if (!s_dl_bump_rec) return;
+    if (s_dl_nbumps < 8u) s_dl_bumps[s_dl_nbumps++] = slot;
+    else s_dl_nbumps = 9u;   /* more than a replay holds: not reusable */
+}
+
 static void eng_apply_depth_bias(u32 zeta_offset, const rsx_be_render_state* rs)
 {
     if (!g.be->set_depth_bias) return;
@@ -654,6 +675,7 @@ static void* s_guest_user;
 
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user)
 {
+    s_dl_ev++;   /* (rnd1) PS3RECOMP_ENG_DELTA */
     s_guest_reader = reader;
     s_guest_user = user;
 }
@@ -1179,6 +1201,7 @@ static u32 eng_surface_get_kq(u32 location, u32 offset, u32 want_w, u32 want_h,
                 g.surfaces[i].h == want_h && g.surfaces[i].fmt == want_fmt &&
                 (g.surfaces[i].kq ? g.surfaces[i].kq : 4u) == want_kq) {
                 g.surfaces[i].stamp = ++s_surf_clock;
+                dl_note_bump(i);
                 return i;
             }
         }
@@ -1193,6 +1216,7 @@ static u32 eng_surface_get_kq(u32 location, u32 offset, u32 want_w, u32 want_h,
             g.surfaces[i].h == want_h && g.surfaces[i].fmt == want_fmt) {
             if ((g.surfaces[i].kq ? g.surfaces[i].kq : 4u) != want_kq) { reuse = i; break; }   /* PS3RECOMP_FX_RES changed */
             g.surfaces[i].stamp = ++s_surf_clock;
+            dl_note_bump(i);
             if (memo_on) memo[memo_i++ & 3u] = i;
             return i;
         }
@@ -1232,7 +1256,10 @@ static u32 eng_surface_get_kq(u32 location, u32 offset, u32 want_w, u32 want_h,
     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
                                                  eng_fxres_px(want_w, want_kq), eng_fxres_px(want_h, want_kq),
                                                  seed, seed_row);
-    if (!handle) return reuse != ENG_INVALID ? reuse : ENG_INVALID;   /* the old size rather than nothing */
+    if (!handle) {
+        s_dl_surf_fail = 1;   /* (rnd1) the next lookup tries again: not one to reuse */
+        return reuse != ENG_INVALID ? reuse : ENG_INVALID;   /* the old size rather than nothing */
+    }
 
     eng_surface* s = &g.surfaces[slot];
     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
@@ -1242,6 +1269,7 @@ static u32 eng_surface_get_kq(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->kq = (u8)want_kq;
     s->handle = handle;
     s->stamp = ++s_surf_clock;
+    dl_note_bump(slot);
     s->wb_stamp = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
     { static u32 logs = 0, cap = 0;
@@ -1359,8 +1387,10 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     }
 
     const u32 handle = g.be->depth_target_create(g.be->user, want_w, want_h);
-    if (!handle)
+    if (!handle) {
+        s_dl_surf_fail = 1;   /* (rnd1) the next lookup tries again: not one to reuse */
         return (!zevict && slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
+    }
 
     eng_zdepth* z = &g.zdepths[slot];
     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
@@ -1374,6 +1404,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
+    s_dl_zgen++;   /* (rnd1) PS3RECOMP_ENG_DELTA: the depth table changed */
     z->snapshot = 0;
     z->cleared = 0;
     z->had_write = 0;
@@ -3563,22 +3594,30 @@ static const eng_fp_memo* eng_fp_current(void)
  * microcode: answer from the first lookup of the draw. */
 static u32 s_draw_serial = 1;
 
+static u32 s_gp_serial;
+static const eng_vp_memo* s_gp_vp;
+static const eng_fp_memo* s_gp_fp;
 static int eng_guest_programs(const eng_vp_memo** out_vp, const eng_fp_memo** out_fp)
 {
-    static u32 serial;
-    static const eng_vp_memo* c_vp;
-    static const eng_fp_memo* c_fp;
-    if (serial != s_draw_serial) {
+    if (s_gp_serial != s_draw_serial) {
         eng_prog_stats_frame();             /* (rsx5) PS3RECOMP_ENG_PROG_STATS */
-        c_vp = eng_vp_current();
-        c_fp = c_vp ? eng_fp_current() : NULL;
-        serial = s_draw_serial;
+        s_gp_vp = eng_vp_current();
+        s_gp_fp = s_gp_vp ? eng_fp_current() : NULL;
+        s_gp_serial = s_draw_serial;
     }
-    const eng_vp_memo* vp = c_vp;
-    const eng_fp_memo* fp = c_fp;
+    const eng_vp_memo* vp = s_gp_vp;
+    const eng_fp_memo* fp = s_gp_fp;
     if (out_vp) *out_vp = vp;
     if (out_fp) *out_fp = fp;
     return vp && fp;
+}
+/* (rnd1) PS3RECOMP_ENG_DELTA: this draw's programs are the last draw's (the
+ * registers, the transform program and the fragment program's bytes are as
+ * they were): the lookups' answer for this draw without making them. */
+static void eng_guest_programs_carry(const eng_vp_memo* vp, const eng_fp_memo* fp)
+{
+    s_gp_vp = vp; s_gp_fp = fp;
+    s_gp_serial = s_draw_serial;
 }
 
 static u64 eng_current_fp_structural(void)
@@ -4799,6 +4838,12 @@ static int s_ic_want = -1, s_ic_applied = -2;
 static eng_ic_entry* s_ic_cur;
 static u64 s_ic_cur_content;
 static int s_ic_hit, s_ic_ranged;
+/* (rnd1) PS3RECOMP_ENG_DELTA: the index runs the last eng_ic_probe mapped (the
+ * first four) and, for a pair-memo hit, what dc_fetch found it with. */
+static const u8* s_icp_runs[4];
+static u32 s_icp_n;
+static eng_vc_entry* s_dl_pv;
+static u64 s_dl_psig;
 static void eng_ic_set(int id, int on) { (void)id; __atomic_store_n(&s_ic_want, on != 0, __ATOMIC_RELAXED); }
 static void eng_ic_drop(eng_ic_entry* e)
 {
@@ -4868,6 +4913,9 @@ static eng_ic_entry* eng_ic_probe(const rsx_dsp_index_array* ia, u32 ia_loc, int
         if (!count || start + bytes > 0x100000000ull) return NULL;
         if (!(runs[b] = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes))) return NULL;
     }
+    /* (rnd1) PS3RECOMP_ENG_DELTA: the runs, for the next draw's proof (dl_consts_ok) */
+    s_icp_n = dc.n_idx;
+    for (u32 b = 0; b < dc.n_idx && b < 4u; b++) s_icp_runs[b] = runs[b];
     if (!key) key = 1;
     u32 p = (u32)(key ^ (key >> 32)) & (ENG_IC_SIZE - 1u);
     eng_ic_entry* e = NULL;
@@ -5048,6 +5096,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
 {
     s_ic_cur = NULL; s_ic_hit = 0; s_ic_ranged = 0; dc.refs_lazy = 0;
     dc.consecutive = 0; dc.plan_stale = 0;
+    s_dl_pv = NULL; s_dl_psig = 0; s_icp_n = 0;   /* (rnd1) PS3RECOMP_ENG_DELTA */
     /* PS3RECOMP_ENG_ICACHE: an index-only draw whose rebuilt list is resident
      * and whose vertices the vertex cache holds skips the index work. */
     if (dc.n_idx && !dc.n_arr && !dc.inl && dc.fetch_ok && allow_remap && layout->stride &&
@@ -5084,6 +5133,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                     dc.vbuf = pv->vbuf; dc.vbuf_hit = 1; dc.n_verts = dc.n_refs;
                     e->last_frame = g.frames;
                     s_ic_hit = 1; ds_ic_hit++; ds_vc_hit++; ds_pair_hit++;
+                    s_dl_pv = pv; s_dl_psig = psig;   /* (rnd1) PS3RECOMP_ENG_DELTA */
                     if (eng_ds_enabled()) { ds.refs += dc.n_source_refs; ds.uniq += dc.n_refs; }
                     return;
                 }
@@ -5707,6 +5757,9 @@ static u32 eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs, u3
     if (!(rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_ENABLE) & 1u) || zslot == ENG_INVALID ||
         !__atomic_load_n(&s_dbounds_on, __ATOMIC_RELAXED))
         return tex_mask;
+    /* (rnd1) PS3RECOMP_ENG_DELTA: from here the answer depends on the depth
+     * buffer's state (a copy exists only once it was written since the clear) */
+    s_tex_volatile = 1;
     float mn, mx;
     { const u32 a = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MIN), b = rsx_dsp_reg(&g.rsx, M_DEPTH_BOUNDS_MAX);
       memcpy(&mn, &a, 4); memcpy(&mx, &b, 4); }
@@ -5757,6 +5810,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
 {
     u32 mask = 0;
     s_fbf.cand = 0; s_fbf.applied = 0;
+    s_tex_volatile = 0;   /* (rnd1) PS3RECOMP_ENG_DELTA: set below by every state-dependent path */
     const u32 fp_reads = eng_bind_unread() ? 0xFFFFu : eng_fp_tex_mask();
     const rsx_dsp_texture* units = eng_draw_textures();
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
@@ -5829,6 +5883,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
               for (u32 i = 0; i < g.n_zdepths; i++)
                   if (g.zdepths[i].handle && g.zdepths[i].location == t.location &&
                       g.zdepths[i].offset == t.offset && current_zslot != i) {
+                      s_tex_volatile = 1;
                       const u32 snap = eng_zdepth_snapshot_sized(i, t.width, t.height);
                       if (snap) textures[u] = snap;
                       break;
@@ -5850,6 +5905,9 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
           if (on && (cb == 0x85u || cb == 0x9Eu)) {
               for (u32 i = 0; i < g.n_zdepths; i++) {
                   const eng_zdepth* z = &g.zdepths[i];
+                  /* (rnd1) a depth buffer at this address: had_write and the
+                   * stamps move with every draw, so the answer may too */
+                  if (z->handle && z->location == t.location && z->offset == t.offset) s_tex_volatile = 1;
                   if (!z->handle || !z->had_write || z->location != t.location || z->offset != t.offset) continue;
                   int newest = 1;
                   for (u32 k = 0; k < g.n_surfaces && newest; k++)
@@ -5905,6 +5963,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          * bind a copy taken just before this draw instead of guest memory,
          * which never sees GPU-rendered pixels. */
         if (sampled < 0 && own_slot >= 0 && g.be->color_snapshot && (eng_fp_tex_mask() >> u & 1u)) {
+            s_tex_volatile = 1;   /* (rnd1) a copy of the target as it is now, or the attachment */
             /* PS3RECOMP_ENG_FBFETCH: read the attachment itself if the
              * program allows (decided with the pipeline; the copy is taken
              * after eng_pipeline_get otherwise -- eng_fbf_fallback). */
@@ -5961,6 +6020,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             for (u32 i = 0; i < g.n_zdepths; i++)
                 if (g.zdepths[i].location == t.location &&
                     g.zdepths[i].offset == t.offset && current_zslot != i) {
+                    s_tex_volatile = 1;   /* (rnd1) */
                     const u32 snap = eng_zdepth_snapshot_sized(i, t.width, t.height);
                     if (snap) textures[u] = snap;
                     break;
@@ -5973,6 +6033,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         if (base_fmt == 0x85u || base_fmt == 0x9Eu) {
             for (u32 i = 0; i < g.n_zdepths; i++)
                 if (g.zdepths[i].location == t.location && g.zdepths[i].offset == t.offset) {
+                    s_tex_volatile = 1;   /* (rnd1) */
                     const u32 snap = eng_zdepth_snapshot_rgba8_sized(i, t.width, t.height);
                     if (snap) {
                         const u32 view = g.be->surface_view
@@ -5987,12 +6048,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         /* CONTROL1's high word is the remap override the two-channel 16-bit
          * formats read (rsx_texture_component_remap); it rides along in the
          * cache key like the crossbar itself. */
-        if ((textures[u] = eng_gpu_light_texture(&t)) != 0) continue;
-        if ((textures[u] = eng_gpu_ssao_texture(&t)) != 0) continue;
+        if ((textures[u] = eng_gpu_light_texture(&t)) != 0) { s_tex_volatile = 1; continue; }
+        if ((textures[u] = eng_gpu_ssao_texture(&t)) != 0) { s_tex_volatile = 1; continue; }
         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                        t.width, t.height, t.mipmaps, t.pitch,
                                        (int)t.cubemap, t.remap & 0x1FFFFu,
                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+        if (!textures[u]) s_tex_volatile = 1;   /* (rnd1) a failed texture may be made at the next bind */
         /* PS3_MODS_DUMP: the effects draws' textures (fx_textures.txt). */
         if (__builtin_expect(s_mods.dump_dir[0] != 0, 0) && textures[u] && n_targets &&
             eng_fxres_listed(g.surfaces[target_slots[0]].offset, g.surfaces[target_slots[0]].w,
@@ -6086,12 +6148,19 @@ static u64 s_hud_fp[8];
 static int s_hud_n = -1, s_hud_after;
 static u32 s_hud_frame = ~0u, s_hud_slice, s_hud_seen;
 
-static void sink_end(void* user, const rsx_dispatch* r)
+#include "rsx_draw_delta.inc"   /* (rnd1) PS3RECOMP_ENG_DELTA */
+
+static void sink_end_body(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
     if (!g.ready) return;
     if (++s_draw_serial == 0) s_draw_serial = 1;
     const u32 prim = g.rsx.current_primitive;
+    /* (rnd1) PS3RECOMP_ENG_DELTA: the parts of the previous draw's work that
+     * still hold for this one (dl_use), or, verifying, which to compare (dl_chk) */
+    u32 dl_chk = 0;
+    const int dl = s_dl_on > 0;
+    const u32 dl_use = dl ? dl_begin(prim, &dl_chk) : 0u;
     if (!dc.n_packets) { eng_drop("no_packets", prim); return; }
 
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
@@ -6113,9 +6182,20 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
     rsx_vertex_layout_plan layout;
     const u64 ds_tl = eng_ds_enabled() ? eng_ds_now() : 0;
-    eng_vertex_layout(&layout);
+    if (dl_use & DL_PROG) dl_prog_restore(&layout);
+    else {
+        eng_vertex_layout(&layout);
+        if (dl) dl_prog_note(&layout, (dl_chk & DL_PROG) != 0);
+    }
     if (ds_tl) ds.ns_layout += eng_ds_now() - ds_tl;
-    dc_fetch(&layout, rebuild);
+    if (dl_use & DL_CONSTS) dl_consts_take();
+    else {
+        dl_cpred dl_pred;
+        if (dl_chk & DL_CONSTS) dl_consts_predict(&dl_pred);
+        dc_fetch(&layout, rebuild);
+        if (dl_chk & DL_CONSTS) dl_consts_check(&dl_pred);
+        if (dl) dl_consts_note(prim);
+    }
     /* (rsx5, PS3RECOMP_ENG_PREFETCH) the backend's entries for the resident
      * buffers this draw will name, while the rest of the draw is prepared */
     if (g.be->vbuf_prefetch && eng_prefetch_on()) {
@@ -6155,21 +6235,36 @@ static void sink_end(void* user, const rsx_dispatch* r)
     }
 
     rsx_be_render_state rs;
-    rsx_draw_engine_decode_render_state(&g.rsx, &rs);
+    if (dl_use & DL_RS) rs = s_dl.rs;
+    else {
+        rsx_draw_engine_decode_render_state(&g.rsx, &rs);
+        if (dl) dl_rs_note(&rs, (dl_chk & DL_RS) != 0);
+    }
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
-    const u32 n_targets = eng_current_target_set(targets);
+    u32 n_targets;
+    if (dl_use & DL_SURF) n_targets = dl_surf_take(targets);
+    else {
+        s_dl_bump_rec = dl; s_dl_nbumps = 0; s_dl_surf_fail = 0;
+        n_targets = eng_current_target_set(targets);
+        s_dl_bump_rec = 0;
+    }
     if (!n_targets) { eng_drop("no_targets", prim); return; }
     const u32 target = targets[0];
 
     rsx_dsp_surface sf;
     rsx_dsp_viewport vp;
-    rsx_dsp_get_surface(&g.rsx, &sf);
-    rsx_dsp_get_viewport(&g.rsx, &vp);
-    /* PS3RECOMP_FX_RES: a scaled target's depth attachment is that much larger. */
-    const u32 tkq = g.surfaces[target].kq > 4u ? g.surfaces[target].kq : 4u;
-    const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
-                                     eng_fxres_px(sf.clip_w, tkq), eng_fxres_px(sf.clip_h, tkq));
+    u32 tkq, zslot;
+    if (dl_use & DL_SURF) { sf = s_dl.sf; vp = s_dl.vpt; tkq = s_dl.tkq; zslot = s_dl.zslot; }
+    else {
+        rsx_dsp_get_surface(&g.rsx, &sf);
+        rsx_dsp_get_viewport(&g.rsx, &vp);
+        /* PS3RECOMP_FX_RES: a scaled target's depth attachment is that much larger. */
+        tkq = g.surfaces[target].kq > 4u ? g.surfaces[target].kq : 4u;
+        zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
+                               eng_fxres_px(sf.clip_w, tkq), eng_fxres_px(sf.clip_h, tkq));
+        if (dl) dl_surf_note(targets, n_targets, &sf, &vp, tkq, zslot, (dl_chk & DL_SURF) != 0);
+    }
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */
@@ -6177,14 +6272,20 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES];
     u32 vtextures[RSX_BE_MAX_VERTEX_TEXTURES];
     rsx_be_sampler_desc vsamplers[RSX_BE_MAX_VERTEX_TEXTURES];
-    memset(textures, 0, sizeof textures);
-    memset(samplers, 0, sizeof samplers);
-    memset(vtextures, 0, sizeof vtextures);
-    memset(vsamplers, 0, sizeof vsamplers);
+    if (!(dl_use & DL_TEX)) {   /* (rnd1) taken whole from the last draw otherwise */
+        memset(textures, 0, sizeof textures);
+        memset(samplers, 0, sizeof samplers);
+        memset(vtextures, 0, sizeof vtextures);
+        memset(vsamplers, 0, sizeof vsamplers);
+    }
     DS_MARK(ns_bind);   /* render state, targets, zeta: counted with binds */
-    u32 tex_mask = sink_bind_textures(targets, n_targets, zslot,
+    u32 tex_mask;
+    if (dl_use & DL_TEX) dl_tex_take(textures, samplers, &tex_mask);
+    else {
+        tex_mask = sink_bind_textures(targets, n_targets, zslot,
                                       textures, samplers);
-    tex_mask = eng_depth_bounds_prepare(zslot, &rs, target, dc.n_verts, tex_mask, textures, samplers);
+        tex_mask = eng_depth_bounds_prepare(zslot, &rs, target, dc.n_verts, tex_mask, textures, samplers);
+    }
     /* PS3RECOMP_ENG_TEXSTATE=1: for a full-screen draw (<= 4 vertices) into
      * a 1280-wide target, every enabled unit's raw state and the backend
      * handle it resolved to, once per fragment program -- which buffer a
@@ -6221,8 +6322,18 @@ static void sink_end(void* user, const rsx_dispatch* r)
           const u64 fk = eng_guest_programs(NULL, &fpm) && fpm ? fpm->structural : 0;
           for (int k = 0; k < nskip; k++) if (fk && skipfp[k] == fk) return; } }
 
-    const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
-                                                    vsamplers);
+    u32 vtex_mask;
+    if (dl_use & DL_TEX) {
+        memcpy(vtextures, s_dl.vtextures, sizeof vtextures);
+        memcpy(vsamplers, s_dl.vsamplers, sizeof vsamplers);
+        vtex_mask = s_dl.vtex_mask;
+    } else {
+        const u32 vreq = eng_vtex_mask();
+        vtex_mask = sink_bind_vertex_textures(vreq, vtextures,
+                                              vsamplers);
+        if (dl) dl_tex_note(textures, samplers, tex_mask, vtextures, vsamplers, vtex_mask,
+                            vtex_mask == vreq, (dl_chk & DL_TEX) != 0);
+    }
 
     /* A guest program pair that will not translate has no fallback: the draw
      * is dropped, as the reference engine drops it. Substituting the built-in
@@ -6230,9 +6341,16 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * see than a missing object and hides the translation failure. */
     DS_MARK(ns_tex);
     int pipeline_is_fixed = 1;
-    const u32 pipeline = eng_pipeline_get(&layout, &rs,
-                                          eng_surface_format(sf.color_format),
-                                          n_targets, &pipeline_is_fixed);
+    u32 pipeline;
+    if (dl_use & DL_PIPE) {
+        pipeline = s_dl.pipeline; pipeline_is_fixed = s_dl.pipe_fixed;
+        s_fbf.applied = s_dl.fbf_applied; g.fp_constants = s_dl.fp_constants;
+    } else {
+        pipeline = eng_pipeline_get(&layout, &rs,
+                                    eng_surface_format(sf.color_format),
+                                    n_targets, &pipeline_is_fixed);
+        if (dl) dl_pipe_note(pipeline, pipeline_is_fixed, (dl_chk & DL_PIPE) != 0);
+    }
     if (!pipeline) { eng_drop("pipeline", prim); return; }
     eng_fbf_fallback(textures);   /* PS3RECOMP_ENG_FBFETCH */
     DS_MARK(ns_pipe);
@@ -6911,12 +7029,27 @@ static void sink_end(void* user, const rsx_dispatch* r)
           if (on < 0) on = getenv("PS3RECOMP_ENG_RESOLVE_LOG") ? 1 : 0;
           if (on) g.zdepths[zslot].writer_fp = eng_current_fp_structural(); }
     }
+    if (dl) dl_end();   /* (rnd1) completed: its parts are the next draw's to take */
+}
+
+/* (rnd1) PS3RECOMP_ENG_DELTA's counters: the time a draw takes on this thread. */
+static void sink_end(void* user, const rsx_dispatch* r)
+{
+    if (__builtin_expect(s_dl_stats != 0, 0)) {
+        const u64 t0 = dl_tsc();
+        sink_end_body(user, r);
+        s_dlc.ticks += dl_tsc() - t0;
+        s_dlc.timed++;
+        return;
+    }
+    sink_end_body(user, r);
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 {
     (void)user; (void)r;
     if (!g.ready) return;
+    s_dl_ev++;   /* (rnd1) PS3RECOMP_ENG_DELTA: the next draw goes the whole way */
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
     if (!n_targets) return;
@@ -7095,6 +7228,8 @@ static u64 eng_ds_now(void);
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    s_dl_ev++;   /* (rnd1) PS3RECOMP_ENG_DELTA */
+    dl_frame_report();
     /* (rsx5) PS3RECOMP_LIMITS: this frame's uses */
     rsx_lim_use(RSX_LIM_DROPS, s_drops_frame); s_drops_frame = 0;
     rsx_lim_use(RSX_LIM_TEXCACHE, s_tex_ws); s_tex_ws = 0;
@@ -7353,6 +7488,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     /* (rsx5) PS3RECOMP_DSP_SEEN=1: count rsx_dispatch.seen[] again (nothing on
      * this path reads it; see rsx_dispatch.h no_seen). */
     { const char* e = getenv("PS3RECOMP_DSP_SEEN"); g.rsx.no_seen = !(e && *e == '1'); }
+    dl_init();   /* (rnd1) PS3RECOMP_ENG_DELTA: the dirty bitmap of this instance, the group map */
     s_vpgen_memo = NULL;   /* PS3RECOMP_ENG_VP_GEN: vp_gen starts over */
     /* The game's post effects the PC menu turns off (ENG_DOF_BLEND_FP). */
     ps3_setting_register("PS3RECOMP_DOF", eng_fx_dof_apply);
@@ -7386,6 +7522,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
 void rsx_draw_engine_shutdown(void)
 {
     if (!g.be) return;
+    dl_frame_report_ex(1);   /* (rnd1) PS3RECOMP_ENG_DELTA: the last counters */
     if (g.ready && g.be->submit_and_wait)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
     for (u32 i = 0; i < g.n_textures; i++)
@@ -7474,6 +7611,7 @@ int rsx_draw_engine_write_back(int local, u32 offset, u32 pitch)
 int rsx_draw_engine_write_back_to(int local, u32 offset, u32 pitch, int dst_local, u32 dst_offset)
 {
     s_gl_wb_skipped = 0;
+    s_dl_ev++;   /* (rnd1) PS3RECOMP_ENG_DELTA: targets put back, light copies taken */
     if (!g.ready || !g.be->readback || !g.be->submit_and_wait) return 0;
     if (eng_gpu_light_blit(local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN, offset, pitch,
                            dst_local, dst_offset)) { s_gl_wb_skipped = 1; return 0; }

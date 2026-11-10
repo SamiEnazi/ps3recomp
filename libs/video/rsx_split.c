@@ -388,8 +388,12 @@ static void sp_exec(const u8* p, rsx_dispatch* e)
         const sp_state* r = (const sp_state*)p;
         const sp_blk* b = (const sp_blk*)(r + 1);
         u8* base = (u8*)e->regs;
-        for (u32 i = 0; i < r->n; i++)
-            memcpy(base + (size_t)b[i].id * RSX_DSP_BLK_BYTES, b[i].b, RSX_DSP_BLK_BYTES);
+        u64* const d = e->dirty;   /* (rnd1) PS3RECOMP_ENG_DELTA: the engine's instance tracks them too */
+        for (u32 i = 0; i < r->n; i++) {
+            const u32 id = b[i].id;
+            memcpy(base + (size_t)id * RSX_DSP_BLK_BYTES, b[i].b, RSX_DSP_BLK_BYTES);
+            if (d) { d[id >> 6] |= 1ull << (id & 63u); d[RSX_DSP_DIRTY_WORDS] |= 1ull << (id >> 6); }
+        }
         break; }
     case SP_EVENT: {
         const sp_event_rec* r = (const sp_event_rec*)p;
@@ -509,6 +513,10 @@ static void sp_give(void)
 {
     rsx_dispatch* e = rsx_draw_engine_dsp();
     sp_copy_state(e, s_sp.a);
+    if (e->dirty) {   /* (rnd1) PS3RECOMP_ENG_DELTA: every block may have changed */
+        for (u32 w = 0; w < RSX_DSP_DIRTY_WORDS; w++) e->dirty[w] = ~0ull;
+        e->dirty[RSX_DSP_DIRTY_WORDS] = (1ull << RSX_DSP_DIRTY_WORDS) - 1u;
+    }
     g_rsx_dsp_tex_gen = s_sp.tgen + 1u;
     g_rsx_dsp_misc_gen = s_sp.mgen + 1u;
     s_sp.owner = 0;
