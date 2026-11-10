@@ -1969,7 +1969,7 @@ void cellGcm_fifo_kick_wait(unsigned ms)
     static int spin_us = -1; static LONGLONG spin_ticks;
     if (spin_us < 0) {
         const char* e = getenv("PS3RECOMP_GCM_SPIN_US");
-        int v = e ? atoi(e) : 0;
+        int v = e ? atoi(e) : 300;   /* (m16) default 300 us: +12% at the dock in the nt-* A/B of 2026-11-10; 0 = off */
         if (v < 0) v = 0;
         if (v > 4000) v = 4000;
         LARGE_INTEGER f; QueryPerformanceFrequency(&f);
