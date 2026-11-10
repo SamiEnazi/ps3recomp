@@ -778,8 +778,53 @@ void ps3_sampler_start(void)
     CreateThread(NULL, 0, samp_thread, (LPVOID)(uintptr_t)ms, 0, NULL);
     fprintf(stderr, "[samp] sampling every %u ms\n", ms);
 }
+/* (limits) PS3_STALL_MS: what the guest MAIN thread is doing on the host right
+ * now -- the lifted function its RIP is in and the first lifted functions
+ * found on its host stack (return addresses), plus the HLE call it is inside.
+ * The thread is suspended only for the register read and an 8 KB stack copy
+ * (no allocation, no lock while it is stopped). */
+static HANDLE s_main_host_thread;
+extern "C" const char* g_hle_inflight[];
+extern "C" int ppu_stall_host_where(char* buf, int size)
+{
+    if (!s_main_host_thread || size < 64) return 0;
+    samp_build_map();                       /* before suspending: it allocates */
+    static uint64_t stk[1024];
+    CONTEXT c; memset(&c, 0, sizeof c);
+    c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    SIZE_T got = 0;
+    if (SuspendThread(s_main_host_thread) == (DWORD)-1) return 0;
+    const BOOL ok = GetThreadContext(s_main_host_thread, &c);
+    if (ok) ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)c.Rsp, stk, sizeof stk, &got);
+    ResumeThread(s_main_host_thread);
+    if (!ok) return 0;
+    int k = snprintf(buf, (size_t)size, " main: hle=%s rip=", g_hle_inflight[1] ? g_hle_inflight[1] : "-");
+    const uint32_t g = samp_lookup((uintptr_t)c.Rip);
+    if (g) k += snprintf(buf + k, (size_t)(size - k), "func_%08X", g & 0x7FFFFFFFu);
+    else {
+        HMODULE m = 0; char nm[64] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)(uintptr_t)c.Rip, &m) && m) {
+            char path[MAX_PATH]; if (GetModuleFileNameA(m, path, sizeof path)) {
+                const char* b = strrchr(path, '\\'); snprintf(nm, sizeof nm, "%s", b ? b + 1 : path); }
+        }
+        k += snprintf(buf + k, (size_t)(size - k), "%s+%llX", nm, (unsigned long long)((uintptr_t)c.Rip - (uintptr_t)m));
+    }
+    k += snprintf(buf + k, (size_t)(size - k), " stack=");
+    uint32_t seen[4] = {0}; int ns = 0;
+    for (size_t i = 0; i < got / 8 && ns < 4 && k < size - 16; i++) {
+        const uint32_t f = samp_lookup((uintptr_t)stk[i]);
+        if (!f || f == g) continue;
+        int dup = 0; for (int j = 0; j < ns; j++) dup |= seen[j] == f;
+        if (dup) continue;
+        seen[ns++] = f;
+        k += snprintf(buf + k, (size_t)(size - k), "%sfunc_%08X", ns > 1 ? "<" : "", f & 0x7FFFFFFFu);
+    }
+    return k;
+}
 #else
 void ps3_sampler_start(void) {}
+extern "C" int ppu_stall_host_where(char* buf, int size) { (void)buf; (void)size; return 0; }
 #endif
 
 #endif
@@ -4587,6 +4632,11 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, stack_top);
     g_active_ctx = &ctx;
     ppu_resv_register(&ctx);   /* main/entry thread: join the reservation set too */
+#ifdef _WIN32
+    /* PS3_STALL_MS (ppu_stall_host_where): the guest main thread's host thread */
+    s_main_host_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                    FALSE, GetCurrentThreadId());
+#endif
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
     return 0;
