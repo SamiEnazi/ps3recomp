@@ -283,7 +283,8 @@ s32 cellSysutilCheckCallback(void)
  * no, pl, tr (es-es and es-419, Spanish of Spain and of Latin America, are
  * both es to the title: runtime/ppu/ppu_fs_lang.h picks the files); else the host's UI language (Windows: the user's UI LANGID;
  * elsewhere LC_ALL, LC_MESSAGES, LANG); else English (US), the old fixed
- * answer. A title only switches if its data carries that language. */
+ * answer. PS3_LANG=auto (or system) is the same as unset: the in-game menu's
+ * "Automatic" writes it. A title only switches if its data carries that language. */
 static int sysutil_ieq(const char* a, const char* b)
 {
     for (; *a && *b; a++, b++) {
@@ -374,10 +375,12 @@ static void sysutil_host_language(char* out, size_t n)
 #endif
 }
 
+/* What the title was told; -1 until it asked (read by the in-game menu). */
+static volatile s32 s_sysutil_lang = -1;
+
 static s32 sysutil_language(void)
 {
-    static s32 lang = -1;
-    if (lang >= 0) return lang;
+    if (s_sysutil_lang >= 0) return s_sysutil_lang;
     static const struct { const char* code; s32 id; } k[] = {
         {"ja", CELL_SYSUTIL_LANG_JAPANESE}, {"en", CELL_SYSUTIL_LANG_ENGLISH_US},
         {"en-us", CELL_SYSUTIL_LANG_ENGLISH_US}, {"fr", CELL_SYSUTIL_LANG_FRENCH},
@@ -392,10 +395,10 @@ static s32 sysutil_language(void)
         {"pl", CELL_SYSUTIL_LANG_POLISH}, {"pt-br", CELL_SYSUTIL_LANG_PORTUGUESE_BR},
         {"en-gb", CELL_SYSUTIL_LANG_ENGLISH_GB}, {"tr", CELL_SYSUTIL_LANG_TURKISH},
     };
-    lang = CELL_SYSUTIL_LANG_ENGLISH_US;
+    s32 lang = CELL_SYSUTIL_LANG_ENGLISH_US;
     const char* e = getenv("PS3_LANG");
     const char* from = "default";
-    if (e && *e) {
+    if (e && *e && !sysutil_ieq(e, "auto") && !sysutil_ieq(e, "system")) {
         char* end = NULL;
         long n = strtol(e, &end, 10);
         if (end && *end == '\0' && n >= 0 && n <= CELL_SYSUTIL_LANG_TURKISH) { lang = (s32)n; from = "PS3_LANG"; }
@@ -413,8 +416,15 @@ static s32 sysutil_language(void)
             if (sysutil_ieq(host, k[i].code)) { lang = k[i].id; from = "host"; break; }
     }
     printf("[cellSysutil] system language %d (%s)\n", (int)lang, from);
+    s_sysutil_lang = lang;
     return lang;
 }
+
+/* For the in-game menu (libs/video/vk_overlay.cpp): the PS3_LANG code that
+ * "Automatic" gives the title ("" = the host's language is none of the PS3's:
+ * English), and the CELL_SYSUTIL_LANG_* the title was told (-1 until it asked). */
+void ps3_sysutil_host_language(char* out, size_t n) { if (out && n) sysutil_host_language(out, n); }
+s32 ps3_sysutil_language_in_use(void) { return s_sysutil_lang; }
 
 s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 {
