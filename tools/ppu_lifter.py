@@ -1131,6 +1131,95 @@ def _nv_mod():
 _RE_CALL_DRAIN = re.compile(r"((\w*func_[0-9A-Fa-f]{8})\(ctx\);) DRAIN_TRAMPOLINE\(ctx\);")
 
 
+# Cross-function codegen (ppu-xfn, 2026-11-10). Lift-time switches, read in every worker;
+# unset or =0 = the old lift, byte for byte:
+#   PPU_XTAIL=1      a direct tail jump -- `b`/`bc` to another function, a body that runs off
+#                    its end into the next one, a jump-table arm outside the function -- is a
+#                    real tail call (clang musttail: one jmp, the host stack does not grow)
+#                    instead of the trampoline (g_trampoline_fn set, a return, and the caller's
+#                    drain loop making the call). The same call happens with the same ctx at
+#                    the same point: the drain runs right after the return, before anything
+#                    else. A function then returns with the trampoline set only if it has an
+#                    import stub or indirect call, or tail-calls one that may: PPU_DRAIN_ELIDE
+#                    drops the drain after every call to any other. PPU_XTAIL_VERIFY=1: each
+#                    dropped drain stays as a test that reports a pending trampoline (and runs it).
+#   PPU_XINLINE=1    a direct call to a small frameless leaf is lifted inline (see
+#                    PPULifter._xin_apply): no call, no entry snapshot, no register file
+#                    traffic for its arguments and results; the register locals pass then sees
+#                    one body. PPU_XINLINE_MAX=<n>: the largest leaf, in statements (default 48);
+#                    PPU_XINLINE_FEW=<n>: the largest for a leaf with at most 3 `bl` sites in the
+#                    whole image (default 160: little code growth).
+#   PPU_TLS_CONSTINIT=1  g_trampoline_fn redeclared constinit in the lifted source: clang-cl
+#                    then drops its TLS init guard (a load, a test and a cold call) from every
+#                    access -- each drain test, several per call (see _preamble_lines).
+def _xtail_on() -> bool:
+    return _env_on("PPU_XTAIL")
+
+
+def _xin_on() -> bool:
+    return _env_on("PPU_XINLINE")
+
+
+# A direct tail jump as the lifter spells it (and as PPU_XTAIL rewrites it at emit time).
+_RE_TRAMP_RET = re.compile(r"g_trampoline_fn = \(void\(\*\)\(void\*\)\)(\w*func_[0-9A-Fa-f]{8}); return;")
+# A direct call as `bl` lifts it, on a line of its own (the only call PPU_XINLINE inlines).
+_RE_XIN_CALL = re.compile(r"^    (ctx->lr = 0x[0-9A-F]{8};) (\w*func_([0-9A-F]{8}))\(ctx\); DRAIN_TRAMPOLINE\(ctx\);$")
+# What an inlined leaf may not contain: a call, syscall, import stub or indirect jump, LR,
+# a switch, the stack register r1 at all, a write to the TOC/thread registers (r2 r13; a
+# TOC-relative load is fine), any non-volatile register (r14-r31, f14-f31, v20-v31: a leaf
+# that names one is a save/restore routine or breaks the ABI), a callee-save snapshot,
+# undecoded words, a run-time patch or hook, a native body.
+_RE_XIN_BAD = re.compile(
+    r"ps3_hle_call|ps3_indirect_call|lv2_syscall|DRAIN_TRAMPOLINE|ctx->lr\b|\bswitch\b|"
+    r"indirect|icall|hle_call|syscall|trampoline|"   # any other spelling of the above
+    r"ctx->gpr\[1\]|&ctx->gpr\[(?:2|13)\]|ctx->gpr\[(?:2|13)\]\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)|"
+    r"\+\+ctx->gpr\[(?:2|13)\]|--ctx->gpr\[(?:2|13)\]|ctx->gpr\[(?:2|13)\](?:\+\+|--)|"
+    r"ctx->gpr\[(?:1[4-9]|2[0-9]|3[01])\]|ctx->fpr\[(?:1[4-9]|2[0-9]|3[01])\]|"
+    r"ctx->vr\[(?:2[0-9]|3[01])\]|_cs_|TODO|undecoded|non-code|g_ppu_patch|ppu_hook|ppu_native|"
+    r"ctx->cia|\w*func_[0-9A-Fa-f]{8}\(")
+_RE_XIN_LOC = re.compile(r"\bloc_([0-9A-Fa-f]{8})\b")
+_RE_XIN_RET = re.compile(r"\breturn;")
+_RE_XIN_SITE = re.compile(r"(\w*func_([0-9A-F]{8}))\(ctx\); DRAIN_TRAMPOLINE\(ctx\);")
+_RE_XIN_LABEL_ONLY = re.compile(r"^loc_[0-9A-Fa-f]{8}:$")
+_XIN_CACHE: dict = {}   # (prefix, address) -> the leaf's lifted lines, or None (per process)
+_XIN_EXCLUDED = None
+
+
+def _xin_excluded() -> set:
+    """Functions PPU_XINLINE never inlines: the ones with a cheat hook or a native body in
+    front (ppu_fastpath: PPU_HOOK_FILE / PPU_NATIVE_FILE), which a call has to go through."""
+    global _XIN_EXCLUDED
+    if _XIN_EXCLUDED is None:
+        import ppu_fastpath
+        _XIN_EXCLUDED = set(ppu_fastpath._hooks()) | set(ppu_fastpath._natives())
+    return _XIN_EXCLUDED
+
+
+def _xin_leaf(f, start: int, end: int, cap: int):
+    """f's lines if it is a leaf PPU_XINLINE may lift inline, else None: at most `cap`
+    statements, nothing _RE_XIN_BAD names, no way out but `return;` and direct tail jumps
+    (no fall-through into the next function), every goto and label its own."""
+    if f.fallthrough_to:
+        return None
+    n = 0
+    for ln in f.body_lines:
+        s = ln.strip()
+        if s and s != "/* nop */;" and not _RE_XIN_LABEL_ONLY.match(s):
+            n += 1
+    if n == 0 or n > cap:
+        return None
+    text = "\n".join(f.body_lines)
+    rest = _RE_TRAMP_RET.sub(" ", text)
+    if "g_trampoline_fn" in rest or _RE_XIN_BAD.search(rest):
+        return None
+    if re.search(r"\breturn\b(?!;)", rest) or re.search(r"\bgoto\b(?! loc_[0-9A-Fa-f]{8};)", rest):
+        return None
+    for m in _RE_XIN_LOC.finditer(text):
+        if not start <= int(m.group(1), 16) < end:
+            return None
+    return list(f.body_lines)
+
+
 # Max span (bytes) for a mid-function tail-entry / gap wrapper. A real interior
 # entry has a short tail to its function's end; a span larger than this means the
 # target landed in a mis-sized or rodata-misread region, where lifting to the far
@@ -1259,8 +1348,10 @@ class PPULifter:
         return ordered[lo:hi]
 
     def lift_function(self, instructions: list[Instruction],
-                      start: int, end: int) -> LiftedFunction:
-        """Lift a range of instructions into a C function."""
+                      start: int, end: int, raw: bool = False) -> LiftedFunction:
+        """Lift a range of instructions into a C function. raw=True (PPU_XINLINE): only
+        the per-instruction text, for a leaf about to be inlined -- not recorded, no
+        callee-save or register-locals pass."""
         func = LiftedFunction(
             name=f"{self.prefix}func_{start:08X}",
             start_addr=start,
@@ -1352,6 +1443,12 @@ class PPULifter:
         # are handled by the boundary-recovery prologue scan instead.
         if not _last_line_is_terminator(func.body_lines):
             func.fallthrough_to = end
+        if raw:
+            return func
+        # PPU_XINLINE=1: small frameless leaves called from here, lifted in place of the call
+        # (before the callee-save and register-locals passes, which then see one body).
+        if _xin_on() and getattr(self, "xin_bounds", None):
+            self._xin_apply(func)
 
         # Robust callee-saved-register preservation. The PPC ABI guarantees
         # r14-r31 survive a call; the callee saves them to its frame and restores
@@ -1546,6 +1643,128 @@ class PPULifter:
                                            stats=NV_STATS, live=live)
         if new is not None:
             func.body_lines = new
+
+    def _xin_apply(self, func) -> None:
+        """PPU_XINLINE=1: every `bl` to a small frameless leaf (_xin_body) becomes the
+        leaf's own lifted statements, in place:
+
+            ctx->lr = <return address>;          (kept: LR as the guest has it)
+            <the leaf's lines>                   labels renamed for this site,
+                                                 `return;` -> goto <end of site>,
+                                                 a tail jump -> call + drain + goto <end>
+            <end of site>: ;
+
+        The guest does the same thing either way: the leaf's instructions run on the same
+        registers and memory in the same order, and a tail jump in it, which the call's
+        drain used to run right after the leaf returned, is called at that same point
+        (ctx->lr still the return address). What goes is the host call around it: the
+        argument and result registers through the register file, the leaf's entry
+        snapshot of the memory gates, the call, the drain test. A leaf here names no
+        stack register, LR or non-volatile register and has no call of its own, so the
+        caller's callee-save and register-locals passes see nothing of it but plain
+        statements on volatile registers."""
+        out, site = [], 0
+        for line in func.body_lines:
+            m = _RE_XIN_CALL.match(line) if site < 0x3FFF else None
+            if m and m.group(2) == f"{self.prefix}func_{m.group(3)}":
+                tgt = int(m.group(3), 16)
+                body = None if func.start_addr <= tgt < func.end_addr else self._xin_body(tgt)
+                if body is not None:
+                    out += self._xin_expand(func, body, tgt, site, m.group(1))
+                    site += 1
+                    continue
+            out.append(line)
+        if site:
+            # every label of the sites once, every goto of the sites to one of them
+            labs = Counter(m.group(1) for ln in out for m in re.finditer(r"\b(loc_C[0-9A-F]{7}):", ln))
+            gos = {m.group(1) for ln in out for m in re.finditer(r"\bgoto (loc_C[0-9A-F]{7});", ln)}
+            if any(v != 1 for v in labs.values()) or gos - set(labs):
+                raise RuntimeError(f"PPU_XINLINE: {func.name}: the inlined sites' labels do not pair up")
+            func.body_lines = out
+
+    def _xin_body(self, tgt: int):
+        """The lifted lines of func_<tgt> (as lift_function writes them, before any pass)
+        if it is a leaf PPU_XINLINE lifts inline, else None. Cached: the lift of a range
+        is the same in every worker."""
+        key = (self.prefix, tgt)
+        if key in _XIN_CACHE:
+            return _XIN_CACHE[key]
+        res = None
+        end = self.xin_bounds.get(tgt)
+        cap = int(os.environ.get("PPU_XINLINE_MAX", "48") or "48")
+        if getattr(self, "xin_sites", {}).get(tgt, 0) <= 3:   # few call sites: little code growth
+            cap = max(cap, int(os.environ.get("PPU_XINLINE_FEW", "160") or "0"))
+        if (end and tgt < end and (end - tgt) // 4 <= cap + 16 and tgt not in self.hle_stub_nids
+                and f"{self.prefix}func_{tgt:08X}" not in _xin_excluded()):
+            insns = []
+            for va, d in getattr(self, "xin_segs", None) or []:
+                if va <= tgt < va + len(d):
+                    insns = disassemble_bytes(d[tgt - va:min(end - va, len(d))], tgt, self.xin_be)
+                    break
+            if insns:
+                saved = self._range_cache       # the caller's instruction index stays
+                try:
+                    f = self.lift_function(insns, tgt, end, raw=True)
+                finally:
+                    self._range_cache = saved
+                res = _xin_leaf(f, tgt, end, cap)
+        _XIN_CACHE[key] = res
+        return res
+
+    def xin_relift(self, all_insns) -> int:
+        """PPU_XINLINE, after the mid-function passes: the functions those passes made
+        (a `bl` into the middle of a listed range, a gap entry) were not known to the
+        workers, and most small leaves are such entries. Learn their extents (as emitted),
+        then lift again, the same way, every function with a direct call to one of them
+        that is an inlinable leaf, in its place in the list. Returns how many."""
+        funcs = self._emit_functions()
+        new_bounds = {}
+        for f in funcs:
+            if f.start_addr not in self.xin_bounds:
+                new_bounds[f.start_addr] = max(f.end_addr, new_bounds.get(f.start_addr, 0))
+        if not new_bounds:
+            return 0
+        self.xin_bounds.update(new_bounds)
+        for k in [k for k in _XIN_CACHE if k[0] == self.prefix and k[1] in new_bounds]:
+            del _XIN_CACHE[k]          # cached as "no such function" by the passes' own lifts
+        pos = {id(f): i for i, f in enumerate(self.functions)}
+        n = 0
+        for f in funcs:
+            tgts = {int(m.group(2), 16) for ln in f.body_lines if "DRAIN_TRAMPOLINE" in ln
+                    for m in _RE_XIN_SITE.finditer(ln)}
+            if not any(t in new_bounds and not f.start_addr <= t < f.end_addr and self._xin_body(t) is not None
+                       for t in tgts):
+                continue
+            new = self.lift_function(all_insns, f.start_addr, f.end_addr)
+            if self.functions[-1] is new:
+                self.functions.pop()
+            self.functions[pos[id(f)]] = new
+            n += 1
+        return n
+
+    def _xin_expand(self, func, body, tgt, site, lr_stmt) -> list:
+        """One inlined site (see _xin_apply). Its labels are loc_C<site:4><n:4>, n the
+        leaf instruction's index; loc_C<site>FFFF ends it -- outside the guest address
+        space, so they meet no label of the caller or of another site."""
+        base = 0xC0000000 | (site << 16)
+        end_lab = f"loc_{base | 0xFFFF:08X}"
+
+        def lab(m):
+            return f"loc_{base | (((int(m.group(1), 16) - tgt) >> 2) & 0xFFFF):08X}"
+
+        def tail(m):
+            t = int(m.group(1)[-8:], 16)
+            func.calls.append(t)
+            self.call_targets.add(t)
+            return f"{m.group(1)}(ctx); DRAIN_TRAMPOLINE(ctx); goto {end_lab};"
+
+        out = [f"    {lr_stmt}  /* PPU_XINLINE {self.prefix}func_{tgt:08X} */"]
+        for ln in body:
+            ln = _RE_XIN_LOC.sub(lab, ln)
+            ln = _RE_TRAMP_RET.sub(tail, ln)
+            out.append(_RE_XIN_RET.sub(f"goto {end_lab};", ln))
+        out.append(f"    {end_lab}: ;")
+        return out
 
     # ------------------------------------------------------------------ #
     # Per-instruction translation
@@ -4263,6 +4482,39 @@ class PPULifter:
             lines.append("#endif")
             lines.append("#endif")
             lines.append("")
+        if _xtail_on():
+            lines.append("/* PPU_XTAIL lift: a direct tail jump is a real tail call (one jmp; the host stack")
+            lines.append(" * does not grow) instead of the trampoline the caller's drain would run. */")
+            lines.append("#if !defined(__clang__)")
+            lines.append('#error "a PPU_XTAIL lift needs clang (musttail)"')
+            lines.append("#endif")
+            lines.append("#define PPU_TAIL(f) __attribute__((musttail)) return f(ctx)")
+            lines.append("")
+        if _env_on("PPU_TLS_CONSTINIT"):
+            # PPU_TLS_CONSTINIT=1: clang-cl guards every access to an extern thread-local
+            # (MSVC's on-demand TLS init: load + test __tls_guard, a call when clear), even a
+            # __declspec(thread) one -- in every drain test, several times per call. The
+            # trampoline pointer is constant-initialised (= nullptr, runtime/ppu/
+            # ppu_loader.cpp, itself constinit): saying so drops the guard. Same variable.
+            lines.append("/* PPU_TLS_CONSTINIT lift: the trampoline pointer is constant-initialised (no TLS guard) */")
+            lines.append("#if defined(__cplusplus) && defined(__cpp_constinit)")
+            lines.append('extern "C" constinit PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);')
+            lines.append("#endif")
+            lines.append("")
+        if _xtail_on() and _env_on("PPU_XTAIL_VERIFY"):
+            # PPU_XTAIL_VERIFY=1: every drain the elision drops stays as a test. A call that
+            # does come back with the trampoline set is reported (the first 60 times) and
+            # drained as before: the elision was wrong there.
+            lines.append("/* PPU_XTAIL_VERIFY lift: a dropped drain is a test that reports a pending trampoline */")
+            lines.append("static void ppu_drain_differs(unsigned callee, unsigned lr)")
+            lines.append("{")
+            lines.append("    static int said = 0;")
+            lines.append('    if (said < 60) { said++; fprintf(stderr, "[xtail-verify] func_%08X (call returning to %08X) '
+                         'came back with the trampoline set; its drain was dropped\\n", callee, lr); fflush(stderr); }')
+            lines.append("}")
+            lines.append("#define PPU_DRAIN_CHECK(ctx, callee) do { if (__builtin_expect(g_trampoline_fn != 0, 0)) { "
+                         "ppu_drain_differs(callee, (unsigned)(ctx)->lr); DRAIN_TRAMPOLINE(ctx); } } while (0)")
+            lines.append("")
         if _nv_verify():
             lines.append("/* PPU_NV_VERIFY lift (ppu_nv_dirty.py): a local taken as unchanged is compared")
             lines.append(" * with the register file at each transfer; a dropped write-back stores poison. */")
@@ -4358,7 +4610,9 @@ class PPULifter:
         cached = getattr(self, "_drainless_cache", None)
         if cached is None:
             cached = set()
-            if _env_on("PPU_DRAIN_ELIDE"):
+            if _env_on("PPU_DRAIN_ELIDE") and _xtail_on():
+                cached = self._drainless_xtail()
+            elif _env_on("PPU_DRAIN_ELIDE"):
                 for f in self._emit_functions():
                     if f.fallthrough_to:
                         continue
@@ -4370,6 +4624,49 @@ class PPULifter:
                       f"never return with the trampoline set", flush=True)
             self._drainless_cache = cached
         return cached
+
+    def _drainless_xtail(self) -> set:
+        """_drainless for a PPU_XTAIL lift. Every direct tail jump is a musttail call there
+        (the same rewrite _function_def_lines makes, _RE_TRAMP_RET), so a function returns
+        with the trampoline set only if (a) it keeps a trampoline of another shape, (b) it
+        has an import stub or indirect call (as above), or (c) a function it tail-calls --
+        whose return is its return -- may: the least fixed point over the tail-call graph,
+        a cycle of tail calls among clean functions staying clean."""
+        funcs = self._emit_functions()
+        func_by_addr = {f.start_addr: f for f in funcs}
+        sorted_addrs = sorted(func_by_addr)
+        addr_index = {a: i for i, a in enumerate(sorted_addrs)}
+        may, tails = set(), {}
+        for f in funcs:
+            text = "\n".join(f.body_lines)
+            if "ps3_hle_call" in text or "ps3_indirect_call" in text:
+                may.add(f.name)
+                continue
+            if "g_trampoline_fn" in _RE_TRAMP_RET.sub(" ", text):
+                may.add(f.name)
+                continue
+            t = {m.group(1) for m in _RE_TRAMP_RET.finditer(text)}
+            if f.fallthrough_to:      # the continuation _function_def_lines chains to
+                nxt = func_by_addr.get(f.fallthrough_to)
+                if nxt is None:
+                    k = addr_index.get(f.start_addr)
+                    if k is not None and k + 1 < len(sorted_addrs) and sorted_addrs[k + 1] == f.fallthrough_to:
+                        nxt = func_by_addr[sorted_addrs[k + 1]]
+                if nxt is not None:
+                    t.add(nxt.name)
+            tails[f.name] = t
+        names = set(tails) | may
+        changed = True
+        while changed:
+            changed = False
+            for n, t in tails.items():
+                if n not in may and any(x in may or x not in names for x in t):
+                    may.add(n)
+                    changed = True
+        out = {f.name for f in funcs if f.name not in may}
+        print(f"  drain elision (PPU_XTAIL): {len(out)} of {len(funcs)} functions never return with "
+              f"the trampoline set", flush=True)
+        return out
 
     def _nv_needs(self):
         """(need, verify) for ppu_nv_dirty.expand, or None: the scratch registers each
@@ -4424,6 +4721,8 @@ class PPULifter:
         nv = self._nv_needs() if _nv_on() else None
         nvmod = _nv_mod() if nv is not None else None
         drainless = self._drainless()
+        xtail = _xtail_on()
+        xverify = xtail and _env_on("PPU_XTAIL_VERIFY")
         # PPU_NV_LOCALS: the CR fusion is the plain form's; the locals form leaves
         # the compare-and-branch to the compiler, which now sees it.
         body = func.body_lines if _nv_on() else _fuse_cr(func.body_lines)
@@ -4433,7 +4732,11 @@ class PPULifter:
                                      self._nv_counts, self._nv_vr_reload, self._nv_nvout)
             if drainless and "DRAIN_TRAMPOLINE" in bline:
                 bline = _RE_CALL_DRAIN.sub(
-                    lambda m: m.group(1) if m.group(2) in drainless else m.group(0), bline)
+                    lambda m: (m.group(0) if m.group(2) not in drainless else
+                               f"{m.group(1)} PPU_DRAIN_CHECK(ctx, 0x{m.group(2)[-8:]}u);" if xverify else
+                               m.group(1)), bline)
+            if xtail and "g_trampoline_fn" in bline:
+                bline = _RE_TRAMP_RET.sub(r"PPU_TAIL(\1);", bline)
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional
@@ -4461,12 +4764,20 @@ class PPULifter:
                     # → heap corruption). Halting the thread is strictly safer.
                     if nxt.start_addr == func.fallthrough_to:
                         target = nxt.name
-            if target:
+            if target and xtail:
+                lines.append(f"        {{ PPU_TAIL({target}); }}")
+            elif target:
                 lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}")
             else:
                 print(f"  WARNING: {func.name} has no continuation at "
                       f"0x{func.fallthrough_to:08X}; emitting halt", flush=True)
                 lines.append(f"        /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;")
+        # PPU_XTAIL: the drain elision took this function as never returning with the
+        # trampoline set. Every trampoline in it must have become a tail call, or a
+        # caller would skip a pending jump: stop the lift rather than emit that.
+        if xtail and func.name in drainless and any("g_trampoline_fn" in l for l in lines):
+            raise RuntimeError(f"PPU_XTAIL: {func.name} keeps a trampoline the drain elision "
+                               f"took as gone")
 
         lines.append("}")
         lines.append("")
@@ -5052,8 +5363,9 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0):
+                 toc_base=0, xin=None):
     _WORKER_STATE["segs"] = segs
+    _WORKER_STATE["xin"] = xin   # PPU_XINLINE: ({start: end} of every function, {start: bl sites})
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
     _WORKER_STATE["prefix"] = prefix
@@ -5093,6 +5405,9 @@ def _worker_lift(task):
     lifter.code_hi = _WORKER_STATE.get("code_hi", None)
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
+    if _WORKER_STATE.get("xin"):
+        lifter.xin_bounds, lifter.xin_sites = _WORKER_STATE["xin"]
+        lifter.xin_segs, lifter.xin_be = _WORKER_STATE["segs"], _WORKER_STATE["be"]
     results = []
     for start, end in bounds:
         blob = b""
@@ -5129,7 +5444,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
-                             getattr(lifter, "toc_base", 0)))
+                             getattr(lifter, "toc_base", 0),
+                             (lifter.xin_bounds, lifter.xin_sites) if getattr(lifter, "xin_bounds", None) else None))
     try:
         for idx0, results, ct, bt, st in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -5672,6 +5988,18 @@ def main() -> None:
     lifter.function_entries = _func_entries
     lifter.opd_entries = _opd_entries
     lifter.jump_tables = jt_dispatchers
+    if _xin_on():   # PPU_XINLINE: where each function ends (the widest extent, as emitted)
+        lifter.xin_bounds = {}
+        for _s, _e in func_bounds:
+            lifter.xin_bounds[_s] = max(_e, lifter.xin_bounds.get(_s, 0))
+        lifter.xin_segs, lifter.xin_be = seg_blobs, big_endian
+        lifter.xin_sites = Counter()     # direct call sites (bl) of each address
+        for _i in all_insns:
+            if _i.mnemonic == "bl":
+                try:
+                    lifter.xin_sites[int(_i.operands.split(",")[-1].strip(), 16)] += 1
+                except ValueError:
+                    pass
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
@@ -5718,6 +6046,21 @@ def main() -> None:
         print(f"  Mid-function pass {pass_num}: generated {n} tail-entry wrappers ({total_mid} total)")
     if total_mid:
         print(f"  Generated {total_mid} mid-function tail-entry wrappers total")
+    if _xin_on() and getattr(lifter, "xin_bounds", None):
+        _t0 = time.time()
+        _nre = lifter.xin_relift(all_insns)
+        for pass_num in range(1, max_passes + 1):   # (their targets exist already: normally 0)
+            n = lifter.generate_mid_function_entries(all_insns)
+            if n == 0:
+                break
+            print(f"  Mid-function pass after the inline re-lift: {n} more tail-entry wrappers")
+        _ef = lifter._emit_functions()
+        _ns = sum(1 for f in _ef for ln in f.body_lines if "/* PPU_XINLINE " in ln)
+        _nf = sum(1 for f in _ef if any("/* PPU_XINLINE " in ln for ln in f.body_lines))
+        print(f"  inline leaves (PPU_XINLINE, max {os.environ.get('PPU_XINLINE_MAX', '48')} statements, "
+              f"{os.environ.get('PPU_XINLINE_FEW', '160')} with <= 3 call sites): {_ns} call sites in {_nf} "
+              f"functions ({_nre} lifted again after the mid-function passes, {time.time() - _t0:.1f} s)",
+              flush=True)
 
     os.makedirs(args.output, exist_ok=True)
 

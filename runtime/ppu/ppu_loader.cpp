@@ -2500,8 +2500,14 @@ void flow_lookup_alloc(unsigned int p) {
     else      fprintf(stderr, "[alloc-tag] garbage obj 0x%08X is in NO live alloc -> use-after-free or pool/untracked\n", p);
 }
 
-/* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
+/* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). constinit: a
+ * lift with PPU_TLS_CONSTINIT declares it so, which spares each access clang-cl's TLS
+ * init guard; the definition says the same (it is, and always was, constant-initialised). */
+#if defined(__cpp_constinit)
+extern "C" constinit PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
+#else
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
+#endif
 
 /* Per-thread active guest context, for the crash handler to report the guest PC
  * (ctx->pc, updated by lifted code at block boundaries) of a host AV. */
