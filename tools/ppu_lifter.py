@@ -1168,6 +1168,7 @@ _RE_XIN_CALL = re.compile(r"^    (ctx->lr = 0x[0-9A-F]{8};) (\w*func_([0-9A-F]{8
 # undecoded words, a run-time patch or hook, a native body.
 _RE_XIN_BAD = re.compile(
     r"ps3_hle_call|ps3_indirect_call|lv2_syscall|DRAIN_TRAMPOLINE|ctx->lr\b|\bswitch\b|"
+    r"indirect|icall|hle_call|syscall|trampoline|"   # any other spelling of the above
     r"ctx->gpr\[1\]|&ctx->gpr\[(?:2|13)\]|ctx->gpr\[(?:2|13)\]\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)|"
     r"\+\+ctx->gpr\[(?:2|13)\]|--ctx->gpr\[(?:2|13)\]|ctx->gpr\[(?:2|13)\](?:\+\+|--)|"
     r"ctx->gpr\[(?:1[4-9]|2[0-9]|3[01])\]|ctx->fpr\[(?:1[4-9]|2[0-9]|3[01])\]|"
