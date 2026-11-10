@@ -145,6 +145,7 @@ enum {
     V_HUD, V_HUD_CORNER, V_HUD_OPACITY, V_HUD_GRAPH, V_HUD_CPU,
     V_THEME,
     V_LANG, V_VOICE_LANG, V_TEXT_LANG,
+    V_ASPECT,                 /* [wide] */
     V_N
 };
 static const char* const kVar[V_N] = {
@@ -157,6 +158,7 @@ static const char* const kVar[V_N] = {
     "PS3_OVERLAY_HUD_GRAPH", "PS3_OVERLAY_HUD_CPU",
     "PS3_OVERLAY_THEME",
     "PS3_LANG", "PS3_VOICE_LANG", "PS3_TEXT_LANG",   /* the game reads them once, at start */
+    "PS3RECOMP_ASPECT",                               /* [wide] read once, at start */
 };
 /* Plain arrays: filled during this file's dynamic initialisation, before
  * main (zero-initialised storage exists before any of it runs). */
@@ -1017,6 +1019,10 @@ static const char* const kScaleName[] = { "720p  (1280x720, the PS3's)", "1080p 
                                           "1440p  (2560x1440, untested)", "4K  (3840x2160, untested)" };
 static const char* const kAniso[] = { "1", "2", "4", "8", "16" };
 static const char* const kAnisoName[] = { "Off (1x)", "2x", "4x", "8x", "16x" };
+/* [wide] PS3RECOMP_ASPECT (vk_postfx.c ps3_aspect_wanted, docs/WIDESCREEN.md) */
+static const char* const kAspect[] = { "16:9", "auto", "21:9", "32:9", "16:10" };
+static const char* const kAspectName[] = { "16:9  (the game's)", "Auto  (the screen's or window's shape)",
+                                           "21:9  ultrawide", "32:9  super ultrawide", "16:10" };
 static const char* const kUp[] = { "fsr", "cas", "bilinear" };   /* VK_POSTFX_UP_* order */
 static const char* const kUpName[] = { "AMD FSR 1 (sharpest)", "AMD CAS scaling", "Bilinear (soft)" };
 
@@ -1027,6 +1033,7 @@ struct Ui {
     int aa, scale, aniso, upscale; float sharpen;
     bool dof, edge_blur;      /* the game's own effects (rsx_draw_engine.c ENG_DOF_BLEND_FP) */
     int mesh_trim;            /* [trim] 0 = off (the fix, default), 1 = the PS3's culling */
+    int aspect;               /* [wide] index in kAspect; -1 = another value (env / file) */
     int volume;
     int input_mode, button_icons;
     bool rumble; int rumble_strength;
@@ -1068,6 +1075,8 @@ static void ui_load(void)
       s_ui.scale = v >= 2.5 ? 3 : v >= 1.75 ? 2 : v >= 1.25 ? 1 : 0; }
     { const int v = vk_postfx_aniso();
       s_ui.aniso = v >= 16 ? 4 : v >= 8 ? 3 : v >= 4 ? 2 : v >= 2 ? 1 : 0; }
+    { const char* e = getenv(kVar[V_ASPECT]);   /* [wide] what the next start reads */
+      s_ui.aspect = (!e || !*e) ? 0 : pick(e, kAspect, 5, -1); }
     s_ui.volume = cellAudio_host_volume();
     s_ui.input_mode = cellPad_host_input_mode();
     s_ui.button_icons = ps3_button_icons_mode_setting();
@@ -1165,6 +1174,24 @@ static void tab_display(void)
         apply_setting(V_FULLSCREEN, s_ui.fullscreen ? "1" : "0");
     live_mark(V_FULLSCREEN);
     hint("Also Alt+Enter or F11.");
+    /* [wide] PS3RECOMP_ASPECT: read at start (the game's cameras and every target) */
+    { char preview[64];
+      if (s_ui.aspect >= 0) snprintf(preview, sizeof preview, "%s", kAspectName[s_ui.aspect]);
+      else { const char* e = getenv(kVar[V_ASPECT]); snprintf(preview, sizeof preview, "%s (custom)", e ? e : ""); }
+      ImGui::SetNextItemWidth(combo_w());
+      if (ImGui::BeginCombo("Aspect ratio", preview)) {
+          for (int i = 0; i < 5; i++)
+              if (ImGui::Selectable(kAspectName[i], s_ui.aspect == i)) { s_ui.aspect = i; apply_setting(V_ASPECT, kAspect[i]); }
+          ImGui::EndCombo();
+      } }
+    live_mark(V_ASPECT);
+    { const float k = vk_postfx_aspect_k();
+      char b[400];
+      snprintf(b, sizeof b, "Wider screens see more at the sides (hor+: the same vertical view as 16:9); the HUD, menus and "
+               "movies stay 16:9 in the middle. Auto takes the fullscreen screen's shape (or PS3RECOMP_VK_WINDOW_SIZE's). "
+               "16:10 shows a little less at the sides than 16:9. Now: %s.",
+               k > 1.001f || k < 0.999f ? "wide" : "16:9");
+      hint(b); }
 
     section("Menu");   /* [theme] */
     { static const char* const looks[] = { "Hero (blue)", "Infamous (red)" };
@@ -1178,8 +1205,9 @@ static void tab_display(void)
     { SDL_Window* w = (SDL_Window*)s_vk.sdl_window;
       int ww = 0, wh = 0; if (w) SDL_GetWindowSize(w, &ww, &wh);
       const float rs = vk_postfx_render_scale();   /* [res] the internal resolution in effect */
+      const float ka = vk_postfx_aspect_k();       /* [wide] the frame's width vs 16:9 */
       ImGui::Text("Window %d x %d, game image %u x %u", ww, wh,
-                  (unsigned)((float)s_vk.render_width * rs + 0.5f), (unsigned)((float)s_vk.render_height * rs + 0.5f)); }
+                  (unsigned)((float)s_vk.render_width * rs * ka + 0.5f), (unsigned)((float)s_vk.render_height * rs + 0.5f)); }
 }
 
 static void tab_graphics(void)
@@ -1202,7 +1230,7 @@ static void tab_graphics(void)
       char b[320];
       snprintf(b, sizeof b, "The game draws its 3D scene, effects and HUD at this size (now %ux%u); the window then "
                "gets it scaled with FSR or shrunk. Each step costs GPU time: 1080p draws 2.25x the pixels of 720p.",
-               (unsigned)(1280.0f * rs + 0.5f), (unsigned)(720.0f * rs + 0.5f));
+               (unsigned)(1280.0f * rs * vk_postfx_aspect_k() + 0.5f), (unsigned)(720.0f * rs + 0.5f));   /* [wide] */
       hint(b); }
     /* [trim] Edge's SPU triangle culling (tools/spu_patches.txt switch mesh_trim, PS3RECOMP_MESH_TRIM) */
     { static const char* const kTrimName[] = { "Off: whole meshes (fix, default)", "On: the PS3's original" };
