@@ -3026,6 +3026,7 @@ typedef struct {
 } eng_fp_memo;
 
 static eng_vp_memo s_vp_memo[ENG_VP_MEMO_MAX];
+static u64 s_vp_pfx[ENG_VP_MEMO_MAX][2];   /* (rsx5) each entry's first 16 bytes (PROG_CMEMO) */
 /* PS3RECOMP_ENG_VP_GEN: the entry the last lookup found, and the dispatcher's
  * vp_gen and program start it was found under. */
 static eng_vp_memo* s_vpgen_memo;
@@ -3130,6 +3131,107 @@ static int eng_fp_kp_refresh(eng_fp_memo* m, const u8* uc)
     return 1;
 }
 
+/* (rsx5) PS3RECOMP_ENG_PROG_CMEMO (default 1; 0 = as before): programs
+ * analysed before are remembered by CONTENT, not by where they sit. The city
+ * frame re-uploads its fragment and vertex programs (drawstats: ~170 + ~110
+ * memo misses a frame), so the address-keyed memos miss on bytes they have
+ * analysed many times -- each fragment miss a 32 KB clear, the structural hash
+ * a byte at a time and five microcode walks. A miss now hashes the program's
+ * bytes (eng_khash), and a table entry with the same hash, length and bytes
+ * (compared in full) hands over its analysis -- which depends on those bytes
+ * alone. Also, with it: the constant collection's own walk without its 32 KB
+ * clear (every reader stops at count), and the vertex memo's scan tests a
+ * 16-byte prefix kept beside each entry before comparing the program.
+ * PS3RECOMP_ENG_PROG_STATS=1: every 600 frames, the misses, the content hits,
+ * and how many misses were bytes ever analysed before (an exact set). */
+static int s_cmemo_on = -1;
+static inline int eng_cmemo_on(void)
+{
+    if (__builtin_expect(s_cmemo_on < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_PROG_CMEMO");
+        s_cmemo_on = !(e && *e == '0');
+    }
+    return s_cmemo_on;
+}
+#define ENG_FPC_SIZE 256u
+typedef struct {
+    u64 h; u32 size;                /* size 0: empty */
+    u8* bytes;
+    u64 structural; int constants_ok;
+    u32 tex_mask, sampled_units, gamma_cand, expand_cand;
+    u32 nconst, vcap; u32 (*vals)[4];
+} eng_fpc_entry;
+static eng_fpc_entry s_fpc[ENG_FPC_SIZE];
+#define ENG_VPC_SIZE 128u
+typedef struct {
+    u64 h; u32 instrs, cap;         /* instrs 0: empty; cap: instructions bytes holds */
+    u8* bytes;
+    u32 input_mask; int vpc_full; u32 vpc_lo, vpc_n;
+    u64 hash;
+} eng_vpc_entry;
+static eng_vpc_entry s_vpc[ENG_VPC_SIZE];
+static u64 s_fpc_hits, s_fpc_misses, s_vpc_hits, s_vpc_misses;
+/* PS3RECOMP_ENG_PROG_STATS: per kind (0 vp, 1 fp) an exact set of every
+ * program content ever missed on, and how many misses found theirs in it. */
+static int s_pstats_on = -1;
+static u64* s_pstats_set[2];
+static u64 s_pstats_n[2], s_pstats_dup[2], s_pstats_full[2];
+#define ENG_PSTATS_SET (1u << 16)
+static void eng_prog_stats_note(int kind, u64 h)
+{
+    if (__builtin_expect(s_pstats_on < 0, 0)) s_pstats_on = getenv("PS3RECOMP_ENG_PROG_STATS") ? 1 : 0;
+    if (!s_pstats_on) return;
+    if (!s_pstats_set[kind]) s_pstats_set[kind] = (u64*)calloc(ENG_PSTATS_SET, sizeof(u64));
+    u64* set = s_pstats_set[kind];
+    if (!set) return;
+    s_pstats_n[kind]++;
+    if (!h) h = 1;
+    u32 p = (u32)((h * 0x9E3779B97F4A7C15ull) >> 48);
+    for (u32 k = 0; k < ENG_PSTATS_SET; k++, p = (p + 1u) & (ENG_PSTATS_SET - 1u)) {
+        if (set[p] == h) { s_pstats_dup[kind]++; return; }
+        if (!set[p]) { set[p] = h; return; }
+    }
+    s_pstats_full[kind]++;
+}
+static void eng_prog_stats_frame(void)
+{
+    static u32 last = ~0u;
+    if (s_pstats_on <= 0 || g.frames / 600u == last) return;
+    if (last != ~0u)
+        fprintf(stderr, "[progstats] frames %u..%u: fp misses %llu (%llu bytes seen before), content hits %llu of %llu; "
+                        "vp misses %llu (%llu seen before), content hits %llu of %llu%s\n",
+                last * 600u, g.frames, (unsigned long long)s_pstats_n[1], (unsigned long long)s_pstats_dup[1],
+                (unsigned long long)s_fpc_hits, (unsigned long long)(s_fpc_hits + s_fpc_misses),
+                (unsigned long long)s_pstats_n[0], (unsigned long long)s_pstats_dup[0],
+                (unsigned long long)s_vpc_hits, (unsigned long long)(s_vpc_hits + s_vpc_misses),
+                (s_pstats_full[0] || s_pstats_full[1]) ? " (set full)" : "");
+    last = g.frames / 600u;
+    s_pstats_n[0] = s_pstats_n[1] = s_pstats_dup[0] = s_pstats_dup[1] = 0;
+    s_fpc_hits = s_fpc_misses = s_vpc_hits = s_vpc_misses = 0;
+}
+/* rsx_fp_collect_constants without its clear of the whole 32 KB block: the
+ * same walk and values; past `count` the block keeps older values, which no
+ * reader looks at (g.fp_cb copies count rows; the pipeline compares count). */
+static int eng_fp_collect_lean(const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out)
+{
+    out->count = 0;
+    u32 off = 0;
+    while (off + 16u <= max_bytes) {
+        const u32 w0 = rsx_fp_read_word(ucode + off), w1 = rsx_fp_read_word(ucode + off + 4),
+                  w2 = rsx_fp_read_word(ucode + off + 8), w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16u;
+        if ((w1 & 3u) == 2u || (w2 & 3u) == 2u || (w3 & 3u) == 2u) {
+            if (off + 16u > max_bytes || out->count >= RSX_FP_MAX_INLINE_CONSTANTS) return -1;
+            for (u32 c = 0; c < 4u; c++)
+                out->values[out->count][c] = rsx_fp_sanitize_constant_word(rsx_fp_read_word(ucode + off + c * 4u));
+            out->count++;
+            off += 16u;
+        }
+        if (w0 & 1u) return (int)out->count;
+    }
+    return -1;
+}
+
 static u32 eng_memo_victim_vp(void)
 {
     u32 v = 0;
@@ -3161,8 +3263,14 @@ static const eng_vp_memo* eng_vp_current(void)
         const long n = e ? strtol(e, NULL, 10) : (long)ENG_VP_MEMO_MAX;
         s_vp_cap = n < 1 ? 1u : n > (long)ENG_VP_MEMO_MAX ? ENG_VP_MEMO_MAX : (u32)n;
     }
+    /* (rsx5, PS3RECOMP_ENG_PROG_CMEMO) the first 16 bytes, kept beside each
+     * entry (s_vp_pfx), before the entry's own 8 KB copy is touched */
+    const int cm = eng_cmemo_on();
+    u64 pf0 = 0, pf1 = 0;
+    if (cm) { memcpy(&pf0, uc, 8); memcpy(&pf1, uc + 8, 8); }
     for (u32 i = 0; i < s_vp_cap; i++) {
         eng_vp_memo* m = &s_vp_memo[i];
+        if (cm && (s_vp_pfx[i][0] != pf0 || s_vp_pfx[i][1] != pf1)) continue;
         if (m->instrs && m->start == start && !memcmp(m->bytes, uc, m->instrs * 16u)) {
             m->used = ++s_memo_clock;
             ds_memo_hit[0]++;
@@ -3173,11 +3281,31 @@ static const eng_vp_memo* eng_vp_current(void)
     ds_memo_miss[0]++;
     const u32 instrs = rsx_vp_program_size_instrs(uc, (RSX_DSP_VP_INSTR - start) * 16u);
     if (!instrs) return NULL;
-    eng_vp_memo* m = &s_vp_memo[eng_memo_victim_vp()];
+    const u32 vi = eng_memo_victim_vp();
+    eng_vp_memo* m = &s_vp_memo[vi];
     m->start = start;
     m->instrs = instrs;
     memcpy(m->bytes, uc, instrs * 16u);
     m->used = ++s_memo_clock;
+    memcpy(&s_vp_pfx[vi][0], m->bytes, 8); memcpy(&s_vp_pfx[vi][1], m->bytes + 8, 8);
+    /* (rsx5) PS3RECOMP_ENG_PROG_CMEMO: these bytes analysed before (at any
+     * start) -- the hash, input mask and constant range are theirs alone. */
+    eng_vpc_entry* ce = NULL;
+    u64 ch = 0;
+    if (cm) {
+        uc = m->bytes;                      /* hash, compare and analyse the one copy */
+        ch = eng_khash(uc, instrs * 16u, 0xBB67AE8584CAA73Bull);
+        eng_prog_stats_note(0, ch ^ instrs);
+        ce = &s_vpc[(u32)(ch >> 40) & (ENG_VPC_SIZE - 1u)];
+        if (ce->instrs == instrs && ce->h == ch && ce->bytes && !memcmp(ce->bytes, uc, instrs * 16u)) {
+            m->hash = ce->hash;
+            m->input_mask = ce->input_mask;
+            m->vpc_full = ce->vpc_full; m->vpc_lo = ce->vpc_lo; m->vpc_n = ce->vpc_n;
+            s_vpc_hits++;
+            s_vpgen_memo = m; s_vpgen_gen = g.rsx.vp_gen; s_vpgen_start = start;
+            return m;
+        }
+    }
     /* (rsx5, PS3RECOMP_ENG_FASTKEY) only the pipeline key reads it */
     m->hash = eng_fastkey_on() ? eng_khash(uc, instrs * 16u, 1469598103934665603ull)
                                : eng_fnv1a(uc, instrs * 16u, 1469598103934665603ull);
@@ -3194,6 +3322,20 @@ static const eng_vp_memo* eng_vp_current(void)
         m->vpc_full = 0;
         m->vpc_lo = cu.lo <= cu.hi ? cu.lo : 0;
         m->vpc_n = cu.lo <= cu.hi ? cu.hi - cu.lo + 1u : 0;
+    }
+    if (ce) {                               /* remembered for the next load of these bytes */
+        u8* cb = ce->bytes;
+        if (!cb || ce->cap < instrs) {
+            cb = (u8*)realloc(ce->bytes, instrs * 16u);
+            if (cb) { ce->bytes = cb; ce->cap = instrs; }
+        }
+        if (cb && ce->cap >= instrs) {
+            memcpy(ce->bytes, uc, instrs * 16u);
+            ce->h = ch; ce->instrs = instrs; ce->hash = m->hash;
+            ce->input_mask = m->input_mask;
+            ce->vpc_full = m->vpc_full; ce->vpc_lo = m->vpc_lo; ce->vpc_n = m->vpc_n;
+        } else ce->instrs = 0;
+        s_vpc_misses++;
     }
     s_vpgen_memo = m; s_vpgen_gen = g.rsx.vp_gen; s_vpgen_start = start;
     return m;
@@ -3281,14 +3423,62 @@ static const eng_fp_memo* eng_fp_current(void)
     m->size = size;
     m->used = ++s_memo_clock;
     s_fp_key[v] = key; s_fp_sz[v] = size; s_fp_use[v] = m->used;
+    /* (rsx5) PS3RECOMP_ENG_PROG_CMEMO: the same program bytes analysed before
+     * (at any address) -- take that analysis. Everything below is a function
+     * of the `size` bytes alone; the entry's copy is compared in full. */
+    eng_fpc_entry* ce = NULL;
+    u64 ch = 0;
+    if (eng_cmemo_on()) {
+        uc = m->bytes;                      /* hash, compare and analyse the one copy */
+        ch = eng_khash(uc, size, 0x6A09E667F3BCC909ull);
+        eng_prog_stats_note(1, ch ^ size);
+        ce = &s_fpc[(u32)(ch >> 40) & (ENG_FPC_SIZE - 1u)];
+        if (ce->size == size && ce->h == ch && ce->bytes && !memcmp(ce->bytes, uc, size)) {
+            m->structural = ce->structural;
+            m->constants_ok = ce->constants_ok;
+            m->constants.count = ce->nconst;
+            if (ce->nconst) memcpy(m->constants.values, ce->vals, (size_t)ce->nconst * 16u);
+            m->tex_mask = ce->tex_mask;
+            m->sampled_units = ce->sampled_units;
+            m->gamma_cand = ce->gamma_cand;
+            m->expand_cand = ce->expand_cand;
+            s_fpc_hits++;
+            m->kp_ok = 0; m->kp_n = 0;
+            if (s_fp_kpatch) {
+                eng_fp_kp_scan(m);
+                s_fp_hint[(u32)((key * 0x9E3779B97F4A7C15ull) >> 56)] = (u8)(v + 1);
+            }
+            return m;
+        }
+    }
     m->structural = rsx_fp_structural_hash(uc, size, 1469598103934665603ull);
     m->constants.count = 0;
-    m->constants_ok = rsx_fp_collect_constants(uc, size, &m->constants) >= 0;
+    m->constants_ok = (ce ? eng_fp_collect_lean(uc, size, &m->constants)
+                          : rsx_fp_collect_constants(uc, size, &m->constants)) >= 0;
     m->tex_mask = rsx_fp_texture_mask(uc, size);
     static const u8 all[RSX_DSP_NUM_TEXTURES] = { 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1 };
     m->sampled_units = rsx_fp_texture_units(uc, size);
     m->gamma_cand = rsx_fp_texture_gamma_units(uc, size, all);
     m->expand_cand = rsx_fp_texture_expand_units(uc, size, all);
+    if (ce) {                               /* remembered for the next upload of these bytes */
+        const u32 nk = m->constants.count;
+        u8* cb = (u8*)realloc(ce->bytes, size);
+        if (cb) ce->bytes = cb;
+        u32 (*cv)[4] = ce->vals;
+        if (cb && nk > ce->vcap) {
+            cv = (u32 (*)[4])realloc(ce->vals, (size_t)nk * 16u);
+            if (cv) { ce->vals = cv; ce->vcap = nk; }
+        }
+        if (cb && (!nk || (cv && nk <= ce->vcap))) {
+            memcpy(ce->bytes, uc, size);
+            if (nk) memcpy(ce->vals, m->constants.values, (size_t)nk * 16u);
+            ce->h = ch; ce->size = size; ce->nconst = nk;
+            ce->structural = m->structural; ce->constants_ok = m->constants_ok;
+            ce->tex_mask = m->tex_mask; ce->sampled_units = m->sampled_units;
+            ce->gamma_cand = m->gamma_cand; ce->expand_cand = m->expand_cand;
+        } else ce->size = 0;
+        s_fpc_misses++;
+    }
     m->kp_ok = 0; m->kp_n = 0;
     if (s_fp_kpatch) {
         eng_fp_kp_scan(m);
@@ -3313,6 +3503,7 @@ static int eng_guest_programs(const eng_vp_memo** out_vp, const eng_fp_memo** ou
     static const eng_vp_memo* c_vp;
     static const eng_fp_memo* c_fp;
     if (serial != s_draw_serial) {
+        eng_prog_stats_frame();             /* (rsx5) PS3RECOMP_ENG_PROG_STATS */
         c_vp = eng_vp_current();
         c_fp = c_vp ? eng_fp_current() : NULL;
         serial = s_draw_serial;
