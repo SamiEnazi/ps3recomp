@@ -183,7 +183,28 @@ struct rsx_dispatch {
     u32 inline_ovf;
     /* (rsx5) immediate-mode vertices of the current pair past the cap */
     u32 imm_drop_draw;
+
+    /* (rsx-par) PS3RECOMP_RSX_SPLIT (rsx_split.c): an instance the FIFO walker
+     * runs on its own thread, whose state the draw engine's instance follows.
+     * dirty: NULL = no tracking (every other instance); else a bitmap of the
+     * 64-byte blocks of regs/vp/constants written since the last copy-out
+     * (RSX_DSP_BLK_*), plus a summary word at [RSX_DSP_DIRTY_WORDS]: bit w set
+     * when word w has a bit. tgen/mgen: the counters this instance bumps for
+     * g_rsx_dsp_tex_gen / g_rsx_dsp_misc_gen (rsx_dispatch_init points them at
+     * those two). limit_hook: NULL = g_rsx_dsp_limit_hook. */
+    u64* dirty;
+    u32* tgen;
+    u32* mgen;
+    void (*limit_hook)(int what, u32 n);
 };
+
+/* (rsx-par) regs, vp and constants are one contiguous run of u32 (the struct's
+ * first three members), cut into 64-byte blocks for the dirty bitmap. */
+#define RSX_DSP_BLK_BYTES   64u
+#define RSX_DSP_BLK_VP0     (RSX_DSP_NUM_REGS / 16u)                            /* 1024 */
+#define RSX_DSP_BLK_CONST0  (RSX_DSP_BLK_VP0 + RSX_DSP_VP_WORDS / 16u)          /* 1160 */
+#define RSX_DSP_BLK_COUNT   (RSX_DSP_BLK_CONST0 + RSX_DSP_NUM_CONSTANTS / 4u)   /* 1288 */
+#define RSX_DSP_DIRTY_WORDS ((RSX_DSP_BLK_COUNT + 63u) / 64u)                   /* 21 */
 
 /* ---- lifecycle -------------------------------------------------------- */
 

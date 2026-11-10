@@ -7192,6 +7192,11 @@ void rsx_draw_engine_burst(u32 method, int incr, const u32* be_words, u32 count)
     rsx_dispatch_burst(&g.rsx, method & 0x1FFCu, incr, be_words, count);
 }
 
+/* (rsx-par) rsx_split.c: the engine's dispatcher instance (its sinks are the
+ * engine's), and whether the engine takes methods at all. */
+rsx_dispatch* rsx_draw_engine_dsp(void) { return &g.rsx; }
+int rsx_draw_engine_ready(void) { return g.ready; }
+
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
                                         u32 pitch, u32 width, u32 height)
 {
