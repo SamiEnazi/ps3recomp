@@ -770,6 +770,216 @@ def _lean_float_default() -> bool:
     return os.environ.get("SPU_LIFT_LEAN_FLOAT", "1") != "0"
 
 
+# ---------------------------------------------------------------------------
+# Register-file codegen (spu-cg, 2026-11-10): dead stores and speculative float runs
+# ---------------------------------------------------------------------------
+# What the x86 of a long lifted function spent its time on (inFAMOUS 2 job 201's hot leaf,
+# llvm-mca over the fall-through path): one ctx->gpr store per SPU instruction, a movemask +
+# branch after every checked float op, and stack spills. The stores stay because LLVM's DSE
+# gives up on these functions (its walk limits, and a cold fix-up call after every float op
+# splits the blocks); the branches cut the code into blocks of a few instructions, so the
+# scheduler cannot shorten the live ranges of values the SPU compiler loaded early.
+#
+# SPU_LIFT_DSE (default 1; 0 = the old form): in a straight run of register statements (no
+# label, branch, call or runtime access between them), a register write that the same run
+# writes again is not stored: it goes to a C local (L<n>_<k>), and the run's reads of it use
+# the local. Nothing can read ctx->gpr inside such a run (the statements touch ctx only through
+# ctx->gpr[n], the inline LS accessors and ctx->code_base), so the register file seen at any
+# label, branch, call, return or runtime call is exactly the old one.
+#
+# SPU_LIFT_SPEC_FLOAT (default 1; 0 = the old form): a part of such a run with no LS store and
+# at least SPU_LIFT_SPEC_MIN (2) checked float ops (fa fs fm fma fms fnms cflts cfltu; at most
+# SPU_LIFT_SPEC_MAX statements) runs first with the checks deferred (spu_*_spec, spu_helpers.h):
+# no branch per op, one test at the end. The registers the part reads and then overwrites keep
+# their new values in locals and are stored only after the test passed; if any op would have
+# taken its exact path, the part runs again in the ordinary form from the untouched inputs (LS
+# is untouched too: no store in the part). The fast forms' bits are the ordinary forms'
+# fast-path bits, so the result is the same either way. A site that took the exact path g_spu_spec_cap times (PS3_SPU_SPEC,
+# default 64) runs only the ordinary form from then on. Needs the lean float ops.
+_CG_DEF = re.compile(r'^ctx->gpr\[(\d+)\] = (.+);$')
+_CG_LSST = re.compile(r'^spu_ls_write128\(ctx, .+\);$')
+_CG_NOP = re.compile(r'^/\*[^*]*\*/;$')
+_CG_SPEC_RR = re.compile(r'^spu_(fa|fs|fm|fma|fms|fnms)_lean\((.*)\)$')
+_CG_SPEC_CF = re.compile(r'^spu_(cflts|cfltu)\((.*)\)$')
+
+
+def _cg_dse_default() -> bool:
+    return os.environ.get("SPU_LIFT_DSE", "1") != "0"
+
+
+def _cg_spec_default() -> bool:
+    return os.environ.get("SPU_LIFT_SPEC_FLOAT", "1") != "0"
+
+
+def _cg_plain(s: str) -> bool:
+    """One statement whose only effects are register / LS reads and one register write or LS
+    store, reading ctx only through ctx->gpr[n], the LS accessors and ctx->code_base."""
+    if s.count(';') != 1 or any(k in s for k in ('{', '}', 'if (', 'return', 'goto', '"', '?')):
+        return False
+    return _rl_ctx_free(s)
+
+
+class _CgState:
+    """Per-TU state of cg_rewrite: site numbering and the locals of the current function."""
+    def __init__(self):
+        self.sites = 0
+        self.fail_name = "spu_spec_fail"
+
+
+def cg_rewrite(body_lines: list, st: _CgState, dse: bool, spec: bool) -> list:
+    """SPU_LIFT_DSE / SPU_LIFT_SPEC_FLOAT over one lifted function body (see above). Returns the
+    new body lines; the input when there is nothing to do."""
+    spec_min = int(os.environ.get("SPU_LIFT_SPEC_MIN", "2") or 2)
+    spec_max = int(os.environ.get("SPU_LIFT_SPEC_MAX", "256") or 256)
+    volx = os.environ.get("SPU_LIFT_SPEC_VOLX", "0") == "1"   # A/B knob: measured worse (llvm-mca, 201 + Edge)
+    # how a speculative run keeps the old values of the registers it reads and then overwrites:
+    # "slot" = a volatile stack slot each, restored on the exact pass; "commit" = the new values
+    # in locals, stored after the test
+    commit = os.environ.get("SPU_LIFT_SPEC_SAVE", "commit") != "slot"   # commit measured better (Edge skin loop -10%)
+    out = []
+    locals_ = []
+    ctr = [0]
+    changed = False
+
+    def emit_run(run):
+        """run: plain statements (stripped) and nops of one straight run."""
+        nonlocal changed
+        stm = [s for s in run if not _CG_NOP.match(s)]
+        # the last write of each register in the run is the one the register file keeps
+        last = {}
+        for i, s in enumerate(stm):
+            m = _CG_DEF.match(s)
+            if m:
+                last[int(m.group(1))] = i
+        cur = {}            # register -> local holding its current value (absent: ctx->gpr)
+        items = []          # (lhs or None, kind 'loc'|'mem'|'st', register, text)
+
+        def rd(mm):
+            name = cur.get(int(mm.group(1)))
+            return name if name else mm.group(0)
+        for i, s in enumerate(stm):
+            m = _CG_DEF.match(s)
+            if not m:
+                items.append((None, 'st', None, _RL_GPR.sub(rd, s)))
+                continue
+            k = int(m.group(1))
+            rhs = _RL_GPR.sub(rd, m.group(2))
+            if dse and last[k] != i:
+                ctr[0] += 1
+                name = f"L{k}_{ctr[0]}"
+                locals_.append(name)
+                cur[k] = name
+                items.append((name, 'loc', k, rhs))
+                changed = True
+            else:
+                cur.pop(k, None)
+                items.append((f"ctx->gpr[{k}]", 'mem', k, rhs))
+        # speculative parts: maximal stretches between LS stores
+        seg = []
+        for it in items + [(None, 'end', None, None)]:
+            if it[1] in ('loc', 'mem') and len(seg) < spec_max:
+                seg.append(it)
+                continue
+            emit_seg(seg)
+            seg = [it] if it[1] in ('loc', 'mem') else []
+            if it[1] == 'st':
+                out.append(it[3])
+        emit_seg(seg)
+
+    def plain_line(it):
+        return f"{it[0]} = {it[3]};"
+
+    def spec_rhs(rhs):
+        m = _CG_SPEC_RR.match(rhs)
+        if m:
+            return f"spu_{m.group(1)}_spec({m.group(2)}, &_sa)"
+        m = _CG_SPEC_CF.match(rhs)
+        if m:
+            return f"spu_{m.group(1)}_spec({m.group(2)}, &_sa)"
+        return rhs
+
+    def emit_seg(seg):
+        nonlocal changed
+        if not seg:
+            return
+        nops = sum(1 for it in seg if _CG_SPEC_RR.match(it[3]) or _CG_SPEC_CF.match(it[3]))
+        if not spec or nops < spec_min:
+            out.extend(plain_line(it) for it in seg)
+            return
+        changed = True
+        # registers this part stores that it read from ctx->gpr before its first store
+        memw, exposed, save = set(), set(), []
+        for lhs, kind, k, rhs in seg:
+            for mm in _RL_GPR.finditer(rhs):
+                r = int(mm.group(1))
+                if r not in memw:
+                    exposed.add(r)
+            if kind == 'mem':
+                if k in exposed and k not in memw:
+                    save.append(k)
+                memw.add(k)
+        site = st.sites
+        st.sites += 1
+        fail = f"{st.fail_name}[{site}]"
+        out.append(f"{{ spu_spec_acc _sa = SPU_SPEC_INIT();   /* speculative float run {site}: {nops} ops */")
+        out.append(f"  if (__builtin_expect({fail} < g_spu_spec_cap, 1)) {{")
+        if save and commit:
+            # the fast pass keeps its new values of these registers in locals and stores them
+            # only once it has passed: the register file is untouched if it has not
+            sv = set(save)
+            out.append("    u128 " + ", ".join(f"_n{k}" for k in save) + ";")
+            done = set()
+
+            def rdn(mm):
+                r = int(mm.group(1))
+                return f"_n{r}" if r in done else mm.group(0)
+            for lhs, kind, k, rhs in seg:
+                rhs = _RL_GPR.sub(rdn, rhs)
+                if kind == 'mem' and k in sv:
+                    lhs = f"_n{k}"
+                    done.add(k)
+                out.append(f"    {lhs} = {spec_rhs(rhs)};")
+            out.append(f"    if (__builtin_expect(SPU_SPEC_OK(_sa), 1)) {{" +
+                       "".join(f" ctx->gpr[{k}] = _n{k};" for k in save) + f" goto spu_spec_done_{site}; }}")
+            out.append(f"    if ({fail} < 255) {fail}++;")
+        else:
+            if save:
+                out.append("    volatile spu_spec_sv " + ", ".join(f"_o{k} = SPU_SPEC_SAVE(ctx, {k})" for k in save) + ";")
+            for it in seg:
+                out.append(f"    {it[0]} = {spec_rhs(it[3])};")
+            out.append(f"    if (__builtin_expect(SPU_SPEC_OK(_sa), 1)) goto spu_spec_done_{site};")
+            out.append(f"    if ({fail} < 255) {fail}++;" +
+                       ("".join(f" ctx->gpr[{k}] = spu_spec_restore(&_o{k});" for k in save)))
+        out.append("  }")
+        for it in seg:
+            if volx:
+                # the exact pass reads the register file again (SPU_GPR_VLD: a load the compiler
+                # cannot replace by a value it still holds), so the fast pass need not keep the
+                # part's inputs alive to its end
+                out.append(f"  {it[0]} = {_RL_GPR.sub(lambda mm: f'SPU_GPR_VLD(ctx, {mm.group(1)})', it[3])};")
+            else:
+                out.append(f"  {plain_line(it)}")
+        out.append(f"spu_spec_done_{site}:; }}")
+
+    run = []
+    for raw in body_lines:
+        s = raw.strip()
+        if _CG_NOP.match(s) or ((_CG_DEF.match(s) or _CG_LSST.match(s)) and _cg_plain(s)):
+            run.append(s)
+            continue
+        if run:
+            emit_run(run)
+            run = []
+        out.append(raw)
+    if run:
+        emit_run(run)
+    if not changed:
+        return body_lines
+    if locals_:
+        out.insert(0, "u128 " + ", ".join(locals_) + ";")
+    return out
+
+
 # lv2 stop-and-signal syscalls that resume at the next instruction (the same
 # set as find_spu_functions.LV2_RESUMING_STOPS, which decides function extents).
 LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
@@ -781,6 +991,10 @@ class SPULifter:
         # --reg-locals; never with --trace (its hooks read ctx->gpr).
         self.reg_locals = (_reg_locals_default() if reg_locals is None else reg_locals) and not trace
         self.lean_float = _lean_float_default() if lean_float is None else lean_float
+        # cg_rewrite (SPU_LIFT_DSE / SPU_LIFT_SPEC_FLOAT, default on): not with --trace (its
+        # hooks read ctx->gpr after every instruction) and not with register locals.
+        self.cg_dse = _cg_dse_default() and not trace and not self.reg_locals
+        self.cg_spec = _cg_spec_default() and not trace and not self.reg_locals and self.lean_float
         # --relocatable: the image is lifted at LS 0 and runs wherever it is
         # loaded; every LS address derived from its own position adds
         # ctx->code_base (spu_overlay_register_region_reloc).
@@ -1413,13 +1627,24 @@ class SPULifter:
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
+        cg = _CgState()
+        cg_at = len(lines)          # the speculative sites' counters go here (count known at the end)
         for f in self.functions:
             lines.append(f"void {weak}{f.name}(spu_context* ctx) {{")
-            body = reg_localize(f.body_lines) if self.reg_locals else f.body_lines
+            if self.reg_locals:
+                body = reg_localize(f.body_lines)
+            elif self.cg_dse or self.cg_spec:
+                body = cg_rewrite(f.body_lines, cg, self.cg_dse, self.cg_spec)
+            else:
+                body = f.body_lines
             for b in body:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
             lines.append("")
+        self.cg_sites = cg.sites
+        if cg.sites:
+            lines.insert(cg_at, f"/* exact-path count of each speculative float run (SPU_LIFT_SPEC_FLOAT) */\n"
+                                f"static unsigned char {cg.fail_name}[{cg.sites}];\n")
 
         # Stubs for cross-function branch/call targets the function-boundary
         # detector did not promote to standalone functions. The lifter emits
@@ -1496,6 +1721,12 @@ def main() -> None:
                    help="Prefix for all emitted spu_func_* / spu_recomp_register "
                         "symbols, so multiple lifted SPU images can link into one "
                         "binary without colliding (e.g. flow_spu_00_). Default: none.")
+    p.add_argument("--no-dse", action="store_true",
+                   help="store every register write to ctx->gpr (cg_rewrite off); SPU_LIFT_DSE=0 "
+                        "does the same")
+    p.add_argument("--no-spec-float", action="store_true",
+                   help="no speculative float runs (every checked float op branches on its own); "
+                        "SPU_LIFT_SPEC_FLOAT=0 does the same")
     p.add_argument("--extra-funcs", default="",
                    help="Comma-separated extra function entry addresses (e.g. "
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
@@ -1661,6 +1892,10 @@ def main() -> None:
     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix, reloc=args.relocatable,
                        reg_locals=True if args.reg_locals else None,
                        lean_float=False if args.no_lean_float else None)
+    if args.no_dse:
+        lifter.cg_dse = False
+    if args.no_spec_float:
+        lifter.cg_spec = False
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
@@ -1718,6 +1953,10 @@ def main() -> None:
     print(f"Wrote {hp}")
     print(f"Wrote {sp}")
     print(f"  {len(lifter.functions)} function(s) lifted")
+    if lifter.cg_dse or lifter.cg_spec:
+        print(f"  register codegen: dead stores {'local' if lifter.cg_dse else 'off'}, "
+              f"{getattr(lifter, 'cg_sites', 0)} speculative float run(s)"
+              f"{'' if lifter.cg_spec else ' (off)'} (SPU_LIFT_DSE / SPU_LIFT_SPEC_FLOAT)")
     print(f"  {len(lifter.call_targets)} call target(s)")
     if lifter.unsupported:
         total = sum(lifter.unsupported.values())
