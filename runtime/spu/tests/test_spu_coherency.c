@@ -57,6 +57,10 @@ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
  * wakes the SPU only on its next 10 ms re-poll. */
 static int g_wakes;
 void spu_ch_wake(spu_context* ctx) { (void)ctx; g_wakes++; }
+/* PS3_SPU_WAKE_DEFER's wake (issued after the stripes are dropped, only for a
+ * parked context): the tests below mark their contexts parked, so a deferred
+ * wake is counted like an immediate one. */
+void spu_ch_wake_sync(spu_context* ctx) { (void)ctx; g_wakes++; }
 
 /* ---------------------------------------------------------------------------
  * Harness
@@ -111,6 +115,7 @@ static void spu_reset(spu_context* ctx, uint32_t spu_id)
 {
     spu_context_init(ctx, 0);
     ctx->spu_id = spu_id;
+    ctx->coh_parked = 1;   /* as if asleep in spu_ch_wait: every wake reaches spu_ch_wake* */
 }
 
 /* ===========================================================================
