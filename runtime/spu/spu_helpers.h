@@ -72,6 +72,22 @@ static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST
 /* SPU_FLOAT_RZ_ONLY (a lifted TU's -D, with SPU_LS_FASTPATH): the slow-path fix-ups are pure
  * functions of their operands, said so to the compiler so a cold call does not make it reload
  * the register file; and the lean float ops are compiled in their SPU_FLOAT_RZ form only. */
+/* SPU_CG_COLD (spu-cg, 2026-11-10; default 1, -DSPU_CG_COLD=0 = the old forms): the RZ fix-ups
+ * whose operands and result travel in vector registers (spu__xv_*_slow, __vectorcall) are
+ * declared const, not pure. They read nothing but their operands (and the once-set
+ * PS3_SPU_RZ_VSLOW choice, whose two forms give the same bits), and a pure call may read any
+ * memory, so every pending ctx->gpr store had to stay in front of each cold call: no store of a
+ * register the code writes again later could be dropped. (The u128-by-value ones stay pure:
+ * on Win64 such an operand is passed through memory.) Also: cflts/cfltu take their exact form
+ * out of line on the cold side (it was four inlined scalar lanes in the hot code). */
+#ifndef SPU_CG_COLD
+#define SPU_CG_COLD 1
+#endif
+#if SPU_CG_COLD
+#define SPU__X_PUREATTR const
+#else
+#define SPU__X_PUREATTR pure
+#endif
 #if defined(SPU_FLOAT_RZ_ONLY) && SPU_FLOAT_RZ_ONLY
 #define SPU__X_SLOW   static inline __attribute__((noinline, cold, pure))
 #define SPU__RZ_ON    1
@@ -1131,19 +1147,19 @@ SPU__X_INLINE __m128i spu__xw_narrow(__m256d v) {          /* truncated, saturat
     r = _mm256_andnot_si256(_mm256_cmpgt_epi64(_mm256_set1_epi64x(1), b), r);
     return _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(r, _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7)));
 }
-static __attribute__((noinline, cold, pure)) __m128i SPU__X_VC spu__xv_fa_slow(__m128i a, __m128i b, uint32_t negb) {
+static __attribute__((noinline, cold, SPU__X_PUREATTR)) __m128i SPU__X_VC spu__xv_fa_slow(__m128i a, __m128i b, uint32_t negb) {
     if (__builtin_expect(spu__rz_vslow_on(), 1))
         return spu__xw_narrow(_mm256_add_pd(spu__xw_wide(a), spu__xw_wide(_mm_xor_si128(b, _mm_set1_epi32((int)negb)))));
     u128 x, y; _mm_storeu_si128((__m128i*)x._u8, a); _mm_storeu_si128((__m128i*)y._u8, b);
     return spu__xl(spu__xln_fa_slow(x, y, negb));
 }
-static __attribute__((noinline, cold, pure)) __m128i SPU__X_VC spu__xv_fm_slow(__m128i a, __m128i b) {
+static __attribute__((noinline, cold, SPU__X_PUREATTR)) __m128i SPU__X_VC spu__xv_fm_slow(__m128i a, __m128i b) {
     if (__builtin_expect(spu__rz_vslow_on(), 1))
         return spu__xw_narrow(_mm256_mul_pd(spu__xw_wide(a), spu__xw_wide(b)));
     u128 x, y; _mm_storeu_si128((__m128i*)x._u8, a); _mm_storeu_si128((__m128i*)y._u8, b);
     return spu__xl(spu__xln_fm_slow(x, y));
 }
-static __attribute__((noinline, cold, pure)) __m128i SPU__X_VC spu__xv_fma_slow(__m128i a, __m128i b, __m128i c, uint32_t negp, uint32_t negc) {
+static __attribute__((noinline, cold, SPU__X_PUREATTR)) __m128i SPU__X_VC spu__xv_fma_slow(__m128i a, __m128i b, __m128i c, uint32_t negp, uint32_t negc) {
     if (__builtin_expect(spu__rz_vslow_on(), 1))
         return spu__xw_narrow(_mm256_add_pd(_mm256_mul_pd(spu__xw_wide(_mm_xor_si128(a, _mm_set1_epi32((int)negp))),
                                                           spu__xw_wide(b)),
@@ -1342,19 +1358,14 @@ SPU__X_INLINE int spu__xcfl_ok(__m128i x, int scale, __m128i* zero_mask) {
     *zero_mask = _mm_cmpeq_epi32(e, _mm_setzero_si128());
     return 1;
 }
-static inline u128 spu_cflts(u128 a, int i8) {
-    const int scale = 173 - (i8 & 0xFF);
-    const __m128i x = spu__xl(a); __m128i z;
-    if (!spu__xcfl_ok(x, scale, &z)) return spu_cflts_exact(a, i8);
+/* The fast forms' results, valid where spu__xcfl_ok holds (z = its exponent-0 lanes). */
+SPU__X_INLINE __m128i spu__xcflts_core(__m128i x, int scale, __m128i z) {
     const __m128 f = _mm_mul_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(_mm_set1_epi32((int)((uint32_t)(127 + scale) << 23))));
     __m128i r = _mm_cvttps_epi32(f);
     r = _mm_blendv_epi8(r, _mm_set1_epi32(0x7FFFFFFF), _mm_castps_si128(_mm_cmpge_ps(f, _mm_set1_ps(2147483648.0f))));
-    return spu__xs(_mm_andnot_si128(z, r));
+    return _mm_andnot_si128(z, r);
 }
-static inline u128 spu_cfltu(u128 a, int i8) {
-    const int scale = 173 - (i8 & 0xFF);
-    const __m128i x = spu__xl(a); __m128i z;
-    if (!spu__xcfl_ok(x, scale, &z)) return spu_cfltu_exact(a, i8);
+SPU__X_INLINE __m128i spu__xcfltu_core(__m128i x, int scale, __m128i z) {
     const __m128 f = _mm_mul_ps(_mm_castsi128_ps(x), _mm_castsi128_ps(_mm_set1_epi32((int)((uint32_t)(127 + scale) << 23))));
     const __m128 two31 = _mm_set1_ps(2147483648.0f);
     const __m128i lo = _mm_cvttps_epi32(f);
@@ -1362,8 +1373,42 @@ static inline u128 spu_cfltu(u128 a, int i8) {
     __m128i r = _mm_blendv_epi8(lo, hi, _mm_castps_si128(_mm_cmpge_ps(f, two31)));
     r = _mm_blendv_epi8(r, _mm_set1_epi32(-1), _mm_castps_si128(_mm_cmpge_ps(f, _mm_set1_ps(4294967296.0f))));
     r = _mm_andnot_si128(_mm_castps_si128(_mm_cmplt_ps(f, _mm_setzero_ps())), r);
-    return spu__xs(_mm_andnot_si128(z, r));
+    return _mm_andnot_si128(z, r);
 }
+#if SPU_CG_COLD
+/* exact lanes out of line, operands and result in vector registers (SPU_CG_COLD) */
+static __attribute__((noinline, cold, const)) __m128i SPU__X_VC spu__xv_cflts_slow(__m128i a, int i8) {
+    u128 x; _mm_storeu_si128((__m128i*)x._u8, a); return spu__xl(spu_cflts_exact(x, i8));
+}
+static __attribute__((noinline, cold, const)) __m128i SPU__X_VC spu__xv_cfltu_slow(__m128i a, int i8) {
+    u128 x; _mm_storeu_si128((__m128i*)x._u8, a); return spu__xl(spu_cfltu_exact(x, i8));
+}
+static inline u128 spu_cflts(u128 a, int i8) {
+    const int scale = 173 - (i8 & 0xFF);
+    const __m128i x = spu__xl(a); __m128i z;
+    if (__builtin_expect(!spu__xcfl_ok(x, scale, &z), 0)) return spu__xs(spu__xv_cflts_slow(x, i8));
+    return spu__xs(spu__xcflts_core(x, scale, z));
+}
+static inline u128 spu_cfltu(u128 a, int i8) {
+    const int scale = 173 - (i8 & 0xFF);
+    const __m128i x = spu__xl(a); __m128i z;
+    if (__builtin_expect(!spu__xcfl_ok(x, scale, &z), 0)) return spu__xs(spu__xv_cfltu_slow(x, i8));
+    return spu__xs(spu__xcfltu_core(x, scale, z));
+}
+#else
+static inline u128 spu_cflts(u128 a, int i8) {
+    const int scale = 173 - (i8 & 0xFF);
+    const __m128i x = spu__xl(a); __m128i z;
+    if (!spu__xcfl_ok(x, scale, &z)) return spu_cflts_exact(a, i8);
+    return spu__xs(spu__xcflts_core(x, scale, z));
+}
+static inline u128 spu_cfltu(u128 a, int i8) {
+    const int scale = 173 - (i8 & 0xFF);
+    const __m128i x = spu__xl(a); __m128i z;
+    if (!spu__xcfl_ok(x, scale, &z)) return spu_cfltu_exact(a, i8);
+    return spu__xs(spu__xcfltu_core(x, scale, z));
+}
+#endif
 #else
 static inline u128 spu_cflts(u128 a, int i8) { return spu_cflts_exact(a, i8); }
 static inline u128 spu_cfltu(u128 a, int i8) { return spu_cfltu_exact(a, i8); }
@@ -1372,6 +1417,158 @@ static inline u128 spu_csflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i+
     r._u32[i] = v ? spu__sf_pack(v < 0 ? 0x80000000u : 0, v < 0 ? 0u - (uint32_t)v : (uint32_t)v, -(155 - (i8 & 0xFF))) : 0; } return r; }
 static inline u128 spu_cuflt(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) { const uint32_t v = a._u32[i];
     r._u32[i] = v ? spu__sf_pack(0, v, -(155 - (i8 & 0xFF))) : 0; } return r; }
+
+#if SPU_X86_SIMD
+/* SPU_CG_CVT (spu-cg, 2026-11-10; default 1, -DSPU_CG_CVT=0 = the scalar lanes above): csflt /
+ * cuflt in four lanes, for the SPU_FLOAT_RZ mode (MXCSR round toward zero; the scalar lanes run
+ * otherwise, and for a scale outside 0..155, which the lifter passes as a constant).
+ * Same bits as spu__sf_pack: the conversion under round toward zero keeps the top 24 bits of |v|
+ * with v's sign (the SPU's one truncation; 0 gives +0), so its biased exponent E is top + 127;
+ * the scale by 2^-scale is then exact in the exponent field, E - scale, and the SPU's result is 0
+ * where that is below 1 (E <= scale) -- the exponent can never pass 255 (E <= 159). cuflt takes
+ * the lanes at or above 2^31 as v >> 1 (top 24 bits of v >> 1 = bits 31..8 of v) with E + 1.
+ * The empty asm keeps the compiler from converting a constant operand at compile time (that
+ * would round to nearest). */
+#ifndef SPU_CG_CVT
+#define SPU_CG_CVT 1
+#endif
+#if SPU_CG_CVT
+SPU__X_INLINE __m128i spu__xcg_cvt_scale(__m128i fb, int scale) {
+    const __m128i s23 = _mm_set1_epi32((int)((uint32_t)scale << 23));
+    const __m128i keep = _mm_cmpgt_epi32(_mm_and_si128(fb, _mm_set1_epi32(0x7F800000)), s23);
+    return _mm_and_si128(_mm_sub_epi32(fb, s23), keep);
+}
+SPU__X_INLINE u128 spu__xcg_csflt(u128 a, int i8) {
+    const int scale = 155 - (i8 & 0xFF);
+    if (!SPU__RZ_ON || scale < 0) return (spu_csflt)(a, i8);
+    __m128i v = spu__xl(a);
+    __asm__("" : "+x"(v));
+    return spu__xs(spu__xcg_cvt_scale(_mm_castps_si128(_mm_cvtepi32_ps(v)), scale));
+}
+SPU__X_INLINE u128 spu__xcg_cuflt(u128 a, int i8) {
+    const int scale = 155 - (i8 & 0xFF);
+    if (!SPU__RZ_ON || scale < 0) return (spu_cuflt)(a, i8);
+    __m128i v = spu__xl(a);
+    __asm__("" : "+x"(v));
+    const __m128i big = _mm_srli_epi32(v, 31);                         /* 1 where v >= 2^31 */
+    const __m128i fb = _mm_add_epi32(_mm_castps_si128(_mm_cvtepi32_ps(_mm_srlv_epi32(v, big))),
+                                     _mm_slli_epi32(big, 23));
+    return spu__xs(spu__xcg_cvt_scale(fb, scale));
+}
+#define spu_csflt(...) spu__xcg_csflt(__VA_ARGS__)
+#define spu_cuflt(...) spu__xcg_cuflt(__VA_ARGS__)
+#endif
+#endif
+
+/* ---- speculative float regions (spu_lifter.py SPU_LIFT_SPEC_FLOAT, spu-cg 2026-11-10) ----
+ * The lifter runs a straight run of register statements holding two or more of the checked
+ * float ops below (fa fs fm fma fms fnms cflts cfltu) once with the checks deferred: each op is
+ * its fast form with no branch, and folds its "the fast form would have taken its exact path"
+ * verdict into one accumulator (spu_spec_acc). At the end of the run one test: all fast -> the
+ * results are exactly what the per-op code computes (every op took its fast path, whose bits
+ * these are); else the registers the run overwrote are put back and the run is executed again
+ * in the ordinary per-op form. Each _spec op's fast result is its per-op form's fast result,
+ * bit for bit; the verdict is the per-op form's own test (RZ ops: |raw result| >= 0x7F7FFFFF,
+ * i.e. FLT_MAX or Inf/NaN, as spu__xrz_out; cflts/cfltu: a lane with exponent 255, as
+ * spu__xcfl_ok), as one unsigned max per op and one compare per run.
+ * g_spu_spec_cap: a run that took its exact path that many times stops speculating (per site
+ * counter in the lifted TU; 0 = never speculate). PS3_SPU_SPEC=<n> sets it (default 64, 0 =
+ * off; read by each lifted TU before main). */
+#if SPU_X86_SIMD && SPU_X64_MXCSR && !defined(SPU_FLOAT_RZ_CHECK)
+typedef __m128i spu_spec_acc;
+#define SPU_SPEC_INIT() _mm_setzero_si128()
+#define SPU_SPEC_OK(acc) _mm_testz_si128(_mm_cmpgt_epi32((acc), _mm_set1_epi32(0x7F7FFFFE)), _mm_set1_epi32(-1))
+SPU__ONCE int g_spu_spec_cap = 64;
+static __attribute__((constructor, used)) void spu__spec_cap_init(void) {
+    const char* e = getenv("PS3_SPU_SPEC");
+    if (e && *e) { const int v = atoi(e); g_spu_spec_cap = v < 0 ? 0 : v > 255 ? 255 : v; }
+}
+/* the exact pass's register reads: a load from ctx->gpr the compiler cannot replace by a value it
+ * still holds in a host register (so the fast pass need not keep its inputs alive to the end) */
+SPU__X_INLINE u128 spu_gpr_vld(const spu_context* ctx, int n) {
+    u128 r; _mm_storeu_si128((__m128i*)r._u8, *(const volatile __m128i*)(const void*)&ctx->gpr[n]); return r;
+}
+#define SPU_GPR_VLD(ctx, n) spu_gpr_vld((ctx), (n))
+/* the old value of a register the fast pass overwrites, kept for the exact pass in a volatile
+ * stack slot: one store now, a load only on the exact pass (not a host register held to the end) */
+typedef __m128i spu_spec_sv;
+#define SPU_SPEC_SAVE(ctx, n) _mm_loadu_si128((const __m128i*)(const void*)(ctx)->gpr[n]._u8)
+SPU__X_INLINE u128 spu_spec_restore(const volatile spu_spec_sv* p) { u128 r; _mm_storeu_si128((__m128i*)r._u8, *p); return r; }
+/* The +0 rule in two operations: under FTZ a result is never denormal, so the only exponent-0
+ * result is a zero and the per-op form's spu__xflush only ever changes -0 into +0. (In the
+ * SPU_FLOAT_RZ=rn checker test FTZ is off; that mode is wrong on purpose either way.) */
+SPU__X_INLINE __m128i spu__xsp_out(__m128i s, spu_spec_acc* acc) {
+    *acc = _mm_max_epu32(*acc, _mm_and_si128(s, _mm_set1_epi32(0x7FFFFFFF)));
+    return _mm_andnot_si128(_mm_cmpeq_epi32(s, _mm_set1_epi32((int)0x80000000u)), s);
+}
+SPU__X_INLINE u128 spu__xsp_fa(u128 a, u128 b, uint32_t negb, spu_spec_acc* acc) {
+    __m128 x = _mm_castsi128_ps(spu__xl(a));
+    const __m128 y = _mm_castsi128_ps(_mm_xor_si128(spu__xl(b), _mm_set1_epi32((int)negb)));
+    __asm__("" : "+x"(x));
+    return spu__xs(spu__xsp_out(_mm_castps_si128(_mm_add_ps(x, y)), acc));
+}
+SPU__X_INLINE u128 spu__xsp_fm(u128 a, u128 b, spu_spec_acc* acc) {
+    __m128 x = _mm_castsi128_ps(spu__xl(a));
+    const __m128 y = _mm_castsi128_ps(spu__xl(b));
+    __asm__("" : "+x"(x));
+    return spu__xs(spu__xsp_out(_mm_castps_si128(_mm_mul_ps(x, y)), acc));
+}
+SPU__X_INLINE u128 spu__xsp_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc, spu_spec_acc* acc) {
+    __m128 x = _mm_castsi128_ps(_mm_xor_si128(spu__xl(a), _mm_set1_epi32((int)negp)));
+    const __m128 y = _mm_castsi128_ps(spu__xl(b));
+    const __m128 z = _mm_castsi128_ps(_mm_xor_si128(spu__xl(c), _mm_set1_epi32((int)negc)));
+    __asm__("" : "+x"(x));
+    return spu__xs(spu__xsp_out(_mm_castps_si128(_mm_fmadd_ps(x, y, z)), acc));
+}
+/* not under SPU__RZ_ON (SPU_FLOAT_RZ=0 in a build without SPU_FLOAT_RZ_ONLY): the per-op form,
+ * exact, the accumulator untouched */
+SPU__X_INLINE u128 spu_fa_spec(u128 a, u128 b, spu_spec_acc* acc) {
+    return SPU__RZ_ON ? spu__xsp_fa(a, b, 0, acc) : spu_fa_lean(a, b); }
+SPU__X_INLINE u128 spu_fs_spec(u128 a, u128 b, spu_spec_acc* acc) {
+    return SPU__RZ_ON ? spu__xsp_fa(a, b, 0x80000000u, acc) : spu_fs_lean(a, b); }
+SPU__X_INLINE u128 spu_fm_spec(u128 a, u128 b, spu_spec_acc* acc) {
+    return SPU__RZ_ON ? spu__xsp_fm(a, b, acc) : spu_fm_lean(a, b); }
+SPU__X_INLINE u128 spu_fma_spec(u128 a, u128 b, u128 c, spu_spec_acc* acc) {
+    return SPU__RZ_ON ? spu__xsp_fma(a, b, c, 0, 0, acc) : spu_fma_lean(a, b, c); }
+SPU__X_INLINE u128 spu_fms_spec(u128 a, u128 b, u128 c, spu_spec_acc* acc) {
+    return SPU__RZ_ON ? spu__xsp_fma(a, b, c, 0, 0x80000000u, acc) : spu_fms_lean(a, b, c); }
+SPU__X_INLINE u128 spu_fnms_spec(u128 a, u128 b, u128 c, spu_spec_acc* acc) {
+    return SPU__RZ_ON ? spu__xsp_fma(a, b, c, 0x80000000u, 0, acc) : spu_fnms_lean(a, b, c); }
+/* cflts/cfltu: the verdict of spu__xcfl_ok (exponent 255 in a lane), as exponent bits: an
+ * exponent-255 lane gives 0x7F800000 (> 0x7F7FFFFE), any other at most 0x7F000000 */
+SPU__X_INLINE u128 spu_cflts_spec(u128 a, int i8, spu_spec_acc* acc) {
+    const int scale = 173 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_cflts(a, i8);
+    const __m128i x = spu__xl(a), e = _mm_and_si128(x, _mm_set1_epi32(0x7F800000));
+    *acc = _mm_max_epu32(*acc, e);
+    return spu__xs(spu__xcflts_core(x, scale, _mm_cmpeq_epi32(e, _mm_setzero_si128())));
+}
+SPU__X_INLINE u128 spu_cfltu_spec(u128 a, int i8, spu_spec_acc* acc) {
+    const int scale = 173 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_cfltu(a, i8);
+    const __m128i x = spu__xl(a), e = _mm_and_si128(x, _mm_set1_epi32(0x7F800000));
+    *acc = _mm_max_epu32(*acc, e);
+    return spu__xs(spu__xcfltu_core(x, scale, _mm_cmpeq_epi32(e, _mm_setzero_si128())));
+}
+#else
+/* no speculation (non-x86, scalar helpers, the RZ check build): the per-op forms, exact */
+typedef int spu_spec_acc;
+#define SPU_SPEC_INIT() 0
+#define SPU_SPEC_OK(acc) ((void)(acc), 1)
+#define SPU_GPR_VLD(ctx, n) ((ctx)->gpr[n])
+typedef u128 spu_spec_sv;
+#define SPU_SPEC_SAVE(ctx, n) ((ctx)->gpr[n])
+#define spu_spec_restore(p) (*(const u128*)(const void*)(p))
+#define g_spu_spec_cap 0
+#define spu_fa_spec(a, b, acc) spu_fa_lean(a, b)
+#define spu_fs_spec(a, b, acc) spu_fs_lean(a, b)
+#define spu_fm_spec(a, b, acc) spu_fm_lean(a, b)
+#define spu_fma_spec(a, b, c, acc) spu_fma_lean(a, b, c)
+#define spu_fms_spec(a, b, c, acc) spu_fms_lean(a, b, c)
+#define spu_fnms_spec(a, b, c, acc) spu_fnms_lean(a, b, c)
+#define spu_cflts_spec(a, i8, acc) spu_cflts(a, i8)
+#define spu_cfltu_spec(a, i8, acc) spu_cfltu(a, i8)
+#endif
 
 /* fi -- Floating Interpolate (SPU ISA v1.2, p. 219; frest/frsqest output
  * format p. 215; single-precision rules section 9.1).
@@ -2326,6 +2523,18 @@ static inline __attribute__((always_inline)) void spu_drain_call_inl(spu_context
     spu_drain_call(ctx, return_pc);
 }
 #define spu_drain_call(ctx, pc) spu_drain_call_inl((ctx), (pc))
+#endif
+
+/* SPU_CG_IMG_INLINE (spu-cg 2026-11-10; lifted TUs, default 1; -DSPU_CG_IMG_INLINE=0 = the call):
+ * the image restore after every lifted call (brsl/bisl) inline -- spu_drain.c's spu_img_restore
+ * is this one statement, and as an out-of-line call it was one more opaque call per SPU call
+ * (keep the two the same). */
+#if defined(SPU_LS_FASTPATH) && SPU_LS_FASTPATH && !(defined(SPU_CG_IMG_INLINE) && !SPU_CG_IMG_INLINE)
+static inline __attribute__((always_inline)) void spu_img_restore_inl(spu_context* ctx, int32_t saved_img)
+{
+    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : saved_img;
+}
+#define spu_img_restore(ctx, s) spu_img_restore_inl((ctx), (s))
 #endif
 
 #endif /* SPU_HELPERS_H */
