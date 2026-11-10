@@ -60,6 +60,23 @@ float vk_postfx_render_scale(void);          /* the scale in effect this session
 /* [res] the backend: the setting read at start, and the scale it runs at. */
 float vk_postfx_render_scale_wanted(void);
 void  vk_postfx_render_scale_active(float s);
+/* [wide] PS3RECOMP_ASPECT=16:9|auto|21:9|32:9|16:10|<w>:<h>|<w>x<h>|<ratio>, read
+ * once at start (docs/WIDESCREEN.md). 16:9 or unset = the game's picture, the
+ * old path exactly. auto = the shape of the screen (PS3RECOMP_VK_FULLSCREEN=1)
+ * or of PS3RECOMP_VK_WINDOW_SIZE=<w>x<h> (windowed; without it the window is
+ * the guest's 16:9). PS3_ASPECT (the Metal port's name) when it is unset.
+ * ps3_aspect_wanted: 1 and the shape (reduced, num:den) when a picture other
+ * than 16:9 is asked for; the first call decides and logs. The title's half
+ * (the port's game_patches.cpp) widens its cameras and says what they see:
+ * ps3_aspect_game_set(<width at the guest's height>, <guest height>), e.g.
+ * 1680, 720 at 21:9. The backend renders wide only when both are there. */
+int   ps3_aspect_wanted(unsigned* num, unsigned* den);
+void  ps3_aspect_game_set(unsigned w, unsigned h);
+int   ps3_aspect_game(unsigned* w, unsigned* h);   /* 1 + what the title said, else 0 */
+/* [wide] the backend: the width / height ratio of its frame relative to 16:9
+ * (1.3125 at 21:9, 1 = 16:9), for the menu's "now" line. */
+void  vk_postfx_aspect_active(float k);
+float vk_postfx_aspect_k(void);
 /* By environment-variable name ("PS3RECOMP_AA", "PS3RECOMP_SHARPEN",
  * "PS3RECOMP_ANISO", "PS3RECOMP_RENDER_SCALE", "PS3RECOMP_UPSCALE") and its
  * text value, as the

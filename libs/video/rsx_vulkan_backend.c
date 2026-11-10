@@ -488,9 +488,16 @@ static struct {
     vk_buffer readback;        /* ... and its CPU copy (PS3RECOMP_VK_DUMP)       */
     u32       dw, dh;
     u32       warned;
-} s_res = { .q = 4u, .s = 1.0f };
-/* Metal's floorf(v * s + 0.5), exact in quarter steps */
+    /* [wide] x has its own scale xn / xd (sx as a float): q / 4 like y, or
+     * with PS3RECOMP_ASPECT q * (the title's camera width) / (4 * gw) */
+    u32       xn, xd;
+    float     sx;
+} s_res = { .q = 4u, .s = 1.0f, .xn = 4u, .xd = 4u, .sx = 1.0f };
+/* Metal's floorf(v * s + 0.5), exact in quarter steps: a height or a y */
 static u32 vk_res_px(u32 v) { return s_res.on ? (v * s_res.q + 2u) / 4u : v; }
+/* [wide] a width or an x: floor(v * xn / xd + 0.5); (v * q + 2) / 4, as
+ * vk_res_px, while the picture is 16:9 (xn = q, xd = 4) */
+static u32 vk_res_px_x(u32 v) { return s_res.on ? (u32)(((u64)v * s_res.xn + s_res.xd / 2u) / s_res.xd) : v; }
 static int vk_res_fits(u32 w, u32 h) { return s_res.on && w <= s_res.gw && h <= s_res.gh; }
 /* the image the present reads (and the frame dump): the scaled one when on */
 static vk_image* vk_disp_img(void) { return s_res.disp.img ? &s_res.disp : &s_vk.color; }
@@ -498,6 +505,74 @@ static u32 vk_disp_w(void) { return s_res.disp.img ? s_res.dw : s_vk.width; }
 static u32 vk_disp_h(void) { return s_res.disp.img ? s_res.dh : s_vk.height; }
 static vk_buffer* vk_disp_readback(void) { return s_res.disp.img ? &s_res.readback : &s_vk.readback; }
 /* ---- [res] end ---- */
+
+/* ---- [wide] PS3RECOMP_ASPECT: a wider (or narrower) picture, hor+ ---------
+ * docs/WIDESCREEN.md has the whole design. The title widens its cameras (the
+ * port's game_patches.cpp: the camera's aspect, so its projection AND its
+ * culling frustum, and the SPU Edge job's view-projection that comes from
+ * them) and says what they see through ps3_aspect_game_set, e.g. 1680 x 720
+ * at 21:9. The guest still draws 1280x720: its clip space now holds the
+ * wider view. Here every screen target is made that much wider than the
+ * guest's (anamorphic: [res]'s scaling with x apart, s_res.xn / xd), so the
+ * pixels come out square; the title's HUD keeps 16:9 in the middle (the draw
+ * engine flags its draws, PS3_ASPECT_HUD_AFTER, set_hud), a frame of overlay
+ * alone (menu, movie, loading screen) gets black bars beside its 16:9, and
+ * the present fits the wide frame into the window by its own shape.
+ * Read at start; off (16:9) = none of this runs: set_hud is not installed,
+ * x scales as y, the present fills the window as before. */
+static struct {
+    int      on;               /* anamorphic targets this session                */
+    u32      cw;               /* the title's camera width at the guest's height */
+    int      pin;              /* the draws being recorded are the HUD (set_hud 1) */
+    int      bars;             /* the frame is overlay alone (set_hud 3; 4 clears) */
+    vk_image black;            /* 8x8 of zeros: the bars are blits of it        */
+} s_wide;
+/* The 16:9 rectangle of a scaled target t: its guest gw x gh at ONE scale --
+ * y's when the picture is wider than 16:9 (1: centred across), x's when it is
+ * narrower (2: centred top to bottom) -- so the HUD keeps its shape. */
+static int vk_wide_pin_rect(u32 gw, u32 gh, u32 w, u32 h, u32* ox, u32* oy)
+{
+    if (s_res.sx >= s_res.s) {
+        const u32 pw = vk_res_px(gw);
+        *ox = w > pw ? (w - pw) / 2u : 0u; *oy = 0u;
+        return 1;
+    }
+    const u32 ph = vk_res_px_x(gh);
+    *ox = 0u; *oy = h > ph ? (h - ph) / 2u : 0u;
+    return 2;
+}
+/* Where a w x h frame goes in an sw x sh window: its own shape, centred. 0 =
+ * the whole window (16:9 picture, or the same shape within a pixel). */
+static int vk_wide_fit(u32 w, u32 h, u32 sw, u32 sh, VkOffset3D* o0, VkOffset3D* o1)
+{
+    o0->x = 0; o0->y = 0; o0->z = 0;
+    o1->x = (int32_t)sw; o1->y = (int32_t)sh; o1->z = 1;
+    if (!s_wide.on || !w || !h || !sw || !sh) return 0;
+    u32 fw = sw, fh = sh;
+    const u64 a = (u64)w * sh, b = (u64)sw * h;     /* a > b: the frame is the wider */
+    if (a > b) fh = (u32)(((u64)sw * h + w / 2u) / w);
+    else if (a < b) fw = (u32)(((u64)sh * w + h / 2u) / h);
+    if (fw > sw) fw = sw;
+    if (fh > sh) fh = sh;
+    if (fw + 1u >= sw && fh + 1u >= sh) return 0;
+    o0->x = (int32_t)((sw - fw) / 2u); o0->y = (int32_t)((sh - fh) / 2u);
+    o1->x = o0->x + (int32_t)fw; o1->y = o0->y + (int32_t)fh;
+    return 1;
+}
+/* The window's bars: the swapchain image (TRANSFER_DST_OPTIMAL) cleared to
+ * black before the frame's blit into the fitted rectangle. */
+static void vk_wide_window_black(VkCommandBuffer cmd, VkImage img)
+{
+    const VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+    const VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    pvkCmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &r);
+    const VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                 .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
+    pvkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          0, 1, &mb, 0, NULL, 0, NULL);
+}
+/* ---- [wide] end (the rest is marked [wide] where it is used) ---- */
 static int s_vk_indep_blend;   /* device has independentBlend (per-attachment state) */
 static int s_vk_depth_clamp_ok; /* device has depthClamp (ZMIN_MAX_CONTROL clamp, not clip) */
 /* DEPTH, or DEPTH|STENCIL when the depth format carries the RSX's 8 stencil
@@ -1352,7 +1427,7 @@ static int64_t vk_batch_gstage(VkDeviceSize bytes)
         if (s_batch.garena.buf && s_batch.garena.size >= need) continue;
         /* [res] the depth decodes it bounces are s^2 larger: as many fit a batch as at 1x */
         VkDeviceSize size = s_batch.garena.size ? s_batch.garena.size * 2
-                                                : ((VkDeviceSize)(64u << 20) * s_res.q * s_res.q / 16u);
+                                                : ((VkDeviceSize)(64u << 20) * s_res.xn * s_res.q / (4u * s_res.xd));   /* [wide] x * y (q * q / 16 at 16:9) */
         while (size < need) size *= 2;
         vk_destroy_buffer(&s_batch.garena);
         if (vk_create_device_buffer(&s_batch.garena, size,
@@ -3487,9 +3562,29 @@ static void vk_window_open(const char* title)
     }
     Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN;
     if (vk_env_on("PS3RECOMP_VK_FULLSCREEN")) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    /* [wide] PS3RECOMP_VK_WINDOW_SIZE=<w>x<h>: the window's size (unset: the
+     * guest's, as before); with a wide picture and no size, the picture's
+     * shape at the guest's height, shrunk to fit the screen */
+    int win_w = (int)s_vk.width, win_h = (int)s_vk.height;
+    { const char* ws = getenv("PS3RECOMP_VK_WINDOW_SIZE");
+      unsigned a = 0, b = 0;
+      char* e = NULL;
+      if (ws && *ws) {
+          a = (unsigned)strtoul(ws, &e, 10);
+          if (e && (*e == 'x' || *e == 'X')) b = (unsigned)strtoul(e + 1, &e, 10);
+          if (a >= 64u && b >= 64u && a <= 16384u && b <= 16384u && e && !*e) { win_w = (int)a; win_h = (int)b; }
+          else VK_LOG("PS3RECOMP_VK_WINDOW_SIZE=%s: expected <w>x<h>; %ux%u\n", ws, s_vk.width, s_vk.height);
+      } else if (s_wide.on) {
+          win_w = (int)s_wide.cw;
+          SDL_DisplayMode dm;
+          if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.w > 0 && dm.h > 0 && win_w > dm.w * 9 / 10) {
+              win_h = (int)((double)win_h * (dm.w * 9 / 10) / win_w + 0.5);
+              win_w = dm.w * 9 / 10;
+          }
+      } }
     s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                   (int)s_vk.width, (int)s_vk.height, flags);
+                                   win_w, win_h, flags);
     s_vk.windowed = 1;          /* so vk_window_drop also shuts SDL video down */
     if (!s_vk.window) {
         char why[256];
@@ -4171,9 +4266,12 @@ static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore ac
         else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); sc = 0; }
     }
     if (sc) {
+        /* [wide] the frame by its own shape in the window (the whole window at 16:9) */
+        VkOffset3D fit0, fit1;
+        const int fit = vk_wide_fit(cw, ch, s_vk.sc_extent.width, s_vk.sc_extent.height, &fit0, &fit1);
         VkImage pf_img = cimg;
         uint32_t pf_w = cw, pf_h = ch;
-        if (!vk_postfx_apply(cmd, cimg, cview, cw, ch, s_vk.sc_extent.width, s_vk.sc_extent.height,
+        if (!vk_postfx_apply(cmd, cimg, cview, cw, ch, (uint32_t)(fit1.x - fit0.x), (uint32_t)(fit1.y - fit0.y),
                              &pf_img, &pf_w, &pf_h)) {
             pf_img = cimg; pf_w = cw; pf_h = ch;
         }
@@ -4186,11 +4284,12 @@ static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore ac
         };
         pvkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                               0, 0, NULL, 0, NULL, 1, &b);
+        if (fit) vk_wide_window_black(cmd, s_vk.sc_images[idx]);   /* [wide] the bars */
         VkImageBlit blit = {
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .srcOffsets = { { 0, 0, 0 }, { (int32_t)pf_w, (int32_t)pf_h, 1 } },
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .dstOffsets = { { 0, 0, 0 }, { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
+            .dstOffsets = { fit0, fit1 },
         };
         pvkCmdBlitImage(cmd, pf_img, VK_IMAGE_LAYOUT_GENERAL, s_vk.sc_images[idx],
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
@@ -4214,9 +4313,11 @@ static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore ac
             vk_shot_record(cmd, cimg, VK_IMAGE_LAYOUT_GENERAL, cw, ch, s_shot.disp_bgra, fence);
     } else if (dark) {
         /* (rsx5) the same post-processing as a shown frame; a shot reads its output */
+        VkOffset3D fit0, fit1;                   /* [wide] as a shown frame */
+        vk_wide_fit(cw, ch, s_vk.sc_extent.width, s_vk.sc_extent.height, &fit0, &fit1);
         VkImage pf_img = cimg;
         uint32_t pf_w = cw, pf_h = ch;
-        if (vk_postfx_apply(cmd, cimg, cview, cw, ch, s_vk.sc_extent.width, s_vk.sc_extent.height,
+        if (vk_postfx_apply(cmd, cimg, cview, cw, ch, (uint32_t)(fit1.x - fit0.x), (uint32_t)(fit1.y - fit0.y),
                             &pf_img, &pf_w, &pf_h) && pf_img != cimg)
             vk_shot_record(cmd, pf_img, VK_IMAGE_LAYOUT_GENERAL, pf_w, pf_h, 0, fence);   /* postfx: RGBA8 */
         else
@@ -4346,10 +4447,12 @@ static void vk_present_window_body(void)
     vk_gprof_note_present();
     vk_barrier_image(di->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     /* [postfx] AA + CAS (vk_postfx.c) on the frame; the window gets its output */
+    VkOffset3D fit0, fit1;                       /* [wide] the frame by its own shape in the window */
+    const int fit = vk_wide_fit(di_w, di_h, s_vk.sc_extent.width, s_vk.sc_extent.height, &fit0, &fit1);
     VkImage pf_img = di->img;
     uint32_t pf_w = di_w, pf_h = di_h;
     if (!vk_postfx_apply(s_vk.cmd, di->img, di->view, di_w, di_h,
-                         s_vk.sc_extent.width, s_vk.sc_extent.height, &pf_img, &pf_w, &pf_h)) {
+                         (uint32_t)(fit1.x - fit0.x), (uint32_t)(fit1.y - fit0.y), &pf_img, &pf_w, &pf_h)) {
         pf_img = di->img; pf_w = di_w; pf_h = di_h;
     }
     VkImageMemoryBarrier b = {
@@ -4361,12 +4464,12 @@ static void vk_present_window_body(void)
     };
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                           0, 0, NULL, 0, NULL, 1, &b);
+    if (fit) vk_wide_window_black(s_vk.cmd, s_vk.sc_images[idx]);   /* [wide] the bars */
     VkImageBlit blit = {
         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .srcOffsets = { { 0, 0, 0 }, { (int32_t)pf_w, (int32_t)pf_h, 1 } },
         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .dstOffsets = { { 0, 0, 0 },
-                        { (int32_t)s_vk.sc_extent.width, (int32_t)s_vk.sc_extent.height, 1 } },
+        .dstOffsets = { fit0, fit1 },
     };
     pvkCmdBlitImage(s_vk.cmd, pf_img, VK_IMAGE_LAYOUT_GENERAL,
                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -4543,6 +4646,7 @@ typedef struct vk_eng_obj {
 } vk_eng_obj;
 /* [res] v (guest pixels) in this object's image pixels */
 static u32 vk_res_obj_px(const vk_eng_obj* o, u32 v) { return (o && o->scaled) ? vk_res_px(v) : v; }
+static u32 vk_res_obj_px_x(const vk_eng_obj* o, u32 v) { return (o && o->scaled) ? vk_res_px_x(v) : v; }   /* [wide] a width */
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
 /* (rsx-par) PS3RECOMP_VK_BT: bumped when slot i is released (vk_eng_release) --
@@ -4838,25 +4942,45 @@ static void vk_res_off(void)
         vk_destroy_image_real(&s_res.disp);
     }
     if (s_res.readback.buf) vk_destroy_buffer(&s_res.readback);
+    if (s_wide.black.img || s_wide.black.view) vk_destroy_image_real(&s_wide.black);   /* [wide] */
     s_res.on = 0; s_res.q = 4u; s_res.s = 1.0f; s_res.dw = s_res.dh = 0;
+    s_res.xn = s_res.xd = 4u; s_res.sx = 1.0f;                                /* [wide] */
+    s_wide.on = s_wide.pin = s_wide.bars = 0;                                 /* [wide] */
     rsx_fp_set_wpos_scale_xy(1.0f, 1.0f);
     vk_postfx_render_scale_active(1.0f);
+    vk_postfx_aspect_active(1.0f);
 }
 static void vk_res_init(void)
 {
     if (s_res.on) return;
     s_res.gw = s_vk.width; s_res.gh = s_vk.height;
-    const u32 q = (u32)(vk_postfx_render_scale_wanted() * 4.0f + 0.5f);   /* quarter steps, 1x..4x */
-    if (q <= 4u || q > 16u || !s_vk.device) { vk_postfx_render_scale_active(1.0f); return; }
+    u32 q = (u32)(vk_postfx_render_scale_wanted() * 4.0f + 0.5f);   /* quarter steps, 1x..4x */
+    if (q < 4u) q = 4u;
+    /* [wide] a wide picture scales x even at 720p */
+    if ((q == 4u && !s_wide.on) || q > 16u || !s_vk.device) {
+        vk_postfx_render_scale_active(1.0f);
+        if (s_wide.on) vk_res_off();
+        return;
+    }
     s_res.q = q; s_res.s = (float)q / 4.0f; s_res.on = 1;
-    s_res.dw = vk_res_px(s_vk.width); s_res.dh = vk_res_px(s_vk.height);
+    if (s_wide.on) {   /* [wide] x: q/4 x (camera width / guest width), as a fraction */
+        s_res.xn = q * s_wide.cw; s_res.xd = 4u * s_vk.width;
+        s_res.sx = (float)((double)s_res.xn / (double)s_res.xd);
+    } else {
+        s_res.xn = q; s_res.xd = 4u; s_res.sx = s_res.s;
+    }
+    s_res.dw = vk_res_px_x(s_vk.width); s_res.dh = vk_res_px(s_vk.height);
     if (vk_create_image(&s_res.disp, VK_FORMAT_R8G8B8A8_UNORM, s_res.dw, s_res.dh,
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT) ||
         vk_create_host_buffer(&s_res.readback, (VkDeviceSize)s_res.dw * s_res.dh * 4u,
-                              VK_BUFFER_USAGE_TRANSFER_DST_BIT) || vk_begin()) {
-        VK_LOG("internal resolution x%.2f: no %ux%u display image -- 720p\n", (double)s_res.s, s_res.dw, s_res.dh);
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT) ||
+        (s_wide.on && vk_create_image(&s_wide.black, VK_FORMAT_R8G8B8A8_UNORM, 8u, 8u,       /* [wide] */
+                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                      VK_IMAGE_ASPECT_COLOR_BIT)) || vk_begin()) {
+        VK_LOG("internal resolution x%.2f: no %ux%u display image -- 720p%s\n", (double)s_res.s, s_res.dw, s_res.dh,
+               s_wide.on ? ", 16:9" : "");
         vk_res_off();
         return;
     }
@@ -4864,8 +4988,17 @@ static void vk_res_init(void)
     VkClearColorValue black = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
     VkImageSubresourceRange cr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     pvkCmdClearColorImage(s_vk.cmd, s_res.disp.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &cr);
+    if (s_wide.black.img) {   /* [wide] the bars' source */
+        vk_barrier_image(s_wide.black.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+        pvkCmdClearColorImage(s_vk.cmd, s_wide.black.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &cr);
+    }
     vk_submit_and_wait();
-    rsx_fp_set_wpos_scale_xy(s_res.s, s_res.s);
+    rsx_fp_set_wpos_scale_xy(s_res.sx, s_res.s);   /* [wide] x apart (sx == s at 16:9) */
+    vk_postfx_aspect_active(s_res.sx / s_res.s);   /* [wide] the menu's "now" line */
+    if (s_wide.on)
+        VK_LOG("aspect: the title's cameras see %ux%u: screen targets %.4fx wide, %.2fx high (display image %ux%u); "
+               "the HUD keeps 16:9 (PS3_ASPECT_HUD_AFTER)\n",
+               s_wide.cw, s_vk.height, (double)s_res.sx, (double)s_res.s, s_res.dw, s_res.dh);
     /* The decompiler's PS3_RES_SHADOW_FIX scales unnormalised shadow-map
      * coordinates for a map made at the scaled size: the maps stay at their own
      * size here (they never fit the display), so it stays off. */
@@ -4956,7 +5089,7 @@ static u32 vk_eng_color_target_make(void* user, rsx_be_format fmt, u32 gw, u32 g
     u32 bpp;
     const VkFormat vf = vk_eng_format(fmt, &bpp);
     scaled = scaled && s_res.on;
-    const u32 w = scaled ? vk_res_px(gw) : gw, h = scaled ? vk_res_px(gh) : gh;   /* [res] the image */
+    const u32 w = scaled ? vk_res_px_x(gw) : gw, h = scaled ? vk_res_px(gh) : gh;   /* [res] the image ([wide] x apart) */
     /* E1: the render pass is built for R8G8B8A8, so that is the one colour
      * target format for now; FP16 HDR targets need their own pass. */
     if (vf != VK_FORMAT_R8G8B8A8_UNORM || !w || !h || gw > 4096u || gh > 4096u || w > 16384u || h > 16384u) {
@@ -4997,7 +5130,7 @@ static u32 vk_eng_color_target_make(void* user, rsx_be_format fmt, u32 gw, u32 g
                 const u8* srow = (const u8*)seed + (size_t)gy * seed_row_bytes;
                 u8* drow = up + (size_t)y * w * bpp;
                 for (u32 x = 0; x < w; x++) {
-                    u32 gx = x * 4u / s_res.q; if (gx >= gw) gx = gw - 1u;
+                    u32 gx = (u32)((u64)x * s_res.xd / s_res.xn); if (gx >= gw) gx = gw - 1u;   /* [wide] x * 4 / q at 16:9 */
                     memcpy(drow + (size_t)x * bpp, srow + (size_t)gx * bpp, bpp);
                 }
             }
@@ -5018,7 +5151,7 @@ static u32 vk_eng_depth_target_create(void* user, u32 gw, u32 gh)
 {
     (void)user;
     const int scaled = vk_res_fits(gw, gh);                              /* [res] as the colour targets */
-    const u32 w = scaled ? vk_res_px(gw) : gw, h = scaled ? vk_res_px(gh) : gh;
+    const u32 w = scaled ? vk_res_px_x(gw) : gw, h = scaled ? vk_res_px(gh) : gh;   /* [wide] x apart */
     if (!w || !h || gw > 4096u || gh > 4096u || w > 16384u || h > 16384u) return 0;
     const u32 hd = vk_eng_alloc();
     if (!hd) return 0;
@@ -5271,6 +5404,42 @@ static void vk_rtd_frame(u32 presented)
 /* The named surface becomes the frame: blit it onto the display image, then
  * the existing present does the readback, the PPM dump and the window. */
 static int vk_lfx_tone(const vk_eng_obj* src);   /* [light] the Lighting page's tone pass */
+/* [wide] a frame of overlay alone (s_wide.bars): black outside the display
+ * image's 16:9 rectangle -- where the guest's clear showed beside the pinned
+ * menu or movie. Blits of the 8x8 black image, after the write that made the
+ * frame (the blit or the tone pass). */
+static void vk_wide_bars(const vk_image* di, u32 w, u32 h)
+{
+    if (!s_wide.on || !s_wide.bars || !s_wide.black.img || !di || !di->img) return;
+    u32 ox = 0u, oy = 0u;
+    const int axis = vk_wide_pin_rect(s_vk.width, s_vk.height, w, h, &ox, &oy);
+    const VkImageSubresourceLayers sl = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    VkImageBlit b[2];
+    memset(b, 0, sizeof b);
+    for (int k = 0; k < 2; k++) {
+        b[k].srcSubresource = sl; b[k].dstSubresource = sl;
+        b[k].srcOffsets[1].x = 1; b[k].srcOffsets[1].y = 1; b[k].srcOffsets[1].z = 1;
+        b[k].dstOffsets[1].z = 1;
+    }
+    if (axis == 1 && ox) {                      /* left and right */
+        const u32 pw = vk_res_px(s_vk.width);
+        if (ox + pw >= w) return;
+        b[0].dstOffsets[1].x = (int32_t)ox;      b[0].dstOffsets[1].y = (int32_t)h;
+        b[1].dstOffsets[0].x = (int32_t)(ox + pw);
+        b[1].dstOffsets[1].x = (int32_t)w;       b[1].dstOffsets[1].y = (int32_t)h;
+    } else if (axis == 2 && oy) {               /* top and bottom */
+        const u32 ph = vk_res_px_x(s_vk.height);
+        if (oy + ph >= h) return;
+        b[0].dstOffsets[1].x = (int32_t)w;       b[0].dstOffsets[1].y = (int32_t)oy;
+        b[1].dstOffsets[0].y = (int32_t)(oy + ph);
+        b[1].dstOffsets[1].x = (int32_t)w;       b[1].dstOffsets[1].y = (int32_t)h;
+    } else {
+        return;
+    }
+    vk_barrier_all();
+    pvkCmdBlitImage(s_vk.cmd, s_wide.black.img, VK_IMAGE_LAYOUT_GENERAL, di->img, VK_IMAGE_LAYOUT_GENERAL,
+                    2u, b, VK_FILTER_NEAREST);
+}
 static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
@@ -5283,6 +5452,7 @@ static void vk_eng_present(void* user, u32 surface)
         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         vk_barrier_image(di->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         if (vk_lfx_tone(o)) {                           /* [light] tone pass instead of the blit */
+            vk_wide_bars(di, di_w, di_h);               /* [wide] an overlay-only frame */
             if (!s_batch.recording) vk_submit_and_wait();
             vk_cb_present(&s_vk, 0);
             return;
@@ -5297,6 +5467,7 @@ static void vk_eng_present(void* user, u32 surface)
                         di->img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                         (o->w == di_w && o->h == di_h) ? VK_FILTER_NEAREST
                                                        : VK_FILTER_LINEAR);
+        vk_wide_bars(di, di_w, di_h);                   /* [wide] an overlay-only frame */
         if (!s_batch.recording) vk_submit_and_wait();   /* batched: vk_cb_present submits */
     }
     vk_cb_present(&s_vk, 0);
@@ -5314,7 +5485,7 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
          * filtering: depth and packed normals must stay exact; Metal's
          * eng_readback does the same). Row r of the guest's is image row
          * floor((r + 0.5) * s), clamped to the rectangle. */
-        const u32 sx0 = vk_res_px(x), sy0 = vk_res_px(y), sx1 = vk_res_px(x + w), sy1 = vk_res_px(y + h);
+        const u32 sx0 = vk_res_px_x(x), sy0 = vk_res_px(y), sx1 = vk_res_px_x(x + w), sy1 = vk_res_px(y + h);   /* [wide] */
         if (sx1 > o->w || sy1 > o->h || sx1 <= sx0 || sy1 <= sy0 || !o->bpp) return;
         const u32 bpp = o->bpp, sw = sx1 - sx0, sh = sy1 - sy0;
         const size_t stight = (size_t)sw * bpp;
@@ -5345,7 +5516,8 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
                     const u8* srow = big + (size_t)r * stight;
                     u8* drow = (u8*)out + (size_t)row * out_pitch;
                     for (u32 col = 0; col < w; col++) {
-                        u32 c = (2u * col + 1u) * s_res.q / 8u; if (c >= sw) c = sw - 1u;
+                        /* [wide] floor((col + 0.5) * xn / xd): (2col+1) q / 8 at 16:9 */
+                        u32 c = (u32)((u64)(2u * col + 1u) * s_res.xn / (2u * s_res.xd)); if (c >= sw) c = sw - 1u;
                         memcpy(drow + (size_t)col * bpp, srow + (size_t)c * bpp, bpp);
                     }
                 }
@@ -5789,7 +5961,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     if (h > z->gh) h = z->gh;
     if (!w || !h) return 0;
     const u32 gw = w, gh = h;
-    w = vk_res_obj_px(z, gw); h = vk_res_obj_px(z, gh);
+    w = vk_res_obj_px_x(z, gw); h = vk_res_obj_px(z, gh);   /* [wide] x apart */
     if (w > z->w) w = z->w;
     if (h > z->h) h = z->h;
     /* [res] PS3RECOMP_VK_ZDIRECT: one pass reading the depth view instead
@@ -6658,6 +6830,18 @@ static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
     (void)user;
     s_e2.sc[0] = x; s_e2.sc[1] = y; s_e2.sc[2] = w; s_e2.sc[3] = h; s_e2.have_sc = 1;
 }
+/* [wide] rsx_draw_backend.set_hud, installed only while s_wide.on (the draw
+ * engine's PS3_ASPECT_HUD_AFTER logic): before each draw, 1 = the title's HUD
+ * (kept 16:9 in the middle), 2 / 0 = fills the wide picture; before a present
+ * that drew, 3 = a frame of overlay alone (black bars beside its 16:9), 4 =
+ * a 3D frame. The bars stay as the last drawing frame left them, so the host
+ * clock's repeat presents of it keep them. */
+static void vk_eng_set_hud(void* user, int hud, u32 target_w)
+{
+    (void)user; (void)target_w;
+    if (hud >= 3) { s_wide.bars = s_wide.on && hud == 3; return; }
+    s_wide.pin = s_wide.on && hud == 1;
+}
 static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
 /* POLYGON_OFFSET: `constant` in units of the guest depth's resolution
  * (2^-24, D24). The depth image is D32_SFLOAT, whose constant unit is
@@ -7513,9 +7697,21 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
     if (!known || s_ecs.pipe != pipe) pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     else s_ecs_skipped++;
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+    /* [wide] the title's HUD (set_hud 1) into a scaled target: its guest
+     * pixels at one scale in the target's 16:9 rectangle (vk_wide_pin_rect),
+     * 1 = y's scale, 2 = x's; 0 = x and y at their own scales */
+    u32 pin_ox = 0u, pin_oy = 0u;
+    const int pin = (s_wide.pin && rt0->scaled) ? vk_wide_pin_rect(rt0->gw, rt0->gh, rt0->w, rt0->h, &pin_ox, &pin_oy) : 0;
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
         const float k = rt0->scaled ? s_res.s : 1.0f;   /* [res] the guest's pixels in the target's */
-        vp.x = s_e2.vp[0] * k; vp.y = s_e2.vp[1] * k; vp.width = s_e2.vp[2] * k; vp.height = s_e2.vp[3] * k;
+        const float kx = rt0->scaled ? s_res.sx : 1.0f;   /* [wide] == k at 16:9 */
+        if (pin) {
+            const float kp = pin == 1 ? s_res.s : s_res.sx;
+            vp.x = (float)pin_ox + s_e2.vp[0] * kp; vp.y = (float)pin_oy + s_e2.vp[1] * kp;
+            vp.width = s_e2.vp[2] * kp; vp.height = s_e2.vp[3] * kp;
+        } else {
+            vp.x = s_e2.vp[0] * kx; vp.y = s_e2.vp[1] * k; vp.width = s_e2.vp[2] * kx; vp.height = s_e2.vp[3] * k;
+        }
     }
     VkRect2D sc = { { 0, 0 }, { w, h } };
     if (s_e2.have_sc) {                       /* clamped: Vulkan rejects negative or over-size */
@@ -7523,10 +7719,15 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
          * scissor that reaches the surface's edge still ends on it (Metal's
          * eng_set_scissor); an empty one stays empty */
         u32 sx = s_e2.sc[0], sy = s_e2.sc[1], sx1 = s_e2.sc[0] + s_e2.sc[2], sy1 = s_e2.sc[1] + s_e2.sc[3];
-        if (rt0->scaled) {
-            sx1 = s_e2.sc[2] ? vk_res_px(sx1) : vk_res_px(sx);
+        if (pin) {   /* [wide] the HUD: both axes at the pin's scale, offset into its rectangle */
+            u32 (*const px)(u32) = pin == 1 ? vk_res_px : vk_res_px_x;
+            sx1 = pin_ox + (s_e2.sc[2] ? px(sx1) : px(sx));
+            sy1 = pin_oy + (s_e2.sc[3] ? px(sy1) : px(sy));
+            sx = pin_ox + px(sx); sy = pin_oy + px(sy);
+        } else if (rt0->scaled) {
+            sx1 = s_e2.sc[2] ? vk_res_px_x(sx1) : vk_res_px_x(sx);   /* [wide] x apart */
             sy1 = s_e2.sc[3] ? vk_res_px(sy1) : vk_res_px(sy);
-            sx = vk_res_px(sx); sy = vk_res_px(sy);
+            sx = vk_res_px_x(sx); sy = vk_res_px(sy);
         }
         u32 x0 = sx < w ? sx : w, y0 = sy < h ? sy : h;
         u32 x1 = sx1, y1 = sy1;
@@ -8139,7 +8340,7 @@ static u32 vk_eng_light_pass(void* user, u32 normals, u32 depth, u32 w, u32 h,
     }
     /* [res] the pass runs per pixel of its inputs: scaled with the normals copy */
     const int lsc = normals < VK_ENG_MAX_OBJ && s_eobj[normals].scaled;
-    const u32 lw = lsc ? vk_res_px(w) : w, lh = lsc ? vk_res_px(h) : h;
+    const u32 lw = lsc ? vk_res_px_x(w) : w, lh = lsc ? vk_res_px(h) : h;   /* [wide] x apart */
     if (!s_lp.light_fb || s_lp.light_w != w || s_lp.light_h != h ||
         !vk_pass_out_live(s_lp.light_out[0]) || !vk_pass_out_live(s_lp.light_out[1]) ||
         s_eobj[s_lp.light_out[0]].w != lw || s_eobj[s_lp.light_out[0]].h != lh) {
@@ -8252,7 +8453,7 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
      * hw x hh and read the scaled pixel under each of theirs (rs); the output
      * (and the full-res AO chain) is the scaled size, Metal's ssao_up4s_fs */
     const int ssc = depth < VK_ENG_MAX_OBJ && s_eobj[depth].scaled;
-    const u32 ow = ssc ? vk_res_px(fw) : fw, oh = ssc ? vk_res_px(fh) : fh;
+    const u32 ow = ssc ? vk_res_px_x(fw) : fw, oh = ssc ? vk_res_px(fh) : fh;   /* [wide] x apart */
     VkPipeline p_upsc = VK_NULL_HANDLE, p_upscs = VK_NULL_HANDLE;
     if (ssc) {
         p_upsc = vk_pass_pipeline(VK_PASS_SSAO_UPSC, kVkSsaoUpScFS, "SSAO upsample (scaled)", rp_out, 1);
@@ -8301,7 +8502,7 @@ static u32 vk_eng_ssao_pass(void* user, u32 depth, u32 normals, const void* cons
     /* [res] the block's `res` (rsx_vk_passes_glsl.h, offset 336): xy = the
      * scale between the depth / normals the passes read and the job's pixels
      * (the MSL's `rs`), 1 unscaled -- written after the game's bytes always */
-    { const float rv[4] = { ssc ? s_res.s : 1.0f, ssc ? s_res.s : 1.0f, 0.0f, 0.0f };
+    { const float rv[4] = { ssc ? s_res.sx : 1.0f, ssc ? s_res.s : 1.0f, 0.0f, 0.0f };   /* [wide] x = sx (== s at 16:9) */
       memcpy((u8*)subo->ptr + 336, rv, sizeof rv); }
     if (ssc) {   /* the strength's scaled upsample, as p_upx below */
         if (lfx_str != 100 && const_bytes <= 320u)
@@ -8366,7 +8567,7 @@ static u32 vk_eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
     if (h > z->gh) h = z->gh;
     if (!w || !h || vk_pass_init()) return 0;
     const u32 gw = w, gh = h;                       /* [res] ... and the image's */
-    w = vk_res_obj_px(z, gw); h = vk_res_obj_px(z, gh);
+    w = vk_res_obj_px_x(z, gw); h = vk_res_obj_px(z, gh);   /* [wide] x apart */
     if (w > z->w) w = z->w;
     if (h > z->h) h = z->h;
     VkRenderPass rp = vk_pass_render_pass(&s_lp.rp_rgba8, VK_FORMAT_R8G8B8A8_UNORM, 1);
@@ -8662,6 +8863,32 @@ static rsx_backend s_vulkan_backend = {
     .present            = vk_cb_present,
 };
 
+/* [wide] at init, before the window: wide only when the setting asks for it
+ * AND the title widened its cameras to match (else the game's 16:9 picture
+ * would be stretched across wide targets) AND the engine draws (guest
+ * programs: the vtable path never scales). */
+static void vk_wide_decide(void)
+{
+    unsigned n = 16u, d = 9u, cw = 0u, ch = 0u;
+    if (!ps3_aspect_wanted(&n, &d)) return;
+    if (!vk_env_on("PS3RECOMP_VK_GUEST_PROGRAMS")) {
+        VK_LOG("aspect %u:%u: needs the draw engine (PS3RECOMP_VK_GUEST_PROGRAMS=1); 16:9\n", n, d);
+        return;
+    }
+    if (!ps3_aspect_game(&cw, &ch)) {
+        VK_LOG("aspect %u:%u: the title did not widen its cameras (no aspect patch for this game or EBOOT); "
+               "16:9, not stretched\n", n, d);
+        return;
+    }
+    if (ch != s_vk.height || !cw || cw == s_vk.width || cw * 2u < s_vk.width || cw > 4u * s_vk.width) {
+        VK_LOG("aspect %u:%u: the title's cameras see %ux%u, the guest draws %ux%u: 16:9\n", n, d, cw, ch,
+               s_vk.width, s_vk.height);
+        return;
+    }
+    s_wide.on = 1;
+    s_wide.cw = cw;
+}
+
 /* ---------------------------------------------------------------------------
  * Public entry points
  * -------------------------------------------------------------------------*/
@@ -8669,6 +8896,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 {
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
+    vk_wide_decide();                /* [wide] PS3RECOMP_ASPECT, before the window takes its shape */
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
     /* (rsx5, round 3) the log writer (PS3RECOMP_LOG_ASYNC), the engine's [limits]
      * lines through it, game-side screenshots (before the swapchain: it may need
@@ -8839,17 +9067,19 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
      * Either way PS3RECOMP_RSX_ENGINE=dispatch|vtable overrides. */
     /* PS3RECOMP_VK_TEX3D=0 (A/B): no 3D textures -- a volume is its first
      * slice sampled in 2D, as before vk_eng_texture_create_3d. */
-    { static rsx_draw_backend no3d;
+    { static rsx_draw_backend no3d, wide;
+      const rsx_draw_backend* base = &s_vk_engine_backend;
       const char* e = getenv("PS3RECOMP_VK_TEX3D");
       if (e && e[0] == '0') {
-          no3d = s_vk_engine_backend; no3d.texture_create_3d = NULL; no3d.texture_upload_3d = NULL;
-          const rsx_draw_backend* bt = vk_bt_install(&no3d);   /* (rsx-par) PS3RECOMP_VK_BT */
-          rsx_draw_engine_set_backend(bt ? bt : &no3d);
+          no3d = *base; no3d.texture_create_3d = NULL; no3d.texture_upload_3d = NULL;
+          base = &no3d;
           VK_LOG("engine: 3D textures off (PS3RECOMP_VK_TEX3D=0)\n");
-      } else {
-          const rsx_draw_backend* bt = vk_bt_install(&s_vk_engine_backend);   /* (rsx-par) PS3RECOMP_VK_BT */
-          rsx_draw_engine_set_backend(bt ? bt : &s_vk_engine_backend);
-      } }
+      }
+      /* [wide] the HUD flags only while the picture is wide: at 16:9 the
+       * engine skips its PS3_ASPECT_HUD_AFTER work entirely (no set_hud) */
+      if (s_wide.on) { wide = *base; wide.set_hud = vk_eng_set_hud; base = &wide; }
+      const rsx_draw_backend* bt = vk_bt_install(base);   /* (rsx-par) PS3RECOMP_VK_BT */
+      rsx_draw_engine_set_backend(bt ? bt : base); }
     rsx_draw_engine_set_default(s_g.on ? 1 : 0);
     if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
         s_vk.eng_active = 1;

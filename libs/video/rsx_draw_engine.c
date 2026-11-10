@@ -6997,10 +6997,17 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
      * and everything stretches with the 3D picture. */
     if (g.be->set_hud) {
         if (s_hud_n < 0) { s_hud_n = 0;
-            /* Only while a wide picture is asked for: unset (or 16:9) costs nothing. */
+            /* Only while a wide picture is asked for: unset (or 16:9) costs nothing.
+             * [wide] PS3RECOMP_ASPECT is the Vulkan backend's name; it installs
+             * set_hud only when the picture really is wide. */
             const char* asp = getenv("PS3_ASPECT");
-            const char* e = (asp && *asp && strcmp(asp, "16:9")) ? getenv("PS3_ASPECT_HUD_AFTER") : NULL;
-            while (e && *e && s_hud_n < 8) { s_hud_fp[s_hud_n++] = strtoull(e, (char**)&e, 16); if (*e == ',') e++; else break; } }
+            const char* asp2 = getenv("PS3RECOMP_ASPECT");
+            const int wide = (asp && *asp && strcmp(asp, "16:9")) || (asp2 && *asp2 && strcmp(asp2, "16:9"));
+            const char* e = wide ? getenv("PS3_ASPECT_HUD_AFTER") : NULL;
+            while (e && *e && s_hud_n < 8) { s_hud_fp[s_hud_n++] = strtoull(e, (char**)&e, 16); if (*e == ',') e++; else break; }
+            if (s_hud_n) fprintf(stderr, "[engine] aspect: %d composite program(s) (PS3_ASPECT_HUD_AFTER, first %016llx): "
+                                         "display draws after them keep 16:9\n", s_hud_n, (unsigned long long)s_hud_fp[0]);
+            else if (wide) fprintf(stderr, "[engine] aspect: no PS3_ASPECT_HUD_AFTER: the HUD stretches with the picture\n"); }
         int hud = 0, display = 0;
         if (s_hud_n) {
             if (g.frames != s_hud_frame) { s_hud_frame = g.frames; s_hud_slice++; s_hud_after = 0; }

@@ -75,6 +75,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>   /* [wide] EnumDisplaySettingsW: the screen's shape for PS3RECOMP_ASPECT=auto */
+#endif
 
 #include "../../third_party/smaa/smaa_glsl.h"
 #include "../../third_party/smaa/AreaTex.h"
@@ -252,6 +255,105 @@ void vk_postfx_render_scale_active(float s)
     const int q = (int)floor(s * 4.0 + 0.5);
     PFX_STORE(s_scale_active, q < 4 ? 4 : q > 16 ? 16 : q);
 }
+
+/* ---- [wide] PS3RECOMP_ASPECT (docs/WIDESCREEN.md) -------------------------
+ * The shape of the picture, decided once: the title's game patch asks first
+ * (before the game runs), the backend at its init. Nothing here changes what
+ * the game does; ps3_aspect_game_set is the title saying it did. */
+static int      s_asp_done, s_asp_on;
+static unsigned s_asp_n = 16u, s_asp_d = 9u;
+static unsigned s_asp_gw, s_asp_gh;            /* what the title's cameras see (0: nothing said) */
+static int      s_asp_k1000 = 1000;            /* the backend's frame vs 16:9, x1000 */
+
+static int pfx_ieq(const char* a, const char* b)
+{
+    for (; *a && *b; a++, b++) {
+        const char x = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a, y = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+/* "<w>:<h>" or "<w>x<h>" (positive integers, nothing after) */
+static int pfx_parse_pair(const char* v, unsigned* w, unsigned* h)
+{
+    char* e = NULL;
+    const unsigned long a = strtoul(v, &e, 10);
+    if (!e || e == v || (*e != ':' && *e != 'x' && *e != 'X')) return 0;
+    const char* p = e + 1;
+    const unsigned long b = strtoul(p, &e, 10);
+    if (!e || e == p || *e || !a || !b || a > 100000ul || b > 100000ul) return 0;
+    *w = (unsigned)a; *h = (unsigned)b;
+    return 1;
+}
+/* The primary screen's mode: SDL_WINDOWPOS_CENTERED opens the window there, so
+ * fullscreen covers it. The pixel count, not the DPI-scaled size. */
+static int pfx_screen_size(unsigned* w, unsigned* h)
+{
+#ifdef _WIN32
+    DEVMODEW dm;
+    memset(&dm, 0, sizeof dm);
+    dm.dmSize = sizeof dm;
+    if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth && dm.dmPelsHeight) {
+        *w = (unsigned)dm.dmPelsWidth; *h = (unsigned)dm.dmPelsHeight;
+        return 1;
+    }
+    const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    if (sw > 0 && sh > 0) { *w = (unsigned)sw; *h = (unsigned)sh; return 1; }
+#else
+    (void)w; (void)h;
+#endif
+    return 0;
+}
+int ps3_aspect_wanted(unsigned* num, unsigned* den)
+{
+    if (!s_asp_done) {
+        s_asp_done = 1;
+        const char* name = "PS3RECOMP_ASPECT";
+        const char* e = getenv(name);
+        if (!e || !*e) { name = "PS3_ASPECT"; e = getenv(name); }
+        unsigned n = 16u, d = 9u;
+        const char* from = NULL;
+        if (e && *e && !pfx_ieq(e, "16:9") && !pfx_ieq(e, "off") && !pfx_ieq(e, "0") && !pfx_ieq(e, "native")) {
+            unsigned w = 0, h = 0;
+            if (pfx_ieq(e, "auto")) {
+                const char* fs = getenv("PS3RECOMP_VK_FULLSCREEN");
+                const char* ws = getenv("PS3RECOMP_VK_WINDOW_SIZE");
+                if (fs && fs[0] && fs[0] != '0') { if (pfx_screen_size(&w, &h)) from = "the screen"; }
+                else if (ws && pfx_parse_pair(ws, &w, &h)) from = "PS3RECOMP_VK_WINDOW_SIZE";
+                if (!from) { w = 16u; h = 9u; from = "a 16:9 window (no PS3RECOMP_VK_WINDOW_SIZE)"; }
+            } else if (!pfx_parse_pair(e, &w, &h)) {
+                char* end = NULL;
+                const double r = strtod(e, &end);
+                if (end && end != e && !*end && r > 0.0 && r < 100.0) { w = (unsigned)(r * 10000.0 + 0.5); h = 10000u; }
+            }
+            if (w && h) { n = w; d = h; }
+            else fprintf(stderr, "[aspect] %s=%s not understood (16:9, auto, 21:9, 32:9, 16:10, <w>:<h>, <w>x<h> or a ratio): 16:9\n", name, e);
+        }
+        { unsigned a = n, b = d; while (b) { const unsigned t = a % b; a = b; b = t; } if (a > 1u) { n /= a; d /= a; } }
+        const double r = (double)n / (double)d;
+        if (fabs(r * 9.0 / 16.0 - 1.0) < 0.005) {          /* 16:9 (1366x768 too): the old path */
+            if (e && *e && from) fprintf(stderr, "[aspect] %s=%s: %u:%u from %s = 16:9, the game's picture\n", name, e, n, d, from);
+        } else if (!(r >= 1.2 && r <= 64.0 / 9.0)) {
+            fprintf(stderr, "[aspect] %s=%s: %u:%u (%.3f) is outside 6:5 .. 64:9; 16:9\n", name, e, n, d, r);
+        } else {
+            s_asp_on = 1; s_asp_n = n; s_asp_d = d;
+            fprintf(stderr, "[aspect] %s=%s: %u:%u (%.4f%s%s), hor+ (the vertical view is the game's); read at start\n",
+                    name, e, n, d, r, from ? ", from " : "", from ? from : "");
+        }
+    }
+    if (s_asp_on) { if (num) *num = s_asp_n; if (den) *den = s_asp_d; }
+    return s_asp_on;
+}
+void ps3_aspect_game_set(unsigned w, unsigned h) { s_asp_gw = w; s_asp_gh = h; }
+int ps3_aspect_game(unsigned* w, unsigned* h)
+{
+    if (!s_asp_gw || !s_asp_gh) return 0;
+    if (w) *w = s_asp_gw;
+    if (h) *h = s_asp_gh;
+    return 1;
+}
+void vk_postfx_aspect_active(float k) { PFX_STORE(s_asp_k1000, (int)(k * 1000.0f + 0.5f)); }
+float vk_postfx_aspect_k(void) { return (float)PFX_LOAD(s_asp_k1000) / 1000.0f; }
 void vk_postfx_set_upscale(int mode)
 {
     pfx_env();
