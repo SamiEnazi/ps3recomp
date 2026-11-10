@@ -31,6 +31,14 @@
  *    and of the view (s_eobj_sg) and dropped on every release the engine
  *    makes; a miss drains and asks the backend.
  *  - vbuf_prefetch is a no-op (the worker reads the entry, not this thread).
+ *  - A bind or set whose arguments equal the last ones sent is not sent again
+ *    (sink_end makes all of them every draw; consecutive draws mostly repeat
+ *    targets, pipeline, viewport, scissor, stencil, bias, textures and the
+ *    fragment constants). Those entry points only store what they are given,
+ *    and nothing else writes that state but pipeline_release and the draw's
+ *    own save/restore; so every other call, and the end of every drain (the
+ *    frame loop may touch the backend), forgets what was sent
+ *    (PS3RECOMP_VK_BT_DEDUP=0: send everything).
  *  - At the end of every FIFO drain the ring is drained (g_rsx_drain_end_hook),
  *    so the present path, the window pump and the overlay -- which touch the
  *    backend directly between drains -- find the worker idle, as before; and
@@ -61,6 +69,32 @@ static void* bt_rec(void (*run)(const u8*), u32 arg_bytes)
 static void bt_commit(void* args) { tq_commit((const u8*)args - sizeof(tq_bcall)); }
 #define BT_A(T, p) const T* a = (const T*)(const void*)(p)
 
+/* What the worker's backend state holds, as last sent (valid flags 0 = unknown). */
+#define BT_PS_CACHE 1024u
+static struct {
+    int tgt_ok, pipe_ok, vp_ok, sc_ok, sref_ok, bias_ok, clamp_ok, ps_ok, tex_ok, vtex_ok;
+    u32 tgt[RSX_BE_MAX_COLOR_TARGETS], ntgt, tdepth, thas;
+    u32 pipe, sref; int clamp;
+    float vp[4], bias[2];
+    u32 sc[4];
+    u32 ps_bytes;
+    u8 ps[BT_PS_CACHE];
+    u32 tex[RSX_BE_MAX_TEXTURES]; rsx_be_sampler_desc samp[RSX_BE_MAX_TEXTURES]; u32 tmask, thas_t, thas_s;
+    u32 vtex[RSX_BE_MAX_VERTEX_TEXTURES]; rsx_be_sampler_desc vsamp[RSX_BE_MAX_VERTEX_TEXTURES]; u32 vmask, vhas_t, vhas_s;
+} s_bt_last;
+static u64 s_bt_dedup_n;
+static int bt_dedup_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3RECOMP_VK_BT_DEDUP"); v = !(e && e[0] == '0'); }
+    return v;
+}
+static void bt_forget(void)
+{
+    s_bt_last.tgt_ok = s_bt_last.pipe_ok = s_bt_last.vp_ok = s_bt_last.sc_ok = s_bt_last.sref_ok = 0;
+    s_bt_last.bias_ok = s_bt_last.clamp_ok = s_bt_last.ps_ok = s_bt_last.tex_ok = s_bt_last.vtex_ok = 0;
+}
+
 /* ---- surface_view memo ---------------------------------------------------- */
 typedef struct { u32 surface, remap, fmt, view, sg_s, sg_v; } bt_sv_ent;
 static bt_sv_ent s_bt_sv[256];
@@ -81,6 +115,7 @@ static u32 bt_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
         return e->view;
     }
     s_bt_sv_miss++;
+    bt_forget();
     vk_tq_sync();
     const u32 v = s_bt_real.surface_view(s_bt_real.user, surface, remap, rsx_format);
     e->surface = surface; e->remap = remap; e->fmt = rsx_format;
@@ -90,36 +125,36 @@ static u32 bt_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
 }
 
 /* ---- calls that drain, then run here ------------------------------------- */
-static void bt_submit_and_wait(void* u, u32 reason) { (void)u; vk_tq_sync(); s_bt_real.submit_and_wait(s_bt_real.user, reason); }
+static void bt_submit_and_wait(void* u, u32 reason) { (void)u; bt_forget(); vk_tq_sync(); s_bt_real.submit_and_wait(s_bt_real.user, reason); }
 static u32 bt_texture_create(void* u, rsx_be_format fmt, u32 w, u32 h, u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
-{ (void)u; vk_tq_sync(); return s_bt_real.texture_create(s_bt_real.user, fmt, w, h, mips, faces, remap, rsx_fmt); }
+{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.texture_create(s_bt_real.user, fmt, w, h, mips, faces, remap, rsx_fmt); }
 static void bt_texture_upload(void* u, u32 texture, u32 face, u32 mip, u32 w, u32 h, const void* src, u32 row_bytes, u32 rows)
-{ (void)u; vk_tq_sync(); s_bt_real.texture_upload(s_bt_real.user, texture, face, mip, w, h, src, row_bytes, rows); }
+{ (void)u; bt_forget(); vk_tq_sync(); s_bt_real.texture_upload(s_bt_real.user, texture, face, mip, w, h, src, row_bytes, rows); }
 static u32 bt_color_target_create(void* u, rsx_be_format fmt, u32 w, u32 h, const void* seed, u32 seed_row_bytes)
-{ (void)u; vk_tq_sync(); return s_bt_real.color_target_create(s_bt_real.user, fmt, w, h, seed, seed_row_bytes); }
-static u32 bt_depth_target_create(void* u, u32 w, u32 h) { (void)u; vk_tq_sync(); return s_bt_real.depth_target_create(s_bt_real.user, w, h); }
-static u32 bt_depth_snapshot(void* u, u32 depth, u32 w, u32 h) { (void)u; vk_tq_sync(); return s_bt_real.depth_snapshot(s_bt_real.user, depth, w, h); }
-static u32 bt_color_snapshot(void* u, u32 surface) { (void)u; vk_tq_sync(); return s_bt_real.color_snapshot(s_bt_real.user, surface); }
-static u32 bt_depth_snapshot_rgba8(void* u, u32 depth, u32 w, u32 h) { (void)u; vk_tq_sync(); return s_bt_real.depth_snapshot_rgba8(s_bt_real.user, depth, w, h); }
+{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.color_target_create(s_bt_real.user, fmt, w, h, seed, seed_row_bytes); }
+static u32 bt_depth_target_create(void* u, u32 w, u32 h) { (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.depth_target_create(s_bt_real.user, w, h); }
+static u32 bt_depth_snapshot(void* u, u32 depth, u32 w, u32 h) { (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.depth_snapshot(s_bt_real.user, depth, w, h); }
+static u32 bt_color_snapshot(void* u, u32 surface) { (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.color_snapshot(s_bt_real.user, surface); }
+static u32 bt_depth_snapshot_rgba8(void* u, u32 depth, u32 w, u32 h) { (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.depth_snapshot_rgba8(s_bt_real.user, depth, w, h); }
 static u32 bt_pipeline_create(void* u, const char* vs, const char* ps, const rsx_be_render_state* rs,
                               const rsx_vertex_layout_plan* layout, u32 stride, rsx_be_format rt_fmt, u32 rt_count)
-{ (void)u; vk_tq_sync(); return s_bt_real.pipeline_create(s_bt_real.user, vs, ps, rs, layout, stride, rt_fmt, rt_count); }
-static void bt_present(void* u, u32 surface) { (void)u; vk_tq_sync(); s_bt_real.present(s_bt_real.user, surface); }
+{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.pipeline_create(s_bt_real.user, vs, ps, rs, layout, stride, rt_fmt, rt_count); }
+static void bt_present(void* u, u32 surface) { (void)u; bt_forget(); vk_tq_sync(); s_bt_real.present(s_bt_real.user, surface); }
 static void bt_readback(void* u, u32 surface, u32 x, u32 y, u32 w, u32 h, void* out, u32 out_pitch)
-{ (void)u; vk_tq_sync(); s_bt_real.readback(s_bt_real.user, surface, x, y, w, h, out, out_pitch); }
+{ (void)u; bt_forget(); vk_tq_sync(); s_bt_real.readback(s_bt_real.user, surface, x, y, w, h, out, out_pitch); }
 static u32 bt_texture_create_3d(void* u, rsx_be_format fmt, u32 w, u32 h, u32 depth, u32 mips, u32 remap, u32 rsx_fmt)
-{ (void)u; vk_tq_sync(); return s_bt_real.texture_create_3d(s_bt_real.user, fmt, w, h, depth, mips, remap, rsx_fmt); }
+{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.texture_create_3d(s_bt_real.user, fmt, w, h, depth, mips, remap, rsx_fmt); }
 static void bt_texture_upload_3d(void* u, u32 texture, u32 z, u32 mip, u32 w, u32 h, const void* src, u32 row_bytes)
-{ (void)u; vk_tq_sync(); s_bt_real.texture_upload_3d(s_bt_real.user, texture, z, mip, w, h, src, row_bytes); }
+{ (void)u; bt_forget(); vk_tq_sync(); s_bt_real.texture_upload_3d(s_bt_real.user, texture, z, mip, w, h, src, row_bytes); }
 static u32 bt_light_pass(void* u, u32 normals, u32 depth, u32 w, u32 h, const void* params, u32 param_bytes, u32* spec_out)
-{ (void)u; vk_tq_sync(); return s_bt_real.light_pass(s_bt_real.user, normals, depth, w, h, params, param_bytes, spec_out); }
+{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.light_pass(s_bt_real.user, normals, depth, w, h, params, param_bytes, spec_out); }
 static u32 bt_ssao_pass(void* u, u32 depth, u32 normals, const void* consts, u32 const_bytes,
                         u32 full_w, u32 full_h, u32 half_w, u32 half_h)
-{ (void)u; vk_tq_sync(); return s_bt_real.ssao_pass(s_bt_real.user, depth, normals, consts, const_bytes, full_w, full_h, half_w, half_h); }
+{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.ssao_pass(s_bt_real.user, depth, normals, consts, const_bytes, full_w, full_h, half_w, half_h); }
 static int bt_image_load(void* u, const char* path, u8** rgba, u32* w, u32* h)
-{ (void)u; vk_tq_sync(); return s_bt_real.image_load(s_bt_real.user, path, rgba, w, h); }
+{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.image_load(s_bt_real.user, path, rgba, w, h); }
 static int bt_image_save(void* u, const char* path, const u8* rgba, u32 w, u32 h, u32 row_bytes)
-{ (void)u; vk_tq_sync(); return s_bt_real.image_save(s_bt_real.user, path, rgba, w, h, row_bytes); }
+{ (void)u; bt_forget(); vk_tq_sync(); return s_bt_real.image_save(s_bt_real.user, path, rgba, w, h, row_bytes); }
 
 /* ---- the engine's thread, no drain ---------------------------------------- */
 static u32 bt_vbuf_create(void* u, const void* data, u32 bytes) { (void)u; return s_bt_real.vbuf_create(s_bt_real.user, data, bytes); }
@@ -132,7 +167,7 @@ typedef struct { u32 h; } bt_a_u32;
     static void bt_##name(void* u, u32 h)                                                    \
     {                                                                                        \
         (void)u;                                                                             \
-        bt_sv_forget(h);                                                                     \
+        bt_sv_forget(h); bt_forget();                                                        \
         bt_a_u32* a = (bt_a_u32*)bt_rec(bt_x_##name, sizeof *a);                             \
         if (!a) { s_bt_real.name(s_bt_real.user, h); return; }                               \
         a->h = h; bt_commit(a);                                                              \
@@ -148,25 +183,31 @@ static void bt_x_bind_pipeline(const u8* p) { BT_A(bt_a_u32, p); s_bt_real.bind_
 static void bt_bind_pipeline(void* u, u32 pipeline)
 {
     (void)u;
+    if (s_bt_last.pipe_ok && s_bt_last.pipe == pipeline) { s_bt_dedup_n++; return; }
     bt_a_u32* a = (bt_a_u32*)bt_rec(bt_x_bind_pipeline, sizeof *a);
-    if (!a) { s_bt_real.bind_pipeline(s_bt_real.user, pipeline); return; }
+    if (!a) { bt_forget(); s_bt_real.bind_pipeline(s_bt_real.user, pipeline); return; }
     a->h = pipeline; bt_commit(a);
+    s_bt_last.pipe = pipeline; s_bt_last.pipe_ok = bt_dedup_on();
 }
 static void bt_x_set_stencil_ref(const u8* p) { BT_A(bt_a_u32, p); s_bt_real.set_stencil_ref(s_bt_real.user, a->h); }
 static void bt_set_stencil_ref(void* u, u32 ref)
 {
     (void)u;
+    if (s_bt_last.sref_ok && s_bt_last.sref == ref) { s_bt_dedup_n++; return; }
     bt_a_u32* a = (bt_a_u32*)bt_rec(bt_x_set_stencil_ref, sizeof *a);
-    if (!a) { s_bt_real.set_stencil_ref(s_bt_real.user, ref); return; }
+    if (!a) { bt_forget(); s_bt_real.set_stencil_ref(s_bt_real.user, ref); return; }
     a->h = ref; bt_commit(a);
+    s_bt_last.sref = ref; s_bt_last.sref_ok = bt_dedup_on();
 }
 static void bt_x_set_depth_clamp(const u8* p) { BT_A(bt_a_u32, p); s_bt_real.set_depth_clamp(s_bt_real.user, (int)a->h); }
 static void bt_set_depth_clamp(void* u, int clamp)
 {
     (void)u;
+    if (s_bt_last.clamp_ok && s_bt_last.clamp == clamp) { s_bt_dedup_n++; return; }
     bt_a_u32* a = (bt_a_u32*)bt_rec(bt_x_set_depth_clamp, sizeof *a);
-    if (!a) { s_bt_real.set_depth_clamp(s_bt_real.user, clamp); return; }
+    if (!a) { bt_forget(); s_bt_real.set_depth_clamp(s_bt_real.user, clamp); return; }
     a->h = (u32)clamp; bt_commit(a);
+    s_bt_last.clamp = clamp; s_bt_last.clamp_ok = bt_dedup_on();
 }
 
 typedef struct { u32 s[RSX_BE_MAX_COLOR_TARGETS]; u32 n, depth, has; } bt_a_targets;
@@ -175,11 +216,18 @@ static void bt_x_bind_targets(const u8* p)
 static void bt_bind_targets(void* u, const u32* surfaces, u32 count, u32 depth)
 {
     (void)u;
+    u32 t[RSX_BE_MAX_COLOR_TARGETS];
+    for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++) t[i] = (surfaces && i < count) ? surfaces[i] : 0u;
+    const u32 has = surfaces != NULL;
+    if (s_bt_last.tgt_ok && s_bt_last.ntgt == count && s_bt_last.tdepth == depth && s_bt_last.thas == has &&
+        !memcmp(s_bt_last.tgt, t, sizeof t)) { s_bt_dedup_n++; return; }
     bt_a_targets* a = (bt_a_targets*)bt_rec(bt_x_bind_targets, sizeof *a);
-    if (!a) { s_bt_real.bind_targets(s_bt_real.user, surfaces, count, depth); return; }
-    for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++) a->s[i] = (surfaces && i < count) ? surfaces[i] : 0u;
-    a->n = count; a->depth = depth; a->has = surfaces != NULL;
+    if (!a) { bt_forget(); s_bt_real.bind_targets(s_bt_real.user, surfaces, count, depth); return; }
+    memcpy(a->s, t, sizeof t);
+    a->n = count; a->depth = depth; a->has = has;
     bt_commit(a);
+    memcpy(s_bt_last.tgt, t, sizeof t); s_bt_last.ntgt = count; s_bt_last.tdepth = depth; s_bt_last.thas = has;
+    s_bt_last.tgt_ok = bt_dedup_on();
 }
 
 typedef struct { float v[4]; } bt_a_f4;
@@ -187,26 +235,35 @@ static void bt_x_set_viewport(const u8* p) { BT_A(bt_a_f4, p); s_bt_real.set_vie
 static void bt_set_viewport(void* u, float x, float y, float w, float h)
 {
     (void)u;
+    const float v[4] = { x, y, w, h };
+    if (s_bt_last.vp_ok && !memcmp(s_bt_last.vp, v, sizeof v)) { s_bt_dedup_n++; return; }   /* bitwise: -0, NaN as given */
     bt_a_f4* a = (bt_a_f4*)bt_rec(bt_x_set_viewport, sizeof *a);
-    if (!a) { s_bt_real.set_viewport(s_bt_real.user, x, y, w, h); return; }
-    a->v[0] = x; a->v[1] = y; a->v[2] = w; a->v[3] = h; bt_commit(a);
+    if (!a) { bt_forget(); s_bt_real.set_viewport(s_bt_real.user, x, y, w, h); return; }
+    memcpy(a->v, v, sizeof v); bt_commit(a);
+    memcpy(s_bt_last.vp, v, sizeof v); s_bt_last.vp_ok = bt_dedup_on();
 }
 static void bt_x_set_depth_bias(const u8* p) { BT_A(bt_a_f4, p); s_bt_real.set_depth_bias(s_bt_real.user, a->v[0], a->v[1]); }
 static void bt_set_depth_bias(void* u, float constant, float slope)
 {
     (void)u;
+    const float v[2] = { constant, slope };
+    if (s_bt_last.bias_ok && !memcmp(s_bt_last.bias, v, sizeof v)) { s_bt_dedup_n++; return; }
     bt_a_f4* a = (bt_a_f4*)bt_rec(bt_x_set_depth_bias, sizeof *a);
-    if (!a) { s_bt_real.set_depth_bias(s_bt_real.user, constant, slope); return; }
+    if (!a) { bt_forget(); s_bt_real.set_depth_bias(s_bt_real.user, constant, slope); return; }
     a->v[0] = constant; a->v[1] = slope; a->v[2] = a->v[3] = 0.0f; bt_commit(a);
+    memcpy(s_bt_last.bias, v, sizeof v); s_bt_last.bias_ok = bt_dedup_on();
 }
 typedef struct { u32 v[4]; } bt_a_u4;
 static void bt_x_set_scissor(const u8* p) { BT_A(bt_a_u4, p); s_bt_real.set_scissor(s_bt_real.user, a->v[0], a->v[1], a->v[2], a->v[3]); }
 static void bt_set_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
 {
     (void)u;
+    const u32 v[4] = { x, y, w, h };
+    if (s_bt_last.sc_ok && !memcmp(s_bt_last.sc, v, sizeof v)) { s_bt_dedup_n++; return; }
     bt_a_u4* a = (bt_a_u4*)bt_rec(bt_x_set_scissor, sizeof *a);
-    if (!a) { s_bt_real.set_scissor(s_bt_real.user, x, y, w, h); return; }
-    a->v[0] = x; a->v[1] = y; a->v[2] = w; a->v[3] = h; bt_commit(a);
+    if (!a) { bt_forget(); s_bt_real.set_scissor(s_bt_real.user, x, y, w, h); return; }
+    memcpy(a->v, v, sizeof v); bt_commit(a);
+    memcpy(s_bt_last.sc, v, sizeof v); s_bt_last.sc_ok = bt_dedup_on();
 }
 typedef struct { int hud; u32 w; } bt_a_hud;
 static void bt_x_set_hud(const u8* p) { BT_A(bt_a_hud, p); s_bt_real.set_hud(s_bt_real.user, a->hud, a->w); }
@@ -214,7 +271,7 @@ static void bt_set_hud(void* u, int hud, u32 target_w)
 {
     (void)u;
     bt_a_hud* a = (bt_a_hud*)bt_rec(bt_x_set_hud, sizeof *a);
-    if (!a) { s_bt_real.set_hud(s_bt_real.user, hud, target_w); return; }
+    if (!a) { bt_forget(); s_bt_real.set_hud(s_bt_real.user, hud, target_w); return; }
     a->hud = hud; a->w = target_w; bt_commit(a);
 }
 
@@ -223,6 +280,7 @@ static void bt_x_clear_color(const u8* p) { BT_A(bt_a_clearc, p); s_bt_real.clea
 static void bt_clear_color(void* u, u32 surface, const float rgba[4])
 {
     (void)u;
+    bt_forget();
     bt_a_clearc* a = (bt_a_clearc*)bt_rec(bt_x_clear_color, sizeof *a);
     if (!a) { s_bt_real.clear_color(s_bt_real.user, surface, rgba); return; }
     a->surface = surface; memcpy(a->rgba, rgba, sizeof a->rgba); bt_commit(a);
@@ -233,6 +291,7 @@ static void bt_x_clear_depth_stencil(const u8* p)
 static void bt_clear_depth_stencil(void* u, u32 depth, u32 flags, float depth_value, u8 stencil)
 {
     (void)u;
+    bt_forget();
     bt_a_clearz* a = (bt_a_clearz*)bt_rec(bt_x_clear_depth_stencil, sizeof *a);
     if (!a) { s_bt_real.clear_depth_stencil(s_bt_real.user, depth, flags, depth_value, stencil); return; }
     a->depth = depth; a->flags = flags; a->value = depth_value; a->stencil = stencil; bt_commit(a);
@@ -246,7 +305,7 @@ static void bt_bind_vs_constants(void* u, const void* data, u32 bytes)
 {
     (void)u;
     bt_a_bytes* a = (bt_a_bytes*)bt_rec(bt_x_bind_vs_constants, (u32)sizeof *a + (data ? bytes : 0u));
-    if (!a) { s_bt_real.bind_vs_constants(s_bt_real.user, data, bytes); return; }
+    if (!a) { bt_forget(); s_bt_real.bind_vs_constants(s_bt_real.user, data, bytes); return; }
     a->bytes = bytes; a->has = data != NULL;
     if (data && bytes) memcpy(a + 1, data, bytes);
     bt_commit(a);
@@ -256,11 +315,16 @@ static void bt_x_bind_ps_constants(const u8* p)
 static void bt_bind_ps_constants(void* u, const void* data, u32 bytes)
 {
     (void)u;
+    if (s_bt_last.ps_ok && data && s_bt_last.ps_bytes == bytes && !memcmp(s_bt_last.ps, data, bytes)) { s_bt_dedup_n++; return; }
     bt_a_bytes* a = (bt_a_bytes*)bt_rec(bt_x_bind_ps_constants, (u32)sizeof *a + (data ? bytes : 0u));
-    if (!a) { s_bt_real.bind_ps_constants(s_bt_real.user, data, bytes); return; }
+    if (!a) { bt_forget(); s_bt_real.bind_ps_constants(s_bt_real.user, data, bytes); return; }
     a->bytes = bytes; a->has = data != NULL;
     if (data && bytes) memcpy(a + 1, data, bytes);
     bt_commit(a);
+    s_bt_last.ps_ok = 0;
+    if (data && bytes <= BT_PS_CACHE) {
+        memcpy(s_bt_last.ps, data, bytes); s_bt_last.ps_bytes = bytes; s_bt_last.ps_ok = bt_dedup_on();
+    }
 }
 
 /* The backend keeps `rows` until the draw: on the worker, the copied rows go
@@ -279,16 +343,18 @@ static void bt_bind_vs_constants_range(void* u, const void* rows, u32 first, u32
                                        const void* tail, u32 tail_bytes, u32 total_bytes)
 {
     (void)u;
-    /* what the worker's buffer cannot hold, as before (drained: in order) */
+    /* what the worker's buffer cannot hold, as before (drained: in order; the
+     * backend rejects such a range anyway -- its window is 528 rows, 64 tail bytes) */
     if ((rows && (first > BT_VS_ROWS || count > BT_VS_ROWS - first)) || tail_bytes > sizeof(((bt_a_vsr*)0)->tail) ||
         (tail_bytes && !tail)) {
+        bt_forget();
         vk_tq_sync();
         s_bt_real.bind_vs_constants_range(s_bt_real.user, rows, first, count, tail, tail_bytes, total_bytes);
         return;
     }
     const u32 nrow = rows ? count : 0u;
     bt_a_vsr* a = (bt_a_vsr*)bt_rec(bt_x_bind_vs_constants_range, (u32)sizeof *a + nrow * 16u);
-    if (!a) { s_bt_real.bind_vs_constants_range(s_bt_real.user, rows, first, count, tail, tail_bytes, total_bytes); return; }
+    if (!a) { bt_forget(); s_bt_real.bind_vs_constants_range(s_bt_real.user, rows, first, count, tail, tail_bytes, total_bytes); return; }
     a->first = first; a->count = count; a->tail_bytes = tail_bytes; a->total_bytes = total_bytes;
     a->has = rows != NULL; a->pad = 0;
     if (tail_bytes) memcpy(a->tail, tail, tail_bytes);
@@ -302,12 +368,20 @@ static void bt_x_bind_textures(const u8* p)
 static void bt_bind_textures(void* u, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask)
 {
     (void)u;
+    if (s_bt_last.tex_ok && textures && samplers && s_bt_last.thas_t && s_bt_last.thas_s && s_bt_last.tmask == mask &&
+        !memcmp(s_bt_last.tex, textures, sizeof s_bt_last.tex) && !memcmp(s_bt_last.samp, samplers, sizeof s_bt_last.samp))
+        { s_bt_dedup_n++; return; }
     bt_a_tex* a = (bt_a_tex*)bt_rec(bt_x_bind_textures, sizeof *a);
-    if (!a) { s_bt_real.bind_textures(s_bt_real.user, textures, samplers, mask); return; }
+    if (!a) { bt_forget(); s_bt_real.bind_textures(s_bt_real.user, textures, samplers, mask); return; }
     if (textures) memcpy(a->tex, textures, sizeof a->tex);
     if (samplers) memcpy(a->samp, samplers, sizeof a->samp);
     a->mask = mask; a->has_t = textures != NULL; a->has_s = samplers != NULL;
     bt_commit(a);
+    s_bt_last.tex_ok = 0;
+    if (textures && samplers) {
+        memcpy(s_bt_last.tex, textures, sizeof s_bt_last.tex); memcpy(s_bt_last.samp, samplers, sizeof s_bt_last.samp);
+        s_bt_last.tmask = mask; s_bt_last.thas_t = s_bt_last.thas_s = 1; s_bt_last.tex_ok = bt_dedup_on();
+    }
 }
 typedef struct { u32 tex[RSX_BE_MAX_VERTEX_TEXTURES]; rsx_be_sampler_desc samp[RSX_BE_MAX_VERTEX_TEXTURES]; u32 mask, has_t, has_s; } bt_a_vtex;
 static void bt_x_bind_vertex_textures(const u8* p)
@@ -315,12 +389,20 @@ static void bt_x_bind_vertex_textures(const u8* p)
 static void bt_bind_vertex_textures(void* u, const u32* textures, const rsx_be_sampler_desc* samplers, u32 mask)
 {
     (void)u;
+    if (s_bt_last.vtex_ok && textures && samplers && s_bt_last.vmask == mask &&
+        !memcmp(s_bt_last.vtex, textures, sizeof s_bt_last.vtex) && !memcmp(s_bt_last.vsamp, samplers, sizeof s_bt_last.vsamp))
+        { s_bt_dedup_n++; return; }
     bt_a_vtex* a = (bt_a_vtex*)bt_rec(bt_x_bind_vertex_textures, sizeof *a);
-    if (!a) { s_bt_real.bind_vertex_textures(s_bt_real.user, textures, samplers, mask); return; }
+    if (!a) { bt_forget(); s_bt_real.bind_vertex_textures(s_bt_real.user, textures, samplers, mask); return; }
     if (textures) memcpy(a->tex, textures, sizeof a->tex);
     if (samplers) memcpy(a->samp, samplers, sizeof a->samp);
     a->mask = mask; a->has_t = textures != NULL; a->has_s = samplers != NULL;
     bt_commit(a);
+    s_bt_last.vtex_ok = 0;
+    if (textures && samplers) {
+        memcpy(s_bt_last.vtex, textures, sizeof s_bt_last.vtex); memcpy(s_bt_last.vsamp, samplers, sizeof s_bt_last.vsamp);
+        s_bt_last.vmask = mask; s_bt_last.vtex_ok = bt_dedup_on();
+    }
 }
 
 /* draws: vertices (vertex_count * stride bytes) then indices (index_count u32s) follow */
@@ -345,7 +427,7 @@ static void bt_draw(void* u, rsx_topology topology, const void* vertices, u32 ve
     }
     const u32 vb = (u32)((vbytes + 7u) & ~7ull);
     bt_a_draw* a = (bt_a_draw*)bt_rec(bt_x_draw, (u32)sizeof *a + vb + (u32)ibytes);
-    if (!a) { s_bt_real.draw(s_bt_real.user, topology, vertices, vertex_count, stride, indices, index_count); return; }
+    if (!a) { bt_forget(); s_bt_real.draw(s_bt_real.user, topology, vertices, vertex_count, stride, indices, index_count); return; }
     a->topology = (u32)topology; a->vbuf = 0; a->vertex_count = vertex_count; a->stride = stride;
     a->index_count = index_count; a->ibuf = 0; a->has_v = vertices != NULL; a->has_i = indices != NULL;
     u8* q = (u8*)(a + 1);
@@ -370,7 +452,7 @@ static void bt_draw_vbuf(void* u, rsx_topology topology, u32 vbuf, u32 vertex_co
         return;
     }
     bt_a_draw* a = (bt_a_draw*)bt_rec(bt_x_draw_vbuf, (u32)sizeof *a + (u32)ibytes);
-    if (!a) { s_bt_real.draw_vbuf(s_bt_real.user, topology, vbuf, vertex_count, stride, indices, index_count); return; }
+    if (!a) { bt_forget(); s_bt_real.draw_vbuf(s_bt_real.user, topology, vbuf, vertex_count, stride, indices, index_count); return; }
     a->topology = (u32)topology; a->vbuf = vbuf; a->vertex_count = vertex_count; a->stride = stride;
     a->index_count = index_count; a->ibuf = 0; a->has_v = 0; a->has_i = indices != NULL;
     if (ibytes) memcpy(a + 1, indices, (size_t)ibytes);
@@ -385,7 +467,7 @@ static void bt_draw_vbuf_ib(void* u, rsx_topology topology, u32 vbuf, u32 vertex
 {
     (void)u;
     bt_a_draw* a = (bt_a_draw*)bt_rec(bt_x_draw_vbuf_ib, sizeof *a);
-    if (!a) { s_bt_real.draw_vbuf_ib(s_bt_real.user, topology, vbuf, vertex_count, stride, ibuf, index_count); return; }
+    if (!a) { bt_forget(); s_bt_real.draw_vbuf_ib(s_bt_real.user, topology, vbuf, vertex_count, stride, ibuf, index_count); return; }
     a->topology = (u32)topology; a->vbuf = vbuf; a->vertex_count = vertex_count; a->stride = stride;
     a->index_count = index_count; a->ibuf = ibuf; a->has_v = 0; a->has_i = 0;
     bt_commit(a);
@@ -393,7 +475,7 @@ static void bt_draw_vbuf_ib(void* u, rsx_topology topology, u32 vbuf, u32 vertex
 
 /* The end of a FIFO drain (rsx_split.h g_rsx_drain_end_hook): the worker idle
  * before the frame loop touches the backend directly. */
-static void vk_bt_quiesce(void) { vk_tq_sync(); }
+static void vk_bt_quiesce(void) { vk_tq_sync(); bt_forget(); }
 
 /* The table the engine gets: the backend's own, each entry it has through a
  * thunk. NULL when the switch is off or recording is not threaded. */
