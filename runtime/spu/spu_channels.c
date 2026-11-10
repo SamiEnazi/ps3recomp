@@ -1677,12 +1677,62 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
  * a running estimate of how often its waits end inside the window (measured on
  * every blocking wait, spun or not) and spins only while that is at least
  * <pct> percent -- an SPU that mostly sits idle (the sixth, non-SPURS SPU; menus;
- * a paused game) stops spending its window on waits that outlast it. */
+ * a paused game) stops spending its window on waits that outlast it.
+ *
+ * PS3_SPU_SPIN_CORES=all|p|e (default all): spin only while the thread is on a
+ * performance core (p) or an efficiency core (e) of a hybrid CPU; elsewhere it
+ * sleeps at once as with the spin off. Left to the OS the SPURS workers run
+ * ~40% of their time on the E-cores (host_place.h). A spin on a P-core holds a
+ * hyperthread whose sibling may be the main or RSX thread; on an E-core it
+ * holds a core nobody shares. A CPU with one efficiency class spins everywhere. */
 static int s_spin_us = -1;
 static int s_spin_lean = 1;
 static int s_spin_adapt = 256;               /* threshold, of 1024 */
 static long long s_spin_qpc;                 /* the window in QPC ticks */
 static LARGE_INTEGER s_spin_qpf;
+static int s_spin_cores;                     /* 0 all, 1 P-cores only, 2 E-cores only */
+static uint64_t s_spin_cpu_ok;               /* group-0 logical processors the spin may use */
+static void spu_spin_cores_init(void)
+{
+    const char* c = getenv("PS3_SPU_SPIN_CORES");
+    s_spin_cores = !c ? 0 : (c[0] == 'p' || c[0] == 'P') ? 1 : (c[0] == 'e' || c[0] == 'E') ? 2 : 0;
+    s_spin_cpu_ok = ~0ull;
+    if (!s_spin_cores) return;
+    ULONG len = 0;
+    GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
+    unsigned char* buf = (unsigned char*)malloc(len ? len : 1);
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) {
+        free(buf); s_spin_cores = 0; return;
+    }
+    BYTE emax = 0, emin = 255;
+    for (ULONG off = 0; off < len;) {
+        PSYSTEM_CPU_SET_INFORMATION q = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (q->Type == CpuSetInformation && q->CpuSet.Group == 0) {
+            if (q->CpuSet.EfficiencyClass > emax) emax = q->CpuSet.EfficiencyClass;
+            if (q->CpuSet.EfficiencyClass < emin) emin = q->CpuSet.EfficiencyClass;
+        }
+        off += q->Size ? q->Size : len;
+    }
+    uint64_t ok = 0;
+    for (ULONG off = 0; off < len;) {
+        PSYSTEM_CPU_SET_INFORMATION q = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (q->Type == CpuSetInformation && q->CpuSet.Group == 0 && q->CpuSet.LogicalProcessorIndex < 64) {
+            const int perf = q->CpuSet.EfficiencyClass == emax;
+            if (emax == emin || (s_spin_cores == 1 ? perf : !perf)) ok |= 1ull << q->CpuSet.LogicalProcessorIndex;
+        }
+        off += q->Size ? q->Size : len;
+    }
+    free(buf);
+    s_spin_cpu_ok = ok;
+    fprintf(stderr, "[spu-spin] PS3_SPU_SPIN_CORES=%s: logical processors %016llX\n", c, (unsigned long long)ok);
+}
+static inline int spu_spin_core_ok(void)
+{
+    if (!s_spin_cores) return 1;
+    PROCESSOR_NUMBER pn;
+    GetCurrentProcessorNumberEx(&pn);
+    return pn.Group != 0 || pn.Number >= 64 || ((s_spin_cpu_ok >> pn.Number) & 1u);
+}
 static __attribute__((noinline, cold)) int spu_spin_us_init(void)
 {
     const char* e = getenv("PS3_SPU_SPIN_US");
@@ -1698,6 +1748,7 @@ static __attribute__((noinline, cold)) int spu_spin_us_init(void)
     s_spin_adapt = pct * 1024 / 100;
     QueryPerformanceFrequency(&s_spin_qpf);
     s_spin_qpc = s_spin_qpf.QuadPart * v / 1000000;
+    if (v) spu_spin_cores_init();
     __atomic_store_n(&s_spin_us, v, __ATOMIC_RELEASE);
     return v;
 }
@@ -1731,6 +1782,7 @@ static int spu_ch_spin(spu_context* ctx, uint32_t channel)
     const int us = spu_spin_us();
     if (!us) return 0;
     if (s_spin_adapt && t_spin_p < s_spin_adapt) return 0;   /* PS3_SPU_SPIN_ADAPT */
+    if (!spu_spin_core_ok()) return 0;                        /* PS3_SPU_SPIN_CORES */
     LARGE_INTEGER t0, t;
     QueryPerformanceCounter(&t0);
     const long long end = t0.QuadPart + s_spin_qpc;
