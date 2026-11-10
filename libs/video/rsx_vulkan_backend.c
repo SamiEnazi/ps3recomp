@@ -9185,7 +9185,11 @@ int rsx_vulkan_backend_pump_messages(void)
              * captured again when it closes */
             else if (!e.key.repeat && cellPad_host_window_event(2)) vk_overlay_open_menu();
         }
-        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9 && !e.key.repeat) s_pl.mark = 1;
+        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F9 && !e.key.repeat) {
+            s_pl.mark = 1;
+            /* (minimap) PS3RECOMP_ENG_HUDLOG_KEY=1: this frame's HUD draws too */
+            __atomic_store_n(&g_rsx_hudlog_key, 1, __ATOMIC_RELEASE);
+        }
         else if (e.type == SDL_MOUSEBUTTONDOWN) cellPad_host_window_event(1);
     }
     vk_mouse_capture_sync();

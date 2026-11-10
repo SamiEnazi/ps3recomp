@@ -33,6 +33,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stdarg.h>   /* (minimap) rsx_logf */
 #include <stddef.h>   /* offsetof: the fast pipeline key */
 #include <stdio.h>
 #include <stdlib.h>
@@ -369,6 +370,7 @@ rsx_lim g_rsx_lim[RSX_LIM_COUNT] = {
 };
 static volatile long s_lim_any;
 void (*g_rsx_log_hook)(const char* line, unsigned n);
+volatile long g_rsx_hudlog_key;   /* (minimap) PS3RECOMP_ENG_HUDLOG_KEY, rsx_draw_engine.h */
 /* (rsx5, round 3) one whole line to the log hook, or to stderr as before */
 static void rsx_log_line(char* line, int len, int cap)
 {
@@ -376,6 +378,19 @@ static void rsx_log_line(char* line, int len, int cap)
     if (len >= cap - 1) { len = cap - 2; line[len++] = '\n'; line[len] = 0; }   /* cut: keep the newline */
     if (g_rsx_log_hook) g_rsx_log_hook(line, (unsigned)len);
     else                fputs(line, stderr);
+}
+/* (minimap) one formatted line the same way (the HUDLOG lines: a key-asked
+ * window prints ~100 draws at once, which must not hold the RSX thread on a
+ * slow disk the way direct stderr writes would) */
+static void rsx_logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void rsx_logf(const char* fmt, ...)
+{
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    const int k = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    rsx_log_line(line, k, (int)sizeof line);
 }
 void rsx_lim_event(int id, int kind, const char* what)
 {
@@ -6827,12 +6842,34 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
                         hsec = hn ? hlist[0] : -1;
                         const char* f = getenv("PS3RECOMP_ENG_HUDLOG_AFTER"); hafter = f ? strtoull(f, 0, 16) : 0; }
       if (hdone && hi + 1u < hn) { hsec = hlist[++hi]; hdone = 0; hframe = ~0u; }
+      /* (minimap) PS3RECOMP_ENG_HUDLOG_KEY=1: the host key (F9, the playlog
+       * MARK) asks for the next two frames' draws into a display buffer, depth
+       * tested or not -- the HUD's layers ARE depth tested (inFAMOUS 2: LessEqual
+       * + write, one z per layer, drawn back to front), so the timed window's
+       * "no depth test" filter does not see them. Every HUD quad of the moment
+       * the player saw something wrong: the minimap's markers among them, with
+       * their textures, constants (c[256..] the minimap matrix, c[466].x the
+       * layer) and input position/colour ranges. */
+      static int hkey = -1; static u32 kframe = ~0u;
+      if (__builtin_expect(hkey < 0, 0)) { const char* e = getenv("PS3RECOMP_ENG_HUDLOG_KEY"); hkey = e && *e && *e != '0'; }
+      if (hkey && __atomic_load_n(&g_rsx_hudlog_key, __ATOMIC_ACQUIRE)) {
+          __atomic_store_n(&g_rsx_hudlog_key, 0, __ATOMIC_RELAXED);
+          kframe = g.frames + 1u;
+          rsx_logf("[hudlog] key at frame %u: every draw into a display buffer in frames %u..%u follows\n",
+                   g.frames, kframe, kframe + 1u);
+      }
+      int kdisp = 0;
+      if (kframe != ~0u && g.frames - kframe <= 1u && n_targets == 1)
+          for (u32 b = 0; b < 8u && !kdisp; b++)
+              kdisp = g.display_buffers[b].valid && g.display_buffers[b].location == g.surfaces[target].location &&
+                      g.display_buffers[b].offset == g.surfaces[target].offset;
+      int hlog = 0;
+      const eng_vp_memo* vpm = NULL; const eng_fp_memo* fpm = NULL;
       if (hsec >= 0 && !hdone) {
           extern unsigned long long ps3_ms_now(void);
           if (!ht0) ht0 = ps3_ms_now();
           if (hframe == ~0u && g.guest_draws > 1000 && ps3_ms_now() - ht0 >= (unsigned long long)hsec * 1000ull) hframe = g.frames;
           if (hframe != ~0u && g.frames > hframe + 2u) hdone = 1;
-          const eng_vp_memo* vpm = NULL; const eng_fp_memo* fpm = NULL;
           if (hframe != ~0u && g.frames - hframe <= 2u) eng_guest_programs(&vpm, &fpm);
           const int after = hafter_frame == g.frames;
           if (hafter && fpm && fpm->structural == hafter) hafter_frame = g.frames;
@@ -6841,28 +6878,44 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
           static long hrt = -2;
           if (hrt == -2) { const char* e = getenv("PS3RECOMP_ENG_HUDLOG_RT"); hrt = e ? (long)strtoul(e, 0, 16) : -1; }
           const int rt_match = hrt >= 0 && n_targets && g.surfaces[target].offset == (u32)hrt;
-          if (hframe != ~0u && g.frames - hframe <= 2u && (after || rt_match || (n_targets == 1 && !rs.depth_test))) {
+          hlog = hframe != ~0u && g.frames - hframe <= 2u && (after || rt_match || (n_targets == 1 && !rs.depth_test));
+      }
+      if (kdisp) { if (!fpm) eng_guest_programs(&vpm, &fpm); hlog = 1; }
+      if (hlog) {
               float mn[4] = { 1e30f, 1e30f, 1e30f, 1e30f }, mx[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
               const s8 ps = layout.slot_by_attr[0];
               if (ps >= 0 && dc.verts && !(dc.vbuf_hit && indexed))
                   for (u32 v = 0; v < uploaded_hud_n(dc.n_verts, n_draw, indexed); v++) {
                       const float* q = (const float*)((const u8*)dc.verts + (size_t)v * layout.stride + (size_t)ps * 16u);
                       for (int c = 0; c < 4; c++) { if (q[c] < mn[c]) mn[c] = q[c]; if (q[c] > mx[c]) mx[c] = q[c]; } }
-              fprintf(stderr, "[hudlog] f=%u d=%u nt=%u z=%u/0x%X rt=0x%08X %ux%u fp=%016llx vp=%016llx vpc=%u+%u n=%u blend=%u cmask=0x%08X vps=(%g %g) vpt=(%g %g) pos x[%g,%g] y[%g,%g] z[%g,%g] w[%g,%g]\n",
+              rsx_logf("[hudlog] f=%u d=%u nt=%u z=%u/0x%X rt=0x%08X %ux%u fp=%016llx vp=%016llx vpc=%u+%u n=%u blend=%u cmask=0x%08X vps=(%g %g) vpt=(%g %g) pos x[%g,%g] y[%g,%g] z[%g,%g] w[%g,%g]\n",
                       g.frames, g.guest_draws, n_targets, rs.depth_test, rs.depth_func, g.surfaces[target].offset, g.surfaces[target].w, g.surfaces[target].h,
                       (unsigned long long)(fpm ? fpm->structural : 0), (unsigned long long)(vpm ? vpm->hash : 0),
                       g.vpc_lo, g.vpc_n, dc.n_verts, rs.blend_enable, rsx_dsp_reg(&g.rsx, 0x0324),
                       vp.scale[0], vp.scale[1], vp.translate[0], vp.translate[1],
                       mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], mn[3], mx[3]);
+              /* (minimap) the colour input (attribute 3, COLOR0) the same way: a
+               * marker drawn with alpha 0 is drawn and still invisible. No ranges
+               * (1e+30) = the vertices came from the vertex cache unread. */
+              { const s8 cs = layout.slot_by_attr[3];
+                if (cs >= 0) {
+                    float cn[4] = { 1e30f, 1e30f, 1e30f, 1e30f }, cx[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
+                    if (dc.verts && !(dc.vbuf_hit && indexed))
+                        for (u32 v = 0; v < uploaded_hud_n(dc.n_verts, n_draw, indexed); v++) {
+                            const float* q = (const float*)((const u8*)dc.verts + (size_t)v * layout.stride + (size_t)cs * 16u);
+                            for (int c = 0; c < 4; c++) { if (q[c] < cn[c]) cn[c] = q[c]; if (q[c] > cx[c]) cx[c] = q[c]; } }
+                    rsx_logf("[hudlog]   colour r[%g,%g] g[%g,%g] b[%g,%g] a[%g,%g]\n",
+                             cn[0], cx[0], cn[1], cx[1], cn[2], cx[2], cn[3], cx[3]);
+                } }
               /* The blend itself (SFACTOR/DFACTOR/EQUATION, A<<16|RGB) and the
                * blend colour 0x0310+.. -- what a fade or composite does with
                * the frame under it. */
-              fprintf(stderr, "[hudlog]   blend sf=0x%08X df=0x%08X eq=0x%08X color=0x%08X tex_mask=0x%X\n",
+              rsx_logf("[hudlog]   blend sf=0x%08X df=0x%08X eq=0x%08X color=0x%08X tex_mask=0x%X\n",
                       rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR), rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR),
                       rsx_dsp_reg(&g.rsx, M_BLEND_EQUATION), rsx_dsp_reg(&g.rsx, 0x031C), tex_mask);
               /* What can reject every fragment of a draw whose depth test is
                * off: the stencil test, the scissor, depth bounds. */
-              fprintf(stderr, "[hudlog]   stencil en=%u func=0x%X ref=0x%02X fmask=0x%02X wmask=0x%02X ops=0x%X/0x%X/0x%X two=%u dbounds=%u scissor=0x%08X/0x%08X zslot=%d vpz=(%g %g) zminmax=0x%X\n",
+              rsx_logf("[hudlog]   stencil en=%u func=0x%X ref=0x%02X fmask=0x%02X wmask=0x%02X ops=0x%X/0x%X/0x%X two=%u dbounds=%u scissor=0x%08X/0x%08X zslot=%d vpz=(%g %g) zminmax=0x%X\n",
                       rsx_dsp_reg(&g.rsx, M_STENCIL_TEST_ENABLE) & 1u, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC),
                       rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_MASK) & 0xFFu,
                       rsx_dsp_reg(&g.rsx, M_STENCIL_MASK) & 0xFFu, rsx_dsp_reg(&g.rsx, M_STENCIL_OP_FAIL),
@@ -6873,31 +6926,32 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
               { const float* k = (const float*)g.fp_cb;   /* the fragment constants handed over */
                 const u32 nk = g.fp_constants->count;
                 for (u32 i = 0; i < nk && i < 32u; i++)
-                    fprintf(stderr, "[hudlog]   fpc[%u] = (%g %g %g %g)\n", i, k[i*4], k[i*4+1], k[i*4+2], k[i*4+3]);
-                if (!nk) fprintf(stderr, "[hudlog]   fpc: none\n");
+                    rsx_logf("[hudlog]   fpc[%u] = (%g %g %g %g)\n", i, k[i*4], k[i*4+1], k[i*4+2], k[i*4+3]);
+                if (!nk) rsx_logf("[hudlog]   fpc: none\n");
                 char tb[256]; int tp = 0;
+                tb[0] = 0;   /* (minimap) no unit bound: an empty list, not stack bytes */
                 for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && tp < (int)sizeof tb - 16; u++)
                     if (tex_mask & (1u << u)) tp += snprintf(tb + tp, sizeof tb - (size_t)tp, " u%u=h%u", u, textures[u]);
-                fprintf(stderr, "[hudlog]   textures:%s\n", tb);
+                rsx_logf("[hudlog]   textures:%s\n", tb);
                 /* Each sampled unit's raw state: what a read returning black
                  * was given (format, remap, filter, wrap, LOD control). */
                 for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
                     if (!(tex_mask & (1u << u))) continue;
                     rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
-                    fprintf(stderr, "[hudlog]     u%u en %u loc %u off 0x%08X fmt 0x%02X %ux%u mips %u pitch %u cube %u dim %u remap 0x%08X filter 0x%08X ctl0 0x%08X wrap 0x%08X\n",
+                    rsx_logf("[hudlog]     u%u en %u loc %u off 0x%08X fmt 0x%02X %ux%u mips %u pitch %u cube %u dim %u remap 0x%08X filter 0x%08X ctl0 0x%08X wrap 0x%08X\n",
                             u, t.enabled, t.location, t.offset, t.format, t.width, t.height, t.mipmaps, t.pitch,
                             t.cubemap, t.dimension, t.remap, t.filter, t.control0, t.wrap);
                 } }
               for (u32 c = g.vpc_lo; c < g.vpc_lo + g.vpc_n && c < g.vpc_lo + 6u && c < RSX_DSP_NUM_CONSTANTS; c++) {
                   float v4[4]; memcpy(v4, g.rsx.constants[c], sizeof v4);
-                  fprintf(stderr, "[hudlog]   c[%u] = (%g %g %g %g)\n", c, v4[0], v4[1], v4[2], v4[3]); }
+                  rsx_logf("[hudlog]   c[%u] = (%g %g %g %g)\n", c, v4[0], v4[1], v4[2], v4[3]); }
               /* The rows full-screen passes take clip z/w and texcoord
                * transforms from (463..467), whatever the program's range. */
               if (g.vpc_lo + g.vpc_n > 463u && g.vpc_lo < 458u)
                   for (u32 c = 463; c < 468; c++) {
                       float v4[4]; memcpy(v4, g.rsx.constants[c], sizeof v4);
-                      fprintf(stderr, "[hudlog]   c[%u] = (%g %g %g %g)\n", c, v4[0], v4[1], v4[2], v4[3]); }
-          } } }
+                      rsx_logf("[hudlog]   c[%u] = (%g %g %g %g)\n", c, v4[0], v4[1], v4[2], v4[3]); }
+          } }
     /* PS3RECOMP_FX_LOG=1 (diagnostic): once a second, how strong the game's
      * DOF/edge-blur pass is (ENG_DOF_BLEND_FP): the largest edge weight of its
      * screen mesh (vertex attribute 8, the tc0.z the pass reads; "cached" =

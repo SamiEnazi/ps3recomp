@@ -197,6 +197,10 @@ int rsx_lim_format(char* buf, int size, const char* why);
  * holds the RSX thread. NULL: written to stderr directly, as before. Each call
  * is one whole line, '\n' included. */
 extern void (*g_rsx_log_hook)(const char* line, unsigned n);
+/* (minimap) PS3RECOMP_ENG_HUDLOG_KEY=1: a host key (the Vulkan window's F9, the
+ * playlog MARK) sets this; the engine then logs the next two frames' draws into
+ * the display buffers in PS3RECOMP_ENG_HUDLOG's format and clears it. */
+extern volatile long g_rsx_hudlog_key;
 
 /* ---- the backend interface ---------------------------------------------- */
 
