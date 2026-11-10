@@ -189,6 +189,8 @@ typedef struct IoMapping {
 
 static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;
+static void gcm_spu_put_box_update(void);   /* (perf17) after every change to s_io_mappings */
+static int s_spu_put_mode = 0;              /* (perf17) see gcm_spu_put_box_update */
 
 /* Callback handlers — these are GUEST OPD addresses passed by the
  * recompiled game, not host function pointers. Stored as uint32_t and
@@ -463,6 +465,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
 
     s_local_mem_allocated = 0;
     s_io_mapping_count = 0;
+    gcm_spu_put_box_update();   /* (perf17) no mappings (yet) */
     /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
      * this every unmapped EA page silently aliased io page 0 (and vice versa),
      * producing plausible-but-wrong offsets instead of a translation failure. */
@@ -519,7 +522,12 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
       extern int (*g_spu_put_rsx_hook)(u32 ea, u32 size);
       int gcm_spu_put_is_rsx(u32 ea, u32 size);
       const char* pd = getenv("PS3RECOMP_SPU_PUT_DESC");
-      g_spu_put_rsx_hook = (pd && *pd == '0') ? NULL : gcm_spu_put_is_rsx; }
+      g_spu_put_rsx_hook = (pd && *pd == '0') ? NULL : gcm_spu_put_is_rsx;
+      /* (perf17) PS3RECOMP_SPU_PUT_INLINE (default 1): the test inline against
+       * the mappings' interval; 0 = the hook call for every PUT, as m17 */
+      const char* pi = getenv("PS3RECOMP_SPU_PUT_INLINE");
+      s_spu_put_mode = !g_spu_put_rsx_hook ? 0 : (pi && *pi == '0') ? 2 : 1;
+      gcm_spu_put_box_update(); }
 
     s_gcm_initialized = 1;
     return CELL_OK;
@@ -1751,6 +1759,50 @@ int gcm_spu_put_is_rsx(u32 ea, u32 size)
         if (ea < m->ea + m->size && ea + size > m->ea) return 1;
     }
     return 0;
+}
+
+/* (perf17) The SPU side's inline form of the test above (spu_dma.h
+ * spu_put_is_rsx): the mappings' union as [lo, hi) when it is one interval
+ * (exact), else their bounding box with the hook deciding inside it. Called
+ * after every change to s_io_mappings. s_spu_put_mode: 0 = PUT_DESC off (never
+ * RSX), 1 = this interval (PS3RECOMP_SPU_PUT_INLINE, default), 2 = the hook for
+ * every PUT (PS3RECOMP_SPU_PUT_INLINE=0, as m17). */
+static void gcm_spu_put_box_update(void)
+{
+    extern u32 g_spu_put_rsx_lo, g_spu_put_rsx_hi;
+    extern int g_spu_put_rsx_exact;
+    u32 lo = 0, hi = 0; int exact = 0;
+    if (s_spu_put_mode == 2) { lo = 0; hi = 0xFFFFFFFFu; exact = 0; }
+    else if (s_spu_put_mode == 1) {
+        /* the active ranges sorted by ea, merged; one left = exact */
+        u32 rs[CELL_GCM_MAX_IO_MAPPINGS], re[CELL_GCM_MAX_IO_MAPPINGS]; int n = 0;
+        for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+            const IoMapping* m = &s_io_mappings[i];
+            if (!m->active || !m->size) continue;
+            const u64 e64 = (u64)m->ea + m->size;
+            const u32 s = m->ea, e = e64 > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)e64;
+            int k = n++;
+            while (k > 0 && rs[k - 1] > s) { rs[k] = rs[k - 1]; re[k] = re[k - 1]; k--; }
+            rs[k] = s; re[k] = e;
+        }
+        int pieces = 0; u32 cur_e = 0;
+        for (int k = 0; k < n; k++) {
+            if (k == 0 || rs[k] > cur_e) pieces++;
+            if (k == 0 || re[k] > cur_e) cur_e = re[k];
+        }
+        if (n) { lo = rs[0]; hi = cur_e; exact = pieces == 1; }
+    }
+    /* exact off first, on last: a reader racing a map/unmap call may mix the
+     * old and new interval for an instant, which (as a stale hook answer)
+     * only picks the copy order of that one PUT */
+    __atomic_store_n(&g_spu_put_rsx_exact, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_spu_put_rsx_lo, lo, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_spu_put_rsx_hi, hi, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_spu_put_rsx_exact, exact, __ATOMIC_RELEASE);
+    { static int _n = 0;
+      if (s_spu_put_mode && PS3_LOG_FIRST(_n, 16))
+          fprintf(stderr, "[cellGcmSys] SPU PUT RSX range 0x%08X-0x%08X %s (mode %d)\n", lo, hi,
+                  exact ? "exact" : "box, hook inside", s_spu_put_mode); }
 }
 
 void gcm_forget_spu_blocks(void)
@@ -3661,7 +3713,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
         IoMapping* m = find_free_mapping();
         if (m) {
             m->ea = ea_page; m->io = io; m->size = 0x100000u; m->active = 1;
-            s_io_mapping_count++;
+            s_io_mapping_count++; gcm_spu_put_box_update();   /* (perf17) */
         } else {
             printf("[cellGcmSys] WARNING: auto-map has no free IO mapping slot; "
                    "the FIFO will not be able to walk io 0x%08X\n", io);
@@ -3739,7 +3791,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
     mapping->io     = io_offset;
     mapping->size   = size;
     mapping->active = 1;
-    s_io_mapping_count++;
+    s_io_mapping_count++; gcm_spu_put_box_update();   /* (perf17) */
 
     populate_offset_table(ea, io_offset, size);
 
@@ -3779,7 +3831,7 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
     mapping->io     = io;
     mapping->size   = size;
     mapping->active = 1;
-    s_io_mapping_count++;
+    s_io_mapping_count++; gcm_spu_put_box_update();   /* (perf17) */
 
     populate_offset_table(ea, io, size);
 
@@ -3797,7 +3849,7 @@ s32 cellGcmUnmapEaIoAddress(u32 ea)
 
     clear_offset_table(mapping->ea, mapping->io, mapping->size);
     mapping->active = 0;
-    s_io_mapping_count--;
+    s_io_mapping_count--; gcm_spu_put_box_update();   /* (perf17) */
 
     return CELL_OK;
 }
@@ -3813,7 +3865,7 @@ s32 cellGcmUnmapIoAddress(u32 io)
 
     clear_offset_table(mapping->ea, mapping->io, mapping->size);
     mapping->active = 0;
-    s_io_mapping_count--;
+    s_io_mapping_count--; gcm_spu_put_box_update();   /* (perf17) */
 
     return CELL_OK;
 }
@@ -4224,6 +4276,7 @@ void cellGcmTerminate(void)
     s_queue_handler    = NULL;
     s_local_mem_allocated = 0;
     s_io_mapping_count = 0;
+    gcm_spu_put_box_update();   /* (perf17) no mappings (yet) */
     /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
      * this every unmapped EA page silently aliased io page 0 (and vice versa),
      * producing plausible-but-wrong offsets instead of a translation failure. */
@@ -4557,7 +4610,7 @@ void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
     IoMapping* m = find_free_mapping();
     if (m) {
         m->ea = ea; m->io = io; m->size = size; m->active = 1;
-        s_io_mapping_count++;
+        s_io_mapping_count++; gcm_spu_put_box_update();   /* (perf17) */
     } else rsx_lim_event(RSX_LIM_GCM_IOMAP, 0, "IO mapping table full: a syscall mapping is not walkable");
     rsx_lim_cap(RSX_LIM_GCM_IOMAP, CELL_GCM_MAX_IO_MAPPINGS); rsx_lim_use(RSX_LIM_GCM_IOMAP, (unsigned long long)s_io_mapping_count);
     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }
