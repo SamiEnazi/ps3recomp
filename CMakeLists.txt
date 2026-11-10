@@ -410,6 +410,19 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     if(PS3RECOMP_HAS_MSSE41)
         target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
     endif()
+    # (critic) PS3RECOMP_VIDEO_ARCH (environment at configure time; unset or
+    # empty = as before): extra target flags for the RSX / Vulkan C sources
+    # only, e.g. "-mavx2;-mfma;-mbmi;-mbmi2;-mlzcnt;-mpopcnt;-mf16c" (x86-64-v3).
+    # The whole runtime -- the RSX thread's draw engine and Vulkan backend
+    # included -- is built for SSE4.1, while the lifted PPU and SPU code that
+    # the same exe runs already needs AVX2 (PORT_LIFT_OPT / PORT_SPU_ARCH), so
+    # this adds no CPU requirement. Codegen only: -ffp-contract=off above
+    # still forbids fusing, and libs/video has no #if on a CPU feature.
+    if(DEFINED ENV{PS3RECOMP_VIDEO_ARCH} AND NOT "$ENV{PS3RECOMP_VIDEO_ARCH}" STREQUAL "")
+        file(GLOB _ps3_video_c "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/*.c")
+        set_property(SOURCE ${_ps3_video_c} APPEND PROPERTY COMPILE_OPTIONS "$ENV{PS3RECOMP_VIDEO_ARCH}")
+        message(STATUS "ps3recomp: libs/video C sources get $ENV{PS3RECOMP_VIDEO_ARCH} (PS3RECOMP_VIDEO_ARCH)")
+    endif()
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
     #

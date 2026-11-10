@@ -844,6 +844,13 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
 static int s_sema_live = 0;           /* the LAST drain pass ended on one (see cellGcm_drain_sema_blocked) */
 static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
+/* (critic) what the frame clock's idle wait may end early on -- written by the
+ * draining thread at the end of each pass, read by the same thread in
+ * cellGcm_fifo_kick_wait and (s_sema_live / s_sema_offset only) by the SPU DMA
+ * hook, which only uses them to decide whether to signal the kick event. */
+static u32 s_sema_wait_val;            /* the value the blocked acquire waits for */
+static u32 s_kw_put;                   /* `put` as the last drain pass read it */
+static int s_kw_more;                  /* the last pass stopped at a flip with words left before put */
 
 /* RSX_SNAP_AT=<sec>, RSX_SNAP_RANGES=<ea>:<len>[,<ea>:<len>...], RSX_SNAP_DIR=<dir>:
  * photograph guest memory at two points of one frame, once, after <sec> s.
@@ -1730,8 +1737,10 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+static void gcm_sema_kick_if(u32 ea, u32 size);   /* (critic) below, with the kick event */
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    gcm_sema_kick_if(ea, size);   /* (critic) PS3RECOMP_GCM_SEMA_KICK: a label the walker waits on */
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
@@ -1925,13 +1934,76 @@ void* cellGcm_fifo_kick_event(void)
  * starved guest still paid the full tick. Waiting here instead costs nothing
  * when no one kicks (the timeout is the old sleep) and drains immediately when
  * someone does. */
+/* (critic) Is there work for a drain pass right now? New words behind a moved
+ * `put`, the rest of a frame the last pass left at its flip, a flip to present,
+ * or the label a blocked acquire waits for now holding its value. */
+static int gcm_kw_ready(void)
+{
+    if (s_kw_more || s_flip_pending) return 1;
+    if (vm_read32(GCM_CONTROL_GUEST_ADDR + 0) != s_kw_put) return 1;
+    if (s_sema_live && vm_read32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu)) == s_sema_wait_val) return 1;
+    return 0;
+}
+
 void cellGcm_fifo_kick_wait(unsigned ms)
 {
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    /* (critic) PS3RECOMP_GCM_SPIN_US=<us> (default 0 = off, as before): spin up
+     * to <us> before the event wait, ending as soon as gcm_kw_ready(). The FIFO
+     * has no doorbell, and the wait below is a 1 ms WaitForSingleObject that
+     * the scheduler rounds to its timer ticks: in the city A/B of 2026-11-10
+     * (cv2-*, split off) the RSX thread sat 0.5 / 1.0 / 1.5 / 2.0 ms -- tick
+     * multiples -- between the drain that caught up with the title and the
+     * present of that frame, ~1.0-1.4 ms of every ~9.2 ms dock frame. Timing
+     * only: the passes this lets run earlier are the ones the timeout or a kick
+     * would have run. */
+    static int spin_us = -1; static LONGLONG spin_ticks;
+    if (spin_us < 0) {
+        const char* e = getenv("PS3RECOMP_GCM_SPIN_US");
+        int v = e ? atoi(e) : 0;
+        if (v < 0) v = 0;
+        if (v > 4000) v = 4000;
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        spin_ticks = f.QuadPart * (LONGLONG)v / 1000000;
+        spin_us = v;
+        if (v) fprintf(stderr, "[cellGcmSys] PS3RECOMP_GCM_SPIN_US=%d: the frame clock spins up to %d us for new FIFO work before it sleeps\n", v, v);
+    }
+    if (spin_us && s_gcm_initialized) {
+        if (gcm_kw_ready()) return;
+        LARGE_INTEGER t0, now; QueryPerformanceCounter(&t0);
+        unsigned n = 0;
+        do {
+            for (int i = 0; i < 16; i++) YieldProcessor();
+            if (gcm_kw_ready()) return;
+            if (ev && (++n & 15u) == 0u && WaitForSingleObject(ev, 0) == WAIT_OBJECT_0) return;
+            QueryPerformanceCounter(&now);
+        } while (now.QuadPart - t0.QuadPart < spin_ticks);
+    }
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
+}
+
+/* (critic) PS3RECOMP_GCM_SEMA_KICK (default 1; 0 = as before): the walker
+ * blocked on a semaphore acquire waits for a label that an SPU DMA (or, with
+ * PS3RECOMP_RSX_SPLIT, the exec thread's release) writes, and neither kicked
+ * the frame clock, so every acquire stall lasted at least one wait timeout
+ * (median 1.83 ms with the split on, 0.9-1.3 ms off, in the cv-* / cv2-* city
+ * runs). Signal the kick event when that exact label is written. Timing only:
+ * the next pass re-reads the label as before. Never creates the event (only
+ * the frame clock does), so it is safe from any thread. */
+static int gcm_sema_kick_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PS3RECOMP_GCM_SEMA_KICK"); on = !(e && *e == '0'); }
+    return on;
+}
+static void gcm_sema_kick_if(u32 ea, u32 size)
+{
+    if (!__atomic_load_n(&s_sema_live, __ATOMIC_RELAXED) || !s_gcm_kick_ev || !gcm_sema_kick_on()) return;
+    const u32 la = GCM_LABEL_GUEST_BASE + (__atomic_load_n(&s_sema_offset, __ATOMIC_RELAXED) & 0xFFFFu);
+    if (la - ea < size) SetEvent(s_gcm_kick_ev);
 }
 
 
@@ -2203,7 +2275,7 @@ void gcm_split_run(u32 kind, u32 a, u32 b, u32 c)
 {
     switch (kind) {
     case RSX_SPLIT_ACT_WORD: gcm_word_effects(a >> 13, a & 0x1FFCu, b, c); break;
-    case RSX_SPLIT_ACT_SEMA: vm_write32(a, b); break;
+    case RSX_SPLIT_ACT_SEMA: vm_write32(a, b); gcm_sema_kick_if(a, 4u); break;   /* (critic) */
     case RSX_SPLIT_ACT_FLIP: gcm_flip_word_effects(a); break;
     default: break;
     }
@@ -2212,6 +2284,7 @@ void gcm_split_run(u32 kind, u32 a, u32 b, u32 c)
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     s_sema_live = 0;
+    s_kw_more = 0;   /* (critic) set again at the end of a full pass */
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
@@ -2244,6 +2317,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * own command ring, so everything after the jump (including the reference
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    s_kw_put = put; s_kw_more = 0;   /* (critic) PS3RECOMP_GCM_SPIN_US */
     /* The words behind `put` were stored by another thread (the title, or the
      * recycle below) before it stored `put`. On x86 the hardware keeps loads
      * in order; on arm64 it does not, so without an acquire here the ring
@@ -2660,6 +2734,7 @@ walk_more:
                 if (!blk_ms || gcm_run_clock_ms(&b_run, now) < blk_ms) {
                     if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
                     if (!s_ha_sema_t0) s_ha_sema_t0 = ps3_ft_now();
+                    s_sema_wait_val = v;   /* (critic) cellGcm_fifo_kick_wait's early end */
                     sem_blocked = 1; break;
                 }
                 if (s_ft_sema_t0) {
@@ -2944,6 +3019,8 @@ walk_more:
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
     s_drain_why = s_sema_live ? "sema-acquire" : why;
+    /* (critic) stopped at a flip with words left: the next pass has work at once */
+    s_kw_more = !s_sema_live && why && !strcmp(why, "flip") && s_fifo_getoff != put;
     gcm_flip_stats_tick();
     if (draindbg) {
         static int n2 = 0;
