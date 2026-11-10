@@ -1149,6 +1149,9 @@ _RE_CALL_DRAIN = re.compile(r"((\w*func_[0-9A-Fa-f]{8})\(ctx\);) DRAIN_TRAMPOLIN
 #                    one body. PPU_XINLINE_MAX=<n>: the largest leaf, in statements (default 48);
 #                    PPU_XINLINE_FEW=<n>: the largest for a leaf with at most 3 `bl` sites in the
 #                    whole image (default 160: little code growth).
+#   PPU_TLS_CONSTINIT=1  g_trampoline_fn redeclared constinit in the lifted source: clang-cl
+#                    then drops its TLS init guard (a load, a test and a cold call) from every
+#                    access -- each drain test, several per call (see _preamble_lines).
 def _xtail_on() -> bool:
     return _env_on("PPU_XTAIL")
 
@@ -4486,6 +4489,17 @@ class PPULifter:
             lines.append('#error "a PPU_XTAIL lift needs clang (musttail)"')
             lines.append("#endif")
             lines.append("#define PPU_TAIL(f) __attribute__((musttail)) return f(ctx)")
+            lines.append("")
+        if _env_on("PPU_TLS_CONSTINIT"):
+            # PPU_TLS_CONSTINIT=1: clang-cl guards every access to an extern thread-local
+            # (MSVC's on-demand TLS init: load + test __tls_guard, a call when clear), even a
+            # __declspec(thread) one -- in every drain test, several times per call. The
+            # trampoline pointer is constant-initialised (= nullptr, runtime/ppu/
+            # ppu_loader.cpp, itself constinit): saying so drops the guard. Same variable.
+            lines.append("/* PPU_TLS_CONSTINIT lift: the trampoline pointer is constant-initialised (no TLS guard) */")
+            lines.append("#if defined(__cplusplus) && defined(__cpp_constinit)")
+            lines.append('extern "C" constinit PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);')
+            lines.append("#endif")
             lines.append("")
         if _xtail_on() and _env_on("PPU_XTAIL_VERIFY"):
             # PPU_XTAIL_VERIFY=1: every drain the elision drops stays as a test. A call that
