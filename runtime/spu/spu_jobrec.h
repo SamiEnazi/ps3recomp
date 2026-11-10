@@ -61,6 +61,9 @@ void spu_jobrec_unwound(struct spu_context* ctx);
  * code (0 = every replay passed); -1 = not in replay mode, boot the game. */
 int spu_jobreplay_main(void);
 
+/* The recording / replay directory ("" = neither): spu_patch.c keeps spu_patches.txt there. */
+const char* spu_jobrec_dir(void);
+
 /* The unhooked operations (spu_channels.c), for the recorder's own use. */
 uint32_t spu_rdch_raw(struct spu_context* ctx, uint32_t ch);
 uint32_t spu_rchcnt_raw(struct spu_context* ctx, uint32_t ch);

@@ -20,6 +20,7 @@
 #include "spu_slot_verify.h" /* resident code slot word check (dispatch) */
 #include "spu_lockstep.h"
 #include "spu_jobrec.h"     /* PS3_JOBREC / PS3_JOBREPLAY / PS3_JOBSTAT */
+#include "spu_patch.h"      /* SPU_PATCH_FILE alternatives: g_spu_patch_ready, spu_patch_env_init */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "spu_fastjmp.h"   /* PS3_SPU_FASTJMP: SPU_SETJMP / SPU_LONGJMP without the SEH unwind */
 #include "ps3emu/ps3_ftrace.h"
@@ -522,6 +523,8 @@ static void spu_float_mode_leave(unsigned outer)
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     int halted = 0;
+    /* SPU_PATCH_FILE alternatives (spu_patch.c): their settings, once, after main */
+    if (__builtin_expect(!g_spu_patch_ready, 0)) spu_patch_env_init();
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
      * and stamp every image-1 run here to find the argless caller. */

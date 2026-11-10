@@ -110,6 +110,7 @@ typedef struct jr_hdr {
 /* Configuration                                                             */
 /* ------------------------------------------------------------------------- */
 static char     s_dir[1024];
+const char* spu_jobrec_dir(void) { return s_dir; }   /* spu_patch.c: spu_patches.txt goes beside the jobs */
 static uint32_t s_ret_pc = 0x3218;
 static long     s_max = 8, s_every = 1;
 static uint64_t s_after_ms = 0, s_gap_ms = 0;
