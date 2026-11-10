@@ -2175,7 +2175,7 @@ static void pad_watch_start(void)
     }
 }
 /* Does `path` exist? From the watcher (lags by at most a few ms). */
-static int pad_file_exists(const char* path)
+static int pad_watch_exists(const char* path)
 {
     if (!pad_watch_on()) return access(path, F_OK) == 0;
     LONG n = s_pw_n;
@@ -2189,7 +2189,7 @@ static int pad_file_exists(const char* path)
 }
 #else
 static int pad_watch_on(void) { return 0; }
-static int pad_file_exists(const char* path) { return access(path, F_OK) == 0; }
+static int pad_watch_exists(const char* path) { return access(path, F_OK) == 0; }
 #endif
 
 /* PS3_PAD_RECORD=<file> / PS3_PAD_REPLAY=<file> -- a recorded route (testspeed, 2026-11-08).
@@ -2256,7 +2256,7 @@ static void pad_route_apply(u32 port_no, CellPadData* data)
     }
     if (!s_mode) return;
     if (!s_t0) {
-        if (s_anchor && !pad_file_exists(s_anchor)) return;
+        if (s_anchor && !pad_watch_exists(s_anchor)) return;
         s_t0 = pad_route_us();
         printf("[cellPad] pad route: anchor reached, %s starts\n", s_mode == 1 ? "recording" : "replay"); fflush(stdout);
     }
@@ -2447,7 +2447,7 @@ skip_inject: ;
       }
       if (s_sc && port_no == 0) {
           double now = (double)(GetTickCount64() - t0) / 1000.0;
-          if (wait_path && !t_world && pad_file_exists(wait_path)) {
+          if (wait_path && !t_world && pad_watch_exists(wait_path)) {
               t_world = GetTickCount64();
               printf("[cellPad] PAD_SCRIPT: world clock starts at t=%.1fs\n", now); }
           const double now_world = t_world ? (double)(GetTickCount64() - t_world) / 1000.0 : -1.0;
