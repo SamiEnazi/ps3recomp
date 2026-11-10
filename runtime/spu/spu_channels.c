@@ -1843,7 +1843,10 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             /* PS3_SPU_WAKE_DEFER: from here on a queued coherence wake must
              * reach the OS (spu_coherency.c reads this after its event raise;
              * the test below reads the event after this store). */
-            if (!ctx->coh_parked) __atomic_store_n(&ctx->coh_parked, 1, __ATOMIC_SEQ_CST);
+            if (!ctx->coh_parked) {
+                __atomic_store_n(&ctx->coh_parked, 1, __ATOMIC_SEQ_CST);
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* before the event test below */
+            }
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             if (!spu_ch_ready(ctx, channel)) {
                 ft_sleeps++;
