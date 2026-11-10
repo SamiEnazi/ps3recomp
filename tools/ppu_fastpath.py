@@ -24,6 +24,8 @@ computes -- only the order and number of tests change.
                     the same bit (see header_preamble).
   PPU_VM_RUNS_LOADS=1  ppu_nv_dirty's access runs for loads (see _RUNS_C);
                     PPU_VM_RUNS_VERIFY=1 = the check build of it.
+  PPU_VMX_CLEAN, PPU_VMX_INT, PPU_FP_SINGLE, PPU_FP_CVT (ppu-vmx, 2026-11-10): the
+                    dataflow fast paths of tools/ppu_vmx_flow.py, applied after these.
 
 Two run-time switches for a title's own code (cheats agent, 2026-11-09), each read from a
 file of title knowledge kept with the title, not here (both unset = the lift as before):
@@ -239,7 +241,12 @@ def source_preamble(text: str) -> str:
                  "extern volatile uint8_t g_ppu_patch[256];\n"
                  "int ppu_patch_register(int slot);\n"
                  "#ifdef __cplusplus\n}\n#endif\n")
-    return text
+    return _flow().source_preamble(text)
+
+
+def _flow():
+    import ppu_vmx_flow   # ppu-vmx's dataflow fast paths (all switches off = unchanged text)
+    return ppu_vmx_flow
 
 
 # PPU_VMX_SSE: the lifter's inline vperm (a 16-step byte loop) -> ppu_vperm_sse (two pshufb + a blend).
@@ -465,7 +472,7 @@ def rewrite_body(lines: list) -> list:
         slots = sorted({int(s) for ln in lines if "g_ppu_patch[" in ln for s in _RE_PATCH_SLOT.findall(ln)})
         lines = lines + ["static const int s_ppu_patch_reg_%d = ppu_patch_register(%d);" % (s, s) for s in slots]
     if not _on("PPU_VMX_SSE"):
-        return lines
+        return _flow().rewrite(lines)
     out = []
     for ln in lines:
         if "sel < 16" in ln:
@@ -490,4 +497,4 @@ def rewrite_body(lines: list) -> list:
             ln = _sub(ln, re.compile(r"\bvm_raw_ld16\("), "ppu_vld16_sse(", "lvx")
             ln = _sub(ln, re.compile(r"\bvm_raw_st16\("), "ppu_vst16_sse(", "stvx")
         out.append(ln)
-    return out
+    return _flow().rewrite(out)

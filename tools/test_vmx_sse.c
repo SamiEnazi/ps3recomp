@@ -16,6 +16,8 @@ static uint8_t* vm_base;
 #define VM_RAW_LD(T, ea) ({ const uint8_t* _p = vm_base + (uint32_t)(ea); T _v; memcpy(&_v, _p, sizeof(T)); _v; })
 #define PPU_VMX_SSE_NO_REDIRECT   /* call each side by its own name */
 #define PPU_VMX_FAST 1            /* and the fast forms (ppu3) */
+#define PPU_VMX_CLEAN 1           /* the masked forms (ppu-vmx; -DPPU_VMX_CLEAN_VERIFY: the check build) */
+#define PPU_VMX_INT 1             /* the integer ops (ppu-vmx) */
 #include "ppu_vmx_sse.h"
 
 static uint64_t s = 0x9E3779B97F4A7C15ull;
@@ -198,6 +200,132 @@ int main(int argc, char** argv) {
               total++; taken += !vmxs_special(m, z1); }
         }
         printf("fast forms: %ld cases, plain path on %ld (%.0f%%)\n", n, taken, total ? 100.0 * taken / total : 0.0);
+    }
+    /* PPU_VMX_CLEAN (ppu-vmx): the masked forms for every mask k. An operand whose bit is
+     * clear is CLEAN, as tools/ppu_vmx_flow.py promises: with NJ = 1 no lane of it is a
+     * denormal (one drawn as a denormal becomes a signed zero or the smallest normal),
+     * with NJ = 0 it is anything. Same mixed / normal / near-cancelling lanes as above. */
+    {
+        long plain = 0;
+        for (long it = 0; it < n; it++) {
+            const uint32_t vscr = (it & 1) ? VMX_NJ : 0;
+            const int mode = (int)((it >> 1) % 3);
+            const unsigned k = (unsigned)(rnd() & 7);
+            uint8_t* op3[3] = { a, b, c };
+            for (int i = 0; i < 4; i++) {
+                uint32_t v[3];
+                if (mode == 0) { v[0] = lane(); v[1] = lane(); v[2] = lane(); }
+                else {
+                    for (int j = 0; j < 3; j++) v[j] = (rnd() & 0x80000000u) | ((1 + rnd() % 254) << 23) | (rnd() & 0x7FFFFFu);
+                    if (mode == 2) { const uint32_t ex = 1 + rnd() % 40;
+                        v[0] = (v[0] & 0x807FFFFFu) | (ex << 23);
+                        v[1] = (v[0] ^ ((rnd() & 1) ? 0x80000000u : 0)) + (rnd() % 5) - 2;
+                        v[2] = 0x3F800000u + (rnd() % 9) - 4; }
+                    for (int j = 0; j < 3; j++) if (rnd() % 48 == 0) v[j] = SPECIAL[rnd() % NSP];
+                }
+                for (int j = 0; j < 3; j++) {
+                    if (!(k >> j & 1) && (vscr & VMX_NJ) && (v[j] & 0x7F800000u) == 0 && (v[j] & 0x7FFFFFu))
+                        v[j] = (v[j] & 0x80000000u) | ((rnd() & 1) ? 0x00800000u : 0);
+                    op3[j][4*i] = v[j] >> 24; op3[j][4*i+1] = v[j] >> 16; op3[j][4*i+2] = v[j] >> 8; op3[j][4*i+3] = v[j];
+                }
+            }
+            /* the 1-operand forms take their operand in b: b's clean rule is bit 1, the form's is bit 0 */
+            const unsigned k1 = (k >> 1) & 1;
+            vmx_vaddfp(w, a, b, vscr);   vmx_vaddfp_k(g, a, b, &vscr, k & 3);   check("vaddfp k", w, g, a, b, 0, vscr | k << 4);
+            vmx_vsubfp(w, a, b, vscr);   vmx_vsubfp_k(g, a, b, &vscr, k & 3);   check("vsubfp k", w, g, a, b, 0, vscr | k << 4);
+            vmx_vmaddfp(w, a, b, c, vscr);  vmx_vmaddfp_k(g, a, b, c, &vscr, k);  check("vmaddfp k", w, g, a, b, c, vscr | k << 4);
+            vmx_vnmsubfp(w, a, b, c, vscr); vmx_vnmsubfp_k(g, a, b, c, &vscr, k); check("vnmsubfp k", w, g, a, b, c, vscr | k << 4);
+            vmx_vrefp(w, b, vscr);       vmx_vrefp_k(g, b, &vscr, k1);       check("vrefp k", w, g, a, b, 0, vscr | k1 << 4);
+            vmx_vrsqrtefp(w, b, vscr);   vmx_vrsqrtefp_k(g, b, &vscr, k1);   check("vrsqrtefp k", w, g, a, b, 0, vscr | k1 << 4);
+            vmx_vmaxfp(w, a, b, vscr);   vmx_vmaxfp_k(g, a, b, &vscr, k & 3);   check("vmaxfp k", w, g, a, b, 0, vscr | k << 4);
+            vmx_vminfp(w, a, b, vscr);   vmx_vminfp_k(g, a, b, &vscr, k & 3);   check("vminfp k", w, g, a, b, 0, vscr | k << 4);
+            { uint8_t bb[16];   /* b = -(a*c): the fused result is the tiny residual */
+              for (int i = 0; i < 4; i++) { float fa, fc, fb; uint32_t ua = (uint32_t)a[4*i] << 24 | a[4*i+1] << 16 | a[4*i+2] << 8 | a[4*i+3];
+                uint32_t uc = (uint32_t)c[4*i] << 24 | c[4*i+1] << 16 | c[4*i+2] << 8 | c[4*i+3];
+                memcpy(&fa, &ua, 4); memcpy(&fc, &uc, 4); fb = -(fa * fc); uint32_t ub; memcpy(&ub, &fb, 4);
+                if (!(k & 2) && (vscr & VMX_NJ) && (ub & 0x7F800000u) == 0) ub &= 0x80000000u;
+                bb[4*i] = ub >> 24; bb[4*i+1] = ub >> 16; bb[4*i+2] = ub >> 8; bb[4*i+3] = ub; }
+              vmx_vmaddfp(w, a, bb, c, vscr);  vmx_vmaddfp_k(g, a, bb, c, &vscr, k);  check("vmaddfp k cancel", w, g, a, bb, c, vscr | k << 4);
+              vmx_vnmsubfp(w, a, bb, c, vscr); vmx_vnmsubfp_k(g, a, bb, c, &vscr, k); check("vnmsubfp k cancel", w, g, a, bb, c, vscr | k << 4); }
+            memcpy(w, a, 16); memcpy(g, a, 16);   /* d == a, d == c (the lifted code's aliasing) */
+            vmx_vmaddfp(w, w, b, c, vscr);  vmx_vmaddfp_k(g, g, b, c, &vscr, k);  check("vmaddfp k d=a", w, g, a, b, c, vscr | k << 4);
+            memcpy(w, c, 16); memcpy(g, c, 16);
+            vmx_vnmsubfp(w, a, b, w, vscr); vmx_vnmsubfp_k(g, a, b, g, &vscr, k); check("vnmsubfp k d=c", w, g, a, b, c, vscr | k << 4);
+            memcpy(w, b, 16); memcpy(g, b, 16);
+            vmx_vaddfp(w, a, w, vscr);  vmx_vaddfp_k(g, a, g, &vscr, k & 3);  check("vaddfp k d=b", w, g, a, b, 0, vscr | k << 4);
+            vmx_vaddfp(w, a, a, vscr);  vmx_vaddfp_k(g, a, a, &vscr, k & 1 ? 3 : 0);  check("vaddfp k a=b", w, g, a, a, 0, vscr | k << 4);
+            if ((it & 7) == 2) memcpy(b, a, 16);   /* equal operands, zeros of both signs */
+            vmx_vmaxfp(w, a, b, vscr);   vmx_vmaxfp_k(g, a, b, &vscr, k & 3);   check("vmaxfp k eq", w, g, a, b, 0, vscr | k << 4);
+            vmx_vminfp(w, a, b, vscr);   vmx_vminfp_k(g, a, b, &vscr, k & 3);   check("vminfp k eq", w, g, a, b, 0, vscr | k << 4);
+            { uint32_t r1 = vmx_vcmpeqfp(w, a, b, vscr), r2 = vmx_vcmpeqfp_k(g, a, b, &vscr, k & 3); check("vcmpeqfp k", w, g, a, b, 0, vscr | k << 4);
+              if (r1 != r2) { fails++; printf("FAIL vcmpeqfp k cr6 %u %u\n", r1, r2); } }
+            { uint32_t r1 = vmx_vcmpgefp(w, a, b, vscr), r2 = vmx_vcmpgefp_k(g, a, b, &vscr, k & 3); check("vcmpgefp k", w, g, a, b, 0, vscr | k << 4);
+              if (r1 != r2) { fails++; printf("FAIL vcmpgefp k cr6 %u %u\n", r1, r2); } }
+            { uint32_t r1 = vmx_vcmpgtfp(w, a, b, vscr), r2 = vmx_vcmpgtfp_k(g, a, b, &vscr, k & 3); check("vcmpgtfp k", w, g, a, b, 0, vscr | k << 4);
+              if (r1 != r2) { fails++; printf("FAIL vcmpgtfp k cr6 %u %u\n", r1, r2); } }
+            { const __m128i x = vmxs_ld(a), y = vmxs_ld(b), cc = vmxs_ld(c);   /* how often the plain path decides (vmaddfp) */
+              plain += !vmxs_special_k(vmxs_f2i(_mm_fmadd_ps(vmxs_i2f(x), vmxs_i2f(cc), vmxs_i2f(y))), x, y, cc, k); }
+        }
+        printf("masked forms: %ld cases, plain path on %.0f%%\n", n, 100.0 * plain / (n ? n : 1));
+#ifdef PPU_VMX_CLEAN_VERIFY
+        /* the check build: a denormal operand left out of k under NJ = 1 is reported and the
+         * exact form runs (same result) */
+        { const long before = vmxs_clean_bad_n; const uint32_t nj = VMX_NJ;
+          for (int i = 0; i < 16; i++) { a[i] = (uint8_t)(i * 7); b[i] = (uint8_t)(0x3F + i); c[i] = 0; }
+          a[0] = 0x00; a[1] = 0x12; a[2] = 0x34; a[3] = 0x56;   /* a denormal lane in a */
+          vmx_vmaddfp(w, a, b, c, nj); vmx_vmaddfp_k(g, a, b, c, &nj, 6); check("vmaddfp verify", w, g, a, b, c, nj);
+          vmx_vaddfp(w, a, b, nj); vmx_vaddfp_k(g, a, b, &nj, 2); check("vaddfp verify", w, g, a, b, 0, nj);
+          { uint32_t r1 = vmx_vcmpgtfp(w, a, b, nj), r2 = vmx_vcmpgtfp_k(g, a, b, &nj, 0); check("vcmpgtfp verify", w, g, a, b, 0, nj);
+            if (r1 != r2) { fails++; printf("FAIL vcmpgtfp verify cr6\n"); } }
+          if (vmxs_clean_bad_n - before != 3) { fails++; printf("FAIL verify: %ld reports, want 3\n", vmxs_clean_bad_n - before); }
+          else printf("verify build: wrong claims reported and handled\n"); }
+#endif
+    }
+    /* PPU_VMX_INT (ppu-vmx): the integer ops against ppu_vmx.h and the lifter's inline loops */
+#define ADDSUB_REF(TY, CNT, W, OP, D, A, B) { const uint8_t* a_=(const uint8_t*)(A); const uint8_t* b_=(const uint8_t*)(B); uint8_t d_[16]; \
+    for(int i=0;i<CNT;i++){ TY x=0,y=0; for(int k=0;k<W;k++){ x=(TY)((x<<8)|a_[i*W+k]); y=(TY)((y<<8)|b_[i*W+k]); } \
+    TY r=(TY)(x OP y); for(int k=0;k<W;k++) d_[i*W+k]=(uint8_t)(r>>(8*(W-1-k))); } memcpy((D), d_, 16); }
+#define MINMAX_REF(TY, CNT, W, CMP, D, A, B) { const uint8_t* a_=(const uint8_t*)(A); const uint8_t* b_=(const uint8_t*)(B); uint8_t o_[16]; \
+    for(int i=0;i<CNT;i++){ uint32_t ux=0,uy=0; for(int k=0;k<W;k++){ ux=(ux<<8)|a_[i*W+k]; uy=(uy<<8)|b_[i*W+k]; } \
+    TY x=(TY)ux, y=(TY)uy; TY r=(x CMP y)?x:y; for(int k=0;k<W;k++) o_[i*W+k]=(uint8_t)(((TY)r)>>(8*(W-1-k))); } memcpy((D), o_, 16); }
+    for (long it = 0; it < n; it++) {
+        bytes(a); bytes(b);
+        if (it & 1) for (int i = 0; i < 16; i++) b[i] = a[i] ^ (uint8_t)(rnd() & rnd() & rnd());   /* close values */
+        if ((it & 15) == 3) memcpy(b, a, 16);
+        vmx_vslb(w, a, b);  vmx_vslb_sse(g, a, b);  check("vslb", w, g, a, b, 0, 0);
+        vmx_vsrw(w, a, b);  vmx_vsrw_sse(g, a, b);  check("vsrw", w, g, a, b, 0, 0);
+        vmx_vsraw(w, a, b); vmx_vsraw_sse(g, a, b); check("vsraw", w, g, a, b, 0, 0);
+        vmx_vrlw(w, a, b);  vmx_vrlw_sse(g, a, b);  check("vrlw", w, g, a, b, 0, 0);
+        { uint32_t r1 = vmx_vcmpgtsw(w, a, b), r2 = vmx_vcmpgtsw_sse(g, a, b); check("vcmpgtsw", w, g, a, b, 0, 0);
+          if (r1 != r2) { fails++; printf("FAIL vcmpgtsw cr6 %u %u\n", r1, r2); } }
+        { uint32_t r1 = vmx_vcmpgtuw(w, a, b), r2 = vmx_vcmpgtuw_sse(g, a, b); check("vcmpgtuw", w, g, a, b, 0, 0);
+          if (r1 != r2) { fails++; printf("FAIL vcmpgtuw cr6 %u %u\n", r1, r2); } }
+        ADDSUB_REF(uint8_t, 16, 1, +, w, a, b);  PPU_VINT8_SSE(g, _mm_add_epi8, a, b);   check("vaddubm", w, g, a, b, 0, 0);
+        ADDSUB_REF(uint8_t, 16, 1, -, w, a, b);  PPU_VINT8_SSE(g, _mm_sub_epi8, a, b);   check("vsububm", w, g, a, b, 0, 0);
+        ADDSUB_REF(uint16_t, 8, 2, +, w, a, b);  PPU_VINT16_SSE(g, _mm_add_epi16, a, b); check("vadduhm", w, g, a, b, 0, 0);
+        ADDSUB_REF(uint16_t, 8, 2, -, w, a, b);  PPU_VINT16_SSE(g, _mm_sub_epi16, a, b); check("vsubuhm", w, g, a, b, 0, 0);
+        ADDSUB_REF(uint32_t, 4, 4, +, w, a, b);  PPU_VINT32_SSE(g, _mm_add_epi32, a, b); check("vadduwm", w, g, a, b, 0, 0);
+        ADDSUB_REF(uint32_t, 4, 4, -, w, a, b);  PPU_VINT32_SSE(g, _mm_sub_epi32, a, b); check("vsubuwm", w, g, a, b, 0, 0);
+        MINMAX_REF(uint16_t, 8, 2, >, w, a, b);  PPU_VINT16_SSE(g, _mm_max_epu16, a, b); check("vmaxuh", w, g, a, b, 0, 0);
+        MINMAX_REF(int16_t, 8, 2, >, w, a, b);   PPU_VINT16_SSE(g, _mm_max_epi16, a, b); check("vmaxsh", w, g, a, b, 0, 0);
+        MINMAX_REF(uint32_t, 4, 4, >, w, a, b);  PPU_VINT32_SSE(g, _mm_max_epu32, a, b); check("vmaxuw", w, g, a, b, 0, 0);
+        MINMAX_REF(int32_t, 4, 4, >, w, a, b);   PPU_VINT32_SSE(g, _mm_max_epi32, a, b); check("vmaxsw", w, g, a, b, 0, 0);
+        MINMAX_REF(uint16_t, 8, 2, <, w, a, b);  PPU_VINT16_SSE(g, _mm_min_epu16, a, b); check("vminuh", w, g, a, b, 0, 0);
+        MINMAX_REF(int16_t, 8, 2, <, w, a, b);   PPU_VINT16_SSE(g, _mm_min_epi16, a, b); check("vminsh", w, g, a, b, 0, 0);
+        MINMAX_REF(uint32_t, 4, 4, <, w, a, b);  PPU_VINT32_SSE(g, _mm_min_epu32, a, b); check("vminuw", w, g, a, b, 0, 0);
+        MINMAX_REF(int32_t, 4, 4, <, w, a, b);   PPU_VINT32_SSE(g, _mm_min_epi32, a, b); check("vminsw", w, g, a, b, 0, 0);
+        { vec(b);   /* float lanes, and near the int32 / uint32 limits */
+          if (it & 2) for (int i = 0; i < 4; i++) { uint32_t x = (rnd() & 0x80000000u) | ((150u + rnd() % 12) << 23) | (rnd() & 0x7FFFFFu);
+              if (rnd() & 1) { static const uint32_t L[] = { 0x4F000000u, 0xCF000000u, 0x4F800000u, 0xBF800000u, 0x3F000000u };
+                x = L[rnd() % 5] + (rnd() % 5) - 2; }   /* +-2^31, 2^32, -1, 0.5 */
+              b[4*i] = x >> 24; b[4*i+1] = x >> 16; b[4*i+2] = x >> 8; b[4*i+3] = x; }
+          const unsigned u = (it & 2) ? rnd() % 3 : rnd() & 31;
+          uint32_t s1 = rnd() & 1, s2 = s1;
+          vmx_vctsxs(w, b, u, &s1); vmx_vctsxs_sse(g, b, u, &s2); check("vctsxs", w, g, a, b, 0, u);
+          if (s1 != s2) { fails++; printf("FAIL vctsxs SAT %u %u\n", s1, s2); }
+          s1 = rnd() & 1; s2 = s1;
+          vmx_vctuxs(w, b, u, &s1); vmx_vctuxs_sse(g, b, u, &s2); check("vctuxs", w, g, a, b, 0, u);
+          if (s1 != s2) { fails++; printf("FAIL vctuxs SAT %u %u\n", s1, s2); } }
     }
     printf("%ld cases: %ld failures\n", n, fails);
     return fails != 0;
