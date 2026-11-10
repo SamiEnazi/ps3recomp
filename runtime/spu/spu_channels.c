@@ -369,6 +369,27 @@ int (*g_spu_put_rsx_hook)(uint32_t ea, uint32_t size) = 0;
 /* (perf17) its interval, spu_dma.h spu_put_is_rsx; hi = 0 = none until cellGcmInit */
 uint32_t g_spu_put_rsx_lo = 0, g_spu_put_rsx_hi = 0;
 int g_spu_put_rsx_exact = 0;
+/* (edgevp) spu_dma.h spu_edge_viewport_scale: Edge Geometry's viewport copies
+ * scaled to the render targets; set by the video backend once it knows them. */
+int g_spu_edge_vp_on = 0;
+float g_spu_edge_vp_sx = 1.0f, g_spu_edge_vp_sy = 1.0f;
+void spu_edge_vp_set(float sx, float sy)
+{
+    static int s_env = -1;
+    if (s_env < 0) { const char* e = getenv("PS3RECOMP_EDGE_VP"); s_env = !(e && e[0] == '0'); }
+    const int on = s_env && (sx != 1.0f || sy != 1.0f) && sx >= 1.0f && sy >= 1.0f && sx <= 8.0f && sy <= 8.0f;
+    __atomic_store_n(&g_spu_edge_vp_on, 0, __ATOMIC_RELEASE);
+    g_spu_edge_vp_sx = sx; g_spu_edge_vp_sy = sy;
+    __atomic_store_n(&g_spu_edge_vp_on, on, __ATOMIC_RELEASE);
+    static float s_lx = 0.0f, s_ly = 0.0f;
+    if (sx != s_lx || sy != s_ly) {
+        s_lx = sx; s_ly = sy;
+        fprintf(stderr, "[edgevp] Edge Geometry viewport %s: x%.4f wide, x%.4f high (%ux%u)%s\n",
+                on ? "scaled to the render targets" : "as the game gives it", (double)sx, (double)sy,
+                (unsigned)(1280.0f * sx + 0.5f), (unsigned)(720.0f * sy + 0.5f),
+                s_env ? "" : " -- PS3RECOMP_EDGE_VP=0");
+    }
+}
 /* A 128-byte reservation-line commit: top-down into RSX memory, as a PUT. */
 static inline void spu_line_copy(uint32_t ea, uint8_t* mem, const void* ls)
 {

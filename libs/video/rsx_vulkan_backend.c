@@ -4949,6 +4949,7 @@ static void vk_res_off(void)
     rsx_fp_set_wpos_scale_xy(1.0f, 1.0f);
     vk_postfx_render_scale_active(1.0f);
     vk_postfx_aspect_active(1.0f);
+    { void spu_edge_vp_set(float, float); spu_edge_vp_set(1.0f, 1.0f); }   /* (edgevp) */
 }
 static void vk_res_init(void)
 {
@@ -5004,6 +5005,7 @@ static void vk_res_init(void)
      * size here (they never fit the display), so it stays off. */
     if (!getenv("PS3_RES_SHADOW_FIX")) ps3_setting_setenv("PS3_RES_SHADOW_FIX", "0");
     vk_postfx_render_scale_active(s_res.s);
+    { void spu_edge_vp_set(float, float); spu_edge_vp_set(s_res.sx, s_res.s); }   /* (edgevp) Edge culls for this raster */
     VK_LOG("internal resolution x%.2f: screen targets up to %ux%u render at %u%% (display image %ux%u); "
            "shadow maps and guest textures at their own size\n",
            (double)s_res.s, s_res.gw, s_res.gh, s_res.q * 25u, s_res.dw, s_res.dh);

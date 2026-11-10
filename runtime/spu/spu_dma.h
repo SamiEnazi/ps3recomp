@@ -44,6 +44,43 @@ extern int (*g_spu_put_rsx_hook)(uint32_t ea, uint32_t size);
  * (PS3RECOMP_SPU_PUT_DESC=0); PS3RECOMP_SPU_PUT_INLINE=0 = lo 0, hi ~0, exact 0 =
  * the hook for every PUT, as m17. Read racily: the table changes only on a
  * map/unmap call, and a stale answer only picks the copy order (as the hook's). */
+/* (edgevp, 2026-11-11; the idea and the layout from ThiagoFraga761/infamous2-pc's
+ * PS3RECOMP_EDGE_VP, MIT) Edge Geometry, the SPU job that prepares the game's
+ * meshes, culls triangles that cover no pixel centre of the viewport it reads:
+ * an EdgeGeomViewportInfo of 128 bytes, fetched by one GET -- u16 scissor
+ * {0, 0, 1280, 720}, f32 depth range {-1, 1}, a 4x4 matrix, f32 viewportScales
+ * at +80 and viewportOffsets at +96. Rendering above 720p, those triangles DO
+ * cover pixels: culled, they leave holes in faces (the mesh trimming the RPCS3
+ * patch "Disable Mesh Trimming" removes by skipping the culling altogether).
+ * Scaling the job's local-store copy of the scissor and the x/y scales and
+ * offsets to the raster the host draws keeps every cull (back faces,
+ * off-screen, no pixel) and makes the last one exact at the real resolution.
+ * Guest memory keeps the original. The video backend turns it on with the
+ * render target scale (spu_edge_vp_set); PS3RECOMP_EDGE_VP=0 = never; the job
+ * replays (no backend) never scale. */
+extern int g_spu_edge_vp_on;
+extern float g_spu_edge_vp_sx, g_spu_edge_vp_sy;
+void spu_edge_vp_set(float sx, float sy);
+static inline void spu_edge_vp_be_f32_scale(uint8_t* q, float k)
+{
+    uint32_t u = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+    float f; memcpy(&f, &u, 4); f *= k; memcpy(&u, &f, 4);
+    q[0] = (uint8_t)(u >> 24); q[1] = (uint8_t)(u >> 16); q[2] = (uint8_t)(u >> 8); q[3] = (uint8_t)u;
+}
+static inline void spu_edge_viewport_scale(uint8_t* p)
+{
+    static const uint8_t sig[16] = { 0,0, 0,0, 0x05,0x00, 0x02,0xD0, 0xBF,0x80,0,0, 0x3F,0x80,0,0 };
+    if (memcmp(p, sig, 16)) return;
+    const float sx = g_spu_edge_vp_sx, sy = g_spu_edge_vp_sy;
+    const uint32_t w = (uint32_t)(1280.0f * sx + 0.5f), h = (uint32_t)(720.0f * sy + 0.5f);
+    p[4] = (uint8_t)(w >> 8); p[5] = (uint8_t)w;
+    p[6] = (uint8_t)(h >> 8); p[7] = (uint8_t)h;
+    spu_edge_vp_be_f32_scale(p + 80, sx);  spu_edge_vp_be_f32_scale(p + 84, sy);    /* viewportScales x, y */
+    spu_edge_vp_be_f32_scale(p + 96, sx);  spu_edge_vp_be_f32_scale(p + 100, sy);   /* viewportOffsets x, y */
+}
+#define SPU_EDGE_VP_AFTER_GET(ls, n) \
+    do { if (__builtin_expect(__atomic_load_n(&g_spu_edge_vp_on, __ATOMIC_ACQUIRE), 0) && (n) == 128u) \
+             spu_edge_viewport_scale(ls); } while (0)
 extern uint32_t g_spu_put_rsx_lo, g_spu_put_rsx_hi;
 extern int g_spu_put_rsx_exact;
 static inline int spu_put_is_rsx(uint32_t ea, uint32_t n)
@@ -649,6 +686,7 @@ static inline int mfc_do_transfer_raw(spu_context* spu, uint32_t lsa, uint64_t e
               } } }
         /* GET: main memory -> local store */
         gm_copy_from(ls_ptr, (const uint8_t*)ea_ptr, size);
+        SPU_EDGE_VP_AFTER_GET(ls_ptr, size);   /* (edgevp) */
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static _Atomic int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
@@ -908,6 +946,7 @@ static inline int mfc_do_transfer_lean(spu_context* spu, uint32_t lsa, uint64_t 
           g_cri_video_dma = 1; }
     if (mfc_is_get(cmd)) {
         gm_copy_from(ls_ptr, (const uint8_t*)ea_ptr, size);
+        SPU_EDGE_VP_AFTER_GET(ls_ptr, size);   /* (edgevp) */
         { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
         /* no SPU_LS_WATCH (known once read): no out-of-line list call per GET */
