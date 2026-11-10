@@ -79,6 +79,7 @@ void  ps3_sysutil_host_language(char* out, size_t n);   /* cellSysutil.c: "Autom
 int   ps3_sysutil_language_in_use(void);                /* CELL_SYSUTIL_LANG_* the game was told, -1 */
 void  ps3_lang_in_use(int kind, char* asked, char* given, size_t n);   /* runtime/ppu/ppu_fs_lang.h */
 int   ps3_lang_available(int kind, char (*out)[24], int max);
+void  ps3_lang_missing(int kind, char* out, size_t n);   /* the dub wanted but not on the disc */
 int   vk_overlay_cheats_count(void);            /* vk_overlay_cheats.cpp: the title's cheats (ps3_cheats.h) */
 void  vk_overlay_cheats_page(float w);
 int   ps3_overlay_cheat_set(const char* id, double v);   /* below: "cheat=id=value" in the timed script */
@@ -1235,30 +1236,31 @@ static const char* const kHostOs = "Windows";
 static const char* const kHostOs = "system";
 #endif
 /* The game's languages: the files' spelling (ppu_fs_lang.h), the PS3_LANG code
- * the menu writes for one (cellSysutil.c), the label. Endonyms only in scripts
- * the menu's font has (Segoe UI: Latin and Cyrillic). */
-static const struct { const char* name; const char* code; const char* label; } kLang[] = {
-    { "english",    "en",     "English (US)" },
-    { "british",    "en-gb",  "English (UK)" },
-    { "french",     "fr",     "French (Fran\u00e7ais)" },
-    { "german",     "de",     "German (Deutsch)" },
-    { "italian",    "it",     "Italian (Italiano)" },
-    { "spanish",    "es-es",  "Spanish, Spain (Espa\u00f1ol)" },
-    { "latino",     "es-419", "Spanish, Latin America (Espa\u00f1ol)" },
-    { "portuguese", "pt-pt",  "Portuguese, Portugal (Portugu\u00eas)" },
-    { "brazilian",  "pt-br",  "Portuguese, Brazil (Portugu\u00eas)" },
-    { "dutch",      "nl",     "Dutch (Nederlands)" },
-    { "polish",     "pl",     "Polish (Polski)" },
-    { "russian",    "ru",     "Russian (\u0420\u0443\u0441\u0441\u043a\u0438\u0439)" },
-    { "turkish",    "tr",     "Turkish (T\u00fcrk\u00e7e)" },
-    { "finnish",    "fi",     "Finnish (Suomi)" },
-    { "swedish",    "sv",     "Swedish (Svenska)" },
-    { "danish",     "da",     "Danish (Dansk)" },
-    { "norwegian",  "no",     "Norwegian (Norsk)" },
-    { "japanese",   "ja",     "Japanese" },
-    { "korean",     "ko",     "Korean" },
-    { "chinese",    "zh-t",   "Chinese, traditional" },
-    { "chinese_s",  "zh-s",   "Chinese, simplified" },
+ * the menu writes for one (cellSysutil.c), the label, and a short name for
+ * sentences ("no Italian dub"). Endonyms only in scripts the menu's font has
+ * (Segoe UI: Latin and Cyrillic). */
+static const struct { const char* name; const char* code; const char* label; const char* brief; } kLang[] = {
+    { "english",    "en",     "English (US)",                              "English" },
+    { "british",    "en-gb",  "English (UK)",                              "UK English" },
+    { "french",     "fr",     "French (Fran\u00e7ais)",                    "French" },
+    { "german",     "de",     "German (Deutsch)",                          "German" },
+    { "italian",    "it",     "Italian (Italiano)",                        "Italian" },
+    { "spanish",    "es-es",  "Spanish, Spain (Espa\u00f1ol)",             "Spanish (Spain)" },
+    { "latino",     "es-419", "Spanish, Latin America (Espa\u00f1ol)",     "Latin-American Spanish" },
+    { "portuguese", "pt-pt",  "Portuguese, Portugal (Portugu\u00eas)",     "Portuguese (Portugal)" },
+    { "brazilian",  "pt-br",  "Portuguese, Brazil (Portugu\u00eas)",       "Brazilian Portuguese" },
+    { "dutch",      "nl",     "Dutch (Nederlands)",                        "Dutch" },
+    { "polish",     "pl",     "Polish (Polski)",                           "Polish" },
+    { "russian",    "ru",     "Russian (\u0420\u0443\u0441\u0441\u043a\u0438\u0439)", "Russian" },
+    { "turkish",    "tr",     "Turkish (T\u00fcrk\u00e7e)",                "Turkish" },
+    { "finnish",    "fi",     "Finnish (Suomi)",                           "Finnish" },
+    { "swedish",    "sv",     "Swedish (Svenska)",                         "Swedish" },
+    { "danish",     "da",     "Danish (Dansk)",                            "Danish" },
+    { "norwegian",  "no",     "Norwegian (Norsk)",                         "Norwegian" },
+    { "japanese",   "ja",     "Japanese",                                  "Japanese" },
+    { "korean",     "ko",     "Korean",                                    "Korean" },
+    { "chinese",    "zh-t",   "Chinese, traditional",                      "Chinese (traditional)" },
+    { "chinese_s",  "zh-s",   "Chinese, simplified",                       "Chinese (simplified)" },
 };
 
 struct LangUi {
@@ -1274,16 +1276,26 @@ static const char* lang_label(const char* name)
     for (const auto& k : kLang) if (!SDL_strcasecmp(k.name, name)) return k.label;
     return name;
 }
+static const char* lang_brief(const char* name)
+{
+    for (const auto& k : kLang) if (!SDL_strcasecmp(k.name, name)) return k.brief;
+    return name;
+}
 
 /* A CELL_SYSUTIL_LANG_* number (es and pt: the disc's own Spanish / Portuguese). */
-static const char* lang_id_label(int id)
+static const char* lang_id_name(int id)
 {
     static const char* const ids[20] = { "japanese", "english", "french", NULL, "german", "italian", "dutch", NULL,
                                          "russian", "korean", "chinese", "chinese_s", "finnish", "swedish", "danish",
                                          "norwegian", "polish", "brazilian", "british", "turkish" };
+    return id >= 0 && id < 20 ? ids[id] : NULL;
+}
+static const char* lang_id_label(int id)
+{
     if (id == 3) return "Spanish";
     if (id == 7) return "Portuguese";
-    return id >= 0 && id < 20 && ids[id] ? lang_label(ids[id]) : "?";
+    const char* n = lang_id_name(id);
+    return n ? lang_label(n) : "?";
 }
 
 /* The one file-name language a PS3_LANG code names in the table, else NULL. */
@@ -1364,6 +1376,14 @@ static void lang_ui_load(void)
         snprintf(s_lang.win, sizeof s_lang.win, "%s", s_lang.host[0] ? lang_code_label(s_lang.host) : "unknown");
 }
 
+/* The dub this disc plays for a language it has no dub of (ppu_fs_lang.h's
+ * fallback: english, else its first), NULL when it has that one or no list. */
+static const char* lang_dub_fallback(const char* name)
+{
+    if (!name || !s_lang.nvoice || lang_has(s_lang.voice, s_lang.nvoice, name)) return NULL;
+    return lang_has(s_lang.voice, s_lang.nvoice, "english") ? "english" : s_lang.voice[0];
+}
+
 /* "Same as the game" or one of this disc's languages (PS3_VOICE_LANG / PS3_TEXT_LANG). */
 static void lang_pick(int v, const char* label, char (*list)[24], int n)
 {
@@ -1424,6 +1444,16 @@ static void language_section(void)
         else
             snprintf(b, sizeof b, "The console language the game is told: its menus, subtitles and dub follow it, "
                      "unless Voice or Text below says otherwise.");
+        {   /* Voice on "Same as the game" and no dub of that language here: the dialogue's fallback */
+            char vcur[48];
+            lang_choice(V_VOICE_LANG, vcur, sizeof vcur);
+            const char* gname = autom ? (s_lang.host[0] ? lang_code_name(s_lang.host) : "english") : lang_code_name(cur);
+            const char* fb = lang_unset(V_VOICE_LANG, vcur) ? lang_dub_fallback(gname) : NULL;
+            if (fb) {
+                const size_t l = strlen(b);
+                snprintf(b + l, sizeof b - l, " This disc has no %s dub: the voices stay %s.", lang_brief(gname), lang_brief(fb));
+            }
+        }
         hint(b);
     }
     lang_pick(V_VOICE_LANG, "Voice", s_lang.voice, s_lang.nvoice);
@@ -1448,11 +1478,16 @@ static void language_section(void)
         char va[24], vg[24], ta[24], tg[24];
         ps3_lang_in_use(0, va, vg, sizeof va);
         ps3_lang_in_use(1, ta, tg, sizeof ta);
-        char vs[96] = "", ts[96] = "";   /* a file the game asked for that was swapped */
-        if (vg[0] && strcmp(va, vg)) snprintf(vs, sizeof vs, " instead of %s", lang_label(va));
-        if (tg[0] && strcmp(ta, tg)) snprintf(ts, sizeof ts, " instead of %s", lang_label(ta));
-        snprintf(b, sizeof b, "Now: the game was told %s; voice %s%s; text %s%s.", told >= 0 ? lang_id_label(told) : "-",
-                 vg[0] ? lang_label(vg) : "-", vs, tg[0] ? lang_label(tg) : "-", ts);
+        char miss[24];
+        ps3_lang_missing(0, miss, sizeof miss);
+        char vs[96] = "", ts[96] = "";   /* a dub the disc lacks, or a file the game asked for that was swapped */
+        if (miss[0]) snprintf(vs, sizeof vs, " (no %s dub on this disc)", lang_brief(miss));
+        else if (vg[0] && strcmp(va, vg)) snprintf(vs, sizeof vs, " instead of %s", lang_brief(va));
+        if (tg[0] && strcmp(ta, tg)) snprintf(ts, sizeof ts, " instead of %s", lang_brief(ta));
+        const char* tn = lang_id_name(told);
+        snprintf(b, sizeof b, "Now: the game was told %s; voice: %s%s; text: %s%s.",
+                 told == 3 ? "Spanish" : told == 7 ? "Portuguese" : tn ? lang_brief(tn) : "-",
+                 vg[0] ? lang_brief(vg) : "-", vs, tg[0] ? lang_brief(tg) : "-", ts);
         ImGui::PushTextWrapPos(0.0f);
         ImGui::TextUnformatted(b);
         ImGui::PopTextWrapPos();

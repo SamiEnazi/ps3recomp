@@ -22,6 +22,12 @@
  * dutch, polish, russian, turkish, japanese, korean, chinese. A name the
  * copy does not have is ignored with a log line, never half-applied.
  *
+ * Nor is the dialogue ever silent: a copy may lack the dub the game itself
+ * asks for (the EU disc BCES01143 has only english.psarc; told Italian, the
+ * game opens italian.psarc). Such a request is answered with the game's own
+ * dub if that is not it, else english.psarc, else the folder's first dub, and
+ * the movies follow (below). ps3_lang_missing() tells the menu.
+ *
  * Unset, each one follows PS3_LANG: a release only picks the languages of
  * its region and plays every other one in English (the Americas inFAMOUS 2
  * answers en, fr, es and pt with english, french, latino and brazilian, and
@@ -50,8 +56,9 @@
  *    every movie are exactly 10-18, 26, 28-30. The game asks Bink for its own
  *    language's id, so the two ids are swapped in the header as it is read.
  *    The game's own language is learned from the voice archive it opened,
- *    and the movies follow the dub that archive was answered with (a dub the
- *    copy has no dialogue for leaves the movies' voice alone too).
+ *    and the movies follow the dub that archive was answered with (a chosen
+ *    dub the copy lacks leaves the movies' voice the game's; a fallback for
+ *    the game's own missing dub moves them to the fallback).
  *
  * Each redirect is logged once ("[lang] ..."). Only the cellFs layer of
  * ppu_fs.cpp does this: it is the one inFAMOUS 2 opens its data through.
@@ -116,6 +123,7 @@ static struct {
     char game_text[LANG_NAME_MAX];
     char used_voice[LANG_NAME_MAX];  /* what it was given */
     char used_text[LANG_NAME_MAX];
+    char missing_voice[LANG_NAME_MAX]; /* the dub it should have had, not in this copy ("" = none) */
     char voice_dir[1100];            /* host folder of the language archives */
     std::set<std::string> logged;
 } g_lang;
@@ -205,6 +213,64 @@ static bool lang_file_exists(const char* p)
     return stat(p, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG;
 }
 
+/* The dubs in a folder (dir ends in '/'): each <name>.psarc with its
+ * <name>_text.psarc beside it, sorted. */
+static void lang_dubs_in(const char* dir, std::set<std::string>& out)
+{
+    DIR* d = opendir(dir);
+    if (!d) return;
+    while (struct dirent* e = readdir(d)) {
+        const char* nm = e->d_name;
+        const size_t l = strlen(nm);
+        if (l <= 11 || strcmp(nm + l - 11, "_text.psarc") || l - 11 >= LANG_NAME_MAX) continue;
+        char p[1200];
+        snprintf(p, sizeof p, "%s%.*s.psarc", dir, (int)(l - 11), nm);
+        if (lang_file_exists(p)) out.insert(std::string(nm, l - 11));
+    }
+    closedir(d);
+}
+
+/* A voice archive request: the dub it gets is the chosen one (PS3_VOICE_LANG,
+ * else PS3_LANG's), else the game's own, as far as this folder has them. A
+ * dub the copy lacks -- the EU disc BCES01143 carries only english.psarc, and
+ * the game told Italian asks for italian.psarc -- would leave the dialogue
+ * silent, so the game's request then falls back to english.psarc, else the
+ * folder's first dub. A folder with no dub at all (patch/psarc holds only
+ * text archives) is left alone: the game goes on to the disc's. */
+static void lang_redirect_voice(char* path, size_t cap, const char* stem, size_t dl)
+{
+    const char* want = g_lang.voice[0] ? g_lang.voice : stem;   /* the dub this request should get */
+    char dir[1100], cand[1100];
+    snprintf(dir, sizeof dir, "%.*s", (int)dl, path);
+    const char* tries[3] = { want, stem, "english" };
+    char got[LANG_NAME_MAX] = "";
+    for (const char* t : tries) {
+        snprintf(cand, sizeof cand, "%s%s.psarc", dir, t);
+        if (lang_file_exists(cand)) { snprintf(got, sizeof got, "%s", t); break; }
+    }
+    if (!got[0]) {
+        std::set<std::string> dubs;
+        lang_dubs_in(dir, dubs);
+        if (dubs.empty()) return;
+        snprintf(got, sizeof got, "%s", dubs.begin()->c_str());
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_lang.mx);
+        snprintf(g_lang.game_voice, sizeof g_lang.game_voice, "%s", stem);
+        snprintf(g_lang.used_voice, sizeof g_lang.used_voice, "%s", got);
+        snprintf(g_lang.missing_voice, sizeof g_lang.missing_voice, "%s", strcmp(got, want) ? want : "");
+        if (dl < sizeof g_lang.voice_dir) snprintf(g_lang.voice_dir, sizeof g_lang.voice_dir, "%s", dir);
+    }
+    char key[160];
+    snprintf(key, sizeof key, "voice:%s>%s", stem, got);
+    if (strcmp(got, want))
+        lang_log_once(key, "voice: no %s dub in this copy (no %s.psarc in %s): %s.psarc%s", want, want, dir, got,
+                      strcmp(got, stem) ? " instead, so the dialogue is not silent" : ", the game's own");
+    else if (strcmp(got, stem))
+        lang_log_once(key, "voice: %s -> %s.psarc", path, got);
+    if (strcmp(got, stem)) snprintf(path, cap, "%s%s.psarc", dir, got);
+}
+
 /* After the guest path is translated: swap a language archive's name for
  * the chosen one. path is a host path; it is rewritten in place. */
 static void lang_redirect_host(char* path, size_t cap)
@@ -225,37 +291,38 @@ static void lang_redirect_host(char* path, size_t cap)
     for (size_t i = 0; i < sl; i++) if (!((stem[i] >= 'a' && stem[i] <= 'z') || stem[i] == '_')) return;
 
     const size_t dl = (size_t)(base - path);           /* folder, with its trailing '/' */
+    if (dl >= 1000) return;                            /* the folder must fit the candidates' buffers */
     char cand[1100];
     if (is_voice) {
-        /* A voice archive only if its text archive sits beside it. */
+        /* A voice archive: its text archive sits beside it, or it is named
+         * after one of the game's languages (a dub the copy lacks may have
+         * no text archive either). core.psarc, music.psarc: neither. */
         snprintf(cand, sizeof cand, "%.*s%s_text.psarc", (int)dl, path, stem);
-        if (!lang_file_exists(cand)) return;
+        if (!lang_file_exists(cand) && lang_game_index(stem) < 0) return;
+        lang_redirect_voice(path, cap, stem, dl);
+        return;
     }
-    const char* want = is_text ? g_lang.text : g_lang.voice;
+    const char* want = g_lang.text;
     {
         std::lock_guard<std::mutex> lk(g_lang.mx);
-        char* game = is_text ? g_lang.game_text : g_lang.game_voice;
-        char* used = is_text ? g_lang.used_text : g_lang.used_voice;
-        snprintf(game, LANG_NAME_MAX, "%s", stem);
-        snprintf(used, LANG_NAME_MAX, "%s", stem);
-        if (is_voice && dl < sizeof g_lang.voice_dir)
-            snprintf(g_lang.voice_dir, sizeof g_lang.voice_dir, "%.*s", (int)dl, path);
+        snprintf(g_lang.game_text, sizeof g_lang.game_text, "%s", stem);
+        snprintf(g_lang.used_text, sizeof g_lang.used_text, "%s", stem);
     }
     if (!want[0] || !strcmp(want, stem)) return;
-    snprintf(cand, sizeof cand, "%.*s%s%s", (int)dl, path, want, is_text ? kText : kVoice);
+    snprintf(cand, sizeof cand, "%.*s%s%s", (int)dl, path, want, kText);
     char key[160];
     snprintf(key, sizeof key, "file:%s", cand);
     if (!lang_file_exists(cand)) {
         /* The game also probes folders that hold no language at all
          * (patch/psarc): nothing to say unless the folder has the original. */
         if (lang_file_exists(path))
-            lang_log_once(key, "%s: %s is not in this copy, keeping %s", is_text ? "text" : "voice", cand, base);
+            lang_log_once(key, "text: %s is not in this copy, keeping %s", cand, base);
         return;
     }
-    lang_log_once(key, "%s: %s -> %s%s", is_text ? "text" : "voice", path, want, is_text ? kText : kVoice);
+    lang_log_once(key, "text: %s -> %s%s", path, want, kText);
     snprintf(path, cap, "%s", cand);
     std::lock_guard<std::mutex> lk(g_lang.mx);
-    snprintf(is_text ? g_lang.used_text : g_lang.used_voice, LANG_NAME_MAX, "%s", want);
+    snprintf(g_lang.used_text, sizeof g_lang.used_text, "%s", want);
 }
 
 static uint64_t lang_be(const uint8_t* p, int n)
@@ -337,9 +404,8 @@ static void lang_scan_psarc(FILE* f, const char* hpath, std::vector<LangPatch>& 
 }
 
 /* The voice track ids of a .bik: the game's language's and the served dub's
- * swap. The served one, not the chosen one: a dub the copy has no dialogue
- * archive for (lang_redirect_host kept the game's) keeps the movies' voice
- * the game's too, so movies and dialogue never speak different languages. */
+ * swap. The served one, not the chosen one (lang_redirect_voice): movies and
+ * dialogue never speak different languages. */
 static void lang_scan_bik(FILE* f, const char* hpath, std::vector<LangPatch>& out)
 {
     char game[LANG_NAME_MAX], used[LANG_NAME_MAX];
@@ -378,11 +444,17 @@ static void lang_on_open(int fd, const char* hpath)
     if (fd < 0 || fd >= LANG_FD_MAX) return;
     lang_init();
     std::vector<LangPatch> p;
-    if (g_lang.text[0] || g_lang.voice[0]) {
+    /* The movies follow the served dub whenever it is not the game's: a chosen
+     * one, or the fallback for a dub the copy lacks (also with no PS3_VOICE_LANG
+     * or PS3_LANG at all: the game told Italian by the host language). */
+    bool vswap;
+    { std::lock_guard<std::mutex> lk(g_lang.mx);
+      vswap = g_lang.game_voice[0] && g_lang.used_voice[0] && strcmp(g_lang.game_voice, g_lang.used_voice); }
+    if (g_lang.text[0] || vswap) {
         const size_t l = strlen(hpath);
         const bool psarc = (l > 6 && !strcmp(hpath + l - 6, ".psarc")) || (l > 8 && !strcmp(hpath + l - 8, ".psarc_s"));
         const bool bik = l > 4 && lang_ieq_n(hpath + l - 4, ".bik", 4);
-        if ((psarc && g_lang.text[0]) || (bik && g_lang.voice[0])) {
+        if ((psarc && g_lang.text[0]) || (bik && vswap)) {
             /* A FILE of its own: the guest's descriptor keeps its position. */
             if (FILE* f = fopen(hpath, "rb")) {
                 if (psarc) lang_scan_psarc(f, hpath, p); else lang_scan_bik(f, hpath, p);
@@ -426,6 +498,16 @@ extern "C" void ps3_lang_in_use(int kind, char* asked, char* given, size_t n)
     if (given) snprintf(given, n, "%s", kind ? g_lang.used_text : g_lang.used_voice);
 }
 
+/* The dub the game (or PS3_VOICE_LANG) wanted that this copy has no
+ * <name>.psarc for, "" if none: the dialogue then plays ps3_lang_in_use's
+ * "given" one instead. kind 0 (voice) only; text always gets its file. */
+extern "C" void ps3_lang_missing(int kind, char* out, size_t n)
+{
+    if (!out || !n) return;
+    std::lock_guard<std::mutex> lk(g_lang.mx);
+    snprintf(out, n, "%s", kind ? "" : g_lang.missing_voice);
+}
+
 /* The languages this copy has: kind 0 voice (<name>.psarc beside its
  * <name>_text.psarc), 1 text (<name>_text.psarc). Read from the folder the
  * game opened its voice archive in, else <vfs root>/PS3_GAME/USRDIR/cache/psarc.
@@ -435,22 +517,18 @@ extern "C" int ps3_lang_available(int kind, char (*out)[LANG_NAME_MAX], int max)
     char dir[1100];
     { std::lock_guard<std::mutex> lk(g_lang.mx); snprintf(dir, sizeof dir, "%s", g_lang.voice_dir); }
     if (!dir[0]) snprintf(dir, sizeof dir, "%s/PS3_GAME/USRDIR/cache/psarc/", ppu_vfs_root ? ppu_vfs_root : ".");
-    DIR* d = opendir(dir);
-    if (!d) return 0;
     std::set<std::string> found;
-    while (struct dirent* e = readdir(d)) {
-        const char* nm = e->d_name;
-        const size_t l = strlen(nm);
-        if (l <= 11 || strcmp(nm + l - 11, "_text.psarc") || l - 11 >= LANG_NAME_MAX) continue;
-        std::string stem(nm, l - 11);
-        if (kind == 0) {
-            char p[1200];
-            snprintf(p, sizeof p, "%s%s.psarc", dir, stem.c_str());
-            if (!lang_file_exists(p)) continue;
+    if (kind == 0) {
+        lang_dubs_in(dir, found);
+    } else if (DIR* d = opendir(dir)) {
+        while (struct dirent* e = readdir(d)) {
+            const char* nm = e->d_name;
+            const size_t l = strlen(nm);
+            if (l <= 11 || strcmp(nm + l - 11, "_text.psarc") || l - 11 >= LANG_NAME_MAX) continue;
+            found.insert(std::string(nm, l - 11));
         }
-        found.insert(stem);
+        closedir(d);
     }
-    closedir(d);
     int i = 0;
     for (const std::string& s : found) {
         if (i >= max) break;
