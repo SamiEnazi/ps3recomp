@@ -434,6 +434,87 @@ def load_native_entries(prefix: str) -> dict:
     return out
 
 
+SPU_PATCH_MAX = 16    # runtime/spu/spu_patch.h SPU_PATCH_MAX
+# What an alternative's lifted text may not contain: a transfer of control (the analyses that
+# shaped the function -- its labels, chunks, link returns -- saw only the original word).
+_RE_SPU_XFER = re.compile(r"\bgoto\b|\breturn\b|SPU_DIRECT|SPU_RET|SPU_TAILCALL|spu_func_[0-9A-Fa-f]{8}\(|"
+                          r"spu_indirect_branch|SPU_IB_DISPATCH|spu_stop\(|spu_halt\(|spu_link\(|"
+                          r"spu_drain_call|spu_unsupported|TODO")
+_SPU_PATCH_NO_ORIG = {"br", "bra", "bi", "iret", "stop", "stopd"}   # unconditional: nothing falls through
+
+
+def load_spu_patches(prefix: str, path: str = None):
+    """SPU_PATCH_FILE=<file>: run-time instruction alternatives, the SPU twin of the PPU's
+    PPU_PATCH_FILE (ppu_fastpath.patch_line). Two kinds of line (`#` starts a comment):
+
+        switch <name> <setting> <default> <value>=<alternative> ...
+        <image name> <LS address> <original word> <alternative>[,<alternative>...] <switch>
+
+    A switch is one byte the lifted code tests, g_spu_patch[<slot>], slot = the order of the
+    switch lines (at most SPU_PATCH_MAX). <setting> is the environment variable (and
+    settings.ini line / in-game menu setting) that picks its alternative while the game runs:
+    each <value>=<alternative> maps a value of it to an alternative (0 = the original word,
+    k = the k-th word of a patch line), <default> is the value it has when unset
+    (runtime/spu/spu_patch.c). A patch line puts the listed alternatives at one instruction of
+    one image (image name = the lift's symbol prefix without its trailing underscore,
+    jobmod_<sha>_e<entry>, as in SPU_NATIVE_FILE): the instruction lifts as
+        if (g_spu_patch[slot] == 1) { <alternative 1> } else ... else { <the original> }
+    each side the lifter's own translation of its word. The original word is checked against
+    the image (the lift stops on a mismatch); it may be any instruction but an unconditional
+    transfer (br, bra, bi, iret, stop), and every alternative must be straight-line code that
+    leaves r0 alone (the function's shape comes from the original). Returns (switches, patches):
+    [(name, setting, default, map text)], {addr: (slot, original, [alternatives])} for this
+    image. No file = ([], {}) and the lift is the old one, byte for byte."""
+    path = os.environ.get("SPU_PATCH_FILE", "") if path is None else path
+    want = prefix[:-1] if prefix.endswith("_") else prefix
+    if not path:
+        return [], {}
+    if not os.path.isfile(path):
+        sys.exit(f"[spu_lifter] SPU_PATCH_FILE: no file {path}")
+    switches, slot_of, nalt, patches, mine = [], {}, {}, [], {}
+    for n, raw in enumerate(open(path, encoding="utf-8"), 1):
+        ln = raw.split("#", 1)[0].strip()
+        if not ln:
+            continue
+        f = ln.split()
+        where = f"SPU_PATCH_FILE {os.path.basename(path)}:{n}"
+        if f[0] == "switch":
+            if (len(f) < 5 or f[1] in slot_of or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", f[1])
+                    or any('"' in t or "\\" in t for t in f)):   # the tokens become C string literals
+                sys.exit(f"[spu_lifter] {where}: want 'switch <name> <setting> <default> <value>=<alt> ...' "
+                         f"with a new C-identifier name: '{ln}'")
+            amap = {}
+            for kv in f[4:]:
+                v, eq, a = kv.partition("=")
+                if not eq or not v or not a.isdigit() or v in amap:
+                    sys.exit(f"[spu_lifter] {where}: bad or repeated <value>=<alternative> '{kv}'")
+                amap[v] = int(a)
+            if f[3] not in amap:
+                sys.exit(f"[spu_lifter] {where}: the default '{f[3]}' maps to no alternative")
+            if len(switches) >= SPU_PATCH_MAX:
+                sys.exit(f"[spu_lifter] {where}: more than {SPU_PATCH_MAX} switches")
+            slot_of[f[1]] = len(switches)
+            nalt[f[1]] = max(amap.values())
+            switches.append((f[1], f[2], f[3], " ".join(f[4:])))
+            continue
+        if len(f) != 5:
+            sys.exit(f"[spu_lifter] {where}: want '<image> <LS address> <original> <alt>[,<alt>...] <switch>': '{ln}'")
+        patches.append((where, f))
+    for where, (img, a, orig, alts, sw) in patches:
+        if sw not in slot_of:
+            sys.exit(f"[spu_lifter] {where}: no 'switch {sw}' line")
+        words = [int(w, 16) for w in alts.split(",") if w]
+        if not words or nalt[sw] > len(words):
+            sys.exit(f"[spu_lifter] {where}: switch {sw} picks alternative {nalt[sw]}, the line has {len(words)}")
+        if img != want:
+            continue
+        addr = int(a, 0)
+        if addr in mine or addr & 3:
+            sys.exit(f"[spu_lifter] {where}: repeated or unaligned address 0x{addr:X}")
+        mine[addr] = (slot_of[sw], int(orig, 16), words)
+    return switches, mine
+
+
 def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
     """Group contiguous chunks into function-sized runs for --merge-chunks.
 
@@ -1032,6 +1113,11 @@ class SPULifter:
         self.const_bi: dict = {}
         # {function addr: continuation or None} (load_native_entries, SPU_NATIVE_FILE).
         self.native_entries: dict = {}
+        # SPU_PATCH_FILE (load_spu_patches): the switches, {addr: (slot, original, [alts])}
+        # of this image, and the addresses lifted with their alternatives so far.
+        self.patch_switches: list = []
+        self.patches: dict = {}
+        self.patch_done: set = set()
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -1068,6 +1154,8 @@ class SPULifter:
             if insn.addr in internal:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
             c = self._translate(insn, func)
+            if insn.addr in self.patches:   # SPU_PATCH_FILE: run-time alternatives
+                c = self._patch_line(insn, func, c)
             if c:
                 if self.trace:
                     func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
@@ -1111,6 +1199,29 @@ class SPULifter:
 
         self.functions.append(func)
         return func
+
+    def _patch_line(self, insn: SPUInstruction, func: LiftedFunction, c: str) -> str:
+        """The lifted statement of `insn` with its SPU_PATCH_FILE alternatives (load_spu_patches)."""
+        slot, orig, alts = self.patches[insn.addr]
+        where = f"[spu_lifter] SPU_PATCH_FILE: {self.prefix}0x{insn.addr:X}"
+        if insn.raw != orig:
+            sys.exit(f"{where} holds {insn.raw:08X} ({insn.mnemonic} {insn.operands}), not {orig:08X}")
+        if insn.mnemonic in _SPU_PATCH_NO_ORIG:
+            sys.exit(f"{where}: the original is an unconditional transfer ({insn.mnemonic}): not supported")
+        sides = []
+        for w in alts:
+            ai = spu_decode(w, insn.addr)
+            xfer = ("brsl", "brasl", "bisl", "bisled", "biz", "binz", "bihz", "bihnz", "bie", "bid")
+            if (ai.mnemonic in xfer or ai.mnemonic in _SPU_PATCH_NO_ORIG or ai.mnemonic in _COND_BR
+                    or (ai.mnemonic not in _NO_RT_WRITE and _dest_reg(ai) == 0)):
+                sys.exit(f"{where}: alternative {w:08X} ({ai.mnemonic} {ai.operands}) is a transfer or writes r0")
+            code = (self._translate(ai, func) or "").strip() or ";"
+            if _RE_SPU_XFER.search(code):
+                sys.exit(f"{where}: alternative {w:08X} is not straight-line code: {code[:80]}")
+            sides.append(code)
+        self.patch_done.add(insn.addr)
+        out = " else ".join(f"if (g_spu_patch[{slot}] == {k + 1}) {{ {s} }}" for k, s in enumerate(sides))
+        return f"{out} else {{ {(c or '').strip() or ';'} }}   /* SPU_PATCH_FILE: {self.patch_switches[slot][0]} */"
 
     def _A(self, x: int) -> str:
         """An LS address derived from this image's own position."""
@@ -1626,6 +1737,19 @@ class SPULifter:
 
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
+        if self.patch_done:
+            # SPU_PATCH_FILE: the switches this image's alternatives test, registered before main
+            # (runtime/spu/spu_patch.c: their settings, defaults and live appliers)
+            used = {}
+            for a in self.patch_done:
+                used[self.patches[a][0]] = used.get(self.patches[a][0], 0) + 1
+            lines.append('#include "../../runtime/spu/spu_patch.h"   /* SPU_PATCH_FILE: g_spu_patch */')
+            lines.append(f"__attribute__((constructor)) static void {self.prefix}spu_patch_ctor(void) {{")
+            for slot, n in sorted(used.items()):
+                name, setting, default, amap = self.patch_switches[slot]
+                lines.append(f'    spu_patch_register({slot}, "{name}", "{setting}", "{default}", "{amap}", {n});')
+            lines.append("}")
+            lines.append("")
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         cg = _CgState()
         cg_at = len(lines)          # the speculative sites' counters go here (count known at the end)
@@ -1929,6 +2053,10 @@ def main() -> None:
                      f"{', '.join(f'0x{a:X}' for a in missing)} in {args.symbol_prefix}")
         print(f"  {len(lifter.native_entries)} native rewrite entr(y/ies) (SPU_NATIVE_FILE): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.native_entries))}")
+    lifter.patch_switches, lifter.patches = load_spu_patches(args.symbol_prefix or "")
+    if lifter.patches:
+        print(f"  {len(lifter.patches)} run-time instruction alternative(s) (SPU_PATCH_FILE): "
+              f"{', '.join(f'0x{a:X}' for a in sorted(lifter.patches))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     groups = {}
     if args.merge_chunks:
@@ -1941,6 +2069,11 @@ def main() -> None:
               f"(--merge-chunks, max {args.max_group_insns} insns)")
     for s, e in bounds:
         lifter.lift_function(insns, s, groups.get(s, e))
+
+    missing = sorted(set(lifter.patches) - lifter.patch_done)
+    if missing:
+        sys.exit(f"[spu_lifter] SPU_PATCH_FILE: {args.symbol_prefix} has no lifted instruction at "
+                 f"{', '.join(f'0x{a:X}' for a in missing)}")
 
     os.makedirs(args.output, exist_ok=True)
     hp = os.path.join(args.output, args.header_name)
