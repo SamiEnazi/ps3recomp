@@ -122,3 +122,24 @@ present fills the window as before, the window is 1280x720 unless `PS3RECOMP_VK_
   behaviour); Auto fixes that.
 - Every SPU readback of a display target is point-sampled per axis (as `[res]`); at 16:10 and 720p the
   x scale is 0.9 (a few columns are dropped in readbacks; the default GPU light and SSAO read none).
+
+## Checked (2026-11-11, non-PGO build of agent/wide on m17, internal 1080p, city dock from the first save)
+
+Route: a fast.ps1 steps file (the city intro movie, the dock view at anchor+3 / +8, a camera turn at +12),
+runs wd1-* and wd2-* in native\recordings, shots shot_mov / shot_a3 / shot_a8 / shot_a12.
+
+| Run | Shape, window | Display image | Dock fps (2-12 s) | RSX drain ms/frame |
+|---|---|---|---|---|
+| wd2-A | 16:9, 1280x720 | 1920x1080 | 119.7 (clean) | 8.07 |
+| wd2-B | 21:9, 1920x823 | 2520x1080 | 109.5 (0.5 cores other) | 8.90 |
+| wd1-C | auto from 1440x900 = 16:10 | 1728x1080 | 118.3 (one run) | 8.10 |
+| wd2-D | 32:9, 1920x540 | 3840x1080 | 96.2 (contaminated) | 10.02 |
+
+The cost is the wider view's extra geometry on the RSX thread (+0.8 ms/frame at 21:9 here), not the
+pixels. Pictures: more pier and river at both sides at 21:9 and 32:9, the same vertical view, nothing
+missing at the edges, Cole and props not stretched; the energy meter, minimap (round), call box and
+subtitles in the middle 16:9; the placeholder movie pillarboxed (letterboxed at 16:10). The movie's
+2-px green edge columns are the same at 16:9 (x = 0 and 1279), not this change.
+Not run: fullscreen Auto on a real ultrawide screen, menus / pause / loading screens / in-engine
+cutscenes / fights at a wide shape, FSR upscaling of a wide 720p picture, the job-replay gate (no SPU
+change).
