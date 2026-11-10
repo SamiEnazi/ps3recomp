@@ -33,6 +33,8 @@ computes -- only the order and number of tests change.
                     entry's value from the ELF, while the runtime vouches for it per entry
                     (g_ppu_toc_dirty: checked against guest memory at start, set by any
                     store into the TOC); else the load (see toc_setup).
+  PPU_VMX_CLEAN, PPU_VMX_INT, PPU_FP_SINGLE, PPU_FP_CVT (ppu-vmx, 2026-11-10): the
+                    dataflow fast paths of tools/ppu_vmx_flow.py, applied after these.
 
 Two run-time switches for a title's own code (cheats agent, 2026-11-09), each read from a
 file of title knowledge kept with the title, not here (both unset = the lift as before):
@@ -527,7 +529,12 @@ def source_preamble(text: str) -> str:
                  "extern volatile uint8_t g_ppu_patch[256];\n"
                  "int ppu_patch_register(int slot);\n"
                  "#ifdef __cplusplus\n}\n#endif\n")
-    return text
+    return _flow().source_preamble(text)
+
+
+def _flow():
+    import ppu_vmx_flow   # ppu-vmx's dataflow fast paths (all switches off = unchanged text)
+    return ppu_vmx_flow
 
 
 # PPU_VMX_SSE: the lifter's inline vperm (a 16-step byte loop) -> ppu_vperm_sse (two pshufb + a blend).
@@ -755,7 +762,7 @@ def rewrite_body(lines: list) -> list:
     if _toc_on():   # PPU_TOC_FOLD: TOC entry loads -> the entry's value while the runtime vouches for it
         lines = [_RE_TOC_LD.sub(_toc_sub, ln) if "vm_read" in ln and "2" in ln else ln for ln in lines]
     if not _on("PPU_VMX_SSE"):
-        return lines
+        return _flow().rewrite(lines)
     out = []
     for ln in lines:
         if "sel < 16" in ln:
@@ -780,4 +787,4 @@ def rewrite_body(lines: list) -> list:
             ln = _sub(ln, re.compile(r"\bvm_raw_ld16\("), "ppu_vld16_sse(", "lvx")
             ln = _sub(ln, re.compile(r"\bvm_raw_st16\("), "ppu_vst16_sse(", "stvx")
         out.append(ln)
-    return out
+    return _flow().rewrite(out)
