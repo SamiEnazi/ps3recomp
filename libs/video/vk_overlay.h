@@ -33,9 +33,13 @@
  *   PS3_OVERLAY=0            no overlay at all (no HUD, no menu, no file)
  *   PS3_OVERLAY_HUD=0|1      HUD at start (default 1); _CORNER 0..3, _OPACITY, _GRAPH, _CPU
  *   PS3_OVERLAY_PAD=0        no L3+R3 chord
+ *   PS3_LANG / PS3_VOICE_LANG / PS3_TEXT_LANG   Audio page > Language, saved for the next
+ *                            start (the game reads them once): auto = the Windows display
+ *                            language, same = follow the game's (cellSysutil.c, ppu_fs_lang.h)
  * Tests / screenshots:
  *   PS3RECOMP_OVERLAY_MENU_OPEN=1        menu open from the start
  *   PS3RECOMP_OVERLAY_TAB=<page>         0..5 or display|graphics|audio|controls|hud|cheats
+ *                                        (language = audio)
  *                                        (cheats: only when the title registered some,
  *                                        include/ps3emu/ps3_cheats.h, vk_overlay_cheats.cpp)
  *   PS3RECOMP_OVERLAY_MENU_AT="40:display,50:audio,60:close"  a timed script

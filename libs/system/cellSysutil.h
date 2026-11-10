@@ -127,6 +127,12 @@ void cellSysutilQueueEvent(int slot, u32 status, u32 param);
 void ps3_host_quit(const char* why);
 int  ps3_host_quitting(void);
 
+/* For the in-game menu's Language section: the PS3_LANG code that unset /
+ * PS3_LANG=auto gives the title (the host's UI language; "" = none of the
+ * PS3's, so English), and the CELL_SYSUTIL_LANG_* it was told (-1 until it asked). */
+void ps3_sysutil_host_language(char* out, size_t n);
+s32  ps3_sysutil_language_in_use(void);
+
 /* value_ea / buf_ea are GUEST addresses, not host pointers: both write into
  * the title's own memory through vm_write*. Spelt u32 so a caller cannot
  * translate the argument first and hand over a host address. */

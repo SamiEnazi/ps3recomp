@@ -75,6 +75,10 @@ void  ps3_button_icons_set_mode(int mode);      /* rsx_button_icons.h */
 int   ps3_button_icons_mode_setting(void);
 int   ps3_button_icons_effective(void);
 void  ps3_host_quit(const char* why);           /* libs/system/cellSysutil.c */
+void  ps3_sysutil_host_language(char* out, size_t n);   /* cellSysutil.c: "Automatic"'s PS3_LANG code */
+int   ps3_sysutil_language_in_use(void);                /* CELL_SYSUTIL_LANG_* the game was told, -1 */
+void  ps3_lang_in_use(int kind, char* asked, char* given, size_t n);   /* runtime/ppu/ppu_fs_lang.h */
+int   ps3_lang_available(int kind, char (*out)[24], int max);
 int   vk_overlay_cheats_count(void);            /* vk_overlay_cheats.cpp: the title's cheats (ps3_cheats.h) */
 void  vk_overlay_cheats_page(float w);
 int   ps3_overlay_cheat_set(const char* id, double v);   /* below: "cheat=id=value" in the timed script */
@@ -138,6 +142,7 @@ enum {
     V_INPUT_MODE, V_BUTTON_ICONS, V_RUMBLE, V_RUMBLE_STRENGTH,
     V_HUD, V_HUD_CORNER, V_HUD_OPACITY, V_HUD_GRAPH, V_HUD_CPU,
     V_THEME,
+    V_LANG, V_VOICE_LANG, V_TEXT_LANG,
     V_N
 };
 static const char* const kVar[V_N] = {
@@ -149,6 +154,7 @@ static const char* const kVar[V_N] = {
     "PS3_OVERLAY_HUD", "PS3_OVERLAY_HUD_CORNER", "PS3_OVERLAY_HUD_OPACITY",
     "PS3_OVERLAY_HUD_GRAPH", "PS3_OVERLAY_HUD_CPU",
     "PS3_OVERLAY_THEME",
+    "PS3_LANG", "PS3_VOICE_LANG", "PS3_TEXT_LANG",   /* the game reads them once, at start */
 };
 /* Plain arrays: filled during this file's dynamic initialisation, before
  * main (zero-initialised storage exists before any of it runs). */
@@ -520,6 +526,7 @@ static int tab_from_name(const char* e)
     if (e[0] >= '0' && e[0] <= '9') { const int t = atoi(e); return t >= 0 && t < tab_count() ? t : 0; }
     for (int i = 0; i < tab_count(); i++) if (!SDL_strcasecmp(e, names[i])) return i;
     if (!SDL_strcasecmp(e, "performance") || !SDL_strcasecmp(e, "perf")) return 4;
+    if (!SDL_strcasecmp(e, "language") || !SDL_strcasecmp(e, "lang")) return 2;   /* Audio holds Language */
     return -1;
 }
 
@@ -1030,8 +1037,10 @@ static int pick(const char* v, const char* const* list, int n, int def)
     return def;
 }
 
+static void lang_ui_load(void);   /* the Language section's lists (below, by tab_audio) */
 static void ui_load(void)
 {
+    lang_ui_load();
     { const char* e = getenv(kVar[V_FPS_CAP]);
       const int f = e ? atoi(e) : 0;
       s_ui.cap = -1; s_ui.cap_custom = f;
@@ -1065,15 +1074,18 @@ static void ui_load(void)
 static const ImVec4 kOrange(1.0f, 0.60f, 0.20f, 1.0f);
 static const ImVec4 kGrey(0.62f, 0.66f, 0.72f, 1.0f);
 
-/* "env" after a setting whose variable was set at start: it wins next time. */
-static void env_mark(int v)
+/* "env" after a setting whose variable was set at start: it wins next time.
+ * live = false: a setting the game only reads at start (nothing applies now). */
+static void env_mark(int v, bool live = true)
 {
     if (!s_env_set[v]) return;
     ImGui::SameLine();
     ImGui::TextColored(kOrange, "env");
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-        ImGui::SetTooltip("%s was set when the game started (the launcher or the shell).\n"
-                          "The change applies now, but that variable wins again next time.", kVar[v]);
+        ImGui::SetTooltip(live ? "%s was set when the game started (the launcher or the shell).\n"
+                                 "The change applies now, but that variable wins again next time."
+                               : "%s was set when the game started (the launcher or the shell).\n"
+                                 "The choice is saved, but that variable wins over it at the next start.", kVar[v]);
 }
 
 static void hint(const char* text)
@@ -1087,18 +1099,29 @@ static void hint(const char* text)
 
 static void section(const char* text) { vk_ov_heading(text); }   /* [theme] bold, accent, a fading rule */
 
+/* "on restart", or "restart needed" once changed, after a setting read at start. */
+static void restart_mark(int v, bool changed)
+{
+    ImGui::SameLine();
+    ImGui::TextColored(changed ? kOrange : kGrey, changed ? "restart needed" : "on restart");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+        ImGui::SetTooltip("%s is read when the game starts: a change applies the next time.", kVar[v]);
+}
+
 /* "live" or "restart" after a setting a module may or may not take live. */
 static void live_mark(int v)
 {
     const bool live = ps3_setting_applier(kVar[v]) != NULL;
     const char* now = getenv(kVar[v]);
     const bool changed = strcmp(now ? now : "", s_start[v]) != 0;
-    ImGui::SameLine();
-    if (live) ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f), "live");
-    else ImGui::TextColored(changed ? kOrange : kGrey, changed ? "restart needed" : "on restart");
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-        ImGui::SetTooltip(live ? "%s changes while the game runs." :
-                          "%s is read when the game starts: a change applies the next time.", kVar[v]);
+    if (live) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f), "live");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+            ImGui::SetTooltip("%s changes while the game runs.", kVar[v]);
+    } else {
+        restart_mark(v, changed);
+    }
     env_mark(v);
 }
 
@@ -1197,6 +1220,245 @@ static void tab_graphics(void)
          "keeps the borders sharp. No frame-rate cost.");
 }
 
+/* ---- Language (on the Audio page) -------------------------------------------
+ * PS3_LANG is the console language the game is told (libs/system/cellSysutil.c;
+ * unset or "auto" = the Windows display language, English when the game has
+ * none of it). PS3_VOICE_LANG / PS3_TEXT_LANG split the dub from what is read
+ * on screen (runtime/ppu/ppu_fs_lang.h serves that language's files; "same" =
+ * follow the game). The game reads all three once, at start, so the menu only
+ * saves them (set_value): the environment is left alone and nothing changes
+ * halfway through this session. The lists are what this disc has
+ * (cache/psarc: <name>_text.psarc, and <name>.psarc beside it for a dub). */
+#ifdef _WIN32
+static const char* const kHostOs = "Windows";
+#else
+static const char* const kHostOs = "system";
+#endif
+/* The game's languages: the files' spelling (ppu_fs_lang.h), the PS3_LANG code
+ * the menu writes for one (cellSysutil.c), the label. Endonyms only in scripts
+ * the menu's font has (Segoe UI: Latin and Cyrillic). */
+static const struct { const char* name; const char* code; const char* label; } kLang[] = {
+    { "english",    "en",     "English (US)" },
+    { "british",    "en-gb",  "English (UK)" },
+    { "french",     "fr",     "French (Fran\u00e7ais)" },
+    { "german",     "de",     "German (Deutsch)" },
+    { "italian",    "it",     "Italian (Italiano)" },
+    { "spanish",    "es-es",  "Spanish, Spain (Espa\u00f1ol)" },
+    { "latino",     "es-419", "Spanish, Latin America (Espa\u00f1ol)" },
+    { "portuguese", "pt-pt",  "Portuguese, Portugal (Portugu\u00eas)" },
+    { "brazilian",  "pt-br",  "Portuguese, Brazil (Portugu\u00eas)" },
+    { "dutch",      "nl",     "Dutch (Nederlands)" },
+    { "polish",     "pl",     "Polish (Polski)" },
+    { "russian",    "ru",     "Russian (\u0420\u0443\u0441\u0441\u043a\u0438\u0439)" },
+    { "turkish",    "tr",     "Turkish (T\u00fcrk\u00e7e)" },
+    { "finnish",    "fi",     "Finnish (Suomi)" },
+    { "swedish",    "sv",     "Swedish (Svenska)" },
+    { "danish",     "da",     "Danish (Dansk)" },
+    { "norwegian",  "no",     "Norwegian (Norsk)" },
+    { "japanese",   "ja",     "Japanese" },
+    { "korean",     "ko",     "Korean" },
+    { "chinese",    "zh-t",   "Chinese, traditional" },
+    { "chinese_s",  "zh-s",   "Chinese, simplified" },
+};
+
+struct LangUi {
+    char voice[32][24], text[32][24];   /* this disc's dubs and text languages */
+    int  nvoice, ntext;
+    char host[8];                       /* the PS3_LANG code "Automatic" gives ("" = none: English) */
+    char win[64];                       /* the display language's name */
+};
+static LangUi s_lang;
+
+static const char* lang_label(const char* name)
+{
+    for (const auto& k : kLang) if (!SDL_strcasecmp(k.name, name)) return k.label;
+    return name;
+}
+
+/* A CELL_SYSUTIL_LANG_* number (es and pt: the disc's own Spanish / Portuguese). */
+static const char* lang_id_label(int id)
+{
+    static const char* const ids[20] = { "japanese", "english", "french", NULL, "german", "italian", "dutch", NULL,
+                                         "russian", "korean", "chinese", "chinese_s", "finnish", "swedish", "danish",
+                                         "norwegian", "polish", "brazilian", "british", "turkish" };
+    if (id == 3) return "Spanish";
+    if (id == 7) return "Portuguese";
+    return id >= 0 && id < 20 && ids[id] ? lang_label(ids[id]) : "?";
+}
+
+/* The one file-name language a PS3_LANG code names in the table, else NULL. */
+static const char* lang_code_name(const char* code)
+{
+    for (const auto& k : kLang) if (!SDL_strcasecmp(code, k.code)) return k.name;
+    return NULL;
+}
+
+/* A PS3_LANG value (a code from the list, another code cellSysutil takes, or a number). */
+static const char* lang_code_label(const char* code)
+{
+    for (const auto& k : kLang) if (!SDL_strcasecmp(code, k.code)) return k.label;
+    if (!SDL_strcasecmp(code, "en-us")) return lang_label("english");
+    if (!SDL_strcasecmp(code, "es")) return lang_id_label(3);
+    if (!SDL_strcasecmp(code, "pt")) return lang_id_label(7);
+    char* end = NULL;
+    const long n = strtol(code, &end, 10);
+    if (end && end != code && !*end) return lang_id_label((int)n);
+    return code;
+}
+
+/* "" and the words that mean "not chosen" ("auto" for PS3_LANG, "same" for the other two). */
+static bool lang_unset(int v, const char* s)
+{
+    if (!*s) return true;
+    if (v == V_LANG) return !SDL_strcasecmp(s, "auto") || !SDL_strcasecmp(s, "system");
+    return !SDL_strcasecmp(s, "same") || !SDL_strcasecmp(s, "auto") || !SDL_strcasecmp(s, "default");
+}
+static bool lang_same(int v, const char* a, const char* b)
+{
+    const bool ua = lang_unset(v, a), ub = lang_unset(v, b);
+    return (ua || ub) ? ua == ub : !SDL_strcasecmp(a, b);
+}
+
+/* The menu's choice: this session's, else the one in effect at start. */
+static void lang_choice(int v, char* out, size_t n)
+{
+    std::lock_guard<std::mutex> g(s_set_lock);
+    snprintf(out, n, "%s", s_value[v][0] ? s_value[v] : s_start[v]);
+}
+static bool lang_changed(int v)
+{
+    char cur[48];
+    lang_choice(v, cur, sizeof cur);
+    return !lang_same(v, cur, s_start[v]);
+}
+static void lang_set(int v, const char* value)
+{
+    char cur[48];
+    lang_choice(v, cur, sizeof cur);
+    if (!lang_same(v, cur, value)) set_value(v, "%s", value);
+}
+
+static bool lang_has(char (*list)[24], int n, const char* name)
+{
+    for (int i = 0; i < n; i++) if (!SDL_strcasecmp(list[i], name)) return true;
+    return false;
+}
+
+/* When the menu opens (ui_load). The disc's lists are read until found (a disc
+ * not laid out as <root>/PS3_GAME/USRDIR is found once the game opened its
+ * voice archive) and then kept: a listing on a slow drive is not repeated. */
+static void lang_ui_load(void)
+{
+    if (!s_lang.ntext) {
+        s_lang.nvoice = ps3_lang_available(0, s_lang.voice, 32);
+        s_lang.ntext = ps3_lang_available(1, s_lang.text, 32);
+    }
+    if (s_lang.win[0]) return;
+    ps3_sysutil_host_language(s_lang.host, sizeof s_lang.host);
+#ifdef _WIN32
+    if (!GetLocaleInfoA(MAKELCID(GetUserDefaultUILanguage(), SORT_DEFAULT), LOCALE_SENGLISHLANGUAGENAME,
+                        s_lang.win, (int)sizeof s_lang.win))
+        s_lang.win[0] = 0;
+#endif
+    if (!s_lang.win[0])
+        snprintf(s_lang.win, sizeof s_lang.win, "%s", s_lang.host[0] ? lang_code_label(s_lang.host) : "unknown");
+}
+
+/* "Same as the game" or one of this disc's languages (PS3_VOICE_LANG / PS3_TEXT_LANG). */
+static void lang_pick(int v, const char* label, char (*list)[24], int n)
+{
+    char cur[48];
+    lang_choice(v, cur, sizeof cur);
+    const bool same = lang_unset(v, cur);
+    char preview[128];
+    if (same) snprintf(preview, sizeof preview, "Same as the game");
+    else snprintf(preview, sizeof preview, "%s%s", lang_label(cur), n && !lang_has(list, n, cur) ? " (not on this disc)" : "");
+    ImGui::SetNextItemWidth(combo_w());
+    if (ImGui::BeginCombo(label, preview)) {
+        if (ImGui::Selectable("Same as the game", same)) lang_set(v, "same");
+        for (const auto& k : kLang)   /* the table's order, then any name it does not know */
+            if (lang_has(list, n, k.name) && ImGui::Selectable(k.label, !same && !SDL_strcasecmp(cur, k.name)))
+                lang_set(v, k.name);
+        for (int i = 0; i < n; i++) {
+            bool known = false;
+            for (const auto& k : kLang) known = known || !SDL_strcasecmp(k.name, list[i]);
+            if (!known && ImGui::Selectable(list[i], !same && !SDL_strcasecmp(cur, list[i]))) lang_set(v, list[i]);
+        }
+        ImGui::EndCombo();
+    }
+    restart_mark(v, lang_changed(v));
+    env_mark(v, false);
+}
+
+static void language_section(void)
+{
+    section("Language");
+    char b[320];
+    {   /* PS3_LANG */
+        char cur[48];
+        lang_choice(V_LANG, cur, sizeof cur);
+        const bool autom = lang_unset(V_LANG, cur);
+        char autolabel[128];
+        snprintf(autolabel, sizeof autolabel, "Automatic (%s: %s)", kHostOs, s_lang.win);
+        ImGui::SetNextItemWidth(combo_w());
+        if (ImGui::BeginCombo("Game language", autom ? autolabel : lang_code_label(cur))) {
+            if (ImGui::Selectable(autolabel, autom)) lang_set(V_LANG, "auto");
+            for (const auto& k : kLang) {
+                if (s_lang.ntext && !lang_has(s_lang.text, s_lang.ntext, k.name)) continue;   /* not on this disc */
+                if (ImGui::Selectable(k.label, !autom && !SDL_strcasecmp(cur, k.code))) lang_set(V_LANG, k.code);
+            }
+            ImGui::EndCombo();
+        }
+        restart_mark(V_LANG, lang_changed(V_LANG));
+        env_mark(V_LANG, false);
+        if (autom && s_lang.host[0]) {
+            const char* hn = lang_code_name(s_lang.host);
+            const bool missing = hn && s_lang.ntext && !lang_has(s_lang.text, s_lang.ntext, hn);
+            snprintf(b, sizeof b, "The console language the game is told: its menus, subtitles and dub follow it. "
+                     "Automatic follows the %s display language: %s%s.", kHostOs, lang_code_label(s_lang.host),
+                     missing ? " (this disc has no text in it)" : "");
+        } else if (autom)
+            snprintf(b, sizeof b, "The console language the game is told: its menus, subtitles and dub follow it. "
+                     "Automatic follows the %s display language; the game has no %s, so it is told English (US).",
+                     kHostOs, s_lang.win);
+        else
+            snprintf(b, sizeof b, "The console language the game is told: its menus, subtitles and dub follow it, "
+                     "unless Voice or Text below says otherwise.");
+        hint(b);
+    }
+    lang_pick(V_VOICE_LANG, "Voice", s_lang.voice, s_lang.nvoice);
+    if (s_lang.nvoice == 1)
+        snprintf(b, sizeof b, "The dub: dialogue and the movies' voice track. This disc has one dub: %s.", lang_label(s_lang.voice[0]));
+    else
+        snprintf(b, sizeof b, "The dub: dialogue and the movies' voice track. Only the dubs on this disc are listed.");
+    hint(b);
+    lang_pick(V_TEXT_LANG, "Text", s_lang.text, s_lang.ntext);
+    hint("Menus, HUD and subtitles: they change together (the font with the letters comes with the menus).");
+    if (!s_lang.ntext) hint("No language files found on this disc (PS3_GAME\\USRDIR\\cache\\psarc).");
+
+    if (lang_changed(V_LANG) || lang_changed(V_VOICE_LANG) || lang_changed(V_TEXT_LANG)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kOrange);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted("Applies the next time the game starts: the game loads its language once, when it starts.");
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+    {   /* what this session runs with */
+        const int told = ps3_sysutil_language_in_use();
+        char va[24], vg[24], ta[24], tg[24];
+        ps3_lang_in_use(0, va, vg, sizeof va);
+        ps3_lang_in_use(1, ta, tg, sizeof ta);
+        char vs[96] = "", ts[96] = "";   /* a file the game asked for that was swapped */
+        if (vg[0] && strcmp(va, vg)) snprintf(vs, sizeof vs, " instead of %s", lang_label(va));
+        if (tg[0] && strcmp(ta, tg)) snprintf(ts, sizeof ts, " instead of %s", lang_label(ta));
+        snprintf(b, sizeof b, "Now: the game was told %s; voice %s%s; text %s%s.", told >= 0 ? lang_id_label(told) : "-",
+                 vg[0] ? lang_label(vg) : "-", vs, tg[0] ? lang_label(tg) : "-", ts);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(b);
+        ImGui::PopTextWrapPos();
+    }
+}
+
 static void tab_audio(void)
 {
     section("Sound");
@@ -1207,6 +1469,7 @@ static void tab_audio(void)
     }
     env_mark(V_VOLUME);
     hint("What the PC plays; the game's own mix and its volume options are untouched.");
+    language_section();
 }
 
 /* PS3 controls in the table's order, with their labels. */

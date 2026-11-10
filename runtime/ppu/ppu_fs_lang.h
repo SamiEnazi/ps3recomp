@@ -49,7 +49,9 @@
  *    order, then british, latino, brazilian, turkish); the 13 voiced ids in
  *    every movie are exactly 10-18, 26, 28-30. The game asks Bink for its own
  *    language's id, so the two ids are swapped in the header as it is read.
- *    The game's own language is learned from the voice archive it opened.
+ *    The game's own language is learned from the voice archive it opened,
+ *    and the movies follow the dub that archive was answered with (a dub the
+ *    copy has no dialogue for leaves the movies' voice alone too).
  *
  * Each redirect is logged once ("[lang] ..."). Only the cellFs layer of
  * ppu_fs.cpp does this: it is the one inFAMOUS 2 opens its data through.
@@ -334,12 +336,17 @@ static void lang_scan_psarc(FILE* f, const char* hpath, std::vector<LangPatch>& 
                   target, base, others.size());
 }
 
-/* The voice track ids of a .bik: the game's language's and the chosen one's swap. */
+/* The voice track ids of a .bik: the game's language's and the served dub's
+ * swap. The served one, not the chosen one: a dub the copy has no dialogue
+ * archive for (lang_redirect_host kept the game's) keeps the movies' voice
+ * the game's too, so movies and dialogue never speak different languages. */
 static void lang_scan_bik(FILE* f, const char* hpath, std::vector<LangPatch>& out)
 {
-    char game[LANG_NAME_MAX];
-    { std::lock_guard<std::mutex> lk(g_lang.mx); snprintf(game, sizeof game, "%s", g_lang.game_voice); }
-    const int ia = lang_game_index(game), ib = lang_game_index(g_lang.voice);
+    char game[LANG_NAME_MAX], used[LANG_NAME_MAX];
+    { std::lock_guard<std::mutex> lk(g_lang.mx);
+      snprintf(game, sizeof game, "%s", g_lang.game_voice);
+      snprintf(used, sizeof used, "%s", g_lang.used_voice); }
+    const int ia = lang_game_index(game), ib = lang_game_index(used);
     if (ia < 0 || ib < 0 || ia == ib) return;
     uint8_t h[0x2C + 12 * 64];
     if (LANG_FSEEK(f, 0) != 0 || fread(h, 1, 0x2C, f) != 0x2C || memcmp(h, "BIK", 3) || h[3] == 'k') return;
@@ -362,7 +369,7 @@ static void lang_scan_bik(FILE* f, const char* hpath, std::vector<LangPatch>& ou
     char key[160];
     snprintf(key, sizeof key, "bik:%s", base);
     lang_log_once(key, "voice: %s plays its %s track (id %u) for %s (id %u)",
-                  base, g_lang.voice, idb, game, ida);
+                  base, used, idb, game, ida);
 }
 
 /* An fd was opened on hpath: note what its reads must change. */
@@ -408,7 +415,7 @@ static void lang_apply(int fd, uint64_t off, uint8_t* buf, size_t n)
     }
 }
 
-/* ---- for the in-game menu (ps3_overlay.mm) -------------------------------- */
+/* ---- for the in-game menu (ps3_overlay.mm, vk_overlay.cpp) ---------------- */
 
 /* The language the game asked for and the one it was given:
  * kind 0 voice, 1 text. "" until the game opened that archive. */
