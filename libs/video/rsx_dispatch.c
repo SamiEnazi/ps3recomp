@@ -157,19 +157,45 @@ u32 g_rsx_dsp_tex_gen = 1;
  * when it moved (PS3RECOMP_ENG_MISCGEN). Conservative like the texture one. */
 u32 g_rsx_dsp_misc_gen = 1;
 void (*g_rsx_dsp_limit_hook)(int what, u32 n);
-static inline void tex_gen_note(u32 idx, u32 old, u32 arg)
+/* (rsx-par) the counters belong to the instance (rsx->tgen / rsx->mgen): the
+ * walker's own instance (PS3RECOMP_RSX_SPLIT) keeps separate ones, which the
+ * draw engine's thread copies into these two at each draw event. */
+static inline void tex_gen_note(rsx_dispatch* rsx, u32 idx, u32 old, u32 arg)
 {
     if (old != arg) {
         if ((idx - (M_TEX_SIZE1 >> 2)) < 16u || (idx - (M_TEX_OFFSET >> 2)) < RSX_DSP_NUM_TEXTURES * 8u)
-            g_rsx_dsp_tex_gen++;
+            ++*(rsx->tgen ? rsx->tgen : &g_rsx_dsp_tex_gen);
         else if ((idx - (0x0900u >> 2)) < (0x80u >> 2) || idx == (0x1478u >> 2))
-            g_rsx_dsp_misc_gen++;
+            ++*(rsx->mgen ? rsx->mgen : &g_rsx_dsp_misc_gen);
     }
+}
+static inline void dsp_limit(rsx_dispatch* rsx, int what, u32 n)
+{
+    void (*h)(int, u32) = rsx->limit_hook ? rsx->limit_hook : g_rsx_dsp_limit_hook;
+    if (h) h(what, n);
+}
+/* (rsx-par) PS3RECOMP_RSX_SPLIT dirty tracking: block b of the regs/vp/
+ * constants run was (maybe) written. Only for an instance with rsx->dirty. */
+static inline void dsp_dirty(rsx_dispatch* rsx, u32 blk)
+{
+    u64* d = rsx->dirty;
+    d[blk >> 6] |= 1ull << (blk & 63u);
+    d[RSX_DSP_DIRTY_WORDS] |= 1ull << (blk >> 6);
+}
+static void dsp_dirty_range(rsx_dispatch* rsx, u32 blk0, u32 blk1)   /* inclusive */
+{
+    for (u32 b = blk0; b <= blk1 && b < RSX_DSP_BLK_COUNT; b++) dsp_dirty(rsx, b);
+}
+static void dsp_dirty_all(rsx_dispatch* rsx)
+{
+    if (rsx->dirty) dsp_dirty_range(rsx, 0, RSX_DSP_BLK_COUNT - 1u);
 }
 
 void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
 {
     memset(rsx, 0, sizeof(*rsx));
+    rsx->tgen = &g_rsx_dsp_tex_gen;
+    rsx->mgen = &g_rsx_dsp_misc_gen;
     g_rsx_dsp_tex_gen++;
     g_rsx_dsp_misc_gen++;
     if (sink)
@@ -267,8 +293,9 @@ void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)
     if (count > RSX_DSP_NUM_REGS)
         count = RSX_DSP_NUM_REGS;
     memcpy(rsx->regs, regs, count * sizeof(u32));
-    g_rsx_dsp_tex_gen++;
-    g_rsx_dsp_misc_gen++;
+    ++*(rsx->tgen ? rsx->tgen : &g_rsx_dsp_tex_gen);
+    ++*(rsx->mgen ? rsx->mgen : &g_rsx_dsp_misc_gen);
+    dsp_dirty_all(rsx);
 }
 
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -277,6 +304,7 @@ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u3
         count = RSX_DSP_VP_WORDS;
     memcpy(rsx->vp, words, count * sizeof(u32));
     rsx->vp_gen++;
+    dsp_dirty_all(rsx);
 }
 
 void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -286,6 +314,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
         count = max_words;
     memcpy(rsx->constants, words, count * sizeof(u32));
     rsx->const_gen++;   /* (rsx-vtx) */
+    dsp_dirty_all(rsx);
 }
 
 
@@ -331,6 +360,7 @@ static void imm_store(rsx_dispatch* rsx, u32 attr, u32 dword, u32 dwords_per_ver
         u32 b; memcpy(&b, &cur[i], 4);
         rsx->regs[(M_VTX_ATTR_4F + attr * 0x10 + i * 4) >> 2] = b;
     }
+    if (rsx->dirty) dsp_dirty(rsx, (M_VTX_ATTR_4F + attr * 0x10) >> 6);
     if (!rsx->in_begin_end) return;
     rsx->imm_mask |= 1u << attr;
     if (attr != 0) return;
@@ -410,11 +440,11 @@ static void imm_flush_as_inline(rsx_dispatch* rsx)
     for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) if (rsx->imm_mask & (1u << a)) k++;
     const u32 stride = 16u * k;
     u32 n = rsx->imm_n;
-    if (g_rsx_dsp_limit_hook) g_rsx_dsp_limit_hook(2, n + rsx->imm_drop_draw);   /* (rsx5) peak */
-    if (g_rsx_dsp_limit_hook && rsx->imm_drop_draw) g_rsx_dsp_limit_hook(1, n + rsx->imm_drop_draw);
+    dsp_limit(rsx, 2, n + rsx->imm_drop_draw);   /* (rsx5) peak */
+    if (rsx->imm_drop_draw) dsp_limit(rsx, 1, n + rsx->imm_drop_draw);
     if (n * stride > dsp_inline_cap()) {
         n = dsp_inline_cap() / stride;
-        if (g_rsx_dsp_limit_hook) g_rsx_dsp_limit_hook(1, rsx->imm_n);
+        dsp_limit(rsx, 1, rsx->imm_n);
     }
     u32 saved[RSX_DSP_NUM_VERTEX_ATTR];
     for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
@@ -422,6 +452,7 @@ static void imm_flush_as_inline(rsx_dispatch* rsx)
         rsx->regs[(M_VTXFMT >> 2) + a] =
             (rsx->imm_mask & (1u << a)) ? (2u | (4u << 4) | (stride << 8)) : 0u;
     }
+    if (rsx->dirty) dsp_dirty_range(rsx, M_VTXFMT >> 6, (M_VTXFMT + 0x3Cu) >> 6);   /* (rsx-par) */
     u8* o = rsx->inline_data;
     for (u32 i = 0; i < n; i++)
         for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++) {
@@ -437,6 +468,7 @@ static void imm_flush_as_inline(rsx_dispatch* rsx)
         rsx->sink.end(rsx->sink.user, rsx);
     for (u32 a = 0; a < RSX_DSP_NUM_VERTEX_ATTR; a++)
         rsx->regs[(M_VTXFMT >> 2) + a] = saved[a];
+    if (rsx->dirty) dsp_dirty_range(rsx, M_VTXFMT >> 6, (M_VTXFMT + 0x3Cu) >> 6);   /* (rsx-par) */
 }
 
 /* RSX_EMPTY_DRAW_LOG=<flip>: from that flip on, name the methods written
@@ -489,8 +521,9 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         }
     }
     if (!rsx->no_seen) rsx->seen[idx]++;
-    tex_gen_note(idx, rsx->regs[idx], arg);
+    tex_gen_note(rsx, idx, rsx->regs[idx], arg);
     rsx->regs[idx] = arg;
+    if (rsx->dirty) dsp_dirty(rsx, idx >> 4);   /* (rsx-par) */
 
     /* Transform program upload window: word goes to instruction slot
      * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
@@ -502,9 +535,12 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         if (pos < RSX_DSP_VP_WORDS && rsx->vp[pos] != arg) {
             rsx->vp[pos] = arg;
             rsx->vp_gen++;
+            if (rsx->dirty) dsp_dirty(rsx, RSX_DSP_BLK_VP0 + pos / 16u);
         }
-        if (lane == 3)
+        if (lane == 3) {
             (*load)++;
+            if (rsx->dirty) dsp_dirty(rsx, M_VP_UPLOAD_FROM_ID >> 6);
+        }
         return;
     }
 
@@ -517,6 +553,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         if (slot < RSX_DSP_NUM_CONSTANTS) {
             if (rsx->constants[slot][word & 3] != arg) rsx->const_gen++;   /* (rsx-vtx) */
             rsx->constants[slot][word & 3] = arg;
+            if (rsx->dirty) dsp_dirty(rsx, RSX_DSP_BLK_CONST0 + slot / 4u);
         }
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
@@ -608,7 +645,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->inline_len = 0;
             rsx->inline_dropped++;
             rsx->inline_ovf = 1;
-            if (g_rsx_dsp_limit_hook) g_rsx_dsp_limit_hook(0, dsp_inline_cap());
+            dsp_limit(rsx, 0, dsp_inline_cap());
         }
         break;
 
@@ -688,7 +725,15 @@ static __attribute__((noinline)) void burst_const_run(rsx_dispatch* rsx, u32 m, 
             rsx->constants[slot][word & 3] = arg;
         }
     }
-    if (chg) rsx->const_gen++;
+    if (chg) rsx->const_gen++;   /* (rsx-vtx) */
+    /* (rsx-par) the slots written (the window's own registers are not followed:
+     * nothing outside the dispatcher reads them) */
+    if (rsx->dirty && n) {
+        const u32 s0 = base + (w0 >> 2), s1 = base + ((w0 + n - 1u) >> 2);
+        if (s0 < RSX_DSP_NUM_CONSTANTS)
+            dsp_dirty_range(rsx, RSX_DSP_BLK_CONST0 + s0 / 4u,
+                            RSX_DSP_BLK_CONST0 + (s1 < RSX_DSP_NUM_CONSTANTS ? s1 : RSX_DSP_NUM_CONSTANTS - 1u) / 4u);
+    }
 }
 /* A run of words in the transform-program upload window. */
 static __attribute__((noinline)) void burst_inst_run(rsx_dispatch* rsx, u32 m, const u32* be_words, u32 n)
@@ -696,6 +741,14 @@ static __attribute__((noinline)) void burst_inst_run(rsx_dispatch* rsx, u32 m, c
     const u32 idx0 = m >> 2;
     u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
     const int cs = !rsx->no_seen;
+    /* (rsx-par) the program words these n words land on: consecutive from here */
+    if (rsx->dirty && n) {
+        const u32 p0 = *load * 4u + (((m - M_VP_UPLOAD_INST) >> 2) & 3u);
+        if (p0 < RSX_DSP_VP_WORDS)
+            dsp_dirty_range(rsx, RSX_DSP_BLK_VP0 + p0 / 16u,
+                            RSX_DSP_BLK_VP0 + (p0 + n - 1u < RSX_DSP_VP_WORDS ? p0 + n - 1u : RSX_DSP_VP_WORDS - 1u) / 16u);
+        dsp_dirty(rsx, M_VP_UPLOAD_FROM_ID >> 6);
+    }
     for (u32 k = 0; k < n; k++) {
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[k], __ATOMIC_RELAXED));
         if (cs) rsx->seen[idx0 + k]++;
@@ -742,13 +795,18 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
         if (s_burst_lean > 0 && (hi < M_VP_UPLOAD_CONST || method >= M_VP_UPLOAD_CONST + 32u * 4u) &&
             (hi < M_VP_UPLOAD_INST || method >= M_VP_UPLOAD_INST + 32u * 4u)) {
             /* scalar on purpose: a vectorised loop would make every call save XMM registers (rsx3) */
+            /* (rsx-par) dirty tracking: the header's register range, before
+             * (stores ahead of an event a cold word fires) and after (stores
+             * behind it) */
+            if (rsx->dirty) dsp_dirty_range(rsx, method >> 6, hi >> 6);
 #pragma clang loop vectorize(disable) interleave(disable)
             for (; i < count; i++) {
                 const u32 m = incr ? method + i * 4u : method;
                 const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
-                if (s_plain[m >> 2]) { if (cs) rsx->seen[m >> 2]++; tex_gen_note(m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
+                if (s_plain[m >> 2]) { if (cs) rsx->seen[m >> 2]++; tex_gen_note(rsx, m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
                 else dispatch_method_cold(rsx, m, arg);
             }
+            if (rsx->dirty) dsp_dirty_range(rsx, method >> 6, hi >> 6);
             return;
         }
     }
@@ -769,7 +827,12 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
             continue;
         }
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
-        if (s_plain[m >> 2]) { if (cs) rsx->seen[m >> 2]++; tex_gen_note(m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
+        if (s_plain[m >> 2]) {
+            if (cs) rsx->seen[m >> 2]++;
+            tex_gen_note(rsx, m >> 2, rsx->regs[m >> 2], arg);
+            rsx->regs[m >> 2] = arg;
+            if (rsx->dirty) dsp_dirty(rsx, m >> 6);   /* (rsx-par) */
+        }
         else dispatch_method_cold(rsx, m, arg);
         i++;
     }

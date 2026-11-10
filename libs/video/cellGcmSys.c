@@ -22,6 +22,7 @@
 #include "../../include/ps3emu/ps3_toggles.h" /* GCM_STALL_GAP_MS, live */
 #include "gcm_fifo_decode.h"                   /* JUMP forms */
 #include "../../runtime/platform/host_place.h" /* PS3_CPU_PLACE: the draining thread's cores */
+#include "rsx_split.h"                         /* (rsx-par) PS3RECOMP_RSX_SPLIT */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -1852,6 +1853,7 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
         if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
+    __atomic_thread_fence(__ATOMIC_RELEASE);   /* (rsx-par) the value before the tail a poller reads (a compiler fence on x86) */
     s_ref_qtail = t + 1;
     { const u32 d = s_ref_qtail - s_ref_qhead;   /* (rsx5) PS3RECOMP_LIMITS */
       if (d > g_rsx_lim[RSX_LIM_GCM_REFQ].peak) { rsx_lim_cap(RSX_LIM_GCM_REFQ, GCM_REF_QLEN); rsx_lim_use(RSX_LIM_GCM_REFQ, d); } }
@@ -2103,6 +2105,7 @@ void cellGcm_rsx_process_fifo(void)
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     s_ha_drain_t0 = ps3_ft_now();
     gcm_rsx_process_fifo_unlocked();
+    if (g_rsx_drain_end_hook) g_rsx_drain_end_hook();   /* (rsx-par) PS3RECOMP_VK_BT: the recording worker idle */
     s_ha_drain_ns += ps3_ft_now() - s_ha_drain_t0;   /* (the present inside may have taken a part) */
     s_ha_drain_t0 = 0;
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
@@ -2132,6 +2135,79 @@ void cellGcm_rsx_process_fifo(void)
  * every such wait; it can poll faster while this holds. */
 int cellGcm_drain_sema_blocked(void) { return s_sema_live; }
 
+/* The walker's NV406E/NV4097 state machine (rsx_commands.c: SET_REFERENCE,
+ * the back-end semaphore labels). File scope since (rsx-par) the split exec
+ * thread runs those methods too (gcm_split_run). */
+static rsx_state s_state;
+static int  s_inited = 0;
+
+/* (rsx-par) PS3RECOMP_RSX_SPLIT: what the per-word walk does with a word
+ * besides handing it to the draw engine, run on the exec thread in FIFO order
+ * (the engine's own dispatch of the word ran on the walker, ahead of it in
+ * the queue -- the order the per-word walk has). Lean state only: the split
+ * runs only when the walker's fast conditions hold (gcm_lean_state() among
+ * them, no FIFO diagnostic, no live renderer). */
+static void gcm_word_effects(u32 subch, u32 m, u32 dw, u32 getoff)
+{
+    if (subch == 7 && m == 0x0B00u) {
+        extern void rsx_raise_user_cmd(u32 arg);
+        rsx_raise_user_cmd(dw);
+        return;
+    }
+    extern u32 g_rsx_last_reference;
+    const u32 mfull = (subch << 13) | m;
+    if (mfull == 0xEB00u || mfull == 0xEB04u) {
+        cellGcmQueueUserCommand(dw);
+    } else if (mfull == 0xE920u || mfull == 0xE924u) {
+        cellGcmSetFlipCommand(dw & 7u);
+    } else if (subch == 0 || (subch == 1 && !gcm_subch1_2d())) {
+        if (!gcm_lean_state() || m == 0x0050u || (m >= 0x1D6Cu && m <= 0x1D74u))
+            rsx_process_method(&s_state, m, dw);
+        if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, getoff);
+        if (m == 0x1800) {
+            const u32 v = dw, idx = (v & 0xFFFFFFu) / 16u;
+            { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
+            if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+                s_report_data[idx].timestamp = get_timestamp_ns();
+                s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
+            }
+        }
+    } else
+        gcm_2d_method(subch, m, dw);
+}
+/* (rsx-par) does the per-word walk do anything with this word besides the
+ * engine's dispatch (gcm_word_effects, under lean state)? */
+static int gcm_word_needs_act(u32 subch, u32 m, int s1_2d)
+{
+    const u32 mfull = (subch << 13) | m;
+    if (mfull == 0xEB00u || mfull == 0xEB04u || mfull == 0xE920u || mfull == 0xE924u) return 1;
+    if (subch == 0 || (subch == 1 && !s1_2d))
+        return m == 0x0050u || (m >= 0x1D6Cu && m <= 0x1D74u) || m == 0x1800u;
+    return 1;                                   /* the 2D / memory-copy subchannels */
+}
+/* (rsx-par) a FIFO flip word's bookkeeping (the walker keeps the stop and the
+ * diagnostics) */
+static void gcm_flip_word_effects(u32 w)
+{
+    extern s32 cellGcmSetFlipCommand(u32 bufferId);
+    if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
+        s_current_display_buffer_id = w & 7u;
+        s_flip_pending = 1;
+        s_flip_request_count++;
+    } else {
+        cellGcmSetFlipCommand(w & 0xFFu);
+    }
+}
+void gcm_split_run(u32 kind, u32 a, u32 b, u32 c)
+{
+    switch (kind) {
+    case RSX_SPLIT_ACT_WORD: gcm_word_effects(a >> 13, a & 0x1FFCu, b, c); break;
+    case RSX_SPLIT_ACT_SEMA: vm_write32(a, b); break;
+    case RSX_SPLIT_ACT_FLIP: gcm_flip_word_effects(a); break;
+    default: break;
+    }
+}
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     s_sema_live = 0;
@@ -2148,8 +2224,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
               _n = 0; _t0 = now;
           }
       } }
-    static rsx_state s_state;
-    static int  s_inited = 0;
     extern u32 g_rsx_last_reference;
 
     /* A statically-linked libgcm (PS3 firmware modules -- ps1_netemu) never calls
@@ -2269,11 +2343,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
     const int fast = fast_sw && !fast_tc && fast_burst && !gcm_fifo_dbg() && vm_inline_ok &&
                      !fast_live && fast_eng && gcm_lean_state();
     const int fast_s1 = !gcm_subch1_2d();
+    /* (rsx-par) PS3RECOMP_RSX_SPLIT (default 1): the draw engine on its own
+     * thread (rsx_split.c), this one walks and dispatches. Only when the fast
+     * loop's conditions hold (lean state, no FIFO diagnostic, no live
+     * renderer); otherwise the old path, with the state handed back first. */
+    int split = 0;
+    if (fast) split = rsx_split_drain_begin();
+    else rsx_split_release();
     int budget = 0x100000;                    /* words per tick cap */
     /* GCM_DRAINDBG also reports WHY each pass stopped. A drain that ends far
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
+walk_more:
     while (s_fifo_getoff != put && budget-- > 0) {
         if (fast && !s_park_off) {
             u32 g = s_fifo_getoff;
@@ -2301,9 +2383,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     s_tr_off[s_tr_i % GCM_TRACE_N] = g;
                     s_tr_w[s_tr_i % GCM_TRACE_N] = w;
                     s_tr_i++;
-                    if (count)
-                        rsx_draw_engine_burst((subch << 13) | method, type == 0,
-                                              (const u32*)(hb + ((g + 4u) & 0xFFFFFu)), count);
+                    if (count) {
+                        const u32* dws = (const u32*)(hb + ((g + 4u) & 0xFFFFFu));
+                        if (split) rsx_split_burst((subch << 13) | method, type == 0, dws, count);
+                        else       rsx_draw_engine_burst((subch << 13) | method, type == 0, dws, count);
+                    }
                     s_frame_bytes += 4 + count * 4; s_walk_bytes += 4 + count * 4;
                     g += 4 + count * 4;
                     s_fifo_getoff = g;
@@ -2386,7 +2470,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
             if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                                ps3_ft_span(PS3_FT_FLIP_FIFO, 0, w & 7u, 0, t, t); }
             const int unshown = s_flip_pending;   /* the flip before is still not on screen */
-            if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
+            if (split) {
+                rsx_split_act(RSX_SPLIT_ACT_FLIP, w, 0, 0);   /* (rsx-par) behind the frame's draws */
+            } else if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
                 s_current_display_buffer_id = w & 7u;
@@ -2522,6 +2608,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
+                    /* (rsx-par) an acquire reads the label only once every queued
+                     * action that may write one (the release it may wait for) ran */
+                    if (split && m == 0x68u) rsx_split_wait_labels();
                     /* GCM_SEMA_TRACE=<n>: the first n NV406E semaphore methods with
                      * the label's current value, to read a title's RSX<->SPU/PPU
                      * sync protocol (GCM_RECDBG alone shows 12). */
@@ -2542,7 +2631,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         s_ha_sema_t0 = 0;
                     }
                     if (m == 0x64u)      s_sema_offset = v;
-                    else if (m == 0x6Cu) vm_write32(la, v);
+                    else if (m == 0x6Cu) {
+                        if (split) rsx_split_act(RSX_SPLIT_ACT_SEMA, la, v, 0);   /* (rsx-par) behind the draws before it */
+                        else vm_write32(la, v);
+                    }
                     else if (m == 0x68u && vm_read32(la) != v) {
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
              * the hardware does. Off by default: a title whose label nothing
@@ -2596,8 +2688,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 const u32 ea0 = gcm_io2ea(io0);
                 if (ea0 && (io0 >> 20) == (io1 >> 20)) {
                     extern u8* vm_base;
-                    rsx_draw_engine_burst((subch << 13) | method, type == 0,
-                                          (const u32*)(vm_base + ea0), count);
+                    if (split) rsx_split_burst((subch << 13) | method, type == 0, (const u32*)(vm_base + ea0), count);
+                    else rsx_draw_engine_burst((subch << 13) | method, type == 0,
+                                               (const u32*)(vm_base + ea0), count);
                     s_frame_bytes += 4 + count * 4; s_walk_bytes += 4 + count * 4;
                     s_fifo_getoff += 4 + count * 4;
                     continue;
@@ -2623,7 +2716,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                               m, dw); }
                 if (subch == 7 && m == 0x0B00u) {
                     extern void rsx_raise_user_cmd(u32 arg);
-                    rsx_raise_user_cmd(dw);
+                    if (split) rsx_split_act(RSX_SPLIT_ACT_WORD, (subch << 13) | m, dw, s_fifo_getoff);
+                    else rsx_raise_user_cmd(dw);
                     continue;
                 }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
@@ -2697,7 +2791,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * same reason the live engine does, and masks them itself. */
                 { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, dw); }
+                  if (eng) {
+                      if (split) rsx_split_method((subch << 13) | m, dw);
+                      else rsx_draw_engine_method((subch << 13) | m, dw);
+                  } }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -2720,7 +2817,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * truncates them.  Reconstruct the full address the same way
                  * the draw-engine call above does. */
                 { const u32 mfull = (subch << 13) | m;
-                if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                if (split) {
+                    /* (rsx-par) the rest on the exec thread, behind the draws before it */
+                    if (gcm_word_needs_act(subch, m, s1_2d))
+                        rsx_split_act(RSX_SPLIT_ACT_WORD, mfull, dw, s_fifo_getoff);
+                } else if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     cellGcmQueueUserCommand(dw);
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(dw & 7u);
@@ -2761,6 +2862,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
         { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
+    }
+    /* (rsx-par) split: caught up -- if the title has moved put meanwhile, walk
+     * on while the exec thread works (up to ~4 ms of drain), instead of
+     * stopping here to wait for it and starting the next drain cold. Then
+     * everything queued runs before anything below (GET, the fence
+     * publication, the ring recycle) and before the caller presents. */
+    if (split) {
+        if (s_fifo_getoff == put && budget > 0 && !strcmp(why, "caught-up") &&
+            ps3_ms_now() - s_drain_in_ms < 4) {
+            const u32 np = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+            atomic_thread_fence(memory_order_acquire);
+            if (np != put) { put = np; goto walk_more; }
+        }
+        rsx_split_sync();
     }
 
     /* Walker watchdog. Everything above recovers from a *recognised* stall --
