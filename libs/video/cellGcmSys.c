@@ -851,6 +851,7 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
 static u32 s_sema_wait_val;            /* the value the blocked acquire waits for */
 static u32 s_kw_put;                   /* `put` as the last drain pass read it */
 static int s_kw_more;                  /* the last pass stopped at a flip with words left before put */
+static u32 s_kw_park_word;             /* the self-JUMP word the last pass stopped on (s_park_off) */
 
 /* RSX_SNAP_AT=<sec>, RSX_SNAP_RANGES=<ea>:<len>[,<ea>:<len>...], RSX_SNAP_DIR=<dir>:
  * photograph guest memory at two points of one frame, once, after <sec> s.
@@ -1942,6 +1943,12 @@ static int gcm_kw_ready(void)
     if (s_kw_more || s_flip_pending) return 1;
     if (vm_read32(GCM_CONTROL_GUEST_ADDR + 0) != s_kw_put) return 1;
     if (s_sema_live && vm_read32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu)) == s_sema_wait_val) return 1;
+    /* parked on a self-JUMP: inFAMOUS 2 moves put first and patches the park
+     * second, so a patch does not move put */
+    if (s_park_off && s_park_off == s_fifo_getoff) {
+        const u32 ea = gcm_io2ea(s_fifo_getoff);
+        if (ea && vm_read32(ea) != s_kw_park_word) return 1;
+    }
     return 0;
 }
 
@@ -2621,6 +2628,7 @@ walk_more:
                   }
                   why = "parked";
                   s_park_pass = 1;
+                  s_kw_park_word = w;   /* (critic) PS3RECOMP_GCM_SPIN_US: ends when the park is patched */
                   break;
               }
               s_fifo_getoff = tgt; }
