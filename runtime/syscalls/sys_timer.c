@@ -290,6 +290,46 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
+    /* PS3_USLEEP_EARLY_US=<m> (default 250; 0 = the two timer paths below as they
+     * were): a sleep of PS3_USLEEP_TIMER_US (500) us or more waits on the thread's
+     * high-resolution timer for all but the last m us and spins (PAUSE, no yield)
+     * to the exact deadline. Both old timer paths fire on the host's timer ticks
+     * (~0.5 ms for the high-resolution timer, the 1 ms timeBeginPeriod tick for
+     * the plain one) at or AFTER the due time, so a guest usleep(500) took
+     * 500-1000 us and usleep(900) 1000-1500 (fight trace spu3-p4: 900 -> p50
+     * 1034, p90 1340 us). The SPU task kickers pace their stages with exactly
+     * those sleeps -- the light-task kicker sleeps 900+100+100+500 us per frame,
+     * the Edge geometry kicker 500 us per stage -- and the main thread waits
+     * for the light kicker's last stage (func_00350CE0: 6.8% of the main
+     * thread in the m1 fight profile, with the SPUs 44% idle meanwhile), so
+     * every late tick there was main-thread wait the console does not have.
+     * Waking m us early and spinning the rest makes the sleep end on time
+     * whenever the tick lands within m us; the cost is up to m us of spin per
+     * sleep (the kickers make a few hundred such sleeps a second). */
+    { static int s_early = -1;
+      if (s_early < 0) { const char* e = getenv("PS3_USLEEP_EARLY_US"); int v = e ? atoi(e) : 250;
+                         s_early = v < 0 ? 0 : (v > 100000 ? 100000 : v); }
+      static int s_tus2 = -1;
+      if (s_tus2 < 0) { const char* e = getenv("PS3_USLEEP_TIMER_US"); s_tus2 = e ? atoi(e) : 500; if (s_tus2 < 0) s_tus2 = 0; }
+      if (s_early > 0 && s_tus2 > 0 && usec >= (uint64_t)s_tus2) {
+          ensure_qpc_init();
+          LARGE_INTEGER t0, now;
+          QueryPerformanceCounter(&t0);
+          const int64_t deadline = t0.QuadPart + (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+          static __declspec(thread) HANDLE t_et;
+          if (!t_et) t_et = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+          if (usec > (uint64_t)s_early) {
+              LARGE_INTEGER due; due.QuadPart = -((LONGLONG)(usec - (uint64_t)s_early) * 10);
+              if (t_et && SetWaitableTimer(t_et, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(t_et, INFINITE);
+              else Sleep((DWORD)((usec - (uint64_t)s_early) / 1000));
+          }
+          for (;;) {
+              QueryPerformanceCounter(&now);
+              if (now.QuadPart >= deadline) break;
+              for (int k = 0; k < 16; k++) YieldProcessor();
+          }
+          return CELL_OK;
+      } }
     /* Use high-resolution sleep via waitable timer for better precision */
     if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
