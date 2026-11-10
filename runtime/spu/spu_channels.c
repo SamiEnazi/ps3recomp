@@ -850,6 +850,21 @@ static uint64_t ll_mask_for(spu_context* ctx, uint32_t ea)
     return spu_lockline_mask_ea(ea);
 }
 
+/* PS3_SPU_PUTLLC_PRECHECK (see the PUTLLC case below): -1 until first read. */
+static int s_putllc_precheck = -1;
+static __attribute__((noinline, cold)) int spu_putllc_precheck_init(void)
+{
+    const char* e = getenv("PS3_SPU_PUTLLC_PRECHECK");
+    const int on = !(e && e[0] == '0') && !getenv("SPU_PUTLLC_WHY") && !getenv("SPU_ATOM_EA");
+    __atomic_store_n(&s_putllc_precheck, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int spu_putllc_precheck_on(void)
+{
+    const int v = __atomic_load_n(&s_putllc_precheck, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : spu_putllc_precheck_init();
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
 {
@@ -1170,7 +1185,26 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
         __atomic_fetch_add(&g_spu_putllc_count, 1u, __ATOMIC_RELAXED);   /* read by the PM flow trace */
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
-          if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
+          if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++;
+          /* PS3_SPU_PUTLLC_PRECHECK (default 1): a PUTLLC that can only fail
+           * fails without the stripe. Failure is final once it is visible --
+           * a broken reservation is never restored (only this SPU's next
+           * GETLLAR makes a new one), and every write to a reserved line by
+           * another agent breaks it, so a line that already differs from the
+           * snapshot stays a failure whatever the lock would see later -- the
+           * same verdict the locked compare below gives, ordered just after
+           * the write that caused it. In a wake storm most PUTLLCs on the
+           * SPURS control line lose; they no longer queue on the stripe the
+           * winner and the main thread's next store need. A torn read can
+           * only report a difference while a writer is in, and that writer
+           * breaks the reservation. Off with SPU_PUTLLC_WHY / SPU_ATOM_EA /
+           * the sync-line watch, which count or log every attempt. */
+          if (!b && spu_putllc_precheck_on() &&
+              (!RESV_VALID(ctx) || RESV_EA(ctx) != ea || !gm_equal(mem, ctx->resv_line, MFC_ATOMIC_LINE))) {
+              ctx->atomic_stat = 1;                  /* PUTLLC_FAILURE -> retry */
+              RESV_DROP(ctx);                        /* reservation consumed */
+              return 1;
+          } }
         llm = ll_mask_for(ctx, ea);
         spu_lockline_lock_mask(llm);
         if (RESV_VALID(ctx) && RESV_EA(ctx) == ea &&
@@ -1583,6 +1617,20 @@ void spu_ch_wake(spu_context* ctx)
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
 }
 
+/* spu_ch_wake without the lost-wake window: a waiter tests its predicate and
+ * goes to sleep inside ch_wait_lock (spu_ch_wait), so once the waker has been
+ * through that lock the waiter is either still before its test (and sees the
+ * event) or already on the condition variable (and gets the wake). A plain
+ * spu_ch_wake that lands between the two is lost until the 10 ms re-poll.
+ * Callers hold no lock-line stripe (see spu_context.h). */
+void spu_ch_wake_sync(spu_context* ctx)
+{
+    if (!ctx) return;
+    AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    spu_ch_wake(ctx);
+}
+
 /* PS3_FTRACE: when this SPU thread last left a blocking wait. The time between
  * two waits is a busy span, tagged with the lifted image and the SPURS workload
  * id the kernel keeps at LS 0x1DC (SpursKernelContext.wklCurrentId) when it
@@ -1603,38 +1651,147 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
     t_ft_busy0 = t1;
 }
 
-/* PS3_SPU_SPIN_US=<n> (default 0 = off): before an SPU thread sleeps on a
+/* PS3_SPU_SPIN_US=<n> (default 30; 0 = off): before an SPU thread sleeps on a
  * channel, poll it for up to n microseconds. In combat each SPU thread blocks
- * ~2000 times a second and most waits are short, so the job that ends one
+ * ~3000 times a second and most waits are short (fight trace spu3-p4, 5 SPURS
+ * SPUs: idle gap p25 14 us, p50 25 us, p75 67 us), so the job that ends one
  * arrives while the thread is still going to sleep -- and then waits for the OS
- * wake-up (an IPI, a context switch, a C-state exit) before it starts. The
- * polls are the same readiness test the sleep loop makes; when the time runs
- * out the thread sleeps exactly as before, so no wake-up can be lost. */
+ * wake-up (an IPI, a context switch, a C-state exit: p50 5 us, p99 15 us)
+ * before it starts, and its producer pays a wake syscall. The polls are the
+ * same readiness test the sleep loop makes; when the time runs out the thread
+ * sleeps exactly as before, so no wake-up can be lost. (Tried at 40 us in the
+ * city, 2026-11-08: no gain there -- the city view is RSX-bound -- and no
+ * hangs in 15 boots; fights are bound by the main thread's SPU-job waits.)
+ *
+ * PS3_SPU_SPIN_LEAN (default 1; 0 = the full test every turn): a spinning turn
+ * reads only this context's own event / channel words. The full test --
+ * spu_resv_lost_poll, a seqlock read and 128-byte compare of the reserved
+ * guest line -- runs every 64th turn and once more before the sleep: five
+ * spinning SPURS kernels comparing the control line every few hundred
+ * nanoseconds kept that line, which the main thread's job kick and every
+ * PUTLLC write, bouncing between their cores. A notified write raises the
+ * event bit before any wake (spu_coherency.c), so the bit is what the spin
+ * waits for; the poll is the fallback for a write that bypassed the notify.
+ *
+ * PS3_SPU_SPIN_ADAPT=<pct> (default 25; 0 = always spin): each SPU thread keeps
+ * a running estimate of how often its waits end inside the window (measured on
+ * every blocking wait, spun or not) and spins only while that is at least
+ * <pct> percent -- an SPU that mostly sits idle (the sixth, non-SPURS SPU; menus;
+ * a paused game) stops spending its window on waits that outlast it.
+ *
+ * PS3_SPU_SPIN_CORES=all|p|e (default all): spin only while the thread is on a
+ * performance core (p) or an efficiency core (e) of a hybrid CPU; elsewhere it
+ * sleeps at once as with the spin off. Left to the OS the SPURS workers run
+ * ~40% of their time on the E-cores (host_place.h). A spin on a P-core holds a
+ * hyperthread whose sibling may be the main or RSX thread; on an E-core it
+ * holds a core nobody shares. A CPU with one efficiency class spins everywhere. */
 static int s_spin_us = -1;
+static int s_spin_lean = 1;
+static int s_spin_adapt = 256;               /* threshold, of 1024 */
+static long long s_spin_qpc;                 /* the window in QPC ticks */
+static LARGE_INTEGER s_spin_qpf;
+static int s_spin_cores;                     /* 0 all, 1 P-cores only, 2 E-cores only */
+static uint64_t s_spin_cpu_ok;               /* group-0 logical processors the spin may use */
+static void spu_spin_cores_init(void)
+{
+    const char* c = getenv("PS3_SPU_SPIN_CORES");
+    s_spin_cores = !c ? 0 : (c[0] == 'p' || c[0] == 'P') ? 1 : (c[0] == 'e' || c[0] == 'E') ? 2 : 0;
+    s_spin_cpu_ok = ~0ull;
+    if (!s_spin_cores) return;
+    ULONG len = 0;
+    GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
+    unsigned char* buf = (unsigned char*)malloc(len ? len : 1);
+    if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) {
+        free(buf); s_spin_cores = 0; return;
+    }
+    BYTE emax = 0, emin = 255;
+    for (ULONG off = 0; off < len;) {
+        PSYSTEM_CPU_SET_INFORMATION q = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (q->Type == CpuSetInformation && q->CpuSet.Group == 0) {
+            if (q->CpuSet.EfficiencyClass > emax) emax = q->CpuSet.EfficiencyClass;
+            if (q->CpuSet.EfficiencyClass < emin) emin = q->CpuSet.EfficiencyClass;
+        }
+        off += q->Size ? q->Size : len;
+    }
+    uint64_t ok = 0;
+    for (ULONG off = 0; off < len;) {
+        PSYSTEM_CPU_SET_INFORMATION q = (PSYSTEM_CPU_SET_INFORMATION)(buf + off);
+        if (q->Type == CpuSetInformation && q->CpuSet.Group == 0 && q->CpuSet.LogicalProcessorIndex < 64) {
+            const int perf = q->CpuSet.EfficiencyClass == emax;
+            if (emax == emin || (s_spin_cores == 1 ? perf : !perf)) ok |= 1ull << q->CpuSet.LogicalProcessorIndex;
+        }
+        off += q->Size ? q->Size : len;
+    }
+    free(buf);
+    s_spin_cpu_ok = ok;
+    fprintf(stderr, "[spu-spin] PS3_SPU_SPIN_CORES=%s: logical processors %016llX\n", c, (unsigned long long)ok);
+}
+static inline int spu_spin_core_ok(void)
+{
+    if (!s_spin_cores) return 1;
+    PROCESSOR_NUMBER pn;
+    GetCurrentProcessorNumberEx(&pn);
+    return pn.Group != 0 || pn.Number >= 64 || ((s_spin_cpu_ok >> pn.Number) & 1u);
+}
 static __attribute__((noinline, cold)) int spu_spin_us_init(void)
 {
     const char* e = getenv("PS3_SPU_SPIN_US");
-    int v = e ? atoi(e) : 0;
+    int v = e ? atoi(e) : 30;
     if (v < 0) v = 0;
     if (v > 1000) v = 1000;
-    __atomic_store_n(&s_spin_us, v, __ATOMIC_RELAXED);
+    const char* l = getenv("PS3_SPU_SPIN_LEAN");
+    s_spin_lean = !(l && l[0] == '0');
+    const char* a = getenv("PS3_SPU_SPIN_ADAPT");
+    int pct = a ? atoi(a) : 25;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    s_spin_adapt = pct * 1024 / 100;
+    QueryPerformanceFrequency(&s_spin_qpf);
+    s_spin_qpc = s_spin_qpf.QuadPart * v / 1000000;
+    if (v) spu_spin_cores_init();
+    __atomic_store_n(&s_spin_us, v, __ATOMIC_RELEASE);
     return v;
 }
+static inline int spu_spin_us(void)
+{
+    const int us = __atomic_load_n(&s_spin_us, __ATOMIC_ACQUIRE);
+    return __builtin_expect(us >= 0, 1) ? us : spu_spin_us_init();
+}
+/* PS3_SPU_SPIN_ADAPT state of this SPU thread: the share (of 1024) of recent
+ * blocking waits that ended within the spin window; starts optimistic. */
+static SPU_THREAD_LOCAL int t_spin_p = 1024;
+static inline void spu_spin_note(int hit)
+{
+    t_spin_p += ((hit ? 1024 : 0) - t_spin_p) / 8;
+}
 static int spu_ch_ready(spu_context* ctx, uint32_t channel);
+/* spu_ch_ready without the reservation poll: this context's own words only. */
+static inline int spu_ch_ready_lean(spu_context* ctx, uint32_t channel)
+{
+    switch (channel) {
+    case SPU_RdInMbox:      return ctx->rcv_evt_n != 0 || spu_channel_count(&ctx->ch_in_mbox) != 0;
+    case SPU_RdSigNotify1:  return spu_channel_count(&ctx->ch_sig_notify[0]) != 0;
+    case SPU_RdSigNotify2:  return spu_channel_count(&ctx->ch_sig_notify[1]) != 0;
+    case SPU_RdEventStat:   return (spu_ev_get(ctx) & ctx->event_mask) != 0;
+    default:                return 1;
+    }
+}
 /* 1 = the channel became ready (or a stop was requested) while polling. */
 static int spu_ch_spin(spu_context* ctx, uint32_t channel)
 {
-    int us = __atomic_load_n(&s_spin_us, __ATOMIC_RELAXED);
-    if (__builtin_expect(us < 0, 0)) us = spu_spin_us_init();
+    const int us = spu_spin_us();
     if (!us) return 0;
-    static LARGE_INTEGER s_qpf;
-    if (!s_qpf.QuadPart) QueryPerformanceFrequency(&s_qpf);
+    if (s_spin_adapt && t_spin_p < s_spin_adapt) return 0;   /* PS3_SPU_SPIN_ADAPT */
+    if (!spu_spin_core_ok()) return 0;                        /* PS3_SPU_SPIN_CORES */
     LARGE_INTEGER t0, t;
     QueryPerformanceCounter(&t0);
-    const long long end = t0.QuadPart + s_qpf.QuadPart * us / 1000000;
+    const long long end = t0.QuadPart + s_spin_qpc;
+    unsigned turn = 0;
     do {
         for (int k = 0; k < 8; k++) _mm_pause();
-        if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED) || spu_ch_ready(ctx, channel)) return 1;
+        if (__atomic_load_n(&ctx->stop_request, __ATOMIC_RELAXED)) return 1;
+        if ((s_spin_lean && (++turn & 63u)) ? spu_ch_ready_lean(ctx, channel) : spu_ch_ready(ctx, channel))
+            return 1;
         QueryPerformanceCounter(&t);
     } while (t.QuadPart < end);
     return 0;
@@ -1662,6 +1819,9 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
     ctx->status = SPU_STATUS_WAITING_CHANNEL;
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
     unsigned ft_sleeps = 0, ft_timeouts = 0;
+    /* PS3_SPU_SPIN_ADAPT: how long this wait lasted, spun or slept */
+    LARGE_INTEGER sp_t0; sp_t0.QuadPart = 0;
+    if (spu_spin_us() && s_spin_adapt) QueryPerformanceCounter(&sp_t0);
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
         int spun = 0;
@@ -1672,6 +1832,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                  * interpreter sees the request at its next step. */
                 yz_lockstep_block_end(ctx);
                 if (ft_t0) spu_ft_wait_span(ctx, channel, ft_t0);
+                __atomic_store_n(&ctx->coh_parked, 0, __ATOMIC_RELEASE);
                 ctx->status = SPU_STATUS_STOPPED_BY_HALT;
                 spu_halt(ctx);
                 return;
@@ -1679,6 +1840,13 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             /* PS3_SPU_SPIN_US: poll before the first sleep; a hit re-tests
              * the loop condition (and the stop request) above. */
             if (!spun) { spun = 1; if (spu_ch_spin(ctx, channel)) continue; }
+            /* PS3_SPU_WAKE_DEFER: from here on a queued coherence wake must
+             * reach the OS (spu_coherency.c reads this after its event raise;
+             * the test below reads the event after this store). */
+            if (!ctx->coh_parked) {
+                __atomic_store_n(&ctx->coh_parked, 1, __ATOMIC_SEQ_CST);
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* before the event test below */
+            }
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             if (!spu_ch_ready(ctx, channel)) {
                 ft_sleeps++;
@@ -1698,7 +1866,12 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             }
         }
     }
+    if (ctx->coh_parked) __atomic_store_n(&ctx->coh_parked, 0, __ATOMIC_RELEASE);
     yz_lockstep_block_end(ctx);            /* rejoin the rotation, reacquire the token */
+    if (sp_t0.QuadPart) {
+        LARGE_INTEGER sp_t1; QueryPerformanceCounter(&sp_t1);
+        spu_spin_note(sp_t1.QuadPart - sp_t0.QuadPart <= s_spin_qpc);
+    }
     if (ft_t0) {
         /* PS3_FT_SPU_WAKE: producer wake -> this thread running again (the OS
          * wake-up latency); b = 0: no producer woke it (a 10 ms re-poll did) */
@@ -2795,6 +2968,27 @@ static int spu_slot_dead(const spu_context* ctx, unsigned slot)
     return 0;
 }
 
+/* PS3_SPU_OVL_HEAD (default 1; 0 = the full compare only): a fixed-address
+ * lift is tried against every GET whose LS range it covers -- the two raw-SPU
+ * images (LS 0x80..0x18570 and 0x3000..0xC350) cover most of local store, so
+ * every job's input GET on every SPURS SPU came here -- and gm_equal copied
+ * the first 256 bytes of the overlap before its first compare, to fail on the
+ * first word. The head of the overlap is compared first; only a GET whose
+ * head matches gets the full compare, so the verdict is the full compare's. */
+static int s_ovl_head = -1;
+static __attribute__((noinline, cold)) int ovl_head_init(void)
+{
+    const char* e = getenv("PS3_SPU_OVL_HEAD");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_ovl_head, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int ovl_head_on(void)
+{
+    const int v = __atomic_load_n(&s_ovl_head, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : ovl_head_init();
+}
+
 /* One overlay source tried against a GET (the body of note_get's walk): 1 = it
  * hit (the GET is handled, note_get returns), 0 = try the next source. ea and lsa
  * are the GET's; a fixed-address lift that hits re-points them before it returns. */
@@ -2808,6 +3002,8 @@ static int ovl_try_source(spu_context* ctx, const spu_ovl_src* o, uint32_t ea, u
         const uint32_t lo = lsa > o->lift_lsa ? lsa : o->lift_lsa;
         const uint32_t hi = (lsa + size) < (o->lift_lsa + o->span) ? (lsa + size) : (o->lift_lsa + o->span);
         hit = lo < hi && (hi - lo >= 128 || hi - lo == size) &&
+              (!ovl_head_on() ||
+               gm_equal(vm_base + o->src_ea + (lo - o->lift_lsa), ls + (lo - lsa), hi - lo < 16 ? hi - lo : 16)) &&
               gm_equal(vm_base + o->src_ea + (lo - o->lift_lsa), ls + (lo - lsa), hi - lo);
         if (hit) {   /* zeros match any cleared buffer: demand real content */
             const uint8_t* q = ls + (lo - lsa); uint32_t k = 0;

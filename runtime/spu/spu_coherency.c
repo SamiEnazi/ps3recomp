@@ -59,26 +59,109 @@ static ll_stripe g_ll[SPU_LL_STRIPES];
  * for tens of milliseconds. A normal wait is far under a microsecond and never
  * gets here. SPU_LOCKLINE_SLEEP=0 keeps the plain spin. */
 static int s_ll_sleep = -1;
+/* PS3_SPU_LL_SPIN_US=<n> (default 50; 0 = the count-based spin below) and
+ * PS3_SPU_LL_SLEEP_MS=<m> (default 2): a waiter's yields are paced by the time
+ * it has waited, not by a pause count that runs on across every handoff it
+ * loses. It spins (PAUSE) until it has waited n us, then yields once per n us,
+ * and only after m ms of waiting does it Sleep(1) (the priority-inversion case
+ * above). The count-based loop reached its Sleep(1) -- 1-2 ms of a stalled SPU
+ * or main thread -- after six rounds of 4096 pauses, a few hundred
+ * microseconds on these cores, which a busy line (the SPURS control line under
+ * a wake storm, its holders making wake syscalls) can reach without anything
+ * being wrong; in the fight profiles the lock-line lock was 1.5-2% of all SPU
+ * busy time with a third of it inside the yield. A seqlock reader waiting for
+ * a writer to leave (ll_seq_begin) yields on the same clock: it spun without
+ * one, so a reader could spin for as long as a writer stayed descheduled. */
+static int     s_ll_spin_us = -1;
+static int64_t s_ll_spin_qpc, s_ll_sleep_qpc;
+static __attribute__((noinline, cold)) int ll_spin_init(void)
+{
+    const char* e = getenv("PS3_SPU_LL_SPIN_US");
+    int us = e ? atoi(e) : 50;
+    if (us < 0) us = 0;
+    if (us > 100000) us = 100000;
+    const char* m = getenv("PS3_SPU_LL_SLEEP_MS");
+    int ms = m ? atoi(m) : 2;
+    if (ms < 1) ms = 1;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    s_ll_spin_qpc  = (int64_t)us * f.QuadPart / 1000000;
+    s_ll_sleep_qpc = (int64_t)ms * f.QuadPart / 1000;
+    if (s_ll_spin_qpc < 1) s_ll_spin_qpc = 1;
+    if (s_ll_sleep < 0) { const char* z = getenv("SPU_LOCKLINE_SLEEP"); s_ll_sleep = !(z && z[0] == '0'); }
+    __atomic_store_n(&s_ll_spin_us, us, __ATOMIC_RELEASE);
+    return us;
+}
+static inline int ll_spin_us(void)
+{
+    const int v = __atomic_load_n(&s_ll_spin_us, __ATOMIC_ACQUIRE);
+    return __builtin_expect(v >= 0, 1) ? v : ll_spin_init();
+}
+static inline int64_t ll_qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+/* One wait step of the timed spin: `t0` = when the wait began, `next` = the
+ * next yield deadline (both QPC ticks). Called every 32 pauses. */
+static inline void ll_wait_step(int64_t t0, int64_t* next)
+{
+    const int64_t now = ll_qpc();
+    if (now < *next) return;
+    if (s_ll_sleep && now - t0 >= s_ll_sleep_qpc) Sleep(1); else SwitchToThread();
+    *next = ll_qpc() + s_ll_spin_qpc;
+}
+static __attribute__((noinline)) void ll_take_timed(ll_stripe* s)
+{
+    /* Most waits are a holder's few hundred nanoseconds: no clock for those. */
+    for (int k = 0; k < 64; k++) {
+        _mm_pause();
+        if (!s->v && !_InterlockedExchange(&s->v, 1)) return;
+    }
+    const int64_t t0 = ll_qpc();
+    int64_t next = t0 + s_ll_spin_qpc;
+    do {
+        while (s->v) {
+            for (int k = 0; k < 32; k++) { _mm_pause(); if (!s->v) break; }
+            if (s->v) ll_wait_step(t0, &next);
+        }
+    } while (_InterlockedExchange(&s->v, 1));
+}
 static void ll_take(ll_stripe* s)
 {
-    unsigned spins = 0, rounds = 0;
-    while (_InterlockedExchange(&s->v, 1)) {
+    if (__builtin_expect(_InterlockedExchange(&s->v, 1) == 0, 1)) goto got;
+    if (ll_spin_us()) { ll_take_timed(s); goto got; }
+    {
+        unsigned spins = 0, rounds = 0;
         do {
-            _mm_pause();
-            if (++spins >= 4096) {
-                spins = 0;
-                if (s_ll_sleep < 0) { const char* e = getenv("SPU_LOCKLINE_SLEEP"); s_ll_sleep = !(e && e[0] == '0'); }
-                if (rounds++ < 6 || !s_ll_sleep) SwitchToThread(); else Sleep(1);
-            }
-        } while (s->v);
+            do {
+                _mm_pause();
+                if (++spins >= 4096) {
+                    spins = 0;
+                    if (s_ll_sleep < 0) { const char* e = getenv("SPU_LOCKLINE_SLEEP"); s_ll_sleep = !(e && e[0] == '0'); }
+                    if (rounds++ < 6 || !s_ll_sleep) SwitchToThread(); else Sleep(1);
+                }
+            } while (s->v);
+        } while (_InterlockedExchange(&s->v, 1));
     }
+got:
     _InterlockedIncrement(&s->seq);                  /* odd: a writer is in */
 }
 static void ll_drop(ll_stripe* s) { _InterlockedIncrement(&s->seq); _InterlockedExchange(&s->v, 0); }
-static uint32_t ll_seq_begin(ll_stripe* s)
+static __attribute__((noinline)) long ll_seq_wait(ll_stripe* s)
 {
     long q;
-    while ((q = s->seq) & 1) _mm_pause();
+    if (!ll_spin_us()) {
+        while ((q = s->seq) & 1) _mm_pause();
+        return q;
+    }
+    for (int k = 0; k < 64; k++) { _mm_pause(); if (!((q = s->seq) & 1)) return q; }
+    const int64_t t0 = ll_qpc();
+    int64_t next = t0 + s_ll_spin_qpc;
+    for (;;) {
+        for (int k = 0; k < 32; k++) { if (!((q = s->seq) & 1)) return q; _mm_pause(); }
+        ll_wait_step(t0, &next);
+    }
+}
+static uint32_t ll_seq_begin(ll_stripe* s)
+{
+    long q = s->seq;
+    if (__builtin_expect(q & 1, 0)) q = ll_seq_wait(s);
     MemoryBarrier();
     return (uint32_t)q;
 }
@@ -171,24 +254,119 @@ uint64_t spu_lockline_mask_range(uint32_t ea, uint32_t len)
 static ll_stripe g_ll_single;     /* SPU_LL_GLOBAL: the one lock */
 static int ll_global(void);
 
+/* ---------------------------------------------------------------------------
+ * PS3_SPU_WAKE_DEFER (default 1; 0 = wake inside the lock as before)
+ *
+ * A notifier (a PUTLLC/PUTLLUC commit, an SPU DMA PUT, a coherent PPU store)
+ * breaks reservations and raises SPU_EVENT_LR with the line's stripe held --
+ * that is the guest-visible part and it stays exactly where it was. The HOST
+ * wake of a parked SPU thread (WakeAllConditionVariable -> a kernel call, ~1-3
+ * us, once per parked SPU) used to run there too, so every SPU woken by the
+ * notifier, and every other SPU waiting for the same stripe -- the five SPURS
+ * kernels all reserve the one control line the main thread's job kick writes --
+ * waited for the notifier's remaining wake syscalls before it could even read
+ * the line (a GETLLAR spins while the stripe's sequence is odd). Now the wakes
+ * are queued per notifying thread and issued when it drops its last stripe:
+ * the line is free again before the first woken SPU gets there.
+ *
+ * A queued wake goes to the OS only if the SPU thread is in the sleeping part of
+ * its wait (spu_context.coh_parked); a running or spinning SPU (PS3_SPU_SPIN_US)
+ * sees its event bit by itself, and its notifier -- often the main thread's
+ * job kick -- no longer pays a wake call for it. The wake goes through the
+ * waiter's lock (spu_ch_wake_sync), which also closes the window between a
+ * waiter's readiness test and its sleep. A context
+ * on the queue is pinned by coh_wake_ref (spu_coh_unregister waits for zero),
+ * because a transient job context may be unregistered and freed as soon as the
+ * notifier lets go of the stripes. A notify made without a stripe held (none
+ * today) wakes at once, as before.
+ * -------------------------------------------------------------------------*/
+#define COH_DEFER_MAX 32
+typedef struct { int depth, n; spu_context* c[COH_DEFER_MAX]; } coh_defer_t;
+#ifdef _WIN32
+static __declspec(thread) coh_defer_t t_coh_defer;
+#else
+static __thread coh_defer_t t_coh_defer;
+#endif
+static int s_wake_defer = -1;
+static __attribute__((noinline, cold)) int wake_defer_init(void)
+{
+    const char* e = getenv("PS3_SPU_WAKE_DEFER");
+    const int on = !(e && e[0] == '0');
+    __atomic_store_n(&s_wake_defer, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int wake_defer_on(void)
+{
+    const int v = __atomic_load_n(&s_wake_defer, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : wake_defer_init();
+}
+static inline void coh_relax(void)
+{
+#if defined(_MSC_VER)
+    _mm_pause();
+#else
+    ll_pause();
+#endif
+}
+static __attribute__((noinline)) void coh_defer_flush(void)
+{
+    coh_defer_t* d = &t_coh_defer;
+    /* The event raises (under the stripes just dropped) before the reads of
+     * coh_parked: the other half of the waiter's store-then-test. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    while (d->n > 0) {
+        spu_context* c = d->c[--d->n];
+        /* Only a thread that may be asleep needs the OS: a running or
+         * spinning SPU reads its event bit itself (spu_ch_wait). */
+        if (__atomic_load_n(&c->coh_parked, __ATOMIC_SEQ_CST)) spu_ch_wake_sync(c);
+        __atomic_fetch_sub(&c->coh_wake_ref, 1, __ATOMIC_RELEASE);
+    }
+}
+/* The host wake for a context whose reservation a notifier just broke. */
+static inline void coh_wake(spu_context* c)
+{
+    coh_defer_t* d = &t_coh_defer;
+    if (d->depth > 0 && wake_defer_on()) {
+        for (int i = 0; i < d->n; i++) if (d->c[i] == c) return;   /* already queued */
+        if (d->n < COH_DEFER_MAX) {
+            __atomic_fetch_add(&c->coh_wake_ref, 1, __ATOMIC_ACQ_REL);
+            d->c[d->n++] = c;
+            return;
+        }
+    }
+    spu_ch_wake(c);
+}
+/* After `ctx` left the registry: no notifier still holds a queued wake for it. */
+static void coh_wait_unpinned(spu_context* ctx)
+{
+    while (__atomic_load_n(&ctx->coh_wake_ref, __ATOMIC_ACQUIRE)) coh_relax();
+}
+
 void spu_lockline_lock_mask(uint64_t mask)
 {
-    if (mask && ll_global()) { ll_take(&g_ll_single); return; }
-    while (mask) {                       /* ascending: the deadlock-free order */
-        const int i = __builtin_ctzll(mask);
-        ll_take(&g_ll[i]);
-        mask &= mask - 1u;
-    }
+    if (!mask) return;
+    if (ll_global()) ll_take(&g_ll_single);
+    else
+        while (mask) {                   /* ascending: the deadlock-free order */
+            const int i = __builtin_ctzll(mask);
+            ll_take(&g_ll[i]);
+            mask &= mask - 1u;
+        }
+    t_coh_defer.depth++;
 }
 
 void spu_lockline_unlock_mask(uint64_t mask)
 {
-    if (mask && ll_global()) { ll_drop(&g_ll_single); return; }
-    while (mask) {
-        const int i = __builtin_ctzll(mask);
-        ll_drop(&g_ll[i]);
-        mask &= mask - 1u;
-    }
+    if (!mask) return;
+    if (ll_global()) ll_drop(&g_ll_single);
+    else
+        while (mask) {
+            const int i = __builtin_ctzll(mask);
+            ll_drop(&g_ll[i]);
+            mask &= mask - 1u;
+        }
+    coh_defer_t* d = &t_coh_defer;
+    if (--d->depth <= 0) { d->depth = 0; if (d->n) coh_defer_flush(); }
 }
 
 static ll_stripe* ll_for_read(uint32_t ea)
@@ -531,6 +709,9 @@ void spu_coh_unregister(spu_context* ctx)
         if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_RELAXED) == ctx)
             __atomic_store_n(&s_coh_ctxs[i], NULL, __ATOMIC_RELEASE);
     spu_lockline_unlock();
+    /* PS3_SPU_WAKE_DEFER: a notifier that found ctx before it left (under a
+     * stripe this lock waited for) may still be about to wake it. */
+    coh_wait_unpinned(ctx);
 }
 
 /* Drop every registered context that lies in [lo, hi) -- a host thread's
@@ -550,6 +731,9 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, ((spu_context*)c)->image_id);
             __atomic_store_n(&s_coh_ctxs[i], NULL, __ATOMIC_RELEASE);
+            spu_lockline_unlock();
+            coh_wait_unpinned((spu_context*)c);   /* PS3_SPU_WAKE_DEFER, as in unregister */
+            spu_lockline_lock();
         }
     }
     spu_lockline_unlock();
@@ -583,7 +767,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         if (spu_resv_break(c, line)) {
             spu_ev_raise(c, SPU_EVENT_LR);
             __atomic_fetch_add(&g_spu_lr_raise, 1ul, __ATOMIC_RELAXED);   /* raised under different stripes */
-            spu_ch_wake(c);
+            coh_wake(c);
         }
     }
 }
@@ -623,8 +807,9 @@ static void notify_spus(uint32_t line)
             __atomic_fetch_add(&g_spu_lr_raise, 1ul, __ATOMIC_RELAXED);   /* raised under different stripes */
             /* The event_status store has to be visible before the wake. The
              * waiter re-polls its predicate on a timeout as well, so a
-             * straggling store costs latency and not the wakeup itself. */
-            spu_ch_wake(c);
+             * straggling store costs latency and not the wakeup itself.
+             * PS3_SPU_WAKE_DEFER: issued once this thread drops its stripes. */
+            coh_wake(c);
         }
     }
 }

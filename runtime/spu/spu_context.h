@@ -474,6 +474,19 @@ typedef struct spu_context {
         int32_t  img, ovl, task, slot;
         void (*fn)(struct spu_context*);
     } ib_cache[SPU_IB_CACHE_SIZE];
+    /* PS3_SPU_WAKE_DEFER (spu_coherency.c): host wakes a lock-line notifier
+     * has queued for this context and not yet issued. The notifier counts one
+     * up while it holds a stripe (so the context is still registered), issues
+     * the wake after dropping its stripes and counts it down; unregister waits
+     * for zero before the context may go away. */
+    volatile long coh_wake_ref;
+    /* PS3_SPU_WAKE_DEFER: 1 while this SPU's thread is in (or entering) the
+     * sleeping part of spu_ch_wait -- not while it runs or spins. A queued
+     * coherence wake goes to the OS only then; a spinning or running SPU sees
+     * the raised event bit itself. Set before the waiter's last readiness test
+     * and read by the waker after its event raise, both sequentially
+     * consistent, so one of the two always sees the other. */
+    volatile long coh_parked;
 } spu_context;
 
 /* The SPURS kernel's own service entry points, which it plants as
@@ -1020,6 +1033,11 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
+/* The same, passing through the waiter's own lock first, so a waiter between
+ * its readiness test and its sleep cannot miss the wake. Only with no
+ * lock-line stripe held: a waiter may spin on a stripe's sequence while it
+ * holds that lock (spu_resv_lost_poll). */
+void spu_ch_wake_sync(spu_context* ctx);
 /* Runaway lifted-call recursion guard. A lifted brsl/bisl nests a real host
  * call frame, so an SPU loop the lifter lowered as a CALL rather than a
  * transfer recurses until the host stack dies -- surfacing as a bare
