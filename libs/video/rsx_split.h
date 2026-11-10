@@ -42,6 +42,12 @@ void rsx_split_sync(void);
 /* cellGcmSys.c: one action, on the exec thread. */
 void gcm_split_run(u32 kind, u32 a, u32 b, u32 c);
 
+/* (rsx-par) called at the end of every FIFO drain, after everything the drain
+ * queued has run (both paths): the Vulkan backend's PS3RECOMP_VK_BT sets it to
+ * drain its recording worker, so whatever the frame loop does with the backend
+ * between drains finds it idle. NULL = nothing. */
+extern void (*g_rsx_drain_end_hook)(void);
+
 #ifdef __cplusplus
 }
 #endif

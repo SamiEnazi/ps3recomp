@@ -2095,6 +2095,7 @@ void cellGcm_rsx_process_fifo(void)
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     s_ha_drain_t0 = ps3_ft_now();
     gcm_rsx_process_fifo_unlocked();
+    if (g_rsx_drain_end_hook) g_rsx_drain_end_hook();   /* (rsx-par) PS3RECOMP_VK_BT: the recording worker idle */
     s_ha_drain_ns += ps3_ft_now() - s_ha_drain_t0;   /* (the present inside may have taken a part) */
     s_ha_drain_t0 = 0;
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);

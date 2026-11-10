@@ -59,6 +59,8 @@
 rsx_dispatch* rsx_draw_engine_dsp(void);
 int rsx_draw_engine_ready(void);
 
+void (*g_rsx_drain_end_hook)(void);   /* rsx_split.h */
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

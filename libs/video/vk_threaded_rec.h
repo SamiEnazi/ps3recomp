@@ -41,7 +41,7 @@ enum {
     TQ_WRAP = 0, TQ_BARRIER, TQ_CLEARC, TQ_CLEARDS, TQ_CI2B, TQ_CB2I, TQ_BEGINRP, TQ_ENDRP,
     TQ_BINDPIPE, TQ_BINDVB, TQ_BINDDS, TQ_PUSHC, TQ_VIEWPORT, TQ_SCISSOR, TQ_DRAW, TQ_SREF,
     TQ_BINDIB, TQ_DRAWIDX, TQ_DBIAS, TQ_BLIT, TQ_COPYIMG, TQ_RESETQ, TQ_TIMESTAMP,
-    TQ_BEGINCB, TQ_ENDCB, TQ_RESETCB, TQ_UPDDS, TQ_PRESENT, TQ_NOPS
+    TQ_BEGINCB, TQ_ENDCB, TQ_RESETCB, TQ_UPDDS, TQ_PRESENT, TQ_BCALL, TQ_NOPS
 };
 
 typedef struct { u32 op, size; VkCommandBuffer cb; } tq_hdr;   /* size: whole record, 8-aligned */
@@ -265,6 +265,9 @@ typedef struct { tq_hdr h; VkImage src; VkImageLayout sl; VkImage dst; VkImageLa
 typedef struct { tq_hdr h; VkQueryPool pool; u32 a, b; VkPipelineStageFlagBits st; } tq_query;
 typedef struct { tq_hdr h; VkCommandBufferBeginInfo bi; } tq_begincb;
 typedef struct { tq_hdr h; VkDevice dev; u32 nw; } tq_updds;   /* VkWriteDescriptorSet[nw], then each one's infos */
+/* (rsx-par) PS3RECOMP_VK_BT (vk_threaded_be.h): one backend entry point the
+ * worker runs itself, in ring order; its arguments follow (8-aligned). */
+typedef struct { tq_hdr h; void (*run)(const u8* args); } tq_bcall;
 static int tq_ds_image(VkDescriptorType t)
 {
     return t == VK_DESCRIPTOR_TYPE_SAMPLER || t == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
@@ -351,6 +354,10 @@ static void tq_exec(const u8* p)
             else { w[k].pBufferInfo = (const VkDescriptorBufferInfo*)q; q += TQ_ARR(VkDescriptorBufferInfo, w[k].descriptorCount); }
         }
         rvkUpdateDescriptorSets(r->dev, r->nw, w, 0, NULL);
+        break; }
+    case TQ_BCALL: {                    /* (rsx-par) the backend's own code, on this thread */
+        const tq_bcall* r = (const tq_bcall*)p;
+        r->run((const u8*)(r + 1));
         break; }
     case TQ_PRESENT: {
         const tq_present_rec* r = (const tq_present_rec*)p;
@@ -627,6 +634,16 @@ static VkResult VKAPI_CALL tq_vkQueueSubmit(VkQueue q, u32 n, const VkSubmitInfo
  * =0 off, =2 worker pinned to the E-cores) swaps the
  * thunks in and starts the worker. Needs draw batching (PS3RECOMP_VK_BATCH,
  * default on): unbatched, every operation is its own submit anyway. */
+/* (rsx-par) PS3RECOMP_VK_BT (default 1; vk_threaded_be.h): the backend's draw
+ * work on this worker too. It then does ~2-4 ms a frame of real work, so by
+ * default it chases the producer (no wake threshold) and is not pinned to the
+ * E-cores; PS3RECOMP_VK_TQ_WAKE_KB / PS3RECOMP_VK_THREADED=2 still win. */
+static int vk_bt_env(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PS3RECOMP_VK_BT"); v = !(e && e[0] == '0'); }
+    return v;
+}
 static void vk_tq_install(void)
 {
     const char* e = getenv("PS3RECOMP_VK_THREADED");
@@ -641,7 +658,7 @@ static void vk_tq_install(void)
     { /* rsx3: the worker's idle spin and the producer's wake threshold */
       const char* sp = getenv("PS3RECOMP_VK_TQ_SPIN_US"); const char* wk = getenv("PS3RECOMP_VK_TQ_WAKE_KB");
       const double spin_us = sp ? atof(sp) : 20.0;
-      const long wake_kb = wk ? atol(wk) : 64L;
+      const long wake_kb = wk ? atol(wk) : (vk_bt_env() ? 0L : 64L);
       LARGE_INTEGER f, a, b; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&a);
       const u64 c0 = __rdtsc();
       do { QueryPerformanceCounter(&b); } while ((b.QuadPart - a.QuadPart) * 1000000 < f.QuadPart * 2000);   /* 2 ms */
@@ -655,7 +672,7 @@ static void vk_tq_install(void)
     SetThreadPriority(s_tq.thread, GetThreadPriority(GetCurrentThread()));
     /* =2 (rsx3: the default; =1 = on, unpinned): the worker on the E-cores (hybrid CPUs). Its real
      * driver work is ~1-2 ms a frame; on a P-core its idle spin shared a core with the hot threads. */
-    if (!e || atoi(e) == 2) {
+    if ((!e && !vk_bt_env()) || (e && atoi(e) == 2)) {
         ULONG len = 0;
         GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
         u8* buf = len ? (u8*)malloc(len) : NULL;

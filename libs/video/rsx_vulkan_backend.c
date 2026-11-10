@@ -158,6 +158,7 @@ static u32 s_gp_ops[8];
 
 /* PS3RECOMP_VK_THREADED: vkCmd* recording on a second thread (vk_threaded_rec.h) */
 #include "vk_threaded_rec.h"
+#include "rsx_split.h"          /* (rsx-par) g_rsx_drain_end_hook (PS3RECOMP_VK_BT) */
 
 /* ---------------------------------------------------------------------------
  * (rsx5, round 3) The background log writer: PS3RECOMP_LOG_ASYNC (default 1;
@@ -4544,6 +4545,10 @@ typedef struct vk_eng_obj {
 static u32 vk_res_obj_px(const vk_eng_obj* o, u32 v) { return (o && o->scaled) ? vk_res_px(v) : v; }
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
+/* (rsx-par) PS3RECOMP_VK_BT: bumped when slot i is released (vk_eng_release) --
+ * the engine thread's surface_view memo (vk_threaded_be.h) checks its entries
+ * against these while the recording worker runs the releases. */
+static u32 s_eobj_sg[VK_ENG_MAX_OBJ];
 
 /* Defined with the E2 pipeline state and the E5 passes further down. */
 static void vk_eng_drop_framebuffers(void);
@@ -4898,6 +4903,7 @@ static void vk_eng_release(void* user, u32 handle)
     (void)user;
     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
     s_eobj_gen++;
+    __atomic_fetch_add(&s_eobj_sg[handle], 1u, __ATOMIC_RELEASE);   /* (rsx-par) */
     /* (rsx5) a released target's colour copy goes with it: its entry used to
      * stay, so recycled targets used the table up (64) and leaked a copy each */
     if (s_eobj[handle].kind == VK_ENG_COLOR && s_eobj[handle].tag != VK_TAG_CSNAP)
@@ -4911,6 +4917,7 @@ static void vk_eng_release(void* user, u32 handle)
     if (s_eobj[handle].kind == VK_ENG_COLOR)
         for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
             if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
+                __atomic_fetch_add(&s_eobj_sg[i], 1u, __ATOMIC_RELEASE);   /* (rsx-par) */
                 vk_destroy_image(&s_eobj[i].im);
                 memset(&s_eobj[i], 0, sizeof s_eobj[i]);
             }
@@ -7038,7 +7045,40 @@ static void vk_reuse_stats(void)
             s_dset_hit, s_dset_miss, s_vb.live, (double)s_vb.live_bytes / 1e6, s_vb.nchunks);
 }
 
+/* (rsx-par) PS3RECOMP_VK_BT: vbuf_create runs on the engine's thread while the
+ * recording worker runs the draws (and the batch completions that free blocks),
+ * so the handle and block lists take a lock -- create, release and free; the
+ * worker's vk_vb_get reads only entries made before the draw naming them. */
+#ifdef _WIN32
+static INIT_ONCE s_vb_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION s_vb_cs;
+static BOOL CALLBACK vk_vb_cs_init(PINIT_ONCE o, PVOID p, PVOID* c) { (void)o; (void)p; (void)c; InitializeCriticalSection(&s_vb_cs); return TRUE; }
+static void vk_vb_lock(void) { InitOnceExecuteOnce(&s_vb_once, vk_vb_cs_init, NULL, NULL); EnterCriticalSection(&s_vb_cs); }
+static void vk_vb_unlock(void) { LeaveCriticalSection(&s_vb_cs); }
+#else
+static void vk_vb_lock(void) {}
+static void vk_vb_unlock(void) {}
+#endif
+static u32 vk_eng_vbuf_create_body(void* user, const void* data, u32 bytes);
+/* Would this create open a new chunk? (Its failure path destroys a buffer, a
+ * call that drains the recording worker -- which may be waiting for this lock
+ * in a batch completion. So that one goes with the worker idle.) */
+static int vk_vb_needs_chunk(u32 bytes)
+{
+    u32 c = 0;
+    while (c < VK_VB_CLASSES && vk_vb_class_size(c) < bytes) c++;
+    if (c == VK_VB_CLASSES) return 0;
+    return !s_vb.fl_n[c] && (!s_vb.nchunks || s_vb.bump + vk_vb_class_size(c) > VK_VB_CHUNK);
+}
 static u32 vk_eng_vbuf_create(void* user, const void* data, u32 bytes)
+{
+    vk_vb_lock();
+    if (vk_vb_needs_chunk(bytes)) { vk_vb_unlock(); vk_tq_sync(); vk_vb_lock(); }
+    const u32 h = vk_eng_vbuf_create_body(user, data, bytes);
+    vk_vb_unlock();
+    return h;
+}
+static u32 vk_eng_vbuf_create_body(void* user, const void* data, u32 bytes)
 {
     (void)user;
     if (!data || !bytes || !s_vk.device) return 0;
@@ -7084,7 +7124,14 @@ static u32 vk_eng_vbuf_create(void* user, const void* data, u32 bytes)
     if (s_vb.live > g_rsx_lim[RSX_LIM_VK_VB].peak) { rsx_lim_cap(RSX_LIM_VK_VB, VK_VB_HANDLES - 1u); rsx_lim_use(RSX_LIM_VK_VB, s_vb.live); }
     return h;
 }
+static void vk_vb_free_now_body(u32 h);
 static void vk_vb_free_now(u32 h)
+{
+    vk_vb_lock();
+    vk_vb_free_now_body(h);
+    vk_vb_unlock();
+}
+static void vk_vb_free_now_body(u32 h)
 {
     vk_vb_ent* e = &s_vb.ent[h];
     if (!e->live) return;
@@ -7100,7 +7147,14 @@ static void vk_vb_free_now(u32 h)
     e->live = 0;
     s_vb.free_h[s_vb.nfree_h++] = h;
 }
+static void vk_eng_vbuf_release_body(void* user, u32 h);
 static void vk_eng_vbuf_release(void* user, u32 h)
+{
+    vk_vb_lock();                               /* (rsx-par) recursive: the free inside takes it again */
+    vk_eng_vbuf_release_body(user, h);
+    vk_vb_unlock();
+}
+static void vk_eng_vbuf_release_body(void* user, u32 h)
 {
     (void)user;
     if (!h || h >= VK_VB_HANDLES || !s_vb.ent || s_vb.ent[h].live != 1u) return;
@@ -8454,6 +8508,7 @@ static void vk_eng_texture_release_t(void* user, u32 handle)
     vk_slow_note("tex_release", t0);
 }
 
+#include "vk_threaded_be.h"     /* (rsx-par) PS3RECOMP_VK_BT */
 static const rsx_draw_backend s_vk_engine_backend = {
     .user                 = NULL,
     .image_load           = vk_eng_image_load,   /* [fx] texture packs */
@@ -8695,10 +8750,12 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
       const char* e = getenv("PS3RECOMP_VK_TEX3D");
       if (e && e[0] == '0') {
           no3d = s_vk_engine_backend; no3d.texture_create_3d = NULL; no3d.texture_upload_3d = NULL;
-          rsx_draw_engine_set_backend(&no3d);
+          const rsx_draw_backend* bt = vk_bt_install(&no3d);   /* (rsx-par) PS3RECOMP_VK_BT */
+          rsx_draw_engine_set_backend(bt ? bt : &no3d);
           VK_LOG("engine: 3D textures off (PS3RECOMP_VK_TEX3D=0)\n");
       } else {
-          rsx_draw_engine_set_backend(&s_vk_engine_backend);
+          const rsx_draw_backend* bt = vk_bt_install(&s_vk_engine_backend);   /* (rsx-par) PS3RECOMP_VK_BT */
+          rsx_draw_engine_set_backend(bt ? bt : &s_vk_engine_backend);
       } }
     rsx_draw_engine_set_default(s_g.on ? 1 : 0);
     if (rsx_draw_engine_enabled() && rsx_draw_engine_init(s_vk.width, s_vk.height) == 0)
@@ -9042,6 +9099,7 @@ void rsx_vulkan_backend_present(void)
     vk_shot_arm();                   /* (rsx5) a test's screenshot request: its buffer */
     if (s_vk.eng_active) rsx_draw_engine_present();
     else                 vk_cb_present(&s_vk, 0);
+    if (s_bt_on) vk_tq_sync();       /* (rsx-par) PS3RECOMP_VK_BT: the engine's present queued work; idle before the below */
     vk_sc_tick();                    /* save the pipeline cache once a burst ends */
     { static u32 nf;                 /* (rsx5) PS3RECOMP_LIMITS: the object table's use (a scan) */
       if (++nf % 120u == 0u) {
