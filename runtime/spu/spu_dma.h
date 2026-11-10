@@ -37,9 +37,27 @@ extern uint8_t* vm_base;
  * (gm_copy_to_desc), so the FIFO walker never decodes a command segment an SPU
  * is still writing over the park it waited on. Any other PUT as before. */
 extern int (*g_spu_put_rsx_hook)(uint32_t ea, uint32_t size);
+/* (perf17) The same answer without a call per PUT: cellGcmSys keeps the IO-mapped
+ * memory as one interval [lo, hi) here, exact = 1 when the mappings are that one
+ * interval (inFAMOUS 2: cellGcmInit's single mapping), else their bounding box
+ * (exact = 0: the hook decides inside it). hi = 0 = nothing is RSX memory
+ * (PS3RECOMP_SPU_PUT_DESC=0); PS3RECOMP_SPU_PUT_INLINE=0 = lo 0, hi ~0, exact 0 =
+ * the hook for every PUT, as m17. Read racily: the table changes only on a
+ * map/unmap call, and a stale answer only picks the copy order (as the hook's). */
+extern uint32_t g_spu_put_rsx_lo, g_spu_put_rsx_hi;
+extern int g_spu_put_rsx_exact;
+static inline int spu_put_is_rsx(uint32_t ea, uint32_t n)
+{
+    const uint32_t hi = __atomic_load_n(&g_spu_put_rsx_hi, __ATOMIC_RELAXED);
+    const uint32_t lo = __atomic_load_n(&g_spu_put_rsx_lo, __ATOMIC_RELAXED);
+    if (ea >= hi || (uint64_t)ea + n <= (uint64_t)lo) return 0;
+    if (__atomic_load_n(&g_spu_put_rsx_exact, __ATOMIC_RELAXED)) return 1;
+    int (*h)(uint32_t, uint32_t) = g_spu_put_rsx_hook;
+    return h && h(ea, n);
+}
 static inline void spu_put_copy(uint32_t ea, uint8_t* g, const void* s, uint32_t n)
 {
-    if (n > 4u && g_spu_put_rsx_hook && g_spu_put_rsx_hook(ea, n)) gm_copy_to_desc(g, s, n);
+    if (n > 4u && spu_put_is_rsx(ea, n)) gm_copy_to_desc(g, s, n);
     else gm_copy_to(g, s, n);
 }
 

@@ -366,10 +366,13 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 /* (critic2) memory the RSX reads (spu_dma.h spu_put_copy); NULL = none. */
 int (*g_spu_put_rsx_hook)(uint32_t ea, uint32_t size) = 0;
+/* (perf17) its interval, spu_dma.h spu_put_is_rsx; hi = 0 = none until cellGcmInit */
+uint32_t g_spu_put_rsx_lo = 0, g_spu_put_rsx_hi = 0;
+int g_spu_put_rsx_exact = 0;
 /* A 128-byte reservation-line commit: top-down into RSX memory, as a PUT. */
 static inline void spu_line_copy(uint32_t ea, uint8_t* mem, const void* ls)
 {
-    if (g_spu_put_rsx_hook && g_spu_put_rsx_hook(ea & ~127u, MFC_ATOMIC_LINE)) gm_copy_to_desc(mem, ls, MFC_ATOMIC_LINE);
+    if (spu_put_is_rsx(ea & ~127u, MFC_ATOMIC_LINE)) gm_copy_to_desc(mem, ls, MFC_ATOMIC_LINE);
     else gm_copy_to(mem, ls, MFC_ATOMIC_LINE);
 }
 
