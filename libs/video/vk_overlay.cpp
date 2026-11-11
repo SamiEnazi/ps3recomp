@@ -20,12 +20,14 @@
 #include <SDL2/SDL.h>
 
 #include "imgui.h"
+#include "imgui_internal.h"   /* [modsui] ImGui::RegisterUserTexture: the mods' preview pictures (as vk_overlay_saves.cpp) */
 #include "backends/imgui_impl_vulkan.h"
 #include "backends/imgui_impl_sdl2.h"
 
 #include "../../include/ps3emu/ps3_settings.h"
 #include "../../include/ps3emu/ps3_lightfx.h"   /* [light] the Lighting page (vk_overlay_light.inc) */
 #include "../../include/ps3emu/ps3_game_mods.h" /* [mods] the Mods page: runtime/ppu/ppu_fs_mods.h */
+#include "mod_preview.h"                        /* [modsui] a mod's preview picture, decoded and shrunk */
 #include "vk_postfx.h"
 #include "vk_overlay_theme.h"   /* the inFAMOUS look: Hero (blue) / Infamous (red) */
 #include "../../include/ps3emu/ps3_pad_icons.h"
@@ -46,9 +48,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <algorithm>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -77,6 +83,9 @@ void  ps3_button_icons_set_mode(int mode);      /* rsx_button_icons.h */
 int   ps3_button_icons_mode_setting(void);
 int   ps3_button_icons_effective(void);
 void  ps3_host_quit(const char* why);           /* libs/system/cellSysutil.c */
+void  ps3_host_restart(const char* why);        /* [modsui] "Restart to apply" (cellSysutil.c) */
+int   ps3_host_can_restart(void);
+void  ps3_host_set_relauncher(int (*fn)(void));
 void  ps3_sysutil_host_language(char* out, size_t n);   /* cellSysutil.c: "Automatic"'s PS3_LANG code */
 int   ps3_sysutil_language_in_use(void);                /* CELL_SYSUTIL_LANG_* the game was told, -1 */
 void  ps3_lang_in_use(int kind, char* asked, char* given, size_t n);   /* runtime/ppu/ppu_fs_lang.h */
@@ -208,6 +217,115 @@ static void default_ini_path(char* out, size_t n)
     else if (h && *h) snprintf(out, n, "%s/.config/infamous2-port/settings.ini", h);
 #endif
 }
+
+/* ---- [modsui] the start environment, for "Restart to apply" ----------------
+ * Taken before this file's other start-up code changes the environment
+ * (preload below exports the settings file's lines into it, the menu sets
+ * variables as it applies choices): the game started again gets what this
+ * one started with, or every setting changed in the menu would come back as
+ * a variable "set when the game started" and win over the file. Same exe,
+ * command line, environment and working directory, the same stdout/stderr
+ * (a session log goes on); PS3_RESTARTED=<n> counts the restarts (20 in a
+ * row at most) and PS3_RESTART_WAIT_PID makes the new game wait here, before
+ * anything else, until the old one has ended. libs/system/cellSysutil.c calls
+ * relaunch_self when the old one ends (ps3_host_exit_status), unless a
+ * launcher answers the restart (PS3_LAUNCHER_RESTART=1, tools/play.ps1). */
+#ifdef _WIN32
+static std::vector<wchar_t> s_env0;   /* the environment block at start */
+static std::wstring s_cwd0;
+static int relaunch_self(void)
+{
+    static wchar_t exe[32768];
+    const DWORD n = GetModuleFileNameW(NULL, exe, 32768);
+    if (!n || n >= 32768 || s_env0.empty()) return 0;
+    int count = 1;
+    if (const char* r = getenv("PS3_RESTARTED")) count = atoi(r) + 1;
+    if (count > 20) { fprintf(stderr, "[restart] 20 restarts in a row: not again\n"); return 0; }
+    std::vector<std::wstring> vars;
+    for (const wchar_t* p = s_env0.data(); *p; p += wcslen(p) + 1) {
+        if (!_wcsnicmp(p, L"PS3_RESTART_WAIT_PID=", 21) || !_wcsnicmp(p, L"PS3_RESTARTED=", 14)) continue;
+        vars.push_back(p);
+    }
+    vars.push_back(L"PS3_RESTART_WAIT_PID=" + std::to_wstring(GetCurrentProcessId()));
+    vars.push_back(L"PS3_RESTARTED=" + std::to_wstring(count));
+    std::sort(vars.begin(), vars.end(), [](const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
+    std::vector<wchar_t> env;
+    for (const std::wstring& v : vars) { env.insert(env.end(), v.begin(), v.end()); env.push_back(0); }
+    env.push_back(0);
+    std::vector<wchar_t> cmd(GetCommandLineW(), GetCommandLineW() + wcslen(GetCommandLineW()) + 1);
+    /* the same stdout/stderr when they are files or pipes (a log); a console is shared anyway */
+    HANDLE hs[3] = { GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE) };
+    bool redirected = false;
+    HANDLE list[3];
+    int nl = 0;
+    for (HANDLE h : hs) {
+        if (!h || h == INVALID_HANDLE_VALUE) continue;
+        const DWORD t = GetFileType(h);
+        if (t == FILE_TYPE_DISK || t == FILE_TYPE_PIPE) redirected = true;
+    }
+    if (redirected)
+        for (HANDLE& h : hs) {
+            if (!h || h == INVALID_HANDLE_VALUE || !SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) { h = NULL; continue; }
+            bool dup = false;
+            for (int k = 0; k < nl; k++) if (list[k] == h) dup = true;
+            if (!dup) list[nl++] = h;
+        }
+    STARTUPINFOEXW si;
+    memset(&si, 0, sizeof si);
+    si.StartupInfo.cb = sizeof si;
+    std::vector<unsigned char> attr;
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT;
+    if (nl) {
+        SIZE_T sz = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &sz);
+        attr.resize(sz);
+        si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)attr.data();
+        if (InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &sz) &&
+            UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list, sizeof(HANDLE) * (SIZE_T)nl, NULL, NULL)) {
+            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            si.StartupInfo.hStdInput = hs[0]; si.StartupInfo.hStdOutput = hs[1]; si.StartupInfo.hStdError = hs[2];
+            flags |= EXTENDED_STARTUPINFO_PRESENT;
+        } else { si.lpAttributeList = NULL; nl = 0; }
+    }
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof pi);
+    const BOOL ok = CreateProcessW(exe, cmd.data(), NULL, NULL, nl ? TRUE : FALSE, flags, env.data(),
+                                   s_cwd0.empty() ? NULL : s_cwd0.c_str(), &si.StartupInfo, &pi);
+    if (si.lpAttributeList) DeleteProcThreadAttributeList(si.lpAttributeList);
+    if (!ok) { fprintf(stderr, "[restart] could not start %ls (error %lu)\n", exe, GetLastError()); return 0; }
+    fprintf(stderr, "[restart] started the game again as pid %lu (restart #%d)\n", (unsigned long)pi.dwProcessId, count);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return 1;
+}
+static struct StartEnv {
+    StartEnv()
+    {
+        if (const char* w = getenv("PS3_RESTART_WAIT_PID")) {   /* started by a restart: the old game ends first */
+            const DWORD pid = (DWORD)strtoul(w, NULL, 10);
+            HANDLE h = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+            const DWORD r = h ? WaitForSingleObject(h, 20000) : WAIT_OBJECT_0;
+            if (h) CloseHandle(h);
+            _putenv_s("PS3_RESTART_WAIT_PID", "");
+            wchar_t cwd[1024];
+            if (!GetCurrentDirectoryW(1024, cwd)) cwd[0] = 0;
+            fprintf(stderr, "[restart] restart #%s: pid %lu, the old game (pid %lu) %s; cwd %ls\n", getenv("PS3_RESTARTED") ? getenv("PS3_RESTARTED") : "?",
+                    (unsigned long)GetCurrentProcessId(), (unsigned long)pid, r == WAIT_OBJECT_0 ? "has ended" : "still runs after 20 s", cwd);
+        }
+        if (LPWCH e = GetEnvironmentStringsW()) {
+            const wchar_t* b = e;
+            const wchar_t* p = b;
+            while (*p) p += wcslen(p) + 1;
+            s_env0.assign(b, p + 1);
+            FreeEnvironmentStringsW(e);
+        }
+        static wchar_t cwd[32768];
+        const DWORD n = GetCurrentDirectoryW(32768, cwd);
+        if (n && n < 32768) s_cwd0.assign(cwd, n);
+        ps3_host_set_relauncher(relaunch_self);
+    }
+} s_start_env;
+#endif
 
 static void preload(void)
 {
@@ -1864,13 +1982,141 @@ static void tab_effects(void)
  * Game mods are the community's inFAMOUS Mod Manager mods (mod.json, files/,
  * texture_patches/, xpps_patches/, modular.json), served by the file layer
  * (runtime/ppu/ppu_fs_mods.h) from the mods folder (PS3_GAME_MODS_DIR, the
- * launcher's "mods" folder). Which mods are on and their options are saved
- * at once in mods.ini (beside settings.ini) and apply at the next start;
- * "Use mods" is PS3_GAME_MODS in settings.ini. */
+ * launcher's "mods" folder). Which mods are on, their options and the ones
+ * put first are saved at once in mods.ini (beside settings.ini) and apply at
+ * the next start; the page shows that start's result at once (the clash rule
+ * over the saved choices). "Use mods" is PS3_GAME_MODS in settings.ini.
+ * [modsui] preview pictures, "Use this one instead", "Add a mod from a zip",
+ * "Restart to apply". */
+
+/* ---- [modsui] preview pictures: decoded on their own thread (mod_preview.h),
+ * made ImGui user textures on the render thread (as the save list's icons,
+ * vk_overlay_saves.cpp), freed when the page is left or the list is read again ---- */
+enum { PIC_SIDE = 512 };
+struct ModPic { std::string path; ImTextureData* tex; int state; };   /* state 0 loading, 1 ready, -1 none */
+struct PicDone { std::string path; unsigned gen; std::vector<unsigned char> rgba; int w, h; bool ok; };
+static std::vector<ModPic> s_pics;                  /* render thread */
+static std::vector<ImTextureData*> s_pics_dying;    /* render thread: waiting for the renderer to drop them */
+static std::vector<std::pair<std::string, std::string>> s_pic_paths;   /* render thread: folder -> picture ("" = none) */
+static std::mutex s_pic_lock;                       /* below */
+static std::vector<std::string> s_pic_queue;
+static std::vector<PicDone> s_pic_done;
+static bool s_pic_worker;
+static unsigned s_pic_gen;                          /* results of an older generation are dropped */
+
+static void pics_worker(void)
+{
+    for (;;) {
+        std::string path;
+        unsigned gen;
+        {
+            std::lock_guard<std::mutex> g(s_pic_lock);
+            if (s_pic_queue.empty()) { s_pic_worker = false; return; }
+            path = s_pic_queue.front();
+            s_pic_queue.erase(s_pic_queue.begin());
+            gen = s_pic_gen;
+        }
+        PicDone d;
+        d.path = path; d.gen = gen; d.w = d.h = 0;
+        std::string why;
+        d.ok = mod_preview_load(path.c_str(), PIC_SIDE, d.rgba, d.w, d.h, &why) != 0;
+        if (!d.ok) fprintf(stderr, "[overlay] mod picture %s: %s\n", path.c_str(), why.c_str());
+        std::lock_guard<std::mutex> g(s_pic_lock);
+        s_pic_done.push_back(std::move(d));
+    }
+}
+
+static void pics_release_all(void)
+{
+    for (ModPic& p : s_pics)
+        if (p.tex) { p.tex->WantDestroyNextFrame = true; s_pics_dying.push_back(p.tex); }
+    s_pics.clear();
+    s_pic_paths.clear();
+    std::lock_guard<std::mutex> g(s_pic_lock);
+    s_pic_queue.clear();
+    s_pic_done.clear();
+    s_pic_gen++;
+}
+
+/* Once a frame, after ImGui::NewFrame (render thread, ImGui lock held). */
+static void pics_tick(void)
+{
+    if (!s_open || s_tab != TAB_MODS) { if (!s_pics.empty() || !s_pic_paths.empty()) pics_release_all(); }
+    for (size_t i = 0; i < s_pics_dying.size(); ) {
+        ImTextureData* t = s_pics_dying[i];
+        if (t->Status == ImTextureStatus_Destroyed) {
+            ImGui::UnregisterUserTexture(t);
+            delete t;
+            s_pics_dying.erase(s_pics_dying.begin() + (ptrdiff_t)i);
+        } else i++;
+    }
+    std::vector<PicDone> done;
+    {
+        std::lock_guard<std::mutex> g(s_pic_lock);
+        /* at most two new textures a frame: each upload waits for the queue */
+        while (!s_pic_done.empty() && done.size() < 2) { done.push_back(std::move(s_pic_done.front())); s_pic_done.erase(s_pic_done.begin()); }
+    }
+    for (PicDone& d : done) {
+        if (d.gen != s_pic_gen) continue;
+        for (ModPic& p : s_pics) {
+            if (p.path != d.path || p.state != 0) continue;
+            if (!d.ok) { p.state = -1; break; }
+            ImTextureData* t = new ImTextureData();
+            t->Create(ImTextureFormat_RGBA32, d.w, d.h);
+            memcpy(t->Pixels, d.rgba.data(), (size_t)d.w * d.h * 4);
+            t->UseColors = true;
+            ImGui::RegisterUserTexture(t);
+            p.tex = t; p.state = 1;
+            break;
+        }
+    }
+}
+
+/* The overlay is going away: the renderer has destroyed every texture. */
+static void pics_shutdown(void)
+{
+    for (ModPic& p : s_pics) delete p.tex;
+    for (ImTextureData* t : s_pics_dying) delete t;
+    s_pics.clear(); s_pics_dying.clear(); s_pic_paths.clear();
+    std::lock_guard<std::mutex> g(s_pic_lock);
+    s_pic_queue.clear(); s_pic_done.clear(); s_pic_gen++;
+}
+
+/* Mod i's picture: NULL while it loads or when it has none. */
+static ImTextureData* pic_for(int i, const ps3_game_mod& m)
+{
+    if (!m.has_image) return NULL;
+    const char* path = NULL;
+    for (const auto& fp : s_pic_paths) if (fp.first == m.folder) { path = fp.second.c_str(); break; }
+    if (!path) {
+        char p[1024];
+        s_pic_paths.push_back({ m.folder, ps3_game_mods_image(i, p, sizeof p) ? std::string(p) : std::string() });
+        path = s_pic_paths.back().second.c_str();
+    }
+    if (!*path) return NULL;
+    for (ModPic& p : s_pics) if (p.path == path) return p.state == 1 ? p.tex : NULL;
+    s_pics.push_back({ path, NULL, 0 });
+    std::lock_guard<std::mutex> g(s_pic_lock);
+    s_pic_queue.push_back(path);
+    if (!s_pic_worker) { s_pic_worker = true; std::thread(pics_worker).detach(); }
+    return NULL;
+}
+
+static ImVec2 fit(const ImTextureData* t, float w, float h)
+{
+    const float s1 = w / (float)t->Width, s2 = h / (float)t->Height;
+    const float s = s1 < s2 ? s1 : s2;
+    return ImVec2((float)t->Width * s, (float)t->Height * s);
+}
+
+static char s_mods_sel[128];   /* the mod whose picture is shown large ("" = none) */
+
 static void mods_status_line(const ps3_game_mod& m)
 {
-    const bool bad = !strncmp(m.status, "Not used", 8) || !strncmp(m.status, "Made for", 8);
-    const ImVec4 col = (m.active && m.on) ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f) : bad ? kOrange : kGrey;
+    /* green: used now and next time; orange: wanted but not used (or not usable); grey: off */
+    const bool good = m.active && m.on && m.next;
+    const bool bad = !m.for_game || !strncmp(m.status, "Not used", 8) || (m.on && !m.next);
+    const ImVec4 col = good ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f) : bad ? kOrange : kGrey;
     ImGui::PushStyleColor(ImGuiCol_Text, col);
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextUnformatted(m.status);
@@ -1918,6 +2164,133 @@ static void mods_options(int i, int n)
     ImGui::Unindent(S(28.0f));
 }
 
+/* ---- [modsui] "Restart to apply" ------------------------------------------- */
+static volatile int s_restart_ask;   /* 1 open the question, 2 showing */
+
+/* Saves, then ends this game and starts it again (cellSysutil.c ps3_host_restart:
+ * the launcher or this exe again). The test hook (PS3_GAME_MODS_TEST "restart")
+ * goes straight to ps3_host_restart. */
+extern "C" void vk_overlay_restart_game(const char* why)
+{
+    if (s_dirty) settings_save();
+    if (s_enabled) {
+        set_open(0);
+        notice_for("Restarting the game: it comes back at the title screen", 10.0);
+    }
+    ps3_host_restart(why ? why : "in-game menu");
+}
+
+static void restart_confirm(void)
+{
+    if (s_restart_ask == 1) { ImGui::OpenPopup("###restartask"); s_restart_ask = 2; }
+    if (s_restart_ask != 2) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Restart the game?###restartask", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+                                                                  ImGuiWindowFlags_NoSavedSettings)) {
+        s_restart_ask = 0; return;
+    }
+    ImGui::TextUnformatted("The game closes and starts again with the mods as you set them.");
+    ImGui::TextUnformatted("It comes back at the title screen: choose Continue there to go on from your last save.");
+    ImGui::TextUnformatted("Progress since that save is lost.");
+    ImGui::Spacing();
+    const bool go = ImGui::Button("Restart");
+    ImGui::SameLine();
+    const bool cancel = ImGui::Button("Cancel");
+    ImGui::SetItemDefaultFocus();   /* Cancel: a stray Cross does not restart */
+    if (cancel) { s_restart_ask = 0; ImGui::CloseCurrentPopup(); }
+    else if (go) {
+        s_restart_ask = 0;
+        ImGui::CloseCurrentPopup();
+        vk_overlay_restart_game("Mods: Restart to apply");
+    }
+    ImGui::EndPopup();
+}
+
+/* ---- [modsui] "Add a mod from a zip" ------------------------------------------ */
+static bool s_zip_open;
+
+static void zip_panel(void)
+{
+    ImGui::Indent(S(16.0f));
+    char what[200];
+    float prog = 0.0f;
+    const bool busy = ps3_game_mods_zip_busy(what, sizeof what, &prog) != 0;
+    hint("Zip files in your Downloads folder and in the mods folder, newest first. A zip is checked before "
+         "anything is written: only mod files are taken out of it, never a program, and nothing outside the "
+         "mods folder is ever touched.");
+    const int n = ps3_game_mods_zip_count();
+    for (int k = 0; k < n; k++) {
+        ps3_game_mod_zip z;
+        if (!ps3_game_mods_zip_get(k, &z)) continue;
+        ImGui::PushID(3000 + k);
+        ImGui::PushFont(vk_ov_theme_bold(), 0.0f);
+        ImGui::TextUnformatted(z.file);
+        ImGui::PopFont();
+        ImGui::SameLine();
+        char when[32] = "";
+        const time_t tt = (time_t)z.mtime;
+        if (const struct tm* lt = localtime(&tt)) strftime(when, sizeof when, "%Y-%m-%d %H:%M", lt);
+        ImGui::TextColored(kGrey, "%s, %s, %.1f MB", z.where, when, (double)z.size / (1024.0 * 1024.0));
+        ImGui::PushStyleColor(ImGuiCol_Text, z.ok ? kGrey : kOrange);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(z.ok ? z.what : z.what[0] ? z.what : "cannot be installed");
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        if (z.ok) {
+            if (busy) ImGui::BeginDisabled();
+            if (!z.exists) { if (ImGui::Button("Install")) ps3_game_mods_zip_install(z.path, 0); }
+            else {
+                if (ImGui::Button("Replace")) ps3_game_mods_zip_install(z.path, 1);
+                ImGui::SameLine();
+                ImGui::TextColored(kGrey, "the mod there now stays until the new one is in place");
+            }
+            if (busy) ImGui::EndDisabled();
+        }
+        ImGui::PopID();
+        ImGui::Spacing();
+    }
+    if (busy) {
+        char b[260];
+        snprintf(b, sizeof b, "%s...", what);
+        ImGui::ProgressBar(prog > 0.0f ? prog : -1.0f * (float)ImGui::GetTime(), ImVec2(combo_w(), 0.0f), b);
+    } else if (!n) hint("No mod zip files there.");
+    const int other = ps3_game_mods_zip_not_mods();
+    if (other) { char b[160]; snprintf(b, sizeof b, "%d other zip file(s) there are not mods (no mod.json in them).", other); hint(b); }
+#ifdef _WIN32
+    if (busy) ImGui::BeginDisabled();
+    if (ImGui::Button("Choose another file...")) ps3_game_mods_zip_choose();
+    if (busy) ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Look again")) ps3_game_mods_zips_refresh();
+    hint("Choose another file opens the Windows file window over the game (Alt+Tab if it stays behind); "
+         "its folder is listed from then on.");
+#else
+    if (ImGui::Button("Look again")) ps3_game_mods_zips_refresh();
+#endif
+    static char res[2400];
+    static unsigned seen;
+    static int kind;
+    const unsigned seq = ps3_game_mods_zip_seq();
+    if (seq != seen) {
+        static char last[2400];
+        kind = ps3_game_mods_zip_result(res, sizeof res);
+        if (strcmp(res, last)) {   /* a new report: an install may have changed the list */
+            snprintf(last, sizeof last, "%s", res);
+            if (kind > 0) pics_release_all();
+        }
+        seen = seq;
+    }
+    if (kind) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kind > 0 ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f) : kOrange);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(res);
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+    ImGui::Unindent(S(16.0f));
+}
+
 static void tab_mods(void)
 {
     section("Game mods");
@@ -1931,21 +2304,58 @@ static void tab_mods(void)
         if (ImGui::Checkbox("Use mods", &use)) apply_setting(V_GAME_MODS, use ? "1" : "0");
         { const char* now = getenv(kVar[V_GAME_MODS]); restart_mark(V_GAME_MODS, strcmp(now ? now : "", s_start[V_GAME_MODS]) != 0); }
         env_mark(V_GAME_MODS, false);
+        if (ps3_game_mods_restart_needed()) {   /* [modsui] */
+            if (ps3_host_can_restart()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, kOrange);
+                const bool go = ImGui::Button("Restart to apply");
+                ImGui::PopStyleColor();
+                if (go) s_restart_ask = 1;
+                ImGui::SameLine();
+                ImGui::TextColored(kGrey, "the mods differ from what this session uses");
+            } else hint("The mods differ from what this session uses: they apply the next time the game starts.");
+        }
 #ifdef _WIN32
         if (ImGui::Button("Open the mods folder")) ps3_game_mods_open_folder();
         ImGui::SameLine();
 #endif
-        if (ImGui::Button("Look for new mods")) ps3_game_mods_rescan();
+        if (ImGui::Button("Look for new mods")) { ps3_game_mods_rescan(); pics_release_all(); }
+        ImGui::SameLine();
+        if (ImGui::Button(s_zip_open ? "Hide the zip files" : "Add a mod from a zip...")) {
+            s_zip_open = !s_zip_open;
+            if (s_zip_open) ps3_game_mods_zips_refresh();
+        }
         { char b[720]; snprintf(b, sizeof b, "Mods folder: %s", dir); hint(b); }
+        if (s_zip_open) { ImGui::Separator(); zip_panel(); }
         const int n = ps3_game_mods_count();
         if (!n)
-            hint("No mods yet. Unzip a mod into the mods folder (each mod is a folder with a mod.json in it), "
-                 "then \"Look for new mods\".");
+            hint("No mods yet. Use \"Add a mod from a zip\", or unzip a mod into the mods folder (each mod is a folder "
+                 "with a mod.json in it), then \"Look for new mods\".");
+        bool any_pic = false;
+        for (int i = 0; i < n && !any_pic; i++) { ps3_game_mod m; if (ps3_game_mods_get(i, &m) && m.has_image) any_pic = true; }
+        const float tw = S(96.0f), th = S(64.0f);
         for (int i = 0; i < n; i++) {
             ps3_game_mod m;
             if (!ps3_game_mods_get(i, &m)) continue;
             ImGui::PushID(i);
             ImGui::Separator();
+            ImTextureData* pic = NULL;
+            if (any_pic) {   /* [modsui] the picture column: click for it large, hover for a bigger look */
+                pic = pic_for(i, m);
+                if (pic) {
+                    const ImVec2 sz = fit(pic, tw, th);
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2((tw - sz.x) * 0.5f, (th - sz.y) * 0.5f));
+                    if (ImGui::ImageButton("##pic", pic->GetTexRef(), sz))
+                        snprintf(s_mods_sel, sizeof s_mods_sel, "%s", strcmp(s_mods_sel, m.folder) ? m.folder : "");
+                    ImGui::PopStyleVar();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip) && strcmp(s_mods_sel, m.folder)) {
+                        ImGui::BeginTooltip();
+                        ImGui::Image(pic->GetTexRef(), fit(pic, S(360.0f), S(260.0f)));
+                        ImGui::EndTooltip();
+                    }
+                } else ImGui::Dummy(ImVec2(tw, th));
+                ImGui::SameLine();
+            }
+            ImGui::BeginGroup();
             bool on = m.on != 0;
             if (!m.for_game) ImGui::BeginDisabled();
             if (ImGui::Checkbox("##on", &on)) ps3_game_mods_set_on(i, on ? 1 : 0);
@@ -1958,17 +2368,36 @@ static void tab_mods(void)
             const bool ver = m.version[0] && strcmp(m.version, "unknown");
             const bool who = m.author[0] && strcmp(m.author, "unknown");
             ImGui::TextColored(kGrey, "%s%s%s%s", ver ? "v" : "", ver ? m.version : "", who ? (ver ? "  by " : "by ") : "", who ? m.author : "");
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-                ImGui::SetTooltip("%s\n%d whole file(s), %d texture patch(es), %d xpps patch(es)", m.folder, m.n_files, m.n_tex, m.n_xpps);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
+                if (m.priority) ImGui::SetTooltip("%s\n%d whole file(s), %d texture patch(es), %d xpps patch(es)\nPut first by you (priority %d)",
+                                                  m.folder, m.n_files, m.n_tex, m.n_xpps, m.priority);
+                else ImGui::SetTooltip("%s\n%d whole file(s), %d texture patch(es), %d xpps patch(es)", m.folder, m.n_files, m.n_tex, m.n_xpps);
+            }
             mods_status_line(m);
+            if (m.clash && m.on) {   /* [modsui] who wins a clash */
+                if (ImGui::SmallButton("Use this one instead")) ps3_game_mods_prefer(i);
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, kGrey);
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::Text("(%s)", m.prefer);
+                ImGui::PopTextWrapPos();
+                ImGui::PopStyleColor();
+            }
             if (m.n_modules && m.for_game) mods_options(i, m.n_modules);
+            ImGui::EndGroup();
+            if (pic && !strcmp(s_mods_sel, m.folder)) {
+                float w = ImGui::GetContentRegionAvail().x;
+                if (w > S(480.0f)) w = S(480.0f);
+                ImGui::Image(pic->GetTexRef(), fit(pic, w, S(360.0f)));
+            }
             ImGui::PopID();
         }
         if (n) ImGui::Separator();
         hint("Mods made for the inFAMOUS Mod Manager work as they are, with no Unlocker: the game's own files are "
              "never changed, the port hands the game the mod's files in their place. Turning a mod on or off, "
-             "or changing its options, applies the next time the game starts. When two mods change the same "
-             "file, the first one (by folder name) is used.");
+             "changing its options or the one used in a clash applies the next time the game starts (\"Restart "
+             "to apply\" does that now). When two mods change the same file, the one put first is used (\"Use "
+             "this one instead\"), else the first by folder name.");
     }
 
     section("Texture packs");
@@ -2091,6 +2520,7 @@ static void draw_menu(double now)
          : s_ini_path[0] ? "Changes apply at once where they can and are saved."
                          : "Changes apply at once (not saved: PS3_OVERLAY_INI is empty).");
     quit_confirm();
+    restart_confirm();   /* [modsui] */
     ImGui::End();
 }
 
@@ -2339,6 +2769,7 @@ extern "C" int vk_overlay_draw(VkCommandBuffer cmd, uint32_t index, VkImage imag
     if (s_open) { io.BackendFlags |= ImGuiBackendFlags_HasGamepad; feed_pad(io); }
 
     ImGui::NewFrame();
+    pics_tick();                     /* [modsui] the mods' pictures: made, or freed off the Mods page */
     if (s_open) draw_menu(now);
     else if (s_hud) draw_hud();
     if (notices) draw_notices(now);
@@ -2380,6 +2811,7 @@ extern "C" void vk_overlay_shutdown(void)
         if (s_sdl_ready) { ImGui_ImplSDL2_Shutdown(); s_sdl_ready = false; }
         ImGui::DestroyContext();
         s_imgui_ready = false;
+        pics_shutdown();             /* [modsui] the renderer has destroyed their images */
     }
     fb_destroy_all();
     cpu_want(false);

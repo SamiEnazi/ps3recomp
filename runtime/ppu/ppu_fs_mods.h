@@ -38,11 +38,20 @@
  *    infamous1, the order in which the Unlocker's copies overwrite each
  *    other) with the patches written in, built once into <mods>/.port_cache.
  *
- * What a mod changes is decided at start. Mods are applied in folder order
- * (case-insensitive); a mod that changes what an earlier one already
+ * What a mod changes is decided at start. Mods are applied in order: the
+ * ones the player put first (mods.ini "priority", the menu's "Use this one
+ * instead"), the higher priority first, then the rest in folder order
+ * (case-insensitive). A mod that changes what an earlier one already
  * changes is left out whole, as the Manager refuses to enable a conflicting
  * mod: the same whole file, a texture at the same offset, a packed file that
- * overlaps, or a patch onto a file another mod replaces.
+ * overlaps, or a patch onto a file another mod replaces (mods_clash). The
+ * menu shows the same rule over the saved choices at once (plan_locked: no
+ * builds); the real resolve() still builds everything at start.
+ *
+ * The menu also installs mods from zip files (zip_check / zip_install, the
+ * reader in ppu_fs_mods_zip.h): every entry checked before anything is
+ * written, extracted into a dot folder inside the mods folder, then renamed.
+ * mod.json "image" names the mod's preview picture (image_path).
  *
  *   PS3_GAME_MODS_DIR=<dir>    the mods folder: <dir>/<mod>/mod.json, or one
  *                              folder deeper (an unzipped "<name>/<name>/").
@@ -55,6 +64,12 @@
  *                              toggle, a dropdown's first option).
  *   PS3_GAME_MODS_CACHE=<dir>  where patched files are built
  *                              (default <mods dir>/.port_cache).
+ *   PS3_GAME_MODS_ZIP_DIRS=<d;d> more folders the zip list looks in (tests).
+ *   PS3_GAME_MODS_TEST=<steps> test hook, run once (not after a restart),
+ *                              PS3_GAME_MODS_TEST_AT s (default 15) after
+ *                              init: "install=<zip>|replace=<zip>|
+ *                              pick=<folder>=<id,id>|prefer=<folder>|plan|
+ *                              zips|restart", each logged "[mods] test: ...".
  *
  * Log lines start "[mods]".
  */
@@ -63,11 +78,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 #include <ctype.h>
@@ -75,7 +93,13 @@
 #ifdef _WIN32
 #include <direct.h>
 #include <shellapi.h>
+#include <commdlg.h>    /* OPENFILENAMEW: "Choose another file..." (comdlg32 is loaded when used) */
 #endif
+
+/* libs/system/cellSysutil.c: the test hook's "restart" step ends the session
+ * the way the menu's "Restart to apply" does (the overlay saves its settings
+ * first, then calls this) */
+extern "C" void ps3_host_restart(const char* why);
 
 namespace gmods {
 
@@ -405,6 +429,18 @@ struct JParse {
     }
 };
 
+/* The bytes' object (a UTF-8 BOM skipped); false if they are not a JSON object. */
+static bool parse_json(const Bytes& b, J& out)
+{
+    const char* p = (const char*)b.data();
+    const char* e = p + b.size();
+    if (b.size() >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) p += 3;
+    JParse jp{ p, e };
+    J v;
+    if (!b.empty() && jp.val(v, 0) && v.t == 5) { out = std::move(v); return true; }
+    return false;
+}
+
 /* The file's object; an empty one if it is missing or not JSON (err says why). */
 static J read_json(const std::string& path, std::string* err = nullptr)
 {
@@ -414,14 +450,61 @@ static J read_json(const std::string& path, std::string* err = nullptr)
         if (err && finfo(path).ok) *err = base_of(slashes(path)) + " cannot be read or is bigger than 1 MB";
         return j;
     }
-    const char* p = (const char*)b.data();
-    const char* e = p + b.size();
-    if (b.size() >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) p += 3;
-    JParse jp{ p, e };
     J v;
-    if (jp.val(v, 0) && v.t == 5) return v;
+    if (parse_json(b, v)) return v;
     if (err) *err = base_of(slashes(path)) + " is not valid JSON";
     return j;
+}
+
+/* ---- paths from untrusted places (a zip's entry names, mod.json "image") ---- */
+
+/* One part of such a path: printable ASCII only (the file layer's names are
+ * narrow), no character Windows refuses or reads specially (<>:"|?* -- ':' is
+ * a drive letter or an alternate data stream), not ".", "..", empty, ending in
+ * a dot or a space (Windows drops those: two names, one file), and not a
+ * device name (CON, NUL, COM1 ... with any extension). */
+static bool part_name_ok(const std::string& p, std::string* why)
+{
+    auto no = [&](const char* w) { if (why) *why = w; return false; };
+    if (p.empty()) return no("an empty folder name (a doubled or trailing '/')");
+    if (p == "." || p == "..") return no("a \"..\" or \".\" part (it would leave its folder)");
+    if (p.size() > 160) return no("a name longer than 160 characters");
+    for (char c : p) {
+        const unsigned char u = (unsigned char)c;
+        if (u < 0x20 || u > 0x7E) return no("a character other than plain ASCII letters, digits and signs");
+        if (c == ':') return no("a ':' (a drive letter or a file stream)");
+        if (strchr("<>\"|?*", c)) return no("a character Windows does not allow in names (<>\"|?*)");
+    }
+    if (p.back() == '.' || p.back() == ' ') return no("a name that ends in a dot or a space");
+    std::string base = upper(p.substr(0, p.find('.')));
+    while (!base.empty() && base.back() == ' ') base.pop_back();
+    static const char* const kDev[] = { "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$" };
+    for (const char* d : kDev) if (base == d) return no("a Windows device name (CON, NUL, COM1, ...)");
+    if (base.size() == 4 && (!base.compare(0, 3, "COM") || !base.compare(0, 3, "LPT")) && isdigit((unsigned char)base[3]))
+        return no("a Windows device name (CON, NUL, COM1, ...)");
+    return true;
+}
+
+/* A relative path that stays inside its folder: '\' read as '/' (zips made on
+ * Windows), then not absolute ('/' first: also "//server" and "\\?\"), no
+ * drive letter, and every part part_name_ok. out: the '/'-separated path. */
+static bool safe_rel(const std::string& in, std::string& out, std::string* why)
+{
+    auto no = [&](const char* w) { if (why) *why = w; return false; };
+    if (in.empty()) return no("an empty name");
+    if (in.size() > 240) return no("a path longer than 240 characters");
+    std::string s = in;
+    for (char& c : s) if (c == '\\') c = '/';
+    if (s[0] == '/') return no("an absolute path (it starts with a slash, or names a network share)");
+    if (s.size() >= 2 && s[1] == ':') return no("a drive letter");
+    size_t a = 0;
+    for (size_t i = 0; i <= s.size(); i++) {
+        if (i < s.size() && s[i] != '/') continue;
+        if (!part_name_ok(s.substr(a, i - a), why)) return false;
+        a = i + 1;
+    }
+    out = s;
+    return true;
 }
 
 /* ---- PSARC (the game's archives) ------------------------------------------- */
@@ -712,25 +795,53 @@ struct Tex : Part { uint32_t off = 0; int w = 0, h = 0, mips = 0; std::string fm
 struct Xp : Part { int index = 0; uint32_t abs = 0, choff = 0, len = 0; bool chunk = false; std::string name; };
 struct Mod {
     std::string folder, path, name, author, version, game, err;
+    std::string image;                   /* mod.json "image", as written (image_path checks it) */
     bool for_game = false;
     std::vector<Module> modules;
     bool on = true;                      /* the saved choice */
     bool have_pick = false;
     std::vector<std::string> pick;       /* the saved option ids */
+    bool have_prio = false;              /* mods.ini "priority": put first by the player */
+    int prio = 0;                        /* the higher, the earlier */
     std::vector<Part> files;
     std::vector<Tex> tex;
     std::vector<Xp> xp;
     std::set<std::string> targets;
+    uint64_t stamp = 0;                  /* the used files' names, sizes and times (read_parts) */
 };
 
-struct StartInfo { bool active = false; std::string why; };
+/* What this session does with a mod (resolve, at start). key: mod_key then;
+ * fail: left out because a file could not be built -- alone (fails by itself)
+ * or with `partners` (lower folder -> mod_key), the other mods on that file. */
+struct StartInfo {
+    bool active = false, fail = false, alone = false;
+    std::string why, key;
+    std::map<std::string, std::string> partners;
+};
+
+/* The menu's view of the next start (plan_locked): the clash rule over the
+ * saved choices, by index into g.list. */
+struct Plan {
+    uint64_t gen = ~0ull;                 /* g.gen it was made for */
+    bool use = true;                      /* PS3_GAME_MODS as it is now */
+    std::vector<char> next;               /* used from the next start */
+    std::vector<std::string> why;         /* else why not ("" = off, broken, not for the game) */
+    std::vector<std::string> key;         /* mod_key */
+    std::vector<int> prefer;              /* left out by a clash: the priority "Use this one instead" gives (0 = none) */
+    std::vector<std::string> prefer_text; /* ... and what that does to the others */
+    std::set<std::string> sig;            /* mod_key of every mod used from the next start */
+};
 
 static struct {
     std::once_flag once;
-    std::mutex mx;                                   /* list, start, state, pending */
+    std::mutex mx;                                   /* list, start, state, pending, plan, gen, zip_dirs */
     std::string dir, cache, state_path;
     bool use = true;                                 /* PS3_GAME_MODS */
     std::vector<Mod> list;                           /* what the menu shows */
+    uint64_t gen = 0;                                /* bumped by every change of list (the plan is redone) */
+    Plan plan;
+    std::set<std::string> start_sig;                 /* mod_key of every mod this session uses */
+    std::vector<std::string> zip_dirs;               /* folders "Choose another file" took a zip from (mods.ini [.zips]) */
     std::map<std::string, StartInfo> start;          /* by lower(folder): what this session uses */
     std::map<std::string, std::string> serve;        /* lower file name -> host file the game gets */
     std::map<std::string, std::string> serve_mod;    /* lower file name -> the mod's name, for the log */
@@ -988,13 +1099,39 @@ static void read_parts(Mod& m)
     for (const Tex& p : m.tex) m.targets.insert(p.target);
     for (const Xp& p : m.xp) m.targets.insert(p.target);
     if (m.targets.empty()) m.err = "it has no .xpps files, texture patches or xpps patches (with these options)";
+    /* what the files are now (a mod replaced from a zip under the same folder
+     * name changes it): the menu compares it with the start's */
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const std::string& s, uint64_t a, int64_t b) {
+        for (char c : lower(s)) { h ^= (uint8_t)c; h *= 1099511628211ull; }
+        for (int k = 0; k < 8; k++) { h ^= (uint8_t)(a >> (8 * k)); h *= 1099511628211ull; }
+        for (int k = 0; k < 8; k++) { h ^= (uint8_t)((uint64_t)b >> (8 * k)); h *= 1099511628211ull; }
+    };
+    for (const Part& p : m.files) { const FInfo f = finfo(p.path); mix(p.path, f.size, f.mtime); }
+    for (const Tex& p : m.tex) { const FInfo f = finfo(p.path); mix(p.path, f.size, f.mtime); }
+    for (const Xp& p : m.xp) { const FInfo f = finfo(p.path); mix(p.path, f.size, f.mtime); }
+    m.stamp = h;
 }
 
 /* ---- the saved choices (mods.ini) ------------------------------------------ */
 
-struct Saved { bool have_on = false, on = true, have_pick = false; std::vector<std::string> pick; };
+/* mods.ini: a section per mod folder with anything not at its default --
+ *   [Sasha's Black Tar]
+ *   on = 0                 turned off
+ *   pick = default,jbintro the options picked
+ *   priority = 2           put first by the player ("Use this one instead"): a
+ *                          mod with a priority comes before every mod without
+ *                          one, a higher priority before a lower one
+ * and the folders the zip list also looks in ("Choose another file"):
+ *   [.zips]
+ *   folder = S:/Downloads
+ * ([.zips] can be no mod's folder: the scan skips dot folders.) Older builds
+ * read the file as before: they skip the keys and the section they do not know. */
+struct Saved { bool have_on = false, on = true, have_pick = false, have_prio = false; int prio = 0; std::vector<std::string> pick; };
 
-static std::map<std::string, Saved> state_read()
+static const char* const kZipSection = ".zips";
+
+static std::map<std::string, Saved> state_read(std::vector<std::string>* zip_dirs = nullptr)
 {
     std::map<std::string, Saved> st;
     FILE* f = g.state_path.empty() ? nullptr : fopen(g.state_path.c_str(), "r");
@@ -1014,8 +1151,16 @@ static std::map<std::string, Saved> state_read()
         std::string k = s.substr(0, eq), v = s.substr(eq + 1);
         while (!k.empty() && (k.back() == ' ' || k.back() == '\t')) k.pop_back();
         while (!v.empty() && (v[0] == ' ' || v[0] == '\t')) v.erase(0, 1);
+        if (cur == kZipSection) {
+            if (k == "folder" && !v.empty() && zip_dirs && zip_dirs->size() < 8) zip_dirs->push_back(v);
+            continue;
+        }
         Saved& sv = st[cur];
-        if (k == "on") { sv.have_on = true; sv.on = v != "0"; }
+        if (k == "priority") {
+            const long p = strtol(v.c_str(), nullptr, 10);
+            if (p >= 1) { sv.have_prio = true; sv.prio = p > 1000000 ? 1000000 : (int)p; }
+        }
+        else if (k == "on") { sv.have_on = true; sv.on = v != "0"; }
         else if (k == "pick") {
             sv.have_pick = true; sv.pick.clear();
             size_t s0 = 0;
@@ -1031,10 +1176,11 @@ static std::map<std::string, Saved> state_read()
 static void state_write_locked()
 {
     if (g.state_path.empty()) return;
-    std::string out = "# inFAMOUS 2 port: the game mods the menu turned off and the options picked\n"
-                      "# (F2 > Mods). A mod not listed here is on, with its default options.\n";
+    std::string out = "# inFAMOUS 2 port: the game mods the menu turned off, the options picked and the mods\n"
+                      "# put first (F2 > Mods). A mod not listed here is on, with its default options, in\n"
+                      "# folder order.\n";
     for (const Mod& m : g.list) {
-        if (m.on && !m.have_pick) continue;
+        if (m.on && !m.have_pick && !m.have_prio) continue;
         out += "[" + m.folder + "]\n";
         if (!m.on) out += "on = 0\n";
         if (m.have_pick) {
@@ -1042,6 +1188,11 @@ static void state_write_locked()
             for (size_t i = 0; i < m.pick.size(); i++) out += (i ? "," : "") + m.pick[i];
             out += "\n";
         }
+        if (m.have_prio) out += "priority = " + std::to_string(m.prio) + "\n";
+    }
+    if (!g.zip_dirs.empty()) {
+        out += std::string("[") + kZipSection + "]\n";
+        for (const std::string& d : g.zip_dirs) out += "folder = " + d + "\n";
     }
     Bytes b(out.begin(), out.end());
     if (!write_all(g.state_path, b)) fprintf(stderr, "[mods] could not save %s\n", g.state_path.c_str());
@@ -1065,10 +1216,12 @@ static std::vector<Mod> scan()
         m.version = j.str("version", "unknown");
         m.game = game_key(j.str("game"));
         m.for_game = m.game == "inf2";
+        m.image = j.str("image");
         auto it = st.find(lower(folder));
         if (it != st.end()) {
             if (it->second.have_on) m.on = it->second.on;
             m.have_pick = it->second.have_pick; m.pick = it->second.pick;
+            m.have_prio = it->second.have_prio; m.prio = it->second.prio;
         }
         if (!jerr.empty()) m.err = jerr;
         else if (m.for_game) { read_modules(m); read_parts(m); }
@@ -1191,11 +1344,19 @@ static bool build(const std::string& name, const Part* base, const std::vector<c
         if (d.size() < 48 || memcmp(d.data(), "PACK", 4)) { err = name + " is not an XPPS/XPP PACK file"; return false; }
         const uint64_t ds = be32(&d[40]);
         const std::set<TexKey> known = xp_textures(d);
+        size_t misfit = 0;
+        const Tex* first = nullptr;
         for (const Tex* t : tex)
-            if (!known.count(TexKey(t->off, t->w, t->h, t->fmt, t->mips))) {
-                err = t->name + " was made for another version of " + name + ": this game's copy has no such texture there";
-                return false;
-            }
+            if (!known.count(TexKey(t->off, t->w, t->h, t->fmt, t->mips))) { misfit++; if (!first) first = t; }
+        if (misfit == 1) {
+            err = first->name + " was made for another version of " + name + ": this game's copy has no such texture there";
+            return false;
+        }
+        if (misfit) {
+            err = std::to_string(misfit) + " textures (" + first->name + " and more) were made for another version of " + name +
+                  ": this game's copy has no such textures there";
+            return false;
+        }
         for (const Tex* t : tex) {
             Bytes pl;
             if (!read_all(t->path, pl, 128)) { err = "cannot read " + t->path; return false; }
@@ -1291,48 +1452,90 @@ static bool xp_overlap(const Xp& a, const Xp& b)
     return a.choff < b.choff + b.len && b.choff < a.choff + a.len;
 }
 
+/* Whether two mods change the same thing, so only one of them can be used:
+ * the same whole file, a whole file one replaces and the other patches, a
+ * texture at the same offset, or packed-file patches that overlap. The same
+ * rule resolve() always had, both ways round. */
+static bool mods_clash(const Mod& a, const Mod& b)
+{
+    for (const Part& f : a.files) if (b.targets.count(f.target)) return true;
+    for (const Part& f : b.files) if (a.targets.count(f.target)) return true;
+    for (const Tex& x : a.tex)
+        for (const Tex& y : b.tex)
+            if (x.off == y.off && x.target == y.target) return true;
+    for (const Xp& x : a.xp)
+        for (const Xp& y : b.xp)
+            if (xp_overlap(x, y)) return true;
+    return false;
+}
+
+/* The order mods are applied in: the ones with a priority first, the higher
+ * one first, then the rest; equals in folder order (their order in the list,
+ * the scan's). Deterministic: the priorities live in mods.ini. */
+struct Prio { bool have; int prio; };
+static std::vector<size_t> mod_order(const std::vector<Prio>& p)
+{
+    std::vector<size_t> o(p.size());
+    for (size_t i = 0; i < o.size(); i++) o[i] = i;
+    std::stable_sort(o.begin(), o.end(), [&](size_t a, size_t b) {
+        if (p[a].have != p[b].have) return p[a].have;
+        return p[a].have && p[a].prio > p[b].prio; });
+    return o;
+}
+static std::vector<Prio> prios(const std::vector<Mod>& mods)
+{
+    std::vector<Prio> p;
+    for (const Mod& m : mods) p.push_back({ m.have_prio, m.prio });
+    return p;
+}
+
+/* The clash rule over `order`: a mod is used unless it changes what a mod
+ * used before it changes; then it is left out whole and why[lower(folder)]
+ * says with whom (lost_to: their indices). Mods that are off, not for this
+ * game, broken, or in `out` (a build that failed) are not used. Returns the
+ * used mods in order. resolve() and the menu's plan both run it. */
+static std::vector<size_t> plan_pass(const std::vector<Mod>& mods, const std::vector<size_t>& order,
+                                     const std::map<std::string, std::string>& out, std::map<std::string, std::string>& why,
+                                     std::map<size_t, std::vector<size_t>>* lost_to = nullptr)
+{
+    std::vector<size_t> used;
+    for (size_t i : order) {
+        const Mod& m = mods[i];
+        if (!m.on || !m.for_game || !m.err.empty() || out.count(lower(m.folder))) continue;
+        std::vector<size_t> clash;
+        for (size_t u : used) if (mods_clash(m, mods[u])) clash.push_back(u);
+        if (clash.empty()) { used.push_back(i); continue; }
+        std::string s = "it changes the same files as ";
+        for (size_t k = 0; k < clash.size(); k++) s += (k ? ", " : "") + mods[clash[k]].name;
+        why[lower(m.folder)] = s;
+        if (lost_to) (*lost_to)[i] = clash;
+    }
+    return used;
+}
+
+/* A mod as it would be used: its folder, the options picked and its files. */
+static std::string mod_key(const Mod& m)
+{
+    std::string k = lower(m.folder) + "|";
+    if (!m.modules.empty()) for (const std::string& id : picked_ids(m)) k += id + ",";
+    char b[32];
+    snprintf(b, sizeof b, "|%016llx", (unsigned long long)m.stamp);
+    return k + b;
+}
+
 /* Which mods are used, and what the game gets for each file they change. */
 static void resolve(std::vector<Mod>& mods)
 {
     Arcs arcs;
-    std::map<std::string, std::string> why;    /* lower(folder) -> why it is left out */
+    const std::vector<size_t> order = mod_order(prios(mods));
+    std::vector<size_t> rank(mods.size());
+    for (size_t r = 0; r < order.size(); r++) rank[order[r]] = r;
+    std::map<std::string, std::string> blamed;      /* lower(folder) -> why its file could not be built */
+    std::map<std::string, StartInfo> fails;         /* ... alone, or with which mods */
     /* every failed round leaves out at least one more mod, so this ends */
     for (size_t round = 0; round <= mods.size() + 1; round++) {
-        std::map<std::string, size_t> whole;                 /* target -> mod */
-        std::map<std::string, size_t> texk;                  /* target:offset -> mod */
-        std::map<std::string, std::vector<size_t>> patched;  /* target -> mods with patches on it */
-        std::vector<std::pair<size_t, const Xp*>> xps;
-        std::vector<size_t> used;
-        for (size_t i = 0; i < mods.size(); i++) {
-            Mod& m = mods[i];
-            if (!m.on || !m.for_game || !m.err.empty() || why.count(lower(m.folder))) continue;
-            std::set<size_t> clash;
-            for (const Part& f : m.files) {
-                if (whole.count(f.target)) clash.insert(whole[f.target]);
-                for (size_t o : patched[f.target]) clash.insert(o);
-            }
-            for (const Tex& t : m.tex) {
-                const std::string k = t.target + ":" + std::to_string(t.off);
-                if (texk.count(k)) clash.insert(texk[k]);
-                if (whole.count(t.target)) clash.insert(whole[t.target]);
-            }
-            for (const Xp& x : m.xp) {
-                if (whole.count(x.target)) clash.insert(whole[x.target]);
-                for (const auto& o : xps) if (xp_overlap(x, *o.second)) clash.insert(o.first);
-            }
-            clash.erase(i);
-            if (!clash.empty()) {
-                std::string s = "it changes the same files as ";
-                bool first = true;
-                for (size_t o : clash) { s += (first ? "" : ", ") + mods[o].name; first = false; }
-                why[lower(m.folder)] = s;
-                continue;
-            }
-            for (const Part& f : m.files) whole[f.target] = i;
-            for (const Tex& t : m.tex) { texk[t.target + ":" + std::to_string(t.off)] = i; patched[t.target].push_back(i); }
-            for (const Xp& x : m.xp) { xps.push_back({ i, &x }); patched[x.target].push_back(i); }
-            used.push_back(i);
-        }
+        std::map<std::string, std::string> why = blamed;    /* lower(folder) -> why it is left out */
+        const std::vector<size_t> used = plan_pass(mods, order, blamed, why);
         /* each changed file: a whole file as it is, or a build */
         std::map<std::string, std::string> serve, by;
         bool again = false;
@@ -1340,27 +1543,25 @@ static void resolve(std::vector<Mod>& mods)
         for (size_t i : used) for (const std::string& t : mods[i].targets) targets.insert(t);
         for (const std::string& t : targets) {
             const Part* base = nullptr;
-            size_t base_mod = 0;
             std::vector<const Tex*> tl;
             std::vector<const Xp*> xl;
             std::set<size_t> who;
             for (size_t i : used) {
-                for (const Part& f : mods[i].files) if (f.target == t) { base = &f; base_mod = i; who.insert(i); }
+                for (const Part& f : mods[i].files) if (f.target == t) { base = &f; who.insert(i); }
                 for (const Tex& x : mods[i].tex) if (x.target == t) { tl.push_back(&x); who.insert(i); }
                 for (const Xp& x : mods[i].xp) if (x.target == t) { xl.push_back(&x); who.insert(i); }
             }
             std::string bym;
             for (size_t i : who) bym += (bym.empty() ? "" : " + ") + mods[i].name;
             if (tl.empty() && xl.empty()) { serve[t] = base->path; by[t] = bym; continue; }
-            (void)base_mod;
             std::string path, err;
             if (!build(t, base, tl, xl, arcs, path, err)) {
                 fprintf(stderr, "[mods] %s: %s\n", t.c_str(), err.c_str());
                 /* Who is at fault: each mod on this file alone (a dry build). The
                  * ones that fail alone are left out; if each builds alone, the
-                 * last one by folder name, which came after the others (as the
+                 * last one in the order, which came after the others (as the
                  * Manager refuses the mod being turned on, not the ones before). */
-                bool blamed = false;
+                bool blamed_one = false;
                 if (who.size() > 1)
                     for (size_t i : who) {
                         const Part* b1 = nullptr;
@@ -1370,12 +1571,20 @@ static void resolve(std::vector<Mod>& mods)
                         for (const Tex& x : mods[i].tex) if (x.target == t) t1.push_back(&x);
                         for (const Xp& x : mods[i].xp) if (x.target == t) x1.push_back(&x);
                         std::string p1, e1;
-                        if (!build(t, b1, t1, x1, arcs, p1, e1, true)) { why[lower(mods[i].folder)] = "could not build " + t + ": " + e1; blamed = true; }
+                        if (!build(t, b1, t1, x1, arcs, p1, e1, true)) {
+                            blamed[lower(mods[i].folder)] = "could not build " + t + ": " + e1;
+                            fails[lower(mods[i].folder)].alone = true;
+                            blamed_one = true;
+                        }
                     }
-                if (!blamed) {
-                    const size_t last = *who.rbegin();
-                    why[lower(mods[last].folder)] = (who.size() > 1 ? "could not build " + t + " together with the mods before it: "
-                                                                     : "could not build " + t + ": ") + err;
+                if (!blamed_one) {
+                    size_t last = *who.begin();
+                    for (size_t i : who) if (rank[i] > rank[last]) last = i;
+                    blamed[lower(mods[last].folder)] = (who.size() > 1 ? "could not build " + t + " together with the mods before it: "
+                                                                       : "could not build " + t + ": ") + err;
+                    StartInfo& f = fails[lower(mods[last].folder)];
+                    f.alone = who.size() == 1;
+                    for (size_t i : who) if (i != last) f.partners[lower(mods[i].folder)] = mod_key(mods[i]);
                 }
                 again = true;
                 break;
@@ -1386,12 +1595,19 @@ static void resolve(std::vector<Mod>& mods)
         std::lock_guard<std::mutex> lk(g.mx);
         g.serve.swap(serve);
         g.serve_mod.swap(by);
+        g.start_sig.clear();
         for (Mod& m : mods) {
+            const std::string lf = lower(m.folder);
             StartInfo si;
+            auto fi = fails.find(lf);
+            if (fi != fails.end()) si = fi->second;
+            si.fail = blamed.count(lf) != 0;
             si.active = std::find(used.begin(), used.end(), (size_t)(&m - mods.data())) != used.end();
-            auto w = why.find(lower(m.folder));
+            si.key = mod_key(m);
+            auto w = why.find(lf);
             if (w != why.end()) si.why = w->second;
-            g.start[lower(m.folder)] = si;
+            if (si.active) g.start_sig.insert(si.key);
+            g.start[lf] = si;
         }
         g.nserve.store((int)g.serve.size(), std::memory_order_release);
         return;
@@ -1400,10 +1616,12 @@ static void resolve(std::vector<Mod>& mods)
     std::lock_guard<std::mutex> lk(g.mx);
     g.serve.clear();
     g.serve_mod.clear();
+    g.start_sig.clear();
     for (const Mod& m : mods) {
         StartInfo si;
-        auto w = why.find(lower(m.folder));
-        si.why = w != why.end() ? w->second : "the mods' files could not be built (see the session log)";
+        auto w = blamed.find(lower(m.folder));
+        si.why = w != blamed.end() ? w->second : "the mods' files could not be built (see the session log)";
+        si.key = mod_key(m);
         g.start[lower(m.folder)] = si;
     }
     g.nserve.store(0, std::memory_order_release);
@@ -1423,6 +1641,7 @@ static std::string settings_dir()
 }
 
 static void init_body();
+static void test_start();   /* PS3_GAME_MODS_TEST, below */
 static void init()
 {
     std::call_once(g.once, [] {
@@ -1450,11 +1669,23 @@ static void init_body()
         g.state_path = s ? slashes(s) : (settings_dir().empty() ? std::string() : join(settings_dir(), "mods.ini"));
         const char* c = getenv("PS3_GAME_MODS_CACHE");
         g.cache = c && *c ? slashes(c) : join(g.dir, ".port_cache");
+        {
+            std::vector<std::string> zd;
+            state_read(&zd);
+            std::lock_guard<std::mutex> lk(g.mx);
+            g.zip_dirs = zd;
+        }
         std::vector<Mod> mods = scan();
         int n_for = 0;
         for (const Mod& m : mods) if (m.for_game) n_for++;
         fprintf(stderr, "[mods] %s: %zu mod(s), %d for inFAMOUS 2%s\n", g.dir.c_str(), mods.size(), n_for,
                 g.use ? "" : "; PS3_GAME_MODS=0: none used");
+        {
+            std::string first;
+            for (size_t i : mod_order(prios(mods)))
+                if (mods[i].have_prio) first += (first.empty() ? "" : ", ") + mods[i].name + " (priority " + std::to_string(mods[i].prio) + ")";
+            if (!first.empty()) fprintf(stderr, "[mods] put first by the player: %s; then the rest by folder name\n", first.c_str());
+        }
         if (g.use) resolve(mods);
         for (const Mod& m : mods) {
             const StartInfo si = g.start.count(lower(m.folder)) ? g.start[lower(m.folder)] : StartInfo();
@@ -1468,8 +1699,12 @@ static void init_body()
                         !m.err.empty() ? m.err.c_str() : !m.for_game ? "not made for inFAMOUS 2" : !m.on ? "turned off" :
                         !g.use ? "mods are off" : si.why.c_str());
         }
-        std::lock_guard<std::mutex> lk(g.mx);
-        g.list.swap(mods);
+        {
+            std::lock_guard<std::mutex> lk(g.mx);
+            g.list.swap(mods);
+            g.gen++;
+        }
+        test_start();
     }
 }
 
@@ -1545,6 +1780,584 @@ static void on_open(int fd, const char* hpath)
     log_once("hide:" + hp, "%s: %zu file(s) hidden, the mods' are read instead: %s", base_of(slashes(hp)).c_str(), add.size(), hidden.c_str());
 }
 
+/* ---- the menu's plan: the next start from the saved choices ------------------- */
+
+/* "Use mods" as the next start will read it (the menu sets PS3_GAME_MODS at once). */
+static bool use_next()
+{
+    const char* u = getenv("PS3_GAME_MODS");
+    return !(u && u[0] == '0' && !u[1]);
+}
+
+static std::string and_list(const std::vector<std::string>& v)
+{
+    std::string s;
+    for (size_t i = 0; i < v.size(); i++) s += (i == 0 ? "" : i + 1 == v.size() ? " and " : ", ") + v[i];
+    return s;
+}
+
+/* Called with g.mx held: g.plan for the list as it is now -- the clash rule
+ * (plan_pass) over the saved choices, no builds. A mod whose file could not
+ * be built at this start stays out while it, and the mods it failed with,
+ * are unchanged (the same build would fail again). */
+static void plan_locked()
+{
+    const bool use = use_next();
+    Plan& P = g.plan;
+    if (P.gen == g.gen && P.use == use) return;
+    const std::vector<Mod>& L = g.list;
+    const size_t n = L.size();
+    P = Plan();
+    P.gen = g.gen; P.use = use;
+    P.next.assign(n, 0); P.why.assign(n, std::string()); P.key.assign(n, std::string());
+    P.prefer.assign(n, 0); P.prefer_text.assign(n, std::string());
+    std::map<std::string, size_t> at;
+    for (size_t i = 0; i < n; i++) { P.key[i] = mod_key(L[i]); at[lower(L[i].folder)] = i; }
+    std::map<std::string, std::string> out;
+    for (size_t i = 0; i < n; i++) {
+        auto s = g.start.find(lower(L[i].folder));
+        if (s == g.start.end() || !s->second.fail || s->second.key != P.key[i]) continue;
+        bool same = true;
+        for (const auto& pk : s->second.partners) {
+            auto a = at.find(pk.first);
+            if (a == at.end() || !L[a->second].on || P.key[a->second] != pk.second) same = false;
+        }
+        if (same) out[lower(L[i].folder)] = s->second.why;
+    }
+    if (!use) return;
+    const std::vector<Prio> pr = prios(L);
+    std::map<std::string, std::string> why = out;
+    std::map<size_t, std::vector<size_t>> lost;
+    const std::vector<size_t> used = plan_pass(L, mod_order(pr), out, why, &lost);
+    for (size_t i : used) { P.next[i] = 1; P.sig.insert(P.key[i]); }
+    for (size_t i = 0; i < n; i++) {
+        auto w = why.find(lower(L[i].folder));
+        if (w != why.end()) P.why[i] = w->second;
+    }
+    /* "Use this one instead": a priority above every mod it clashes with, and
+     * what that does to the others (the same pass with that priority) */
+    for (const auto& lt : lost) {
+        const size_t i = lt.first;
+        int p = 1;
+        for (size_t j = 0; j < n; j++)
+            if (j != i && L[j].have_prio && L[j].prio >= p && mods_clash(L[i], L[j])) p = L[j].prio + 1;
+        std::vector<Prio> p2 = pr;
+        p2[i] = { true, p };
+        std::map<std::string, std::string> w2 = out;
+        const std::vector<size_t> u2 = plan_pass(L, mod_order(p2), out, w2);
+        if (std::find(u2.begin(), u2.end(), i) == u2.end()) continue;
+        std::vector<std::string> lose, gain;
+        for (size_t u : used) if (std::find(u2.begin(), u2.end(), u) == u2.end()) lose.push_back(L[u].name);
+        for (size_t u : u2) if (u != i && !P.next[u]) gain.push_back(L[u].name);
+        if (lose.empty()) continue;
+        P.prefer[i] = p;
+        P.prefer_text[i] = and_list(lose) + " will be left out" + (gain.empty() ? std::string() : "; " + and_list(gain) + " will be used");
+    }
+}
+
+/* Called with g.mx held, after plan_locked: the mod's line for the menu.
+ * `changes`: the game files it changes, for the line. */
+static std::string status_locked(size_t i, const std::string& changes)
+{
+    const Mod& m = g.list[i];
+    const Plan& P = g.plan;
+    auto it = g.start.find(lower(m.folder));
+    const bool active = it != g.start.end() && it->second.active;
+    if (!m.err.empty()) return "Not used: " + m.err;   /* a broken mod.json names no game: its error first */
+    if (!m.for_game)
+        return m.game.empty() ? "Not used: its mod.json does not name the game (\"game\": \"inf2\")"
+                              : std::string("Made for ") + game_label(m.game) + ", not inFAMOUS 2";
+    if (active) {
+        if (!m.on) return "Off from the next start (in use now: changes " + changes + ")";
+        if (!P.use) return "In use now; not used from the next start: mods are off";
+        if (!P.next[i]) return "In use now; left out from the next start: " + P.why[i];
+        if (it->second.key != P.key[i]) return "In use: changes " + changes + ". The changes apply from the next start";
+        return "In use: changes " + changes;
+    }
+    if (!m.on) return "Off";
+    if (!P.use) return "Not used: mods are off";
+    if (P.next[i]) return "Used from the next start: changes " + changes;
+    if (it != g.start.end() && g.use && it->second.why == P.why[i]) return "Not used: " + P.why[i];
+    return "Left out from the next start: " + P.why[i];
+}
+
+/* ---- preview pictures (mod.json "image") --------------------------------------- */
+
+static const uint64_t kMaxImage = 8ull << 20;
+
+/* The mod's picture: a PNG or JPG inside the mod's folder -- a relative path
+ * (safe_rel: no "..", absolute path, drive, share, stream or device name),
+ * reached through no junction or link, a regular file of at most 8 MB.
+ * out: its host path. */
+static bool image_path(const Mod& m, std::string& out, std::string* why = nullptr)
+{
+    std::string rel;
+    if (m.image.empty()) { if (why) *why = "mod.json names no picture"; return false; }
+    if (!safe_rel(m.image, rel, why)) return false;
+    if (!ends_i(rel, ".png") && !ends_i(rel, ".jpg") && !ends_i(rel, ".jpeg")) { if (why) *why = "not a .png or .jpg file"; return false; }
+    if (is_link(m.path)) { if (why) *why = "the mod's folder is a link"; return false; }
+    std::string p = m.path;
+    for (const std::string& part : split_parts(rel)) {
+        p = join(p, part);
+        if (is_link(p)) { if (why) *why = "it goes through a junction or link"; return false; }
+    }
+    const FInfo f = finfo(p);
+    if (!f.ok || f.dir) { if (why) *why = "no such file in the mod's folder"; return false; }
+    if (!f.size || f.size > kMaxImage) { if (why) *why = "empty or bigger than 8 MB"; return false; }
+    out = p;
+    return true;
+}
+
+/* ---- one mod on its own (a mod just added from a zip) ------------------------- */
+
+/* What the existing checks say about m alone: for each game file it patches,
+ * its textures against this copy of the file (xp_textures, as build() checks
+ * them; the options holding the misfits are named), then a dry build. Empty:
+ * every file builds. */
+static std::vector<std::string> check_alone(const Mod& m, Arcs& arcs)
+{
+    std::vector<std::string> out;
+    if (!m.err.empty() || !m.for_game) return out;
+    std::vector<std::pair<std::string, std::vector<std::string>>> opts;   /* chosen options: name, lower paths */
+    if (!m.modules.empty()) {
+        const std::set<std::string> ids = picked_ids(m);
+        for (const Module& x : m.modules) {
+            if (!ids.count(lower(x.id))) continue;
+            std::vector<std::string> ps;
+            for (const std::string& p : x.paths) ps.push_back(lower(p));
+            opts.push_back({ x.name, ps });
+        }
+    }
+    for (const std::string& t : m.targets) {
+        const Part* base = nullptr;
+        std::vector<const Tex*> tl;
+        std::vector<const Xp*> xl;
+        for (const Part& f : m.files) if (f.target == t) base = &f;
+        for (const Tex& x : m.tex) if (x.target == t) tl.push_back(&x);
+        for (const Xp& x : m.xp) if (x.target == t) xl.push_back(&x);
+        if (tl.empty() && xl.empty()) continue;
+        if (!tl.empty()) {
+            Bytes d;
+            int idx = -1;
+            Psarc* arc = base ? nullptr : arcs.find(t, idx);
+            const bool got = base ? read_all(base->path, d) : (arc && arc->entry((uint32_t)idx, d));
+            if (!got) { out.push_back(base ? "cannot read " + base_of(base->path) : t + " is not in the game's archives"); continue; }
+            const std::set<TexKey> known = xp_textures(d);
+            size_t misfit = 0;
+            bool all_in = true;
+            std::vector<std::string> names;
+            for (const Tex* x : tl) {
+                if (known.count(TexKey(x->off, x->w, x->h, x->fmt, x->mips))) continue;
+                misfit++;
+                const std::string rel = lower(rel_to(m.path, x->path));
+                bool in = false;
+                for (const auto& o : opts)
+                    if (path_on(&o.second, rel)) {
+                        in = true;
+                        if (std::find(names.begin(), names.end(), o.first) == names.end()) names.push_back(o.first);
+                    }
+                if (!in) all_in = false;
+            }
+            if (misfit) {
+                std::string s = (misfit == 1 ? std::string("1 texture was") : std::to_string(misfit) + " textures were") +
+                                " made for another version of " + t;
+                s += !names.empty() && all_in ? ": untick " + and_list(names) : std::string(": the mod does not fit this copy of the game");
+                out.push_back(s);
+                continue;
+            }
+        }
+        std::string p, e;
+        if (!build(t, base, tl, xl, arcs, p, e, true)) out.push_back("could not build " + t + ": " + e);
+    }
+    return out;
+}
+
+#include "ppu_fs_mods_zip.h"   /* zip_check / zip_install */
+
+/* ---- the zip list, the installs and the file dialog (one worker at a time) ------ */
+
+struct ZipRow { std::string path, file, where; int64_t mtime = 0; uint64_t size = 0; bool chosen = false; ZipPlan plan; };
+static struct {
+    std::mutex mx;                    /* everything here */
+    std::vector<ZipRow> rows;         /* the zips that look like mods (and why one cannot be installed) */
+    int not_mods = 0;                 /* zips listed that are no mod at all */
+    bool busy = false;                /* a worker runs */
+    std::string busy_what;
+    std::atomic<uint64_t> done{0};
+    uint64_t total = 0;
+    std::string result;               /* the last install's report */
+    int result_kind = 0;              /* 1 installed, -1 not */
+    uint64_t seq = 0;                 /* bumped when rows/result change */
+} gz;
+
+static bool zip_job(const std::string& what, std::function<void()> fn)
+{
+    {
+        std::lock_guard<std::mutex> lk(gz.mx);
+        if (gz.busy) return false;
+        gz.busy = true; gz.busy_what = what; gz.done = 0; gz.total = 0;
+    }
+    std::thread([fn] {
+        try { fn(); }
+        catch (const std::exception& e) {
+            fprintf(stderr, "[mods] zip: %s\n", e.what());
+            std::lock_guard<std::mutex> lk(gz.mx);
+            gz.result = std::string("Something went wrong (") + e.what() + ")"; gz.result_kind = -1; gz.seq++;
+        }
+        std::lock_guard<std::mutex> lk(gz.mx);
+        gz.busy = false; gz.busy_what.clear(); gz.seq++;
+    }).detach();
+    return true;
+}
+
+/* The folders the list looks in: Downloads, the mods folder, the folders a
+ * zip was chosen from before, PS3_GAME_MODS_ZIP_DIRS. (UTF-8 path, label) */
+static std::vector<std::pair<std::string, std::string>> zip_folders()
+{
+    std::vector<std::pair<std::string, std::string>> v;
+#ifdef _WIN32
+    {   /* FOLDERID_Downloads, through shell32 as it is loaded (no COM headers here) */
+        typedef HRESULT(WINAPI* GetKF)(const GUID&, DWORD, HANDLE, PWSTR*);
+        typedef void(WINAPI* MemFree)(LPVOID);
+        static const GUID kDownloads = { 0x374DE290, 0x123F, 0x4565, { 0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B } };
+        HMODULE sh = LoadLibraryA("shell32.dll"), ole = LoadLibraryA("ole32.dll");
+        GetKF gk = sh ? (GetKF)(void*)GetProcAddress(sh, "SHGetKnownFolderPath") : nullptr;
+        MemFree mf = ole ? (MemFree)(void*)GetProcAddress(ole, "CoTaskMemFree") : nullptr;
+        PWSTR w = nullptr;
+        if (gk && mf && gk(kDownloads, 0, NULL, &w) == S_OK && w) v.push_back({ slashes(utf8_of(w)), "Downloads" });
+        if (w && mf) mf(w);
+    }
+#else
+    if (const char* h = getenv("HOME")) v.push_back({ join(h, "Downloads"), "Downloads" });
+#endif
+    std::vector<std::string> extra;
+    {
+        std::lock_guard<std::mutex> lk(g.mx);
+        extra = g.zip_dirs;
+    }
+    if (!g.dir.empty()) v.push_back({ utf8_of_ansi(g.dir), "the mods folder" });
+    for (const std::string& d : extra) v.push_back({ d, base_of(d) });
+    if (const char* e = getenv("PS3_GAME_MODS_ZIP_DIRS")) {
+        std::string s = e;
+        size_t a = 0;
+        for (size_t i = 0; i <= s.size(); i++)
+            if (i == s.size() || s[i] == ';') {
+                if (i > a) { const std::string d = slashes(utf8_of_ansi(s.substr(a, i - a))); v.push_back({ d, base_of(d) }); }
+                a = i + 1;
+            }
+    }
+    std::vector<std::pair<std::string, std::string>> u;
+    for (auto& x : v) {
+        while (x.first.size() > 3 && x.first.back() == '/') x.first.pop_back();
+        bool dup = false;
+        for (const auto& y : u) if (ieq(y.first, x.first)) dup = true;
+        if (!dup && !x.first.empty()) u.push_back(x);
+    }
+    return u;
+}
+
+/* The .zip files directly in dir (no links), newest first. */
+static void zips_in(const std::string& dir, const std::string& label, std::vector<ZipRow>& out)
+{
+#ifdef _WIN32
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(widen(dir + "/*.zip").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        ZipRow r;
+        r.file = utf8_of(fd.cFileName);
+        if (!ends_i(r.file, ".zip")) continue;
+        r.path = join(dir, r.file); r.where = label;
+        r.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        const uint64_t ft = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        r.mtime = (int64_t)(ft / 10000000ull) - 11644473600ll;
+        out.push_back(r);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+#else
+    for (const std::string& n : list_dir(dir)) {
+        if (!ends_i(n, ".zip")) continue;
+        const std::string p = join(dir, n);
+        if (is_link(p)) continue;
+        const FInfo f = finfo(p);
+        if (!f.ok || f.dir) continue;
+        ZipRow r; r.file = n; r.path = p; r.where = label; r.size = f.size; r.mtime = f.mtime;
+        out.push_back(r);
+    }
+#endif
+}
+
+static const size_t kZipListMax = 30;
+
+/* The list: the newest zips of those folders, each checked (zip_check, read only). */
+static void zip_list_run()
+{
+    std::vector<ZipRow> all;
+    for (const auto& d : zip_folders()) zips_in(d.first, d.second, all);
+    std::stable_sort(all.begin(), all.end(), [](const ZipRow& a, const ZipRow& b) { return a.mtime > b.mtime; });
+    if (all.size() > kZipListMax) all.resize(kZipListMax);
+    {
+        std::lock_guard<std::mutex> lk(gz.mx);
+        std::vector<ZipRow> keep;   /* a file chosen with the dialog stays at the top */
+        for (ZipRow& r : gz.rows) if (r.chosen) keep.push_back(r);
+        gz.rows.swap(keep);
+        gz.not_mods = 0;
+        gz.total = all.size();
+        gz.seq++;
+    }
+    for (ZipRow& r : all) {
+        zip_check(r.path, r.plan);
+        std::lock_guard<std::mutex> lk(gz.mx);
+        gz.done++;
+        bool have = false;
+        for (const ZipRow& x : gz.rows) if (ieq(x.path, r.path)) have = true;
+        if (have) continue;
+        if (r.plan.not_mod) gz.not_mods++;
+        else gz.rows.push_back(r);
+        gz.seq++;
+    }
+}
+
+/* "Use mods" and the rest of the menu see the new folder at once. */
+static void rescan_now();
+
+/* Installs the zip at path_u8 (checked again first), then reports what the
+ * mods' own checks say about it. Runs on the zip worker. */
+static void zip_install_run(const std::string& path_u8, bool replace)
+{
+    ZipPlan z;
+    std::string report;
+    int kind = -1;
+    if (!zip_check(path_u8, z)) report = base_of(slashes(path_u8)) + " was not installed: " + z.err;
+    else if (z.exists && !replace) report = "mods/" + z.folder + " is there already: use Replace to put this one in its place";
+    else {
+        { std::lock_guard<std::mutex> lk(gz.mx); gz.total = z.total; }
+        std::string err;
+        if (!zip_install(z, replace, err, &gz.done)) report = base_of(slashes(path_u8)) + " was not installed: " + err;
+        else {
+            kind = 1;
+            rescan_now();
+            const std::string who = z.name + (z.version.empty() ? "" : " " + z.version) + (z.author.empty() ? "" : " by " + z.author);
+            report = (z.exists ? "Replaced " : "Installed ") + who + " (mods/" + z.folder + ", " + std::to_string(z.files.size()) + " file(s)).";
+            if (z.left_out) report += "\nLeft out " + std::to_string(z.left_out) + " file(s) that are not mod files: " + z.left_kinds + ".";
+            Mod m;
+            bool found = false;
+            std::string status;
+            {
+                std::lock_guard<std::mutex> lk(g.mx);
+                plan_locked();
+                for (size_t i = 0; i < g.list.size(); i++) {
+                    if (!ieq(g.list[i].folder, z.folder)) continue;
+                    m = g.list[i];
+                    std::string t;
+                    for (const std::string& x : m.targets) t += (t.empty() ? "" : ", ") + x;
+                    status = status_locked(i, t);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) report += "\nThe mods folder does not list it (see the session log).";
+            else {
+                report += "\n" + status;
+                Arcs arcs;
+                for (const std::string& s : check_alone(m, arcs)) report += "\n" + s;
+            }
+        }
+    }
+    fprintf(stderr, "[mods] zip: %s\n", report.c_str());
+    ZipPlan again;   /* its row: "there already" now */
+    zip_check(path_u8, again);
+    std::lock_guard<std::mutex> lk(gz.mx);
+    gz.result = report; gz.result_kind = kind;
+    for (ZipRow& r : gz.rows) if (ieq(r.path, path_u8)) r.plan = again;
+    gz.seq++;
+}
+
+#ifdef _WIN32
+/* The open dialog shows over the game: its frame is put on top as it opens. */
+static UINT_PTR CALLBACK zip_dialog_hook(HWND child, UINT msg, WPARAM, LPARAM)
+{
+    if (msg == WM_INITDIALOG) {
+        HWND dlg = GetParent(child);
+        SetWindowPos(dlg, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(dlg);
+    }
+    return 0;
+}
+#endif
+
+/* "Choose another file...": the Windows open dialog (on the worker; the game
+ * goes on), the zip it gives checked and put at the top of the list, and its
+ * folder remembered for the list (mods.ini [.zips]). */
+static void zip_choose_run()
+{
+#ifdef _WIN32
+    typedef BOOL(WINAPI* GetOpen)(LPOPENFILENAMEW);
+    HMODULE dl = LoadLibraryA("comdlg32.dll");
+    GetOpen go = dl ? (GetOpen)(void*)GetProcAddress(dl, "GetOpenFileNameW") : nullptr;
+    if (!go) { std::lock_guard<std::mutex> lk(gz.mx); gz.result = "The file window is not available here."; gz.result_kind = -1; gz.seq++; return; }
+    std::wstring init;
+    for (const auto& d : zip_folders()) { init = widen(d.first); break; }
+    for (wchar_t& c : init) if (c == L'/') c = L'\\';
+    wchar_t file[1024] = L"";
+    OPENFILENAMEW o;
+    memset(&o, 0, sizeof o);
+    o.lStructSize = sizeof o;
+    o.lpstrFilter = L"Zip files (*.zip)\0*.zip\0";
+    o.lpstrFile = file;
+    o.nMaxFile = (DWORD)(sizeof file / sizeof file[0]);
+    o.lpstrInitialDir = init.empty() ? NULL : init.c_str();
+    o.lpstrTitle = L"Add an inFAMOUS 2 mod from a zip";
+    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY | OFN_DONTADDTORECENT |
+              OFN_EXPLORER | OFN_ENABLEHOOK | OFN_ENABLESIZING;
+    o.lpfnHook = zip_dialog_hook;
+    if (!go(&o)) return;   /* cancelled */
+    ZipRow r;
+    r.path = slashes(utf8_of(file));
+    r.file = base_of(r.path);
+    r.where = "chosen";
+    r.chosen = true;
+    const FInfo fi = finfo_u8(r.path);
+    r.size = fi.size; r.mtime = fi.mtime;
+    zip_check(r.path, r.plan);
+    {
+        std::lock_guard<std::mutex> lk(g.mx);
+        const std::string d = dir_of(r.path);
+        std::vector<std::string> v{ d };
+        for (const std::string& x : g.zip_dirs) if (!ieq(x, d) && v.size() < 6) v.push_back(x);
+        g.zip_dirs = v;
+        state_write_locked();
+    }
+    std::lock_guard<std::mutex> lk(gz.mx);
+    for (size_t i = 0; i < gz.rows.size(); i++) if (ieq(gz.rows[i].path, r.path)) { gz.rows.erase(gz.rows.begin() + (ptrdiff_t)i); break; }
+    gz.rows.insert(gz.rows.begin(), r);
+    gz.seq++;
+#endif
+}
+
+static void rescan_now()
+{
+    if (g.dir.empty()) return;
+    std::vector<Mod> mods;
+    try { mods = scan(); }
+    catch (const std::exception& e) { fprintf(stderr, "[mods] could not read the mods folder again (%s)\n", e.what()); return; }
+    std::lock_guard<std::mutex> lk(g.mx);
+    g.list.swap(mods);
+    g.gen++;
+}
+
+/* ---- PS3_GAME_MODS_TEST: the menu's actions from a script (tests) ---------------- */
+
+static int find_folder(const std::string& folder)
+{
+    std::lock_guard<std::mutex> lk(g.mx);
+    for (size_t i = 0; i < g.list.size(); i++) if (ieq(g.list[i].folder, folder)) return (int)i;
+    return -1;
+}
+
+static void test_log_plan(const char* when)
+{
+    const int n = ps3_game_mods_count();
+    for (int i = 0; i < n; i++) {
+        ps3_game_mod m;
+        if (!ps3_game_mods_get(i, &m)) continue;
+        fprintf(stderr, "[mods] test: %s: %s%s%s -- %s%s%s\n", when, m.name, m.priority ? " (priority " : "",
+                m.priority ? (std::to_string(m.priority) + ")").c_str() : "", m.status,
+                m.prefer[0] ? " | Use this one instead: " : "", m.prefer);
+        char img[600];
+        if (ps3_game_mods_image(i, img, sizeof img)) fprintf(stderr, "[mods] test: %s: picture %s\n", m.name, img);
+    }
+    fprintf(stderr, "[mods] test: %s: restart needed: %s\n", when, ps3_game_mods_restart_needed() ? "yes" : "no");
+}
+
+static void test_wait_zip()
+{
+    for (int k = 0; k < 6000; k++) {
+        { std::lock_guard<std::mutex> lk(gz.mx); if (!gz.busy) return; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+static void test_run(std::string steps)
+{
+    fprintf(stderr, "[mods] test: %s\n", steps.c_str());
+    size_t a = 0;
+    for (size_t i = 0; i <= steps.size(); i++) {
+        if (i < steps.size() && steps[i] != '|') continue;
+        const std::string st = steps.substr(a, i - a);
+        a = i + 1;
+        const size_t eq = st.find('=');
+        const std::string k = st.substr(0, eq), v = eq == std::string::npos ? std::string() : st.substr(eq + 1);
+        if (k == "install" || k == "replace") {
+            const std::string p = slashes(utf8_of_ansi(v));
+            ZipPlan z;
+            zip_check(p, z);
+            fprintf(stderr, "[mods] test: check %s: %s\n", base_of(p).c_str(),
+                    !z.err.empty() ? z.err.c_str() : (z.name + " -> mods/" + z.folder + (z.exists ? " (there already)" : "") + ", " +
+                                                      std::to_string(z.files.size()) + " file(s)" +
+                                                      (z.left_out ? ", " + std::to_string(z.left_out) + " left out (" + z.left_kinds + ")" : "")).c_str());
+            if (ps3_game_mods_zip_install(p.c_str(), k == "replace")) test_wait_zip();
+        } else if (k == "pick") {
+            const size_t e2 = v.find('=');
+            const int mi = find_folder(v.substr(0, e2));
+            if (mi < 0 || e2 == std::string::npos) { fprintf(stderr, "[mods] test: pick: no mod %s\n", v.c_str()); continue; }
+            std::set<std::string> want;
+            const std::string ids = v.substr(e2 + 1);
+            size_t b = 0;
+            for (size_t j = 0; j <= ids.size(); j++)
+                if (j == ids.size() || ids[j] == ',') { if (j > b) want.insert(lower(ids.substr(b, j - b))); b = j + 1; }
+            ps3_game_mod m;
+            ps3_game_mods_get(mi, &m);
+            for (int pass = 0; pass < 2; pass++)   /* the wanted ones on first: the choice never goes empty */
+                for (int o = 0; o < m.n_modules; o++) {
+                    ps3_game_mod_option opt;
+                    if (!ps3_game_mods_option(mi, o, &opt)) continue;
+                    const bool w = want.count(lower(opt.id)) != 0;
+                    if (pass == 0 && w && !opt.picked) ps3_game_mods_pick(mi, o, 1);
+                    if (pass == 1 && !w && opt.picked && !opt.dropdown) ps3_game_mods_pick(mi, o, 0);
+                }
+            fprintf(stderr, "[mods] test: picked %s\n", v.c_str());
+        } else if (k == "prefer") {
+            const int mi = find_folder(v);
+            ps3_game_mod m;
+            if (mi < 0 || !ps3_game_mods_get(mi, &m)) { fprintf(stderr, "[mods] test: prefer: no mod %s\n", v.c_str()); continue; }
+            fprintf(stderr, "[mods] test: before \"Use this one instead\" on %s: %s\n", m.name, m.prefer[0] ? m.prefer : "(no button: not left out by a clash)");
+            fprintf(stderr, "[mods] test: prefer %s: %s\n", m.name, ps3_game_mods_prefer(mi) ? "done" : "nothing to do");
+        } else if (k == "plan") {
+            test_log_plan("plan");
+        } else if (k == "zips") {
+            ps3_game_mods_zips_refresh();
+            test_wait_zip();
+            const int n = ps3_game_mods_zip_count();
+            for (int z = 0; z < n; z++) {
+                ps3_game_mod_zip r;
+                if (ps3_game_mods_zip_get(z, &r))
+                    fprintf(stderr, "[mods] test: zip %s (%s): %s%s\n", r.file, r.where, r.ok ? "" : "cannot install: ", r.what);
+            }
+            fprintf(stderr, "[mods] test: %d other zip file(s) are not mods\n", ps3_game_mods_zip_not_mods());
+        } else if (k == "restart") {
+            const int need = ps3_game_mods_restart_needed();
+            fprintf(stderr, "[mods] test: restart needed: %s%s\n", need ? "yes" : "no", need ? "; restarting (as \"Restart to apply\")" : "");
+            if (need) ps3_host_restart("mods test: Restart to apply");
+        } else if (!st.empty()) fprintf(stderr, "[mods] test: unknown step %s\n", st.c_str());
+    }
+}
+
+static void test_start()
+{
+    const char* t = getenv("PS3_GAME_MODS_TEST");
+    if (!t || !*t || getenv("PS3_RESTARTED")) return;   /* once: not again in the game a restart started */
+    const char* at = getenv("PS3_GAME_MODS_TEST_AT");
+    const double secs = at && *at ? atof(at) : 15.0;
+    const std::string steps = t;
+    std::thread([steps, secs] {
+        std::this_thread::sleep_for(std::chrono::milliseconds((long long)(secs * 1000.0)));
+        try { test_run(steps); }
+        catch (const std::exception& e) { fprintf(stderr, "[mods] test: %s\n", e.what()); }
+    }).detach();
+}
+
 } /* namespace gmods */
 
 /* ---- for the in-game menu (vk_overlay.cpp) --------------------------------- */
@@ -1560,12 +2373,20 @@ extern "C" int ps3_game_mods_count(void)
 
 extern "C" int ps3_game_mods_in_use(void) { gmods::init(); return gmods::g.nserve.load(std::memory_order_acquire); }
 
+extern "C" unsigned ps3_game_mods_generation(void)
+{
+    gmods::init();
+    std::lock_guard<std::mutex> lk(gmods::g.mx);
+    return (unsigned)gmods::g.gen;
+}
+
 extern "C" int ps3_game_mods_get(int i, ps3_game_mod* o)
 {
     using namespace gmods;
     init();
     std::lock_guard<std::mutex> lk(g.mx);
     if (i < 0 || i >= (int)g.list.size() || !o) return 0;
+    plan_locked();
     const Mod& m = g.list[(size_t)i];
     memset(o, 0, sizeof *o);
     snprintf(o->folder, sizeof o->folder, "%s", m.folder.c_str());
@@ -1577,21 +2398,18 @@ extern "C" int ps3_game_mods_get(int i, ps3_game_mod* o)
     o->n_modules = (int)m.modules.size();
     auto it = g.start.find(lower(m.folder));
     o->active = it != g.start.end() && it->second.active;
+    o->next = g.plan.next[(size_t)i];
+    o->priority = m.have_prio ? m.prio : 0;
+    o->has_image = !m.image.empty();
+    if (g.plan.prefer[(size_t)i] > 0) {
+        o->clash = 1;
+        snprintf(o->prefer, sizeof o->prefer, "%s", g.plan.prefer_text[(size_t)i].c_str());
+    }
     std::string t;
     int k = 0;
     for (const std::string& x : m.targets) { if (k++ < 4) t += (t.empty() ? "" : ", ") + x; }
     if (k > 4) t += ", +" + std::to_string(k - 4) + " more";
-    std::string s;
-    if (!m.err.empty()) s = "Not used: " + m.err;   /* a broken mod.json names no game: its error first */
-    else if (!m.for_game)
-        s = m.game.empty() ? "Not used: its mod.json does not name the game (\"game\": \"inf2\")"
-                           : std::string("Made for ") + game_label(m.game) + ", not inFAMOUS 2";
-    else if (o->active) s = (m.on ? "In use: changes " : "Off from the next start (in use now: changes ") + t + (m.on ? "" : ")");
-    else if (!m.on) s = "Off";
-    else if (!g.use) s = "Not used: mods are off";
-    else if (it != g.start.end() && !it->second.why.empty()) s = "Not used: " + it->second.why;
-    else s = "Used from the next start: changes " + t;
-    snprintf(o->status, sizeof o->status, "%s", s.c_str());
+    snprintf(o->status, sizeof o->status, "%s", status_locked((size_t)i, t).c_str());
     return 1;
 }
 
@@ -1621,6 +2439,7 @@ extern "C" void ps3_game_mods_set_on(int i, int on)
     std::lock_guard<std::mutex> lk(g.mx);
     if (i < 0 || i >= (int)g.list.size()) return;
     g.list[(size_t)i].on = on != 0;
+    g.gen++;
     state_write_locked();
 }
 
@@ -1658,19 +2477,69 @@ extern "C" void ps3_game_mods_pick(int i, int k, int on)
     std::lock_guard<std::mutex> lk(g.mx);
     if (i >= (int)g.list.size() || g.list[(size_t)i].folder != m.folder) return;   /* rescanned meanwhile */
     g.list[(size_t)i] = std::move(m);
+    g.gen++;
     state_write_locked();
+}
+
+/* "Use this one instead" (a mod left out by a clash): a priority above every
+ * mod it clashes with, saved. 1 = done. */
+extern "C" int ps3_game_mods_prefer(int i)
+{
+    using namespace gmods;
+    init();
+    std::lock_guard<std::mutex> lk(g.mx);
+    if (i < 0 || i >= (int)g.list.size()) return 0;
+    plan_locked();
+    const int p = g.plan.prefer[(size_t)i];
+    if (p <= 0) return 0;
+    Mod& m = g.list[(size_t)i];
+    fprintf(stderr, "[mods] \"%s\" put first (priority %d): %s\n", m.name.c_str(), p, g.plan.prefer_text[(size_t)i].c_str());
+    m.have_prio = true;
+    m.prio = p;
+    g.gen++;
+    state_write_locked();
+    return 1;
+}
+
+/* The saved choices would make the next start use other mods (or the same
+ * mods otherwise) than this session does. */
+extern "C" int ps3_game_mods_restart_needed(void)
+{
+    using namespace gmods;
+    init();
+    if (g.dir.empty()) return 0;
+    std::lock_guard<std::mutex> lk(g.mx);
+    plan_locked();
+    return g.plan.sig != g.start_sig ? 1 : 0;
+}
+
+/* The mod's preview picture (image_path's rules), its host path. 1 = one to show. */
+extern "C" int ps3_game_mods_image(int i, char* out, size_t cap)
+{
+    using namespace gmods;
+    init();
+    if (!out || !cap) return 0;
+    out[0] = 0;
+    Mod m;
+    {
+        std::lock_guard<std::mutex> lk(g.mx);
+        if (i < 0 || i >= (int)g.list.size() || g.list[(size_t)i].image.empty()) return 0;
+        m.path = g.list[(size_t)i].path; m.image = g.list[(size_t)i].image;
+    }
+    std::string p, why;
+    if (!image_path(m, p, &why)) {
+        log_once("img:" + m.path, "%s: no preview picture: \"%s\" -- %s", m.path.c_str(), m.image.c_str(), why.c_str());
+        return 0;
+    }
+    if (p.size() >= cap) return 0;
+    snprintf(out, cap, "%s", p.c_str());
+    return 1;
 }
 
 extern "C" void ps3_game_mods_rescan(void)
 {
-    using namespace gmods;
-    init();
-    if (g.dir.empty()) return;
-    std::vector<Mod> mods;
-    try { mods = scan(); }
-    catch (const std::exception& e) { fprintf(stderr, "[mods] could not read the mods folder again (%s)\n", e.what()); return; }
-    std::lock_guard<std::mutex> lk(g.mx);
-    g.list.swap(mods);
+    gmods::init();
+    gmods::rescan_now();
 }
 
 /* Opens the mods folder in the file manager (Windows; elsewhere nothing). */
@@ -1684,6 +2553,89 @@ extern "C" void ps3_game_mods_open_folder(void)
     for (char& c : w) if (c == '/') c = '\\';
     ShellExecuteA(NULL, "open", w.c_str(), NULL, NULL, SW_SHOWNORMAL);
 #endif
+}
+
+/* ---- zips ---- */
+
+extern "C" void ps3_game_mods_zips_refresh(void)
+{
+    gmods::init();
+    if (gmods::g.dir.empty()) return;
+    gmods::zip_job("Looking at the zip files", [] { gmods::zip_list_run(); });
+}
+
+extern "C" int ps3_game_mods_zip_count(void)
+{
+    std::lock_guard<std::mutex> lk(gmods::gz.mx);
+    return (int)gmods::gz.rows.size();
+}
+
+extern "C" int ps3_game_mods_zip_not_mods(void)
+{
+    std::lock_guard<std::mutex> lk(gmods::gz.mx);
+    return gmods::gz.not_mods;
+}
+
+extern "C" int ps3_game_mods_zip_get(int i, ps3_game_mod_zip* o)
+{
+    using namespace gmods;
+    std::lock_guard<std::mutex> lk(gz.mx);
+    if (!o || i < 0 || i >= (int)gz.rows.size()) return 0;
+    const ZipRow& r = gz.rows[(size_t)i];
+    memset(o, 0, sizeof *o);
+    snprintf(o->path, sizeof o->path, "%s", r.path.c_str());
+    snprintf(o->file, sizeof o->file, "%s", r.file.c_str());
+    snprintf(o->where, sizeof o->where, "%s", r.where.c_str());
+    o->size = (long long)r.size;
+    o->mtime = (long long)r.mtime;
+    o->ok = r.plan.err.empty();
+    o->exists = r.plan.exists;
+    snprintf(o->folder, sizeof o->folder, "%s", r.plan.folder.c_str());
+    if (o->ok) {
+        std::string w = r.plan.name + (r.plan.version.empty() ? "" : " " + r.plan.version) + (r.plan.author.empty() ? "" : " by " + r.plan.author);
+        w += r.plan.exists ? " -- mods/" + r.plan.folder + " is there already" : " -> mods/" + r.plan.folder;
+        snprintf(o->what, sizeof o->what, "%s", w.c_str());
+    } else snprintf(o->what, sizeof o->what, "%s", r.plan.err.c_str());
+    return 1;
+}
+
+extern "C" int ps3_game_mods_zip_install(const char* path_u8, int replace)
+{
+    gmods::init();
+    if (!path_u8 || !*path_u8 || gmods::g.dir.empty()) return 0;
+    const std::string p = path_u8;
+    const bool rep = replace != 0;
+    return gmods::zip_job("Installing " + gmods::base_of(gmods::slashes(p)), [p, rep] { gmods::zip_install_run(p, rep); }) ? 1 : 0;
+}
+
+extern "C" int ps3_game_mods_zip_choose(void)
+{
+    gmods::init();
+    if (gmods::g.dir.empty()) return 0;
+    return gmods::zip_job("Waiting for the file window", [] { gmods::zip_choose_run(); }) ? 1 : 0;
+}
+
+extern "C" int ps3_game_mods_zip_busy(char* what, size_t cap, float* progress)
+{
+    using namespace gmods;
+    std::lock_guard<std::mutex> lk(gz.mx);
+    if (what && cap) snprintf(what, cap, "%s", gz.busy_what.c_str());
+    if (progress) *progress = gz.total ? (float)((double)gz.done.load() / (double)gz.total) : 0.0f;
+    return gz.busy ? 1 : 0;
+}
+
+extern "C" int ps3_game_mods_zip_result(char* out, size_t cap)
+{
+    using namespace gmods;
+    std::lock_guard<std::mutex> lk(gz.mx);
+    if (out && cap) snprintf(out, cap, "%s", gz.result.c_str());
+    return gz.result_kind;
+}
+
+extern "C" unsigned ps3_game_mods_zip_seq(void)
+{
+    std::lock_guard<std::mutex> lk(gmods::gz.mx);
+    return (unsigned)gmods::gz.seq;
 }
 
 #endif /* PPU_FS_MODS_H */

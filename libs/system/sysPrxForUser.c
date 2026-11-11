@@ -168,6 +168,10 @@ static u32 s_next_heap_id = 1;
 int g_sys_process_exit_called = 0;
 s32 g_sys_process_exit_code   = 0;
 
+/* cellSysutil.c: a host restart ("Restart to apply") gives the process its
+ * restart status, or starts the game again first; otherwise exitcode as is */
+extern int ps3_host_exit_status(int code);
+
 void sys_process_exit(s32 exitcode)
 {
     g_sys_process_exit_code   = exitcode;
@@ -195,7 +199,7 @@ void sys_process_exit(s32 exitcode)
 #endif
         }
     }
-    exit(exitcode);
+    exit(ps3_host_exit_status(exitcode));
 }
 
 s32 sys_process_getpid(void)
