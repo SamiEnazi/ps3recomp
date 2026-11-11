@@ -139,7 +139,7 @@ static bool env_on(const char* v)
 enum {
     V_FPS_CAP, V_PRESENT, V_FULLSCREEN,
     V_AA, V_SHARPEN, V_RENDER_SCALE, V_ANISO, V_UPSCALE,
-    V_DOF, V_EDGE_BLUR, V_MESH_TRIM,
+    V_DOF, V_EDGE_BLUR, V_MESH_TRIM, V_EDGE_VP,
     V_VOLUME,
     V_INPUT_MODE, V_BUTTON_ICONS, V_RUMBLE, V_RUMBLE_STRENGTH,
     V_HUD, V_HUD_CORNER, V_HUD_OPACITY, V_HUD_GRAPH, V_HUD_CPU,
@@ -151,7 +151,7 @@ enum {
 static const char* const kVar[V_N] = {
     "PS3RECOMP_FPS_CAP", "PS3RECOMP_VK_PRESENT", "PS3RECOMP_VK_FULLSCREEN",
     "PS3RECOMP_AA", "PS3RECOMP_SHARPEN", "PS3RECOMP_RENDER_SCALE", "PS3RECOMP_ANISO", "PS3RECOMP_UPSCALE",
-    "PS3RECOMP_DOF", "PS3RECOMP_EDGE_BLUR", "PS3RECOMP_MESH_TRIM",
+    "PS3RECOMP_DOF", "PS3RECOMP_EDGE_BLUR", "PS3RECOMP_MESH_TRIM", "PS3RECOMP_EDGE_VP",
     "PS3_AUDIO_VOLUME",
     "PS3_INPUT_MODE", "PS3_BUTTON_ICONS", "PS3_RUMBLE", "PS3_RUMBLE_STRENGTH",
     "PS3_OVERLAY_HUD", "PS3_OVERLAY_HUD_CORNER", "PS3_OVERLAY_HUD_OPACITY",
@@ -1032,7 +1032,8 @@ struct Ui {
     bool fullscreen;
     int aa, scale, aniso, upscale; float sharpen;
     bool dof, edge_blur;      /* the game's own effects (rsx_draw_engine.c ENG_DOF_BLEND_FP) */
-    int mesh_trim;            /* [trim] 0 = off (the fix, default), 1 = the PS3's culling */
+    int mesh_trim;            /* [trim]/[edgevp] 0 = the game's culling at the render resolution (default),
+                               * 1 = off (whole meshes), 2 = the PS3's 720p culling */
     int aspect;               /* [wide] index in kAspect; -1 = another value (env / file) */
     int volume;
     int input_mode, button_icons;
@@ -1066,7 +1067,9 @@ static void ui_load(void)
     { const char* e = getenv(kVar[V_DOF]); s_ui.dof = !(e && !strcmp(e, "0")); }
     { const char* e = getenv(kVar[V_EDGE_BLUR]); s_ui.edge_blur = !(e && !strcmp(e, "0")); }
     { const int t = spu_patch_find("mesh_trim");   /* [trim] what the SPU code runs now */
-      s_ui.mesh_trim = (t < 0 || spu_patch_alt(t) == 0) ? 1 : 0; }
+      const bool culls = t < 0 || spu_patch_alt(t) == 0;
+      const char* e = getenv(kVar[V_EDGE_VP]);       /* [edgevp] culling at the render resolution */
+      s_ui.mesh_trim = !culls ? 1 : (e && e[0] == '0') ? 2 : 0; }
     { const char* e = getenv(kVar[V_RENDER_SCALE]);   /* [res] numbers or 720p/1080p/1440p/4k */
       double v = e ? atof(e) : 1.0;
       if (e && !SDL_strcasecmp(e, "1080p")) v = 1.5;
@@ -1233,22 +1236,26 @@ static void tab_graphics(void)
                (unsigned)(1280.0f * rs * vk_postfx_aspect_k() + 0.5f), (unsigned)(720.0f * rs + 0.5f));   /* [wide] */
       hint(b); }
     /* [trim] Edge's SPU triangle culling (tools/spu_patches.txt switch mesh_trim, PS3RECOMP_MESH_TRIM) */
-    { static const char* const kTrimName[] = { "Off: whole meshes (fix, default)", "On: the PS3's original" };
+    { static const char* const kTrimName[] = { "At the render resolution (default)", "Off: whole meshes", "The PS3's 720p culling" };
       const int slot = spu_patch_find("mesh_trim");
       if (slot < 0) ImGui::BeginDisabled();
       ImGui::SetNextItemWidth(combo_w());
-      if (ImGui::Combo("Mesh trimming (PS3 720p culling)", &s_ui.mesh_trim, kTrimName, 2))
-          apply_setting(V_MESH_TRIM, s_ui.mesh_trim ? "1" : "0");
+      if (ImGui::Combo("Triangle culling (mesh trimming)", &s_ui.mesh_trim, kTrimName, 3)) {
+          apply_setting(V_MESH_TRIM, s_ui.mesh_trim == 1 ? "0" : "1");
+          apply_setting(V_EDGE_VP, s_ui.mesh_trim == 2 ? "0" : "1");
+      }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
-          ImGui::SetTooltip("Off = \"Disable Mesh Trimming\" by Yahfz (RPCS3 patch database).\n"
-                            "The game's SPU geometry code drops triangles that cover no pixel of the PS3's 720p\n"
-                            "picture, and off-screen and back-facing ones. Above 720p that cuts thin parts of\n"
-                            "meshes away. Off sends every triangle (the GPU still clips off-screen ones).");
+          ImGui::SetTooltip("The game's SPU geometry code (Edge) drops back-facing and off-screen triangles, and ones\n"
+                            "that cover no pixel of the PS3's 720p picture. Above 720p that last test cuts thin and\n"
+                            "small parts away: holes in faces.\n"
+                            "At the render resolution: Edge gets the picture's real size, so it keeps every triangle\n"
+                            "that covers a pixel (the idea from ThiagoFraga761/infamous2-pc).\n"
+                            "Off: \"Disable Mesh Trimming\" by Yahfz (RPCS3 patch database), every triangle drawn.");
       if (slot < 0) ImGui::EndDisabled();
       live_mark(V_MESH_TRIM);
       hint(slot < 0 ? "Not in this build: its SPU lift had no tools/spu_patches.txt."
-                    : "Off draws whole meshes at every resolution (fix by Yahfz, the default). On is the PS3's own "
-                      "culling, made for 720p: above it, thin and small geometry goes missing."); }
+                    : "At the render resolution: no holes, and the culling saves GPU and graphics-thread time "
+                      "(the default). Off draws whole meshes. The PS3's 720p culling leaves holes above 720p."); }
     ImGui::SetNextItemWidth(combo_w());
     if (ImGui::Combo("Anisotropic filtering", &s_ui.aniso, kAnisoName, 5)) apply_setting(V_ANISO, kAniso[s_ui.aniso]);
     live_mark(V_ANISO);

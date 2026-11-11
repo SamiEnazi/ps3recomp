@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "../../include/ps3emu/ps3_settings.h"   /* (edgevp) the menu's live switch */
 #include <setjmp.h>
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
@@ -373,22 +374,40 @@ int g_spu_put_rsx_exact = 0;
  * scaled to the render targets; set by the video backend once it knows them. */
 int g_spu_edge_vp_on = 0;
 float g_spu_edge_vp_sx = 1.0f, g_spu_edge_vp_sy = 1.0f;
-void spu_edge_vp_set(float sx, float sy)
+static int s_edge_vp_env = -1;                            /* PS3RECOMP_EDGE_VP: 1 unless "0" */
+static float s_edge_vp_bx = 1.0f, s_edge_vp_by = 1.0f;    /* the backend's raster scale */
+static void spu_edge_vp_update(void)
 {
-    static int s_env = -1;
-    if (s_env < 0) { const char* e = getenv("PS3RECOMP_EDGE_VP"); s_env = !(e && e[0] == '0'); }
-    const int on = s_env && (sx != 1.0f || sy != 1.0f) && sx >= 1.0f && sy >= 1.0f && sx <= 8.0f && sy <= 8.0f;
+    const float sx = s_edge_vp_bx, sy = s_edge_vp_by;
+    const int on = s_edge_vp_env && (sx != 1.0f || sy != 1.0f) && sx >= 1.0f && sy >= 1.0f && sx <= 8.0f && sy <= 8.0f;
     __atomic_store_n(&g_spu_edge_vp_on, 0, __ATOMIC_RELEASE);
     g_spu_edge_vp_sx = sx; g_spu_edge_vp_sy = sy;
     __atomic_store_n(&g_spu_edge_vp_on, on, __ATOMIC_RELEASE);
-    static float s_lx = 0.0f, s_ly = 0.0f;
-    if (sx != s_lx || sy != s_ly) {
-        s_lx = sx; s_ly = sy;
+    static int s_last = -1; static float s_lx = 0.0f, s_ly = 0.0f;
+    if (on != s_last || sx != s_lx || sy != s_ly) {
+        s_last = on; s_lx = sx; s_ly = sy;
         fprintf(stderr, "[edgevp] Edge Geometry viewport %s: x%.4f wide, x%.4f high (%ux%u)%s\n",
                 on ? "scaled to the render targets" : "as the game gives it", (double)sx, (double)sy,
                 (unsigned)(1280.0f * sx + 0.5f), (unsigned)(720.0f * sy + 0.5f),
-                s_env ? "" : " -- PS3RECOMP_EDGE_VP=0");
+                s_edge_vp_env ? "" : " -- PS3RECOMP_EDGE_VP=0");
     }
+}
+/* The in-game menu's live applier (ps3_settings.h): the next Edge job culls for it. */
+static int spu_edge_vp_setting(const char* v)
+{
+    s_edge_vp_env = !(v && v[0] == '0');
+    spu_edge_vp_update();
+    return 1;
+}
+void spu_edge_vp_set(float sx, float sy)
+{
+    if (s_edge_vp_env < 0) {
+        const char* e = getenv("PS3RECOMP_EDGE_VP");
+        s_edge_vp_env = !(e && e[0] == '0');
+        ps3_setting_register("PS3RECOMP_EDGE_VP", spu_edge_vp_setting);
+    }
+    s_edge_vp_bx = sx; s_edge_vp_by = sy;
+    spu_edge_vp_update();
 }
 /* A 128-byte reservation-line commit: top-down into RSX memory, as a PUT. */
 static inline void spu_line_copy(uint32_t ea, uint8_t* mem, const void* ls)
