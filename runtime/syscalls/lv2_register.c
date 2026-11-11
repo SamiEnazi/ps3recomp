@@ -52,6 +52,7 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 #include "../platform/host_qos.h"       /* PS3_QOS: SPU threads at USER_INTERACTIVE */
 #include "../platform/host_place.h"     /* PS3_CPU_PLACE: SPU threads on chosen cores */
+#include "ps3emu/ps3_hitchcatch.h"     /* PS3RECOMP_HITCHCATCH: sampled during a frozen frame */
 
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)
@@ -1069,8 +1070,16 @@ static void* spu_exec_thread_proc(void* arg)
     { static int q = -1;
       if (q < 0) { const char* e = getenv("PS3_HOT_QOS"); q = e ? atoi(e) : 0; }
       if (q) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL); }
+    /* PS3RECOMP_HITCHCATCH: the sampler reads the job module resident in this
+     * context while the thread is stopped; it stops reading at the end below,
+     * before group_join can see the thread finished and free the context. */
+    { char nm[40];
+      snprintf(nm, sizeof nm, "spu 0x%X/g0x%X", (unsigned)t->tid, (unsigned)t->group_id);
+      const ps3_hc_spu_view v = { &t->sctx->resident_ovl, &t->sctx->image_id, &t->sctx->pc, &t->sctx->policy_mode };
+      ps3_hc_thread_begin(PS3_HC_SPU, (unsigned)t->tid, nm, &v); }
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
+    ps3_hc_thread_end();
     t->exit_status = r.exit_status;
 #ifdef _WIN32
     __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
