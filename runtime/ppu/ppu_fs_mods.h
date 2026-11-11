@@ -87,8 +87,15 @@ static std::string lower(std::string s)
     for (char& c : s) if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
     return s;
 }
+static std::string upper(std::string s)
+{
+    for (char& c : s) if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    return s;
+}
 static bool ieq(const std::string& a, const std::string& b) { return lower(a) == lower(b); }
-static bool ilt(const std::string& a, const std::string& b) { return lower(a) < lower(b); }
+/* The Manager's StringComparer.OrdinalIgnoreCase: upper-cased, so '_' and
+ * the other characters between 'Z' and 'a' sort after the letters. */
+static bool ilt(const std::string& a, const std::string& b) { return upper(a) < upper(b); }
 static bool ends_i(const std::string& s, const char* suf)
 {
     const size_t n = strlen(suf);
@@ -148,6 +155,19 @@ static FInfo finfo(const std::string& p)
     return f;
 }
 static bool is_dir(const std::string& p) { const FInfo f = finfo(p); return f.ok && f.dir; }
+/* A junction or symbolic link (on Windows: a reparse point). A mod's folders
+ * are walked without them: a link in a downloaded mod could lead the scan
+ * anywhere on the PC, or round in a loop. */
+static bool is_link(const std::string& p)
+{
+#ifdef _WIN32
+    const DWORD a = GetFileAttributesA(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+#else
+    struct stat st;
+    return lstat(p.c_str(), &st) == 0 && S_ISLNK(st.st_mode);
+#endif
+}
 
 /* Entries of a folder (no "." / ".."), sorted case-insensitively. */
 static std::vector<std::string> list_dir(const std::string& dir)
@@ -161,15 +181,17 @@ static std::vector<std::string> list_dir(const std::string& dir)
     std::stable_sort(v.begin(), v.end(), ilt);
     return v;
 }
-/* Every file below dir whose name ends in ext (case-insensitive), full paths. */
-static void walk(const std::string& dir, const char* ext, std::vector<std::string>& out, int depth = 0)
+/* Every file below dir whose name ends in ext (case-insensitive), full paths.
+ * no_links: junctions and symbolic links are skipped (a mod's own folders). */
+static void walk(const std::string& dir, const char* ext, std::vector<std::string>& out, int depth = 0, bool no_links = false)
 {
     if (depth > 16) return;
     for (const std::string& n : list_dir(dir)) {
         const std::string p = join(dir, n);
+        if (no_links && is_link(p)) continue;
         const FInfo f = finfo(p);
         if (!f.ok) continue;
-        if (f.dir) walk(p, ext, out, depth + 1);
+        if (f.dir) walk(p, ext, out, depth + 1, no_links);
         else if (ends_i(n, ext)) out.push_back(p);
     }
 }
@@ -189,7 +211,14 @@ static std::vector<std::string> split_parts(const std::string& rel)
     return v;
 }
 
-static bool read_all(const std::string& p, Bytes& out, uint64_t at = 0, uint64_t max = ~0ull)
+/* A mod's file bigger than this is refused, not read: a huge (or broken)
+ * download must not take the game's memory at every start. The game's own
+ * largest .xpps is far below it. */
+static const uint64_t kMaxModFile = 512ull << 20;
+static const uint64_t kMaxModJson = 1ull << 20;
+/* The file from `at` on (at most `max` bytes); false when it cannot be read or
+ * what would be read is more than `limit`. */
+static bool read_all(const std::string& p, Bytes& out, uint64_t at = 0, uint64_t max = ~0ull, uint64_t limit = kMaxModFile)
 {
     FILE* f = fopen(p.c_str(), "rb");
     if (!f) return false;
@@ -203,8 +232,10 @@ static bool read_all(const std::string& p, Bytes& out, uint64_t at = 0, uint64_t
         if (n >= 0 && (uint64_t)n >= at) {
             uint64_t len = (uint64_t)n - at;
             if (len > max) len = max;
-            out.resize((size_t)len);
-            ok = LANG_FSEEK(f, at) == 0 && fread(out.data(), 1, out.size(), f) == out.size();
+            if (len <= limit) {
+                out.resize((size_t)len);
+                ok = LANG_FSEEK(f, at) == 0 && fread(out.data(), 1, out.size(), f) == out.size();
+            }
         }
     }
     fclose(f);
@@ -378,7 +409,10 @@ static J read_json(const std::string& path, std::string* err = nullptr)
 {
     J j;
     Bytes b;
-    if (!read_all(path, b)) return j;
+    if (!read_all(path, b, 0, ~0ull, kMaxModJson)) {
+        if (err && finfo(path).ok) *err = base_of(slashes(path)) + " cannot be read or is bigger than 1 MB";
+        return j;
+    }
     const char* p = (const char*)b.data();
     const char* e = p + b.size();
     if (b.size() >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) p += 3;
@@ -583,7 +617,11 @@ static bool parse_xp_name(const std::string& nm, int& index, uint32_t& abs, bool
 
 struct XpFile { uint32_t size, off; size_t size_at, off_at; };
 struct XpChunk { uint32_t size, off, file_index, file_count; size_t size_at, off_at; };
-struct XpLayout { uint32_t data_off = 0, data_size = 0; std::vector<XpChunk> chunks; std::vector<XpFile> files; };
+struct XpLayout {
+    uint32_t data_off = 0, data_size = 0;
+    uint64_t tables_end = 48;            /* the header and both tables end here */
+    std::vector<XpChunk> chunks; std::vector<XpFile> files;
+};
 
 static bool xp_layout(const Bytes& d, XpLayout& L, std::string& err)
 {
@@ -594,6 +632,8 @@ static bool xp_layout(const Bytes& d, XpLayout& L, std::string& err)
     const uint32_t nc = be32(&d[tab + 4]), nf = be32(&d[tab + 12]);
     const uint64_t c0 = (uint64_t)tab + 24, f0 = c0 + (uint64_t)nc * 28;
     if (f0 + (uint64_t)nf * 16 > d.size()) { err = "its file table is out of range"; return false; }
+    L.tables_end = f0 + (uint64_t)nf * 16;
+    if (L.tables_end < 48) L.tables_end = 48;
     for (uint32_t i = 0; i < nc; i++) {
         const size_t r = (size_t)(c0 + (uint64_t)i * 28);
         L.chunks.push_back({ be32(&d[r + 4]), be32(&d[r + 8]), be32(&d[r + 20]), be32(&d[r + 24]), r + 4, r + 8 });
@@ -670,8 +710,14 @@ static void read_modules(Mod& m)
 {
     const J j = read_json(join(m.path, "modular.json"));
     std::set<std::string> used;
+    /* ids are saved in mods.ini as "pick = a,b": no separators, brackets or
+     * line breaks in them (a crafted id could otherwise add lines there) */
+    auto clean = [](std::string s) {
+        for (char& c : s) if ((unsigned char)c < 32 || c == ',' || c == '[' || c == ']' || c == '=' || c == '#' || c == ';') c = '_';
+        return s;
+    };
     auto parse = [&](const J& node, const std::string& fallback, bool dropdown, const std::string& gid, const std::string& gname) {
-        std::string id = node.str("id", node.str("name", fallback));
+        std::string id = clean(node.str("id", node.str("name", fallback)));
         if (id.empty()) id = fallback;
         std::string uid = id;
         for (int k = 2; !used.insert(lower(uid)).second; k++) uid = id + "_" + std::to_string(k);
@@ -698,7 +744,7 @@ static void read_modules(Mod& m)
         for (const J& gr : gs->a) {
             k++;
             if (gr.t != 5) continue;
-            std::string gid = gr.str("id", "group_" + std::to_string(k));
+            std::string gid = clean(gr.str("id", "group_" + std::to_string(k)));
             if (gid.empty()) gid = "group_" + std::to_string(k);
             const std::string gname = gr.str("name", gid);
             const bool dd = ieq(gr.str("type", "toggle"), "dropdown");
@@ -760,6 +806,9 @@ static bool part_ok(const std::string& rel)
  * whole mod unusable (the Manager refuses to enable it). */
 static void read_parts(Mod& m)
 {
+    /* m.err holds only this function's verdict (a mod.json error never gets
+     * here), so a pick that fixes the options clears an old one */
+    m.err.clear();
     m.files.clear(); m.tex.clear(); m.xp.clear(); m.targets.clear();
     std::vector<std::string> selv;
     const std::vector<std::string>* sel = nullptr;
@@ -775,13 +824,14 @@ static void read_parts(Mod& m)
             for (const std::string& p : x.paths) {
                 if (p.find("..") != std::string::npos) continue;
                 const std::string full = join(m.path, p);
-                if (is_dir(full) && std::find_if(roots.begin(), roots.end(), [&](const std::string& r) { return ieq(r, full); }) == roots.end())
+                if (is_dir(full) && !is_link(full) && std::find_if(roots.begin(), roots.end(), [&](const std::string& r) { return ieq(r, full); }) == roots.end())
                     roots.push_back(full);
             }
         }
         std::stable_sort(roots.begin(), roots.end(), ilt);
     }
-    const std::string files_root = is_dir(join(m.path, "files")) ? join(m.path, "files") : m.path;
+    if (is_link(m.path)) { m.err = "its folder is a link (junction or symbolic link); copy the mod in instead"; return; }
+    const std::string files_root = is_dir(join(m.path, "files")) && !is_link(join(m.path, "files")) ? join(m.path, "files") : m.path;
     const std::string backups = join(m.path, "backups");
     std::set<std::string> seen;
 
@@ -790,7 +840,7 @@ static void read_parts(Mod& m)
     std::vector<F> fl;
     auto add_files = [&](const std::string& root, const std::string& rel_root) {
         std::vector<std::string> v;
-        walk(root, ".xpps", v);
+        walk(root, ".xpps", v, 0, true);
         for (const std::string& p : v) {
             if (!ends_i(p, ".xpps") || !seen.insert(lower(p)).second) continue;
             if (!rel_to(backups, p).empty()) continue;
@@ -822,7 +872,7 @@ static void read_parts(Mod& m)
         const std::string rel_root = rel_mod ? m.path : root;
         const std::string tr = join(root, "texture_patches"), xr = join(root, "xpps_patches");
         std::vector<std::string> v;
-        if (is_dir(tr)) walk(tr, ".dds", v);
+        if (is_dir(tr) && !is_link(tr)) walk(tr, ".dds", v, 0, true);
         std::vector<Tex> tl;
         for (const std::string& p : v) {
             if (!seen_tex.insert(lower(p)).second || !path_on(sel, rel_to(rel_root, p))) continue;
@@ -831,12 +881,16 @@ static void read_parts(Mod& m)
             Tex x;
             x.path = p; x.target = t; x.name = base_of(p);
             if (!parse_tex_name(x.name, x.off, x.w, x.h, x.fmt, x.mips)) { m.err = x.name + " does not use the exported texture name format"; return; }
+            if (x.w < 1 || x.h < 1 || x.w > 16384 || x.h > 16384 || x.mips < 1 || x.mips > 16) {
+                m.err = x.name + " names a size or mip count no texture has";
+                return;
+            }
             Bytes hd;
             const FInfo fi = finfo(p);
             if (!read_all(p, hd, 0, 128) || hd.size() < 128 || memcmp(hd.data(), "DDS ", 4)) { m.err = x.name + " is not a DDS file"; return; }
             const int hh = (int)le32(&hd[12]), ww = (int)le32(&hd[16]), mm = (int)le32(&hd[28]);
             const std::string four((const char*)&hd[84], 4);
-            if (ww != x.w || hh != x.h || four != x.fmt || mm != x.mips) {
+            if (ww != x.w || hh != x.h || upper(four) != x.fmt || mm != x.mips) {   /* the Manager upper-cases the fourcc */
                 m.err = x.name + " header does not match its name";
                 return;
             }
@@ -849,7 +903,7 @@ static void read_parts(Mod& m)
             return ilt(a.name, b.name); });
         for (Tex& x : tl) m.tex.push_back(x);
         v.clear();
-        if (is_dir(xr)) walk(xr, ".bin", v);
+        if (is_dir(xr) && !is_link(xr)) walk(xr, ".bin", v, 0, true);
         std::vector<Xp> xl;
         for (const std::string& p : v) {
             if (!seen_xp.insert(lower(p)).second || !path_on(sel, rel_to(rel_root, p))) continue;
@@ -992,8 +1046,26 @@ static int arc_prio(const std::string& name)
 static std::vector<Arc> archives()
 {
     std::vector<std::string> v;
-    if (const char* h = getenv("PS3_HDD0_ROOT"))
-        for (const std::string& t : list_dir(join(slashes(h), "game"))) walk(join(join(join(slashes(h), "game"), t), "USRDIR"), ".psarc_s", v);
+    if (const char* h = getenv("PS3_HDD0_ROOT")) {
+        /* Only the running game's folders: a shared dev_hdd0 can hold other
+         * games' patchN.psarc_s, which would outrank this game's. The game's id
+         * is PS3_TITLE_ID, else the first 9 characters of the folder that holds
+         * infamous2.psarc_s (BCES01143_INSTALL -> BCES01143, whose patches are
+         * in BCES01143); none found: every folder, as before. */
+        const std::string gd = join(slashes(h), "game");
+        const std::vector<std::string> titles = list_dir(gd);
+        std::string id;
+        if (const char* t = getenv("PS3_TITLE_ID")) id = t;
+        for (size_t i = 0; id.empty() && i < titles.size(); i++) {
+            std::vector<std::string> w;
+            walk(join(join(gd, titles[i]), "USRDIR"), ".psarc_s", w);
+            for (const std::string& p : w)
+                if (ieq(base_of(p), "infamous2.psarc_s")) { id = titles[i].substr(0, 9); break; }
+        }
+        for (const std::string& t : titles)
+            if (id.empty() || (t.size() >= id.size() && lang_ieq_n(t.c_str(), id.c_str(), id.size())))
+                walk(join(join(gd, t), "USRDIR"), ".psarc_s", v);
+    }
     walk(join(slashes(ppu_vfs_root ? ppu_vfs_root : "."), "PS3_GAME/USRDIR"), ".psarc_s", v);
     std::vector<Arc> a;
     std::set<std::string> seen;
@@ -1031,9 +1103,10 @@ static std::string sig_line(const char* kind, const std::string& p)
 
 /* The game file `name` with the patches written in (base: a mod's whole file,
  * else the original), built into the cache unless the cache already holds
- * this exact build. */
+ * this exact build. dry: only whether it builds (nothing read from or
+ * written to the cache). */
 static bool build(const std::string& name, const Part* base, const std::vector<const Tex*>& tex,
-                  const std::vector<const Xp*>& xp, Arcs& arcs, std::string& out_path, std::string& err)
+                  const std::vector<const Xp*>& xp, Arcs& arcs, std::string& out_path, std::string& err, bool dry = false)
 {
     out_path = join(g.cache, name);
     std::string sig = "gmods 1\n";
@@ -1050,7 +1123,7 @@ static bool build(const std::string& name, const Part* base, const std::vector<c
     for (const Tex* t : tex) sig += sig_line("tex", t->path);
     for (const Xp* x : xp) sig += sig_line("xpps", x->path);
     Bytes old;
-    if (finfo(out_path).ok && read_all(out_path + ".sig", old) && std::string(old.begin(), old.end()) == sig) return true;
+    if (!dry && finfo(out_path).ok && read_all(out_path + ".sig", old) && std::string(old.begin(), old.end()) == sig) return true;
 
     Bytes d;
     if (base) { if (!read_all(base->path, d)) { err = "cannot read " + base->path; return false; } }
@@ -1061,6 +1134,8 @@ static bool build(const std::string& name, const Part* base, const std::vector<c
         for (const Tex* t : tex) {
             Bytes pl;
             if (!read_all(t->path, pl, 128)) { err = "cannot read " + t->path; return false; }
+            /* the size the scan checked; the file may have changed since */
+            if (pl.size() != dxt_size(t->w, t->h, t->fmt, t->mips)) { err = t->name + " is not the size its name says"; return false; }
             const uint64_t at = ds + t->off;
             if (at + pl.size() > d.size()) { err = t->name + " would patch outside " + name; return false; }
             flip_payload(pl.data(), t->w, t->h, t->fmt, t->mips);
@@ -1089,7 +1164,14 @@ static bool build(const std::string& name, const Part* base, const std::vector<c
                 memcpy(d.data() + a0 + x->choff, pl.data(), pl.size());
                 continue;
             }
-            /* the whole packed file: later files, the chunks after it and the data size move */
+            /* the whole packed file: later files, the chunks after it and the data size move.
+             * The table entries are rewritten at their places in the file, which
+             * only stay put when the replaced bytes lie after the header and both
+             * tables -- as in every one of the game's own files. A file whose
+             * header puts a packed file over its tables (a mod's own copy can) is
+             * refused, and every table write is bounds-checked, as the Manager's
+             * WriteXppsU32 is. */
+            if (a0 < L.tables_end) { err = x->name + " would replace a part of " + name + " that holds its tables"; return false; }
             const int64_t delta = (int64_t)pl.size() - (int64_t)F.size;
             Bytes nd;
             nd.reserve((size_t)((int64_t)d.size() + delta));
@@ -1097,30 +1179,38 @@ static bool build(const std::string& name, const Part* base, const std::vector<c
             nd.insert(nd.end(), pl.begin(), pl.end());
             nd.insert(nd.end(), d.begin() + (ptrdiff_t)a1, d.end());
             d.swap(nd);
+            bool in_range = true;
+            auto put = [&](uint64_t at, uint32_t v) {
+                if (at + 4 > d.size()) { in_range = false; return; }
+                put_be32(&d[(size_t)at], v);
+            };
             const uint32_t old_off = F.off;
             F.size = (uint32_t)pl.size();
-            put_be32(&d[F.size_at], F.size);
-            if (!delta) continue;
-            for (size_t i = (size_t)fi + 1; i < L.files.size(); i++) {
-                L.files[i].off = (uint32_t)((int64_t)L.files[i].off + delta);
-                put_be32(&d[L.files[i].off_at], L.files[i].off);
-            }
-            int ci = -1;
-            for (size_t i = 0; i < L.chunks.size(); i++)
-                if ((int64_t)L.chunks[i].file_index <= fi && fi < (int64_t)L.chunks[i].file_index + L.chunks[i].file_count) { ci = (int)i; break; }
-            if (ci >= 0) {
-                L.chunks[(size_t)ci].size = (uint32_t)((int64_t)L.chunks[(size_t)ci].size + delta);
-                put_be32(&d[L.chunks[(size_t)ci].size_at], L.chunks[(size_t)ci].size);
-            }
-            for (size_t i = 0; i < L.chunks.size(); i++)
-                if ((int)i != ci && L.chunks[i].off > old_off) {
-                    L.chunks[i].off = (uint32_t)((int64_t)L.chunks[i].off + delta);
-                    put_be32(&d[L.chunks[i].off_at], L.chunks[i].off);
+            put(F.size_at, F.size);
+            if (delta) {
+                for (size_t i = (size_t)fi + 1; i < L.files.size(); i++) {
+                    L.files[i].off = (uint32_t)((int64_t)L.files[i].off + delta);
+                    put(L.files[i].off_at, L.files[i].off);
                 }
-            L.data_size = (uint32_t)((int64_t)L.data_size + delta);
-            put_be32(&d[44], L.data_size);
+                int ci = -1;
+                for (size_t i = 0; i < L.chunks.size(); i++)
+                    if ((int64_t)L.chunks[i].file_index <= fi && fi < (int64_t)L.chunks[i].file_index + L.chunks[i].file_count) { ci = (int)i; break; }
+                if (ci >= 0) {
+                    L.chunks[(size_t)ci].size = (uint32_t)((int64_t)L.chunks[(size_t)ci].size + delta);
+                    put(L.chunks[(size_t)ci].size_at, L.chunks[(size_t)ci].size);
+                }
+                for (size_t i = 0; i < L.chunks.size(); i++)
+                    if ((int)i != ci && L.chunks[i].off > old_off) {
+                        L.chunks[i].off = (uint32_t)((int64_t)L.chunks[i].off + delta);
+                        put(L.chunks[i].off_at, L.chunks[i].off);
+                    }
+                L.data_size = (uint32_t)((int64_t)L.data_size + delta);
+                put(44, L.data_size);
+            }
+            if (!in_range) { err = x->name + ": a table entry of " + name + " lies outside it"; return false; }
         }
     }
+    if (dry) return true;
     if (!write_all(out_path, d)) { err = "cannot write " + out_path; return false; }
     Bytes sb(sig.begin(), sig.end());
     write_all(out_path + ".sig", sb);
@@ -1141,7 +1231,8 @@ static void resolve(std::vector<Mod>& mods)
 {
     Arcs arcs;
     std::map<std::string, std::string> why;    /* lower(folder) -> why it is left out */
-    for (int round = 0; round < 8; round++) {
+    /* every failed round leaves out at least one more mod, so this ends */
+    for (size_t round = 0; round <= mods.size() + 1; round++) {
         std::map<std::string, size_t> whole;                 /* target -> mod */
         std::map<std::string, size_t> texk;                  /* target:offset -> mod */
         std::map<std::string, std::vector<size_t>> patched;  /* target -> mods with patches on it */
@@ -1200,7 +1291,27 @@ static void resolve(std::vector<Mod>& mods)
             std::string path, err;
             if (!build(t, base, tl, xl, arcs, path, err)) {
                 fprintf(stderr, "[mods] %s: %s\n", t.c_str(), err.c_str());
-                for (size_t i : who) why[lower(mods[i].folder)] = "could not build " + t + ": " + err;
+                /* Who is at fault: each mod on this file alone (a dry build). The
+                 * ones that fail alone are left out; if each builds alone, the
+                 * last one by folder name, which came after the others (as the
+                 * Manager refuses the mod being turned on, not the ones before). */
+                bool blamed = false;
+                if (who.size() > 1)
+                    for (size_t i : who) {
+                        const Part* b1 = nullptr;
+                        std::vector<const Tex*> t1;
+                        std::vector<const Xp*> x1;
+                        for (const Part& f : mods[i].files) if (f.target == t) b1 = &f;
+                        for (const Tex& x : mods[i].tex) if (x.target == t) t1.push_back(&x);
+                        for (const Xp& x : mods[i].xp) if (x.target == t) x1.push_back(&x);
+                        std::string p1, e1;
+                        if (!build(t, b1, t1, x1, arcs, p1, e1, true)) { why[lower(mods[i].folder)] = "could not build " + t + ": " + e1; blamed = true; }
+                    }
+                if (!blamed) {
+                    const size_t last = *who.rbegin();
+                    why[lower(mods[last].folder)] = (who.size() > 1 ? "could not build " + t + " together with the mods before it: "
+                                                                     : "could not build " + t + ": ") + err;
+                }
                 again = true;
                 break;
             }
@@ -1221,6 +1332,16 @@ static void resolve(std::vector<Mod>& mods)
         return;
     }
     fprintf(stderr, "[mods] gave up building the mods' files; no mod is used\n");
+    std::lock_guard<std::mutex> lk(g.mx);
+    g.serve.clear();
+    g.serve_mod.clear();
+    for (const Mod& m : mods) {
+        StartInfo si;
+        auto w = why.find(lower(m.folder));
+        si.why = w != why.end() ? w->second : "the mods' files could not be built (see the session log)";
+        g.start[lower(m.folder)] = si;
+    }
+    g.nserve.store(0, std::memory_order_release);
 }
 
 static std::string settings_dir()
@@ -1236,9 +1357,24 @@ static std::string settings_dir()
 #endif
 }
 
+static void init_body();
 static void init()
 {
     std::call_once(g.once, [] {
+        /* a mod the scan or a build cannot hold in memory must not crash the
+         * game at every start: no mod is used then, and the log says why */
+        try { init_body(); }
+        catch (const std::exception& e) {
+            fprintf(stderr, "[mods] could not read the mods (%s); none is used this session\n", e.what());
+            std::lock_guard<std::mutex> lk(g.mx);
+            g.serve.clear(); g.serve_mod.clear();
+            g.nserve.store(0, std::memory_order_release);
+        }
+    });
+}
+static void init_body()
+{
+    {
         const char* d = getenv("PS3_GAME_MODS_DIR");
         if (!d || !*d) return;
         g.dir = slashes(d);
@@ -1264,16 +1400,30 @@ static void init()
                         m.name.c_str(), m.version.c_str(), m.author.c_str(), m.files.size(), m.tex.size(), m.xp.size(), t.c_str());
             else
                 fprintf(stderr, "[mods] not using \"%s\": %s\n", m.name.c_str(),
-                        !m.for_game ? "not made for inFAMOUS 2" : !m.err.empty() ? m.err.c_str() : !m.on ? "turned off" :
+                        !m.err.empty() ? m.err.c_str() : !m.for_game ? "not made for inFAMOUS 2" : !m.on ? "turned off" :
                         !g.use ? "mods are off" : si.why.c_str());
         }
         std::lock_guard<std::mutex> lk(g.mx);
         g.list.swap(mods);
-    });
+    }
 }
 
-/* A guest open/stat of a loose file under USRDIR whose name a mod changes:
- * the mod's file (or the build) instead. */
+/* The name whose mod file the game gets for `k` (lower case). With a text
+ * language chosen (PS3_TEXT_LANG, ppu_fs_lang.h), every lang_*.xpps entry of
+ * an archive is pointed at lang_<text>.xpps: whatever name the game asks for,
+ * it reads that text. So a mod's lang_<text>.xpps stands for every
+ * lang_*.xpps name, and a mod's other lang_*.xpps (text the player did not
+ * choose) is not used. Without a chosen text language, names are as they are. */
+static std::string serve_key(const std::string& k)
+{
+    if (k.size() <= 10 || k.compare(0, 5, "lang_") || !ends_i(k, ".xpps")) return k;
+    lang_init();
+    if (!g_lang.text[0]) return k;
+    return lower(std::string("lang_") + g_lang.text + ".xpps");
+}
+
+/* A guest open (read-only) or stat of a loose file under USRDIR whose name a
+ * mod changes: the mod's file (or the build) instead. */
 static void redirect(const char* guest, char* out, size_t cap)
 {
     init();
@@ -1282,13 +1432,17 @@ static void redirect(const char* guest, char* out, size_t cap)
     for (const char* p = guest; *p; p++) if (lang_ieq_n(p, "/USRDIR/", 8)) { u = p; break; }
     if (!u) return;
     const char* b = strrchr(guest, '/');
-    const std::string key = lower(b + 1);
+    const std::string key = serve_key(lower(b + 1));
     std::string host, by;
     {
         std::lock_guard<std::mutex> lk(g.mx);
         auto it = g.serve.find(key);
         if (it == g.serve.end()) return;
         host = it->second; by = g.serve_mod[key];
+    }
+    if (host.size() >= cap) {   /* cut short, it would name another file */
+        log_once("long:" + host, "%s: the path is too long to hand to the game; not used: %s", guest, host.c_str());
+        return;
     }
     snprintf(out, cap, "%s", host.c_str());
     log_once("serve:" + std::string(guest), "%s -> %s's %s", guest, by.c_str(), host.c_str());
@@ -1308,7 +1462,7 @@ static void on_open(int fd, const char* hpath)
     {
         std::lock_guard<std::mutex> lk(g.mx);
         for (uint32_t i = 1; i < p.n; i++) {
-            if (!g.serve.count(p.names[i])) continue;
+            if (!g.serve.count(serve_key(p.names[i]))) continue;
             uint8_t md5[16];
             memcpy(md5, p.rec(i), 16);
             for (int k = 15; k >= 0 && ++md5[k] == 0; k--) { }   /* one larger: the lookup misses */
@@ -1363,10 +1517,10 @@ extern "C" int ps3_game_mods_get(int i, ps3_game_mod* o)
     for (const std::string& x : m.targets) { if (k++ < 4) t += (t.empty() ? "" : ", ") + x; }
     if (k > 4) t += ", +" + std::to_string(k - 4) + " more";
     std::string s;
-    if (!m.for_game)
+    if (!m.err.empty()) s = "Not used: " + m.err;   /* a broken mod.json names no game: its error first */
+    else if (!m.for_game)
         s = m.game.empty() ? "Not used: its mod.json does not name the game (\"game\": \"inf2\")"
                            : std::string("Made for ") + game_label(m.game) + ", not inFAMOUS 2";
-    else if (!m.err.empty()) s = "Not used: " + m.err;
     else if (o->active) s = (m.on ? "In use: changes " : "Off from the next start (in use now: changes ") + t + (m.on ? "" : ")");
     else if (!m.on) s = "Off";
     else if (!g.use) s = "Not used: mods are off";
@@ -1409,21 +1563,36 @@ extern "C" void ps3_game_mods_pick(int i, int k, int on)
 {
     using namespace gmods;
     init();
-    std::lock_guard<std::mutex> lk(g.mx);
-    if (i < 0 || i >= (int)g.list.size()) return;
-    Mod& m = g.list[(size_t)i];
+    /* a copy, read without the lock (read_parts walks the mod's folders, and
+     * every guest USRDIR open waits on g.mx), then put back */
+    Mod m;
+    {
+        std::lock_guard<std::mutex> lk(g.mx);
+        if (i < 0 || i >= (int)g.list.size()) return;
+        m = g.list[(size_t)i];
+    }
     if (k < 0 || k >= (int)m.modules.size()) return;
-    const Module& x = m.modules[(size_t)k];
+    const Module x = m.modules[(size_t)k];
     std::set<std::string> ids = picked_ids(m);
     if (x.dropdown) {
         for (const Module& y : m.modules) if (y.dropdown && ieq(y.group_id, x.group_id)) ids.erase(lower(y.id));
         ids.insert(lower(x.id));
     } else if (on) ids.insert(lower(x.id));
     else ids.erase(lower(x.id));
+    /* the Manager's "Select at least one module": an empty choice is never
+     * saved (read back, it would mean every option) */
+    if (ids.empty()) return;
     m.pick.clear();
     for (const Module& y : m.modules) if (ids.count(lower(y.id))) m.pick.push_back(y.id);
     m.have_pick = true;
-    read_parts(m);
+    try { read_parts(m); }
+    catch (const std::exception&) {
+        m.files.clear(); m.tex.clear(); m.xp.clear(); m.targets.clear();
+        m.err = "its files could not be read (too big?)";
+    }
+    std::lock_guard<std::mutex> lk(g.mx);
+    if (i >= (int)g.list.size() || g.list[(size_t)i].folder != m.folder) return;   /* rescanned meanwhile */
+    g.list[(size_t)i] = std::move(m);
     state_write_locked();
 }
 
@@ -1432,7 +1601,9 @@ extern "C" void ps3_game_mods_rescan(void)
     using namespace gmods;
     init();
     if (g.dir.empty()) return;
-    std::vector<Mod> mods = scan();
+    std::vector<Mod> mods;
+    try { mods = scan(); }
+    catch (const std::exception& e) { fprintf(stderr, "[mods] could not read the mods folder again (%s)\n", e.what()); return; }
     std::lock_guard<std::mutex> lk(g.mx);
     g.list.swap(mods);
 }

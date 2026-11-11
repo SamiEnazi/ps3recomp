@@ -170,11 +170,14 @@ static void host_path_mount(char* out, size_t cap, const char* guest)
 /* The host file the guest gets: its translated path, then a language archive
  * swapped for the chosen language's (ppu_fs_lang.h; open and stat agree), or
  * a game mod's file (ppu_fs_mods.h). */
-static void host_path(char* out, size_t cap, const char* guest)
+static void host_path(char* out, size_t cap, const char* guest, bool mods_ok = false)
 {
     host_path_mount(out, cap, guest);
     lang_redirect_host(out, cap);
-    gmods::redirect(guest, out, cap);   /* a loose USRDIR file a mod changes */
+    /* a loose USRDIR file a mod changes -- for reads only (a read-only open, a
+     * stat): a write, mkdir or opendir of that name must never reach the
+     * user's mod file or the build cache */
+    if (mods_ok) gmods::redirect(guest, out, cap);
 }
 
 /* ---- fd / dir handle tables ---- */
@@ -211,7 +214,8 @@ static void cellFsOpen(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
-    host_path(hpath, sizeof hpath, gpath);
+    host_path(hpath, sizeof hpath, gpath,
+              (flags & 0x3) == CELL_FS_O_RDONLY && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND)));
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
      * file and that is opened in its place. */
@@ -308,7 +312,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
-    host_path(hpath, sizeof hpath, gpath);
+    host_path(hpath, sizeof hpath, gpath, true);   /* SDATA opens are reads */
 
     /* Same NPDRM step cellFsOpen does: an encrypted container is decrypted once
      * into a cache file and that is opened in its place. This used to be a
@@ -628,7 +632,7 @@ static void cellFsStat(ppu_context* ctx)
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t sb = (uint32_t)ctx->gpr[4];
-    host_path(hpath, sizeof hpath, gpath);
+    host_path(hpath, sizeof hpath, gpath, true);   /* the size of what a read-only open gets */
     struct stat st;
     if (stat(hpath, &st) != 0) {
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);

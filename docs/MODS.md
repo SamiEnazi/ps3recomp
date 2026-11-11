@@ -33,7 +33,23 @@ When two mods change the same thing, the Manager refuses to turn on the second
 one. Here the first one by folder name is used and the other is left out
 whole. "The same thing" means the same whole file, a texture at the same
 offset, an overlapping packed-file patch, or a patch onto a file another mod
-replaces.
+replaces. If a file cannot be built, only the mod at fault is left out: each
+mod on that file is tried alone, and if each works alone, the last one by
+folder name is left out.
+
+Downloaded mods are treated as untrusted:
+
+- every patch is bounds-checked, and a packed-file patch that would replace
+  part of a file's own tables is refused;
+- a mod file over 512 MB, or a `mod.json`/`modular.json` over 1 MB, is
+  refused;
+- junctions and symbolic links inside a mod folder are ignored;
+- a mod's files are only ever handed to the game for reading.
+
+With a text language chosen (F2 > Audio > Language, `PS3_TEXT_LANG`), every
+`lang_*.xpps` the game asks for is the chosen language's, so a text mod counts
+for the language it replaces: a mod's `lang_italian.xpps` is used while the
+text is Italian, and a mod's other `lang_*.xpps` is not.
 
 The choices are saved in `mods.ini` beside the menu's `settings.ini`
 (`%APPDATA%\inFAMOUS2-port`). **Use mods** is `PS3_GAME_MODS` in
