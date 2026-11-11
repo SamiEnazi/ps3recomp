@@ -1124,7 +1124,7 @@ static void read_parts(Mod& m)
  *                          one, a higher priority before a lower one
  * and the folders the zip list also looks in ("Choose another file"):
  *   [.zips]
- *   folder = S:/Downloads
+ *   folder = D:/Downloads
  * ([.zips] can be no mod's folder: the scan skips dot folders.) Older builds
  * read the file as before: they skip the keys and the section they do not know. */
 struct Saved { bool have_on = false, on = true, have_pick = false, have_prio = false; int prio = 0; std::vector<std::string> pick; };

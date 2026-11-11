@@ -126,7 +126,7 @@ priority = 2                put first (Use this one instead): a mod with a prior
 [Young Kessler]
 on = 0                      turned off
 [.zips]
-folder = S:/Downloads       a folder "Choose another file" took a zip from
+folder = D:/Downloads       a folder "Choose another file" took a zip from
 ```
 
 Older builds read the same file: they skip `priority` and `[.zips]`.
