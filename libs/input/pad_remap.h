@@ -10,7 +10,8 @@
  *     position, the mouse bits, the controller bit numbers of pad_input_map.h).
  *     Only keys cellPad's Windows reader (pad_win_keys) can see map to a code.
  *   - The keys the window and the menu keep: F1 (HUD), F2 (menu), F3 (lighting
- *     A/B), F9 (play-log mark), F11 and Alt+Enter (fullscreen), Esc (cancels
+ *     A/B), F7 (the Cheats page's quick key: go to the saved spot), F9 (play-log
+ *     mark), F11 and Alt+Enter (fullscreen), Esc (cancels
  *     here, opens the menu in play), Alt (Alt+Tab, Alt+F4), the Windows keys and
  *     Print Screen. The PS/Xbox/Home button is the system's.
  *   - One input, one PS3 control: an input another control has is a conflict
@@ -172,6 +173,7 @@ static inline int prm_capture_key(int scancode, int alt_held, PrmInput* out, con
     case 58:  *why = "F1 shows and hides the performance HUD."; return PRM_CAP_RESERVED;
     case 59:  *why = "F2 opens and closes this menu."; return PRM_CAP_RESERVED;
     case 60:  *why = "F3 is the lighting comparison switch."; return PRM_CAP_RESERVED;
+    case 64:  *why = "F7 is the Cheats page's quick key (go to the saved spot)."; return PRM_CAP_RESERVED;
     case 66:  *why = "F9 marks a moment in the play log."; return PRM_CAP_RESERVED;
     case 68:  *why = "F11 switches fullscreen."; return PRM_CAP_RESERVED;
     case 70:  *why = "Windows takes Print Screen for screenshots."; return PRM_CAP_RESERVED;

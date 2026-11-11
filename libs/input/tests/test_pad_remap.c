@@ -362,7 +362,7 @@ static void test_capture(const char* cellpad)
     CHECK(prm_capture_key(41, 0, &in, &why) == PRM_CAP_CANCEL);                     /* Esc */
     CHECK(prm_capture_key(41, 1, &in, &why) == PRM_CAP_CANCEL);
     static const struct { int sc; const char* word; } kept[] = {
-        { 58, "F1" }, { 59, "F2" }, { 60, "F3" }, { 66, "F9" }, { 68, "F11" }, { 70, "Print Screen" },
+        { 58, "F1" }, { 59, "F2" }, { 60, "F3" }, { 64, "F7" }, { 66, "F9" }, { 68, "F11" }, { 70, "Print Screen" },
         { 226, "Alt" }, { 230, "Alt" }, { 227, "Windows" }, { 231, "Windows" },
     };
     for (unsigned i = 0; i < sizeof kept / sizeof kept[0]; i++)

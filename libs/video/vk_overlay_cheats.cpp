@@ -158,6 +158,7 @@ extern "C" void vk_overlay_cheats_write(FILE* f)
  * callbacks only switch things on; the title's hooks act once the game is in play. */
 extern "C" void vk_overlay_cheats_attach(void)
 {
+    __atomic_store_n(&g_ps3_cheats.notice, &vk_overlay_notice_for, __ATOMIC_RELEASE);   /* ps3_cheats_notice */
     if (!ps3_cheats_count()) return;
     if (g_ps3_cheats.refresh) g_ps3_cheats.refresh();
     { const char* e = getenv("PS3_CHEATS_REMEMBER"); s_remember = !(e && e[0] == '0'); }
@@ -187,6 +188,29 @@ extern "C" void vk_overlay_cheats_attach(void)
         vk_overlay_notice_for(msg, 8.0);
         fprintf(stderr, "[cheats] %s (remembered; F2 -> Cheats)\n", msg);
     }
+}
+
+/* F7 (vk_overlay.cpp vk_overlay_event, menu open or closed): the first cheat marked PS3_CHEAT_HOTKEY
+ * (an ACTION) is pressed, as its button on the page would be; its apply says what happened. Runs on
+ * the window's event thread, not the menu's: no refresh here (`unavailable` is as the window's open
+ * or the page's last draw left it), the apply must be safe on any thread. */
+extern "C" void vk_overlay_cheats_hotkey(void)
+{
+    for (int i = 0; i < ps3_cheats_count(); i++) {
+        ps3_cheat* c = g_ps3_cheats.e[i];
+        if (c->kind != PS3_CHEAT_ACTION || !(c->flags & PS3_CHEAT_HOTKEY)) continue;
+        if (c->unavailable) {
+            char msg[160];
+            snprintf(msg, sizeof msg, "F7 (%s): %s", c->name, c->unavailable);
+            vk_overlay_notice_for(msg, 4.0);
+            fprintf(stderr, "[cheats] F7: %s unavailable (%s)\n", c->id, c->unavailable);
+            return;
+        }
+        fprintf(stderr, "[cheats] F7: %s\n", c->id);
+        ps3_cheat_set(c, c->value);
+        return;
+    }
+    fprintf(stderr, "[cheats] F7: no quick-key cheat in this build\n");
 }
 
 /* The page, inside the menu's tab (vk_overlay.cpp). `w` = the menu's combo width. */

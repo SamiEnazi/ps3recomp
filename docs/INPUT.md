@@ -49,6 +49,8 @@ powers, so aim sits on the right mouse button and the powers under the left hand
   (`PS3_ESC=quit` brings back Esc = quit; binding `Escape` to a control in `[keyboard]`
   gives it to the game instead.)
 - **F9** marks the play log ("this felt bad", `PS3RECOMP_PLAYLOG`).
+- **F7** is the Cheats page's quick key: in inFAMOUS 2 it puts Cole at the saved spot picked
+  under F2 > Cheats > Saved spots (menu open or closed).
 - While Alt (unless bound) or a Windows key is held, keys are a system chord and do not
   reach the game (Alt+Tab does not open the World Map on the way out).
 - Controllers are bound by **position**: SDL is told `SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0`,
@@ -158,8 +160,9 @@ rules are `libs/input/pad_remap.h`:
   **Swap** (that control gets what the cell had; with nothing to give it just loses
   the input) or **Cancel**. A file written by hand may still bind one key to two
   controls (a chord); the menu never makes one.
-- Kept for the window and the menu: F1 (HUD), F2 (menu), F3 (lighting A/B), F9
-  (play-log mark), F11 and Alt+Enter (fullscreen), Esc (cancels a change), Alt, the
+- Kept for the window and the menu: F1 (HUD), F2 (menu), F3 (lighting A/B), F7 (the
+  Cheats page's quick key), F9 (play-log mark), F11 and Alt+Enter (fullscreen), Esc
+  (cancels a change), Alt, the
   Windows keys, Print Screen. The PS / Xbox / Home button is the system's.
 - Enter and keypad Enter are one key (both are VK_RETURN to Windows): they bind,
   clear and swap together, and the file lists both.

@@ -99,6 +99,7 @@ int   vk_overlay_cheats_owns_key(const char* k);         /* its PS3_CHEAT_* line
 void  vk_overlay_cheats_write(FILE* f);
 void  vk_overlay_cheats_attach(void);                    /* the remembered cheats, at window open */
 int   vk_overlay_cheats_remember(void);
+void  vk_overlay_cheats_hotkey(void);                    /* [spot] F7: the PS3_CHEAT_HOTKEY action */
 /* [saves] the system's save-data list (vk_overlay_saves.cpp, include/ps3emu/ps3_savedlg.h): it
  * takes the menu's window while up -- the same input hold, cursor and RSX-thread drawing */
 int   vk_overlay_saves_active(void);
@@ -733,6 +734,7 @@ extern "C" int vk_overlay_event(const void* ev)
         if (k == SDLK_F1) { if (press) { set_hud(!s_hud); if (!s_hud) vk_overlay_notice("Performance HUD off (F1 shows it)"); } return 1; }
         if (k == SDLK_F2) { if (press && !vk_overlay_saves_active()) set_open(!s_open); return 1; }
         if (k == SDLK_F3) { if (press) lfx_compare_toggle(); return 1; }   /* [light] lighting A/B */
+        if (k == SDLK_F7) { if (press) vk_overlay_cheats_hotkey(); return 1; }   /* [spot] the Cheats page's quick key */
         if (k == SDLK_F11 || (k == SDLK_RETURN && (e->key.keysym.mod & KMOD_ALT))) {
             if (press) toggle_fullscreen();
             return 1;
