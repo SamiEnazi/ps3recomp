@@ -35,6 +35,7 @@
 #pragma clang diagnostic ignored "-Wunused-function"   /* the parser half is cellPad's */
 #endif
 #include "../input/pad_input_map.h"                     /* PadInputMap, labels */
+#include "../input/pad_remap.h"                         /* [remap] the rebinding rules (vk_overlay_remap.inc) */
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #endif
@@ -458,6 +459,11 @@ extern "C" void vk_overlay_settings_changed(void)
     s_dirty_t = now_s();
 }
 static void set_open(int o);
+/* [remap] F2 > Controls rebinding (vk_overlay_remap.inc) */
+static bool remap_capturing(void);
+static bool remap_escape(void);
+static void remap_cancel(void);
+static void remap_script(const char* spec);
 /* Esc with the menu closed (the backend's pump, after cellPad took it as the
  * window's key): open the menu. 1 = opened (an overlay exists). */
 extern "C" int vk_overlay_open_menu(void) { if (!s_enabled) return 0; set_open(1); return 1; }
@@ -483,6 +489,7 @@ static void set_open(int o)
         }
     } else {
         s_quit_ask = 0;
+        remap_cancel();                  /* [remap] a binding being changed: dropped */
         if (s_imgui_ready) {
             ImGuiIO& io = ImGui::GetIO();
             io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
@@ -577,6 +584,7 @@ static void script_poll(double now)
             char* eq = strchr(k, '=');
             if (eq) { *eq = 0; ps3_overlay_cheat_set(k, atof(eq + 1)); }
         }
+        else if (!SDL_strncasecmp(w, "bind=", 5)) remap_script(w + 5);   /* [remap] "bind=cross=key:F17", "bind=reset" */
         else { const int t = tab_from_name(w); if (t >= 0) s_tab_want = t; set_open(1); }
     }
 }
@@ -601,6 +609,9 @@ extern "C" int vk_overlay_event(const void* ev)
     case SDL_KEYDOWN: case SDL_KEYUP: {
         const SDL_Keycode k = e->key.keysym.sym;
         const bool press = e->type == SDL_KEYDOWN && !e->key.repeat;
+        /* [remap] a binding waits for a key: every key goes to it (F1, F2, Esc too: it says
+         * whose they are, Esc cancels) */
+        if (s_open && remap_capturing()) { ev_push(e); return 1; }
         if (k == SDLK_F1) { if (press) { set_hud(!s_hud); if (!s_hud) vk_overlay_notice("Performance HUD off (F1 shows it)"); } return 1; }
         if (k == SDLK_F2) { if (press && !vk_overlay_saves_active()) set_open(!s_open); return 1; }
         if (k == SDLK_F3) { if (press) lfx_compare_toggle(); return 1; }   /* [light] lighting A/B */
@@ -610,7 +621,8 @@ extern "C" int vk_overlay_event(const void* ev)
         }
         if (!s_open) return 0;
         if (k == SDLK_ESCAPE) {
-            if (press) { if (vk_overlay_saves_active()) vk_overlay_saves_back(); else if (s_quit_ask) s_quit_cancel = true; else set_open(0); }
+            if (press) { if (vk_overlay_saves_active()) vk_overlay_saves_back(); else if (s_quit_ask) s_quit_cancel = true;
+                         else if (!remap_escape()) set_open(0); }   /* [remap] Esc on Swap / Reset = Cancel */
             return 1;
         }
         ev_push(e);
@@ -1566,63 +1578,6 @@ static void tab_audio(void)
     language_section();
 }
 
-/* PS3 controls in the table's order, with their labels. */
-static const struct { int ctl; const char* name; } kRows[] = {
-    { PIM_CROSS, "Cross" }, { PIM_CIRCLE, "Circle" }, { PIM_SQUARE, "Square" }, { PIM_TRIANGLE, "Triangle" },
-    { PIM_L1, "L1" }, { PIM_R1, "R1" }, { PIM_L2, "L2" }, { PIM_R2, "R2" },
-    { PIM_L3, "L3" }, { PIM_R3, "R3" }, { PIM_START, "START" }, { PIM_SELECT, "SELECT" },
-    { PIM_UP, "D-pad up" }, { PIM_DOWN, "D-pad down" }, { PIM_LEFT, "D-pad left" }, { PIM_RIGHT, "D-pad right" },
-    { PIM_LS_UP, "Left stick up" }, { PIM_LS_DOWN, "Left stick down" },
-    { PIM_LS_LEFT, "Left stick left" }, { PIM_LS_RIGHT, "Left stick right" },
-    { PIM_RS_UP, "Right stick up" }, { PIM_RS_DOWN, "Right stick down" },
-    { PIM_RS_LEFT, "Right stick left" }, { PIM_RS_RIGHT, "Right stick right" },
-};
-/* SDL controller input -> what it is on a PlayStation pad. */
-static const char* pad_input_label(int bit)
-{
-    switch (bit) {
-    case 0: return "Cross";   case 1: return "Circle"; case 2: return "Square"; case 3: return "Triangle";
-    case 4: return "Share";   case 5: return "PS";     case 6: return "Options";
-    case 7: return "L3";      case 8: return "R3";     case 9: return "L1";     case 10: return "R1";
-    case 11: return "D-pad up"; case 12: return "D-pad down"; case 13: return "D-pad left"; case 14: return "D-pad right";
-    case 15: return "Mic";
-    case 16: return "Paddle 1"; case 17: return "Paddle 2"; case 18: return "Paddle 3"; case 19: return "Paddle 4";
-    case 20: return "Touchpad";
-    case PIM_PAD_TRIGGER_LEFT: return "L2"; case PIM_PAD_TRIGGER_RIGHT: return "R2";
-    default: return "?";
-    }
-}
-static const char* mouse_input_label(uint32_t bit)
-{
-    switch (bit) {
-    case 1u: return "Left"; case 2u: return "Right"; case 4u: return "Middle";
-    case PIM_MOUSE_WHEEL_UP: return "Wheel up"; case PIM_MOUSE_WHEEL_DOWN: return "Wheel down";
-    default: break;
-    }
-    static char b[8][16];
-    for (int i = 3; i < 8; i++) if (bit == 1u << i) { snprintf(b[i], sizeof b[i], "Button %d", i + 1); return b[i]; }
-    return "?";
-}
-static void cell_text(const PadInputMap& m, int dev, int ctl, char* out, size_t n)
-{
-    size_t len = 0; out[0] = 0;
-    auto add = [&](const char* name) {
-        int w = snprintf(out + len, n - len, "%s%s", len ? ", " : "", name);
-        if (w > 0) len += (size_t)w;
-        if (len >= n) len = n - 1;
-    };
-    char tmp[16];
-    if (dev == 0) {
-        for (int b = 0; b < 32; b++) if (m.pad[ctl] >> b & 1u) add(pad_input_label(b));
-    } else if (dev == 1) {
-        for (unsigned vk = 0; vk < 128; vk++)
-            if (m.key[ctl][vk >> 5] >> (vk & 31) & 1u) add(pim_key_label(vk, tmp, sizeof tmp));
-    } else {
-        for (int b = 0; b < 32; b++) if (m.mouse[ctl] >> b & 1u) add(mouse_input_label(1u << b));
-    }
-    if (!len) snprintf(out, n, "-");
-}
-
 static char   s_pads[4][128];
 static int    s_n_pads;
 static double s_pads_t;
@@ -1639,6 +1594,8 @@ static void pads_refresh(double now)
         snprintf(s_pads[s_n_pads++], sizeof s_pads[0], "%s", name ? name : "Game controller");
     }
 }
+
+#include "vk_overlay_remap.inc"   /* [remap] remap_section: the bindings, rebinding live (issue #6) */
 
 static void tab_controls(double now)
 {
@@ -1685,35 +1642,7 @@ static void tab_controls(double now)
     ImGui::EndDisabled();
     env_mark(V_RUMBLE_STRENGTH);
 
-    section("PS3 button layout");
-    PadInputMap m;
-    cellPad_host_input_map(&m);
-    const ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingStretchProp;
-    if (ImGui::BeginTable("layout", 4, tf)) {
-        ImGui::TableSetupColumn("PS3", ImGuiTableColumnFlags_WidthStretch, 1.1f);
-        ImGui::TableSetupColumn("Controller", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Keyboard", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Mouse", ImGuiTableColumnFlags_WidthStretch, 0.8f);
-        ImGui::TableHeadersRow();
-        char text[160];
-        for (const auto& r : kRows) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(r.name);
-            for (int dev = 0; dev < 3; dev++) {
-                ImGui::TableSetColumnIndex(dev + 1);
-                cell_text(m, dev, r.ctl, text, sizeof text);
-                ImGui::TextUnformatted(text);
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip) &&
-                    ImGui::CalcTextSize(text).x > ImGui::GetContentRegionAvail().x)
-                    ImGui::SetTooltip("%s", text);   /* the whole list when the cell cuts it */
-            }
-        }
-        ImGui::EndTable();
-    }
-    hint("Buttons are by position, as on a PlayStation pad (bottom = Cross). The sticks always move the PS3 "
-         "sticks. The layout comes from PS3_INPUT_MAP (an input.toml); rebinding from this menu comes with the "
-         "new input layer.");
+    remap_section(now);   /* [remap] "Buttons and keys": every binding, changeable (vk_overlay_remap.inc) */
 
     section("This menu");
     hint("F2 opens and closes it; on a controller hold L3+R3 together for a second. Esc or Circle closes it, "
@@ -2159,7 +2088,8 @@ static void feed_pad(ImGuiIO& io)
     const uint32_t raw = g_pad_overlay_raw;
     for (const auto& r : kRaw) if (raw >> r.sdl & 1u) b |= r.pad;
     b |= (uint16_t)g_pad_overlay_inject;   /* [saves] PAD_SCRIPT / PAD_FILE while a system dialog holds the pad */
-    const int lx = (nav >> 16) & 255, ly = (nav >> 24) & 255, ry = (nav2 >> 8) & 255;
+    int lx = (nav >> 16) & 255, ly = (nav >> 24) & 255, ry = (nav2 >> 8) & 255;
+    if (!vk_overlay_saves_active() && remap_pad_hold(b)) { b = 0; lx = ly = ry = 128; }   /* [remap] a press is awaited: not the menu's */
     io.AddKeyEvent(ImGuiKey_GamepadDpadUp,    (b & PAD_UP) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadDown,  (b & PAD_DOWN) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadLeft,  (b & PAD_LEFT) != 0);
@@ -2311,7 +2241,8 @@ extern "C" int vk_overlay_draw(VkCommandBuffer cmd, uint32_t index, VkImage imag
         static SDL_Event ev[128];
         int n;
         { std::lock_guard<std::mutex> g(s_ev_lock); n = s_ev_n; memcpy(ev, s_ev, sizeof ev[0] * (size_t)n); s_ev_n = 0; }
-        if (s_open && s_sdl_ready) for (int i = 0; i < n; i++) ImGui_ImplSDL2_ProcessEvent(&ev[i]);
+        if (s_open && s_sdl_ready)
+            for (int i = 0; i < n; i++) if (!remap_event(&ev[i])) ImGui_ImplSDL2_ProcessEvent(&ev[i]);   /* [remap] a capture's press */
     }
 
     ImGui_ImplVulkan_NewFrame();

@@ -178,8 +178,10 @@ static const PadInputMap* pad_map(void)
     return &s_maps[__atomic_load_n(&s_map_cur, __ATOMIC_ACQUIRE)];
 }
 
-/* The in-game menu (ps3_overlay.mm): the live map, and a new one. Only the
- * bindings change; the [mouse] settings stay as they were loaded. */
+/* The in-game menu (ps3_overlay.mm; vk_overlay_remap.inc on Windows): the
+ * live map, and a new one. Only the bindings change; the [mouse] settings stay
+ * as they were loaded. The menu's own pace (one change per click) keeps two
+ * flips from landing inside one poll. */
 void cellPad_host_input_map(PadInputMap* out) { *out = *pad_map(); }
 void cellPad_host_set_input_map(const PadInputMap* m)
 {
@@ -200,11 +202,13 @@ static void pad_map_save_path(char* out, size_t n)
     out[0] = 0;
     const char* e = getenv("PS3_INPUT_MAP");
     if (e) { snprintf(out, n, "%s", e); return; }
-    const char* ini = getenv("PS3_OVERLAY_INI");
 #ifdef _WIN32
-    /* Windows: next to the exe, where pad_map_load looks for it. */
-    if (!ini || !*ini) { pad_exe_dir_file("input.toml", out, n); return; }
+    /* Windows: next to the exe, where pad_map_load looks for it at the next
+     * start (play.ps1 sets PS3_INPUT_MAP to the project's input.toml). */
+    pad_exe_dir_file("input.toml", out, n);
+    return;
 #endif
+    const char* ini = getenv("PS3_OVERLAY_INI");
     if (!ini || !*ini) return;
     const char* slash = strrchr(ini, '/');
     if (!slash) { snprintf(out, n, "input.toml"); return; }

@@ -99,10 +99,12 @@ static void test_rebind(void)
     assert(n_keys(&m, PIM_SELECT) == 2 && key_of(&m, PIM_SELECT, 0x30) && key_of(&m, PIM_SELECT, 0x33));
     assert(n_keys(&m, PIM_L3) == 0 && n_keys(&m, PIM_R3) == 0);
     assert(n_keys(&m, PIM_LS_UP) == 1 && key_of(&m, PIM_LS_UP, 0x7E));
-    assert(n_keys(&m, PIM_UP) == 0);                     /* Up left the D-pad, which the file does not mention */
+    /* Up left the D-pad, which the file does not mention (its 1 stays) */
+    assert(n_keys(&m, PIM_UP) == 1 && key_of(&m, PIM_UP, 0x12));
     assert(n_keys(&m, PIM_CIRCLE) == 3 && key_of(&m, PIM_CIRCLE, 0x38) &&
            key_of(&m, PIM_CIRCLE, 0x3D) && key_of(&m, PIM_CIRCLE, 0x0A));
-    assert(key_of(&m, PIM_SQUARE, 0x0E));                /* untouched controls keep their defaults */
+    assert(n_keys(&m, PIM_SQUARE) == 0);                 /* its F went to cross */
+    assert(n_keys(&m, PIM_R1) == 1 && key_of(&m, PIM_R1, 0x0E));   /* untouched controls keep their defaults */
     assert(m.mouse[PIM_R1] == 2 && m.mouse[PIM_R2] == 1 && m.mouse[PIM_L1] == 0);
     assert(m.mouse[PIM_UP] == PIM_MOUSE_WHEEL_UP);
     assert(m.mouse[PIM_DOWN] == (PIM_MOUSE_WHEEL_DOWN | 8u));
@@ -121,8 +123,8 @@ static void test_steal_and_overlap(void)
     PadInputMap m;
     pim_defaults(&m);
     assert(pim_parse(&m, "[keyboard]\ncross = \"Q\"\n[mouse_buttons]\nr2 = \"Button4\"\n", NULL, "s") == 0);
-    assert(key_of(&m, PIM_CROSS, 0x0C) && n_keys(&m, PIM_CIRCLE) == 0);
-    assert(m.mouse[PIM_R2] == 8 && m.mouse[PIM_L1] == (0xFCu & ~8u));
+    assert(key_of(&m, PIM_CROSS, 0x0C) && n_keys(&m, PIM_TRIANGLE) == 0 && n_keys(&m, PIM_CIRCLE) == 1);
+    assert(m.mouse[PIM_R2] == 8 && m.mouse[PIM_L1] == 2u);
     pim_defaults(&m);
     assert(pim_parse(&m, "[keyboard]\ncross = \"Q\"\ncircle = \"Q\"\n", NULL, "o") == 0);
     assert(key_of(&m, PIM_CROSS, 0x0C) && key_of(&m, PIM_CIRCLE, 0x0C));
@@ -261,15 +263,15 @@ static void test_render_round_trip(void)
     pim_inputs_text(&m, PIM_SEC_KEYBOARD, PIM_START, list, sizeof list);
     assert(!strcmp(list, "Return, KeypadEnter"));
     pim_inputs_text(&m, PIM_SEC_MOUSE_BUTTONS, PIM_L1, list, sizeof list);
-    assert(!strcmp(list, "Middle, Button4, Button5, Button6, Button7, Button8"));
+    assert(!strcmp(list, "Right"));
     pim_inputs_text(&m, PIM_SEC_CONTROLLER, PIM_CROSS, list, sizeof list);
     assert(!strcmp(list, "a"));
     pim_inputs_text(&m, PIM_SEC_CONTROLLER, PIM_LS_UP, list, sizeof list);
     assert(!strcmp(list, ""));
 
-    /* the menu moves Q from Circle to Cross and puts R2 on the wheel */
-    assert(pim_rebind(&m, PIM_SEC_KEYBOARD, PIM_CROSS, 0x0C) == 1u << PIM_CIRCLE);
-    assert(key_of(&m, PIM_CROSS, 0x0C) && n_keys(&m, PIM_CROSS) == 1 && n_keys(&m, PIM_CIRCLE) == 0);
+    /* the menu moves Q from Triangle to Cross and puts R2 on the wheel */
+    assert(pim_rebind(&m, PIM_SEC_KEYBOARD, PIM_CROSS, 0x0C) == 1u << PIM_TRIANGLE);
+    assert(key_of(&m, PIM_CROSS, 0x0C) && n_keys(&m, PIM_CROSS) == 1 && n_keys(&m, PIM_TRIANGLE) == 0);
     assert(pim_rebind(&m, PIM_SEC_MOUSE_BUTTONS, PIM_R2, PIM_MOUSE_WHEEL_DOWN) == 0);
     assert(m.mouse[PIM_R2] == PIM_MOUSE_WHEEL_DOWN);
     assert(pim_rebind(&m, PIM_SEC_CONTROLLER, PIM_R1, PIM_PAD_TRIGGER_RIGHT) == 1u << PIM_R2);
@@ -290,12 +292,16 @@ static void test_render_round_trip(void)
         "x = 1\n";
     char* text = pim_render(&m, old);
     assert(text);
-    assert(strstr(text, "\n[keyboard]\ncross    = \"Q\"\ncircle   = \"\"\n"));
+    /* the file stays as it was (its comment too); the binding lines get the map's values, the
+     * controls a section did not list go after its last line */
+    assert(strstr(text, "# hand-written\n[keyboard]\ncross = \"Q\"\ncircle   = \"Shift\"\nsquare   = \"F\"\n"
+                        "triangle = \"\"\n") == text);
     assert(strstr(text, "start    = \"Return, KeypadEnter\"\n"));
-    assert(strstr(text, "\n[mouse]\nsensitivity = 1.5   # fast\ninvert_y = true\n"));
-    assert(strstr(text, "\n[future]\nx = 1\n"));
-    assert(!strstr(text, "hand-written"));          /* the preamble is the writer's own */
-    assert(!strstr(text, "cross = \"b\""));         /* the old bindings are gone */
+    assert(strstr(text, "rs_right = \"L\"\n\n[mouse]\nsensitivity = 1.5   # fast\ninvert_y = true\n\n[controller]\n"
+                        "cross = \"a\"\ncircle   = \"b\"\n"));
+    assert(strstr(text, "select   = \"\"\n"));       /* [controller]: unbound above */
+    assert(strstr(text, "\n[future]\nx = 1\n\n[mouse_buttons]\ncross    = \"\"\n"));   /* a missing section: appended */
+    assert(!strstr(text, "cross = \"b\"") && !strstr(text, "cross = \"F\""));   /* the old values are gone */
     PadInputMap back;
     pim_defaults(&back);
     assert(pim_parse(&back, text, NULL, "rendered") == 1);   /* [future]: unknown to the game too */

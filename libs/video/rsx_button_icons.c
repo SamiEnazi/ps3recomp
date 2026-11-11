@@ -471,7 +471,13 @@ typedef struct { unsigned char code; const char* shrt; const char* lng; } KeyLab
 static const KeyLabel kKeyLabels[] = {
     {0x24, "\x05", "ENTER"}, {0x4C, "\x05", "ENTER"}, {0x30, "TAB", "TAB"}, {0x31, "\x07", "SPACE"},
     {0x33, "\x08", "BKSP"}, {0x35, "ESC", "ESC"}, {0x38, "\x06", "SHIFT"}, {0x3C, "\x06", "SHIFT"},
-    {0x3A, "OPT", "OPT"}, {0x3D, "OPT", "OPT"}, {0x3B, "CTRL", "CTRL"}, {0x3E, "CTRL", "CTRL"},
+#ifdef _WIN32
+    {0x3A, "ALT", "ALT"}, {0x3D, "ALT", "ALT"},     /* (the Mac's Option is a PC's Alt) */
+#else
+    {0x3A, "OPT", "OPT"}, {0x3D, "OPT", "OPT"},
+#endif
+    {0x3B, "CTRL", "CTRL"}, {0x3E, "CTRL", "CTRL"},
+    {0x39, "CAPS", "CAPS"}, {0x6E, "APP", "APPS"},  /* Caps Lock, the Menu key (rebindable in F2 > Controls) */
     {0x7E, "\x01", "\x01"}, {0x7D, "\x02", "\x02"}, {0x7B, "\x03", "\x03"}, {0x7C, "\x04", "\x04"},
     {0x73, "HOME", "HOME"}, {0x77, "END", "END"}, {0x74, "PGUP", "PGUP"}, {0x79, "PGDN", "PGDN"},
     {0x75, "DEL", "DEL"}, {0x72, "INS", "INS"}, {0x0A, "SEC", "SEC"}, {0x47, "CLR", "CLR"},
