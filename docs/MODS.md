@@ -6,20 +6,45 @@ Unlocker, and your game files are never changed.
 
 ## Using mods
 
-1. Unzip the mod into the `mods` folder next to the game (`Play inFAMOUS 2`
-   creates it). Each mod is a folder with a `mod.json` in it, for example
-   `mods\Red Jacket\mod.json`. A zip that unpacks into a folder of its own name
-   one level deeper (`mods\Red Jacket\Red Jacket\mod.json`) works too.
-2. Start the game. **F2 > Mods** lists every mod with its name, version,
-   author and what it changes. From there you can:
+1. Add the mod. Either:
+   - in the game, **F2 > Mods > Add a mod from a zip...**: the page lists the
+     zip files in your Downloads folder and in the mods folder, newest first,
+     each already checked ("Sasha's Black Tar 2.0 by sweetasnz -> mods/Sasha's
+     Black Tar", or why it cannot be installed; a zip with no `mod.json` in it
+     at all is only counted). **Install** puts it in the
+     mods folder; a mod whose folder is there already shows **Replace**, which
+     keeps the old one until the new one is in place. **Choose another
+     file...** opens the Windows file window (over the game; Alt+Tab if it
+     stays behind), and the folder you take a zip from is listed from then
+     on. After an install the page says what the mod's own checks find, for
+     example "15 textures were made for another version of
+     cole_gold_amp.xpps: untick Solid Gold Amp";
+   - or unzip it yourself into the `mods` folder next to the game (`Play
+     inFAMOUS 2` creates it). Each mod is a folder with a `mod.json` in it,
+     for example `mods\Red Jacket\mod.json`. A zip that unpacks into a folder
+     of its own name one level deeper (`mods\Red Jacket\Red Jacket\mod.json`)
+     works too.
+2. **F2 > Mods** lists every mod with its preview picture (if its `mod.json`
+   names one: `"image": "red_jacket.png"`; click it for a large view, hover
+   for a bigger one), name, version, author and what it changes. From there
+   you can:
    - turn each mod on or off,
    - pick its options, if the mod has any (`modular.json`: toggles and
      drop-downs),
+   - choose which mod wins when two clash: **Use this one instead**, on a mod
+     left out by a clash, says first what the others lose ("Climbing Gloves
+     and Karmic Logo Tshirt will be left out"),
    - switch every mod off at once with **Use mods**,
    - use **Open the mods folder** and **Look for new mods**.
-3. Changes apply the next time the game starts. New mods are on by default,
-   with their default options: every toggle, and each drop-down's first option
-   by name, as in the Manager.
+3. Every change is saved at once, and the page shows at once what the next
+   start will do with it: "Used from the next start: changes ...", "Left out
+   from the next start: it changes the same files as ...". The game uses the
+   changes when it starts. **Restart to apply** appears when they differ from
+   what this session uses: it saves, closes the game and starts it again. The
+   game comes back at its title screen; choose **Continue** there to go on
+   from your last save (progress since that save is lost, as when quitting).
+   New mods are on by default, with their default options: every toggle, and
+   each drop-down's first option by name, as in the Manager.
 
 The page also says why a mod is not used:
 
@@ -30,12 +55,16 @@ The page also says why a mod is not used:
 - it changes the same file as a mod that comes before it.
 
 When two mods change the same thing, the Manager refuses to turn on the second
-one. Here the first one by folder name is used and the other is left out
-whole. "The same thing" means the same whole file, a texture at the same
-offset, an overlapping packed-file patch, or a patch onto a file another mod
-replaces. If a file cannot be built, only the mod at fault is left out: each
-mod on that file is tried alone, and if each works alone, the last one by
-folder name is left out.
+one. Here the one that comes first is used and the other is left out whole.
+First means: the mods you put first with **Use this one instead** (each goes
+above every mod it clashes with), then the rest by folder name. "The same thing" means the same
+whole file, a texture at the same offset, an overlapping packed-file patch, or
+a patch onto a file another mod replaces. If a file cannot be built, only the
+mod at fault is left out: each mod on that file is tried alone, and if each
+works alone, the last one in that order is left out. The page's view of the
+next start uses the clash rule only (nothing is built while you choose); the
+start itself builds everything, and a mod whose file could not be built this
+time stays shown as not used until it or the mods it failed with change.
 
 Downloaded mods are treated as untrusted:
 
@@ -51,7 +80,33 @@ Downloaded mods are treated as untrusted:
 - a mod file over 512 MB, or a `mod.json`/`modular.json` over 1 MB, is
   refused;
 - junctions and symbolic links inside a mod folder are ignored;
-- a mod's files are only ever handed to the game for reading.
+- a mod's files are only ever handed to the game for reading;
+- a preview picture is shown only when `"image"` is a relative path inside
+  the mod's folder (no `..`, absolute path, drive letter, network share,
+  `:` stream or device name, through no junction or link) to a PNG or JPEG of
+  at most 8 MB and 64 M pixels; it is decoded on its own thread and shrunk to
+  512 pixels at most. A picture that fails is simply not shown.
+
+A zip is checked whole before anything is written (`runtime/ppu/ppu_fs_mods_zip.h`):
+
+- every name in it must stay inside the mod's folder: no absolute path, `..`,
+  drive letter, `:` stream, device name (`CON`, `NUL`, `COM1`...), name
+  ending in a dot or space, or character outside plain ASCII; `\` is read as
+  `/` and checked the same; no two entries may be the same file;
+- a zip with a program anywhere in it (`exe`, `dll`, `bat`, `cmd`, `ps1`,
+  `vbs`, `js`, `msi`, `scr`, `com`, `lnk`, `py`, `jar`, `sys`, ...) is refused
+  whole: "contains a program, not a mod" (the inFAMOUS 2 Ability Manager zip,
+  for one);
+- at most 20,000 entries, 512 MB per file and 2 GB in all; ZIP64, zips split
+  into parts, password-protected zips and compression other than stored or
+  deflate are refused;
+- one `mod.json`, at the top or one folder down, that names inFAMOUS 2;
+- only mod files are taken out (`json`, `xpps`, `xpp`, `dds`, `bin`, `png`,
+  `jpg`, `jpeg`, `txt`, `md`); others are left out and the page says so;
+- every file's CRC is checked as it is unpacked. The mod is unpacked into a
+  hidden folder inside the mods folder (`.installing-...`) and only renamed
+  into place when all of it is there; nothing outside the mods folder is ever
+  written or deleted.
 
 With a text language chosen (F2 > Audio > Language, `PS3_TEXT_LANG`), every
 `lang_*.xpps` the game asks for is the chosen language's, so a text mod counts
@@ -60,7 +115,30 @@ text is Italian, and a mod's other `lang_*.xpps` is not.
 
 The choices are saved in `mods.ini` beside the menu's `settings.ini`
 (`%APPDATA%\inFAMOUS2-port`). **Use mods** is `PS3_GAME_MODS` in
-`settings.ini`.
+`settings.ini`. `mods.ini` has a section for each mod that is not at its
+defaults, and the folders the zip list also looks in:
+
+```
+[Sasha's Black Tar]
+pick = default,jbintro      the options picked
+priority = 2                put first (Use this one instead): a mod with a priority
+                            comes before every mod without one, a higher one first
+[Young Kessler]
+on = 0                      turned off
+[.zips]
+folder = S:/Downloads       a folder "Choose another file" took a zip from
+```
+
+Older builds read the same file: they skip `priority` and `[.zips]`.
+
+**Restart to apply** goes the way **Quit game** does (the game is asked to
+exit, a save being written is waited for), then: started by `Play inFAMOUS 2`
+(`tools\play.ps1`, which sets `PS3_LAUNCHER_RESTART=1`), the game ends with
+exit code `0x52455354` and the launcher starts it again with the same
+settings, in the same session folder; started any other way, the game starts
+its own exe again with the command line, environment and working directory it
+started with (the environment as it was before the menu's settings were
+applied), and the new one waits for the old one to end.
 
 ## The mod format (the Manager's)
 
@@ -119,9 +197,19 @@ flips, packed-file resizes and chunk patches) and are identical.
 | `PS3_GAME_MODS=0` | use none of them |
 | `PS3_GAME_MODS_STATE` | the saved choices (default: `mods.ini` beside `settings.ini`) |
 | `PS3_GAME_MODS_CACHE` | where builds go (default: `<mods>/.port_cache`) |
+| `PS3_GAME_MODS_ZIP_DIRS` | more folders the zip list looks in (`;`-separated) |
+| `PS3_LAUNCHER_RESTART=1` | a launcher answers **Restart to apply** (exit code `0x52455354`) |
+| `PS3_GAME_MODS_TEST` | tests: the page's actions as steps, once, `PS3_GAME_MODS_TEST_AT` s (15) after start: `install=<zip>`, `replace=<zip>`, `pick=<folder>=<id,id>`, `prefer=<folder>`, `plan`, `zips`, `restart`, separated by `\|` |
+| `PS3_RESTARTED` | set by a restart in the new game (the count); `PS3_RESTART_WAIT_PID` makes it wait for the old one |
 
 Log lines start with `[mods]`: what is used and why something is not, what
-was built, what was hidden in which archive, and each file served.
+was built, what was hidden in which archive, each file served, each install
+(`[mods] zip: ...`) and each mod put first. A restart logs `[restart] ...`.
+
+Tests: `runtime/ppu/tests/test_game_mods.cpp` (the zip reader and every
+refusal on crafted zips, install and Replace, the clash plan with priorities,
+`mods.ini` old and new, the picture path rules and decoding; with a downloads
+folder and the game, the real community zips and the version check).
 
 Texture packs (PNG/DDS replacements by content, `PS3_MODS`) are a separate,
 port-only feature, also on the Mods page.

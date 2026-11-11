@@ -127,6 +127,17 @@ void cellSysutilQueueEvent(int slot, u32 status, u32 param);
 void ps3_host_quit(const char* why);
 int  ps3_host_quitting(void);
 
+/* Restart the game (the Mods page's "Restart to apply"): quit as above, then
+ * the launcher (PS3_LAUNCHER_RESTART=1: exit status PS3_EXIT_RESTART) or the
+ * registered relauncher starts it again. ps3_host_exit_status(code) is the
+ * status the process ends with (code, or PS3_EXIT_RESTART); every host exit
+ * of a quit goes through it. ps3_host_can_restart(): one of the two exists. */
+#define PS3_EXIT_RESTART 0x52455354   /* "REST" */
+void ps3_host_restart(const char* why);
+int  ps3_host_can_restart(void);
+int  ps3_host_exit_status(int code);
+void ps3_host_set_relauncher(int (*fn)(void));   /* 1 = started */
+
 /* For the in-game menu's Language section: the PS3_LANG code that unset /
  * PS3_LANG=auto gives the title (the host's UI language; "" = none of the
  * PS3's, so English), and the CELL_SYSUTIL_LANG_* it was told (-1 until it asked). */

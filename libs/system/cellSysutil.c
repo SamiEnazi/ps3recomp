@@ -735,7 +735,7 @@ static void* host_quit_thread(void* unused)
     printf("[quit] the game did not exit on its own; ending it (save in flight: %s, waited %d ms) -> exit 0\n",
            ps3_savedata_busy() ? "yes, gave up" : "no", waited);
     fflush(NULL);
-    exit(0);
+    exit(ps3_host_exit_status(0));
 #ifdef _WIN32
     return 0;
 #else
@@ -760,5 +760,61 @@ void ps3_host_quit(const char* why)
     if (pthread_create(&th, NULL, host_quit_thread, NULL) == 0) { pthread_detach(th); return; }
 #endif
     fflush(NULL);
-    exit(0);
+    exit(ps3_host_exit_status(0));
+}
+
+/* ---------------------------------------------------------------------------
+ * Host restart: the Mods page's "Restart to apply". The game is quit as
+ * above (REQUEST_EXITGAME, saves waited for), and where the process ends --
+ * the quit thread's exit or the title's own sys_process_exit -- the status
+ * goes through ps3_host_exit_status:
+ *  - started by the launcher (tools/play.ps1 sets PS3_LAUNCHER_RESTART=1):
+ *    the exit status is PS3_EXIT_RESTART, and the launcher starts the game
+ *    again with the same settings (its session log goes on);
+ *  - otherwise the relauncher the overlay registered (vk_overlay.cpp: this
+ *    exe again, with the command line, environment and working directory the
+ *    process started with) starts the new process, which waits for this one
+ *    to end, and this one ends with its own status.
+ * Either way the game comes back at its title screen; the player continues
+ * from the last save with the game's own Continue.
+ * -----------------------------------------------------------------------*/
+static volatile int s_host_restart;
+static volatile int s_restart_done;
+static int (*s_relaunch)(void);
+
+void ps3_host_set_relauncher(int (*fn)(void)) { s_relaunch = fn; }
+
+int ps3_host_can_restart(void)
+{
+    const char* l = getenv("PS3_LAUNCHER_RESTART");
+    return (l && l[0] == '1') || s_relaunch != NULL;
+}
+
+int ps3_host_exit_status(int code)
+{
+    if (!__atomic_load_n(&s_host_restart, __ATOMIC_ACQUIRE)) return code;
+    const char* l = getenv("PS3_LAUNCHER_RESTART");
+    if (l && l[0] == '1') {
+        if (!__atomic_exchange_n(&s_restart_done, 1, __ATOMIC_ACQ_REL)) {
+            fprintf(stderr, "[restart] exit 0x%X: the launcher starts the game again\n", (unsigned)PS3_EXIT_RESTART);
+            fflush(NULL);
+        }
+        return PS3_EXIT_RESTART;
+    }
+    if (!__atomic_exchange_n(&s_restart_done, 1, __ATOMIC_ACQ_REL)) {
+        const int ok = s_relaunch ? s_relaunch() : 0;
+        fprintf(stderr, ok ? "[restart] the game was started again; this one ends (exit %d)\n"
+                           : "[restart] could not start the game again (exit %d)\n", code);
+        fflush(NULL);
+    }
+    return code;
+}
+
+void ps3_host_restart(const char* why)
+{
+    if (!ps3_host_can_restart()) { fprintf(stderr, "[restart] not possible here (no launcher, no relauncher)\n"); return; }
+    if (ps3_host_quitting()) return;   /* already on the way out */
+    __atomic_store_n(&s_host_restart, 1, __ATOMIC_RELEASE);
+    fprintf(stderr, "[restart] requested (%s)\n", why ? why : "host");
+    ps3_host_quit(why);
 }
