@@ -48,8 +48,10 @@ extern "C" {
 
 enum { PS3_CHEAT_TOGGLE, PS3_CHEAT_CHOICE, PS3_CHEAT_INT, PS3_CHEAT_FLOAT, PS3_CHEAT_ACTION };
 /* flags: SAVES = the game writes its effect into the save; NO_REMEMBER = never kept in the
- * settings file (ACTIONs never are: re-running them at every start would repeat them) */
-enum { PS3_CHEAT_SAVES = 1, PS3_CHEAT_NO_REMEMBER = 2 };
+ * settings file (ACTIONs never are: re-running them at every start would repeat them);
+ * HOTKEY = an ACTION the window's F7 key fires too, menu open or closed (the first such cheat;
+ * vk_overlay_cheats_hotkey). F7 is kept from the controls (libs/input/pad_remap.h). */
+enum { PS3_CHEAT_SAVES = 1, PS3_CHEAT_NO_REMEMBER = 2, PS3_CHEAT_HOTKEY = 4 };
 
 typedef struct ps3_cheat ps3_cheat;
 struct ps3_cheat {
@@ -78,6 +80,8 @@ typedef struct {
     const char* note;            /* the title's save warning */
     void      (*refresh)(void);  /* the title's: called before the page is drawn (update
                                     `unavailable`, values changed elsewhere) */
+    void      (*notice)(const char* text, double secs);   /* the menu's corner notice (set by the
+                                    menu when its window opens; NULL = none): ps3_cheats_notice */
 } ps3_cheats_state;
 
 PS3_CHEATS_SHARED ps3_cheats_state g_ps3_cheats = { 0 };
@@ -95,6 +99,14 @@ static inline void ps3_cheat_register(ps3_cheat* c)
 
 static inline void ps3_cheats_set_note(const char* note) { g_ps3_cheats.note = note; }
 static inline void ps3_cheats_set_refresh(void (*fn)(void)) { g_ps3_cheats.refresh = fn; }
+
+/* A short message in the menu's corner for `secs` seconds, from any thread (the menu's notice is
+ * locked); nothing without the menu. */
+static inline void ps3_cheats_notice(const char* text, double secs)
+{
+    void (*fn)(const char*, double) = __atomic_load_n(&g_ps3_cheats.notice, __ATOMIC_ACQUIRE);
+    if (fn && text) fn(text, secs);
+}
 
 static inline int ps3_cheats_count(void) { return __atomic_load_n(&g_ps3_cheats.n, __ATOMIC_ACQUIRE); }
 

@@ -502,7 +502,7 @@ static void remap_section(double now)
     hint("Click a cell and press the new key, mouse button or controller button; right-click clears it. One "
          "input drives one PS3 control: taking one that is in use asks to swap. Two keys per control; Enter and "
          "keypad Enter count as one key.");
-    hint("Kept for the window and this menu: F1, F2, F3, F9, F11, Esc, Alt (Alt+Enter, Alt+Tab, Alt+F4), the "
+    hint("Kept for the window and this menu: F1, F2, F3, F7, F9, F11, Esc, Alt (Alt+Enter, Alt+Tab, Alt+F4), the "
          "Windows key and Print Screen.");
     bool fam = false;
     for (int f = 0; f < PIM_N_FAM; f++) if (m.pad_fam_set[f]) fam = true;
