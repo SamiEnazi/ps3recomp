@@ -222,6 +222,9 @@ typedef struct jr_tls {
     uint32_t cur[2];
     int      failed;
     int      done;        /* the job call came back */
+    int      guest_locked, native_ran;   /* a guest-memory native (spu_native_replay_begin) took part */
+    uint32_t nat_atom;        /* global event index where the native's atomics are looked up from */
+    uint64_t prime_ticks;     /* host time spent priming / checking for natives: not the native's own time */
     char     why[1024];
 } jr_tls;
 
@@ -897,6 +900,192 @@ static const jr_field s_end_fields[] = {
     JRF(list_stall_ea_base, 0), JRF(rcv_evt_n, 0xFFFFFFFFu), JRF(mfc, 0),
 };
 
+
+/* ------------------------------------------------------------------------- */
+/* Natives in the replay (agent/native204)                                   */
+/* A native rewrite of a job's main function (work/rewrites/spu) cannot leave the local store as the  */
+/* lifted code does (the dead stack frames of its callees, scratch buffers) and it does not issue the  */
+/* lifted code's channel operations: it reads the job's inputs from guest memory and PUTs through the  */
+/* MFC engine. So, in a replay:                                                                        */
+/*  - spu_native_dead_ls(lo, hi): the native declares local-store ranges that are dead after it; the   */
+/*    end-of-job local-store compare skips them.                                                       */
+/*  - spu_native_replay_begin(ctx): guest memory is primed from the recording (every recorded GET's    */
+/*    bytes at its EA, each atomic's line, the PUT targets committed) and held until the job ends.     */
+/*  - spu_native_replay_end(ctx, ran): if the native ran, the recorded operations from the point it    */
+/*    was entered up to the wrapper's last 32-byte PUT are replaced by checks of its results: every     */
+/*    recorded PUT's bytes against guest memory (a 4096-byte command block only up to and including    */
+/*    its first JUMP/RETURN word: the RSX never reads past it), every recorded atomic store against     */
+/*    the guest line. The recorded stream positions then continue after that point.                    */
+/* ------------------------------------------------------------------------- */
+extern uint8_t* vm_base;
+static SRWLOCK s_guest_lock = SRWLOCK_INIT;
+#define JR_DEAD_MAX 16
+static SPU_THREAD_LOCAL struct { uint32_t lo, hi; } t_dead[JR_DEAD_MAX];
+static SPU_THREAD_LOCAL unsigned t_dead_n;
+static SPU_THREAD_LOCAL struct { uint32_t ea, size; } t_primed[4096];
+static SPU_THREAD_LOCAL unsigned t_primed_n;
+/* 64 KB chunks of guest memory committed for this job's native: what the native may read in a replay */
+static SPU_THREAD_LOCAL uint32_t t_chunks[8192];
+static SPU_THREAD_LOCAL unsigned t_chunks_n;
+
+void spu_native_dead_ls(uint32_t lo, uint32_t hi)
+{
+    if (!(g_spu_jobrec_mode & SPU_JOBREC_REPLAY) || t_dead_n >= JR_DEAD_MAX || hi <= lo) return;
+    t_dead[t_dead_n].lo = lo & ~15u; t_dead[t_dead_n].hi = (hi + 15u) & ~15u; t_dead_n++;
+}
+
+static int jr_ls_dead(uint32_t a)
+{
+    for (unsigned i = 0; i < t_dead_n; i++) if (a >= t_dead[i].lo && a < t_dead[i].hi) return 1;
+    return 0;
+}
+
+static void jr_commit(uint32_t ea, uint32_t size)
+{
+    const uint32_t lo = ea & ~0xFFFFu, hi = (ea + size + 0xFFFFu) & ~0xFFFFu;
+    VirtualAlloc(vm_base + lo, (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE);
+    for (uint32_t c = lo >> 16; c < (hi >> 16) && t_chunks_n < 8192; c++) {
+        unsigned k = 0; while (k < t_chunks_n && t_chunks[k] != c) k++;
+        if (k == t_chunks_n) t_chunks[t_chunks_n++] = c;
+    }
+    if (t_primed_n < 4096) { t_primed[t_primed_n].ea = ea; t_primed[t_primed_n].size = size; t_primed_n++; }
+}
+
+
+int spu_native_ea_ok(uint32_t ea, uint32_t size)
+{
+    if (ea < 0x10000u || (uint64_t)ea + size > 0xFFFFFFFFull) return 0;
+    jr_tls* t = t_jr;
+    if (!t || !t->replaying || !t->guest_locked) return mfc_ea_range_committed(ea, size);   /* in the game: the DMA engine's own guard (commits on demand) */
+    for (uint32_t c = ea >> 16; c <= (ea + (size ? size - 1 : 0)) >> 16; c++) {
+        int hit = 0;
+        for (unsigned i = 0; i < t_chunks_n; i++) if (t_chunks[i] == c) { hit = 1; break; }
+        if (!hit) return 0;
+    }
+    return 1;
+}
+
+uint32_t spu_native_atomic_add32(spu_context* ctx, uint32_t ea, uint32_t v)
+{
+    jr_tls* t = jr_on(ctx);
+    if (t && t->replaying && t->guest_locked) {
+        /* the recording's own outcome: the first GETLLAR of this line that its PUTLLC then stored */
+        const jr_file* f = t->f;
+        const uint32_t line = ea & ~127u;
+        for (uint32_t i = t->nat_atom; i < f->h->n_ev; i++) {
+            const jr_ev* g = &f->ev[i];
+            if (g->type != EV_ATOM || g->ch != MFC_GETLLAR_CMD || g->b != line) continue;
+            for (uint32_t j = i + 1; j < f->h->n_ev; j++) {
+                const jr_ev* p = &f->ev[j];
+                if (p->type != EV_ATOM || p->ch != MFC_PUTLLC_CMD || p->b != line) continue;
+                if (p->c != 0) break;               /* that attempt failed: the next GETLLAR */
+                uint32_t be; memcpy(&be, f->data + g->off + 128 + (ea & 127u), 4);
+                const uint32_t old = __builtin_bswap32(be), nw = __builtin_bswap32(old + v);
+                memcpy(vm_base + ea, &nw, 4);
+                memcpy(ctx->resv_line, f->data + p->off + 256, 128);   /* the reservation state the job's own atomic leaves */
+                { uint64_t rw; memcpy(&rw, f->data + p->off + 384, 8); ctx->resv_word = rw; }
+                ctx->atomic_stat = p->c;
+                t->nat_atom = j + 1;
+                return old;
+            }
+        }
+        jr_fail(t, "native atomic add on ea=0x%08X: the recording has no such stored atomic", ea);
+    }
+    for (;;) {   /* as the job's own 0x190D8: GETLLAR into LS 0x80, add, PUTLLC, again on failure */
+        ctx->mfc_lsa = 0x80; ctx->mfc_eal = ea & ~127u;
+        spu_mfc_atomic_raw(ctx, MFC_GETLLAR_CMD);
+        uint32_t be; memcpy(&be, ctx->ls + 0x80 + (ea & 127u), 4);
+        const uint32_t old = __builtin_bswap32(be), nw = __builtin_bswap32(old + v);
+        memcpy(ctx->ls + 0x80 + (ea & 127u), &nw, 4);
+        spu_mfc_atomic_raw(ctx, MFC_PUTLLC_CMD);
+        if (ctx->atomic_stat == 0) return old;
+    }
+}
+
+int spu_native_replay_begin(spu_context* ctx)
+{
+    jr_tls* t = jr_on(ctx);
+    if (!t || !t->replaying) return 0;
+    const uint64_t q0 = jr_qpc();
+    if (!t->guest_locked) {
+        AcquireSRWLockExclusive(&s_guest_lock); t->guest_locked = 1;
+        const jr_file* f = t->f;
+        t_dead_n = 0; t_primed_n = 0; t_chunks_n = 0;
+        t->nat_atom = t->cur[0] < f->ns[0] ? f->sidx[0][t->cur[0]] : 0;
+        for (uint32_t i = f->h->n_ev; i-- > 0; ) {      /* last first: the earliest write wins */
+            const jr_ev* e = &f->ev[i];
+            if (e->type == EV_DMA && e->len) {
+                if (mfc_is_get(e->ch)) { jr_commit(e->b, e->len); memcpy(vm_base + e->b, f->data + e->off, e->len); }
+                else if (mfc_is_put(e->ch)) jr_commit(e->b, e->len);
+            } else if (e->type == EV_ATOM && e->ch == MFC_GETLLAR_CMD && e->len >= 256) {
+                jr_commit(e->b, 128); memcpy(vm_base + e->b, f->data + e->off + 128, 128);
+            }
+        }
+    }
+    t->prime_ticks += jr_qpc() - q0;
+    return 1;
+}
+
+static int jr_is_cmd_end(uint32_t w) { return w == 0x00020000u || (w & 0xE0000003u) == 0x20000000u || (w & 3u) == 2u; }
+
+void spu_native_replay_end(spu_context* ctx, int ran)
+{
+    jr_tls* t = jr_on(ctx);
+    if (!t || !t->replaying || !ran) return;
+    const uint64_t q0 = jr_qpc();
+    const jr_file* f = t->f;
+    t->native_ran = 1;
+    /* the wrapper's record PUT = the last 32-byte PUT of stream 0; its channel writes start at the LSA write before it */
+    uint32_t rec_pos = f->ns[0];
+    for (uint32_t k = f->ns[0]; k-- > t->cur[0]; ) {
+        const jr_ev* e = &f->ev[f->sidx[0][k]];
+        if (e->type == EV_DMA && mfc_is_put(e->ch) && e->c == 32) { rec_pos = k; break; }
+    }
+    if (rec_pos == f->ns[0]) jr_fail(t, "native ran but the recording has no 32-byte record PUT after it");
+    uint32_t g1 = f->sidx[0][rec_pos];
+    for (uint32_t k = rec_pos; k-- > t->cur[0]; ) {
+        const jr_ev* e = &f->ev[f->sidx[0][k]];
+        if (e->type == EV_WRCH && e->ch == 0x10) { g1 = f->sidx[0][k]; break; }   /* MFC_LSA */
+        if (e->type == EV_DMA) break;
+    }
+    const uint32_t g0 = t->cur[0] < f->ns[0] ? f->sidx[0][t->cur[0]] : g1;
+    for (uint32_t i = g0; i < g1; i++) {
+        const jr_ev* e = &f->ev[i];
+        if (e->type == EV_DMA && mfc_is_put(e->ch) && e->len) {
+            const uint8_t* rec = f->data + e->off; const uint8_t* g = vm_base + e->b;
+            uint32_t n = e->len;
+            if (n == 4096) {   /* a command block: compare through its first JUMP/RETURN word */
+                uint32_t k = 0;
+                while (k < 4096 && !jr_is_cmd_end(((uint32_t)rec[k] << 24) | ((uint32_t)rec[k + 1] << 16) | ((uint32_t)rec[k + 2] << 8) | rec[k + 3])) k += 4;
+                n = k + 4 > 4096 ? 4096 : k + 4;
+            }
+            if (memcmp(g, rec, n)) {
+                uint32_t k = 0; while (g[k] == rec[k]) k++;
+                jr_fail(t, "native PUT ea=0x%08X size=0x%X: byte +0x%X is %02X, recording %02X (compared %u bytes)", e->b, e->len, k, g[k], rec[k], n);
+            }
+        } else if (e->type == EV_ATOM && e->ch == MFC_PUTLLC_CMD && e->c == 0 && e->len >= 128) {
+            uint32_t later = 0;     /* only the last successful store to a line is visible */
+            for (uint32_t j = i + 1; j < g1; j++) { const jr_ev* x = &f->ev[j]; if (x->type == EV_ATOM && x->ch == MFC_PUTLLC_CMD && x->c == 0 && x->b == e->b) later = 1; }
+            if (!later && memcmp(vm_base + e->b, f->data + e->off, 128))
+                jr_fail(t, "native atomic store to ea=0x%08X differs from the recording", e->b);
+        }
+    }
+    for (int s = 0; s < 2; s++) {
+        uint32_t k = t->cur[s];
+        while (k < f->ns[s] && f->sidx[s][k] < g1) k++;
+        t->cur[s] = k;
+    }
+    t->prime_ticks += jr_qpc() - q0;
+}
+
+static void jr_guest_release(jr_tls* t)
+{
+    if (!t->guest_locked) return;
+    for (unsigned i = 0; i < t_primed_n; i++) memset(vm_base + t_primed[i].ea, 0, t_primed[i].size);
+    t_primed_n = 0; t->guest_locked = 0;
+    ReleaseSRWLockExclusive(&s_guest_lock);
+}
+
 /* 1 = equal; else describes the first difference into why */
 static int jr_compare_end(const jr_file* f, spu_context* ctx, const uint8_t* rec_ls, char* why, size_t wn)
 {
@@ -933,10 +1122,15 @@ static int jr_compare_end(const jr_file* f, spu_context* ctx, const uint8_t* rec
                      f->gpr1[r]._u32[0], f->gpr1[r]._u32[1], f->gpr1[r]._u32[2], f->gpr1[r]._u32[3], nr);
             return 0;
         }
-    if (memcmp(ctx->ls, rec_ls, SPU_LS_SIZE)) {
+    int ls_diff = 0;
+    if (t_dead_n) {   /* a native ran: the ranges it declared dead are not compared */
+        for (uint32_t a = 0; a < SPU_LS_SIZE && !ls_diff; a += 16)
+            if (!jr_ls_dead(a) && memcmp(ctx->ls + a, rec_ls + a, 16)) ls_diff = 1;
+    } else ls_diff = memcmp(ctx->ls, rec_ls, SPU_LS_SIZE) != 0;
+    if (ls_diff) {
         uint32_t first = 0, lines = 0;
         for (uint32_t a = 0; a < SPU_LS_SIZE; a += 16)
-            if (memcmp(ctx->ls + a, rec_ls + a, 16)) { if (!lines) first = a; lines++; }
+            if (!jr_ls_dead(a) && memcmp(ctx->ls + a, rec_ls + a, 16)) { if (!lines) first = a; lines++; }
         uint32_t k = first; while (ctx->ls[k] == rec_ls[k]) k++;
         int n = snprintf(why, wn, "end local store: %u line(s) differ, first at LS 0x%05X; line 0x%05X replay/recording/start:",
                          lines, k, first);
@@ -986,11 +1180,11 @@ static void jr_replay_one(const jr_file* f, jr_result* r, uint8_t* rec_ls, jr_sl
     t->f = f; t->cur[0] = t->cur[1] = 0; t->failed = 0; t->done = 0; t->why[0] = 0;
     AcquireSRWLockExclusive(&slot->lock); slot->ctx = ctx; slot->t0_ms = jr_ms_now(); ReleaseSRWLockExclusive(&slot->lock);
     const uint64_t q0 = jr_qpc();
-    g_spu_native_ran = 0;
+    g_spu_native_ran = 0; t_dead_n = 0; t_primed_n = 0; t->guest_locked = 0; t->native_ran = 0; t->prime_ticks = 0; t->nat_atom = 0;
     const int halted = spu_run_with_halt(jr_replay_entry, ctx);
     if (g_spu_native_ran) __atomic_add_fetch(&s_native_jobs, 1, __ATOMIC_RELAXED);
     AcquireSRWLockExclusive(&slot->lock); slot->ctx = NULL; ReleaseSRWLockExclusive(&slot->lock);
-    r->us = jr_ns(jr_qpc() - q0) / 1e3;
+    r->us = jr_ns(jr_qpc() - q0 - t->prime_ticks) / 1e3;
     t->active = 0; t->replaying = 0;
     r->rec_us = f->h->dur_ns / 1e3;
     if (t->failed) {
@@ -1017,6 +1211,8 @@ static void jr_replay_one(const jr_file* f, jr_result* r, uint8_t* rec_ls, jr_sl
     h = jr_fnv(h, ctx->gpr, sizeof ctx->gpr); h = jr_fnv(h, ctx->ls, SPU_LS_SIZE);
     h = jr_fnv(h, &r->pass, sizeof r->pass); h = jr_fnv(h, r->why, strlen(r->why));
     r->hash = h;
+    jr_guest_release(t);
+    t_dead_n = 0;
     spu_mfc_release(ctx);
     _aligned_free(ctx);
 }

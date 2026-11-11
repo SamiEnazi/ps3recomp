@@ -702,6 +702,14 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
             return 0xFFFFFFFFu;
         }
         const int _st = spu_step(ctx);
+        /* SPU_INTERP_REGTRACE=<file> (agent/native204): every interpreted instruction as "pc opcode rt-register" after
+         * the step (the job replay on the interpreter: PS3_JOBREPLAY_INTERP=1), to derive a job's arithmetic. */
+        { static FILE* s_rtf; static int s_rti = -1;
+          if (s_rti < 0) { const char* e = getenv("SPU_INTERP_REGTRACE"); s_rti = e && *e; if (s_rti) s_rtf = fopen(e, "w"); }
+          if (s_rti && s_rtf) {
+              const u128* r = &ctx->gpr[_top & 0x7F];
+              fprintf(s_rtf, "%05x %08x %08x %08x %08x %08x\n", _tpc, _top, r->_u32[0], r->_u32[1], r->_u32[2], r->_u32[3]);
+          } }
         if (g_spu_oracle_trace_ctx == ctx && _tpc >= 0x3780 && g_spu_oracle_trace_left-- > 0) {
             const u128* r = &ctx->gpr[_top & 0x7F];
             fprintf(stderr, "[oracle] T %05x %08x r%u=%08x %08x %08x %08x\n", _tpc, _top, _top & 0x7F,
