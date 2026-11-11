@@ -30,6 +30,7 @@ static PPU_TLS int     s_exit_done = 0;
 #include "../platform/host_place.h"     /* PS3_CPU_PLACE: guest threads on chosen cores */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
 #include "ps3emu/ps3_limits.h"           /* PS3RECOMP_LIMITS: runtime gauges */
+#include "ps3emu/ps3_hitchcatch.h"       /* PS3RECOMP_HITCHCATCH: sampled during a frozen frame */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
@@ -219,6 +220,7 @@ static void* ppu_host_thread_proc(void* param)
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
             (unsigned long long)info->entry_addr, (unsigned long)GetCurrentThreadId());
+    ps3_hc_thread_begin(PS3_HC_PPU, (unsigned)info->ctx.thread_id, info->name, NULL);
 
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
@@ -257,6 +259,7 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
+    ps3_hc_thread_end();           /* both ways out (return, sys_ppu_thread_exit) pass here */
     /* Its lwarx reservation record (spu_coherency.c) goes with the thread. */
     { extern void spu_coh_ppu_thread_exit(void); spu_coh_ppu_thread_exit(); }
     /* ...and its guest-callback stacks (ppu_loader.cpp, PS3_STACK_REUSE) */

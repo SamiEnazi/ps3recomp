@@ -43,6 +43,8 @@
 #include "ppu_recomp.h"
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
+#include "ps3emu/ps3_hitchcatch.h"   /* PS3RECOMP_HITCHCATCH: the frozen-frame sampler */
+extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp: each guest thread's HLE call in flight */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 /* VSCR at thread start: NJ = 1 like the PS3 (see ppu_vscr_default in
  * runtime/ppu/ppu_context.h, which this TU cannot include: ppu_recomp.h
@@ -4870,6 +4872,10 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     s_main_host_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
                                     FALSE, GetCurrentThreadId());
 #endif
+    /* PS3RECOMP_HITCHCATCH: the guest main thread, and every PPU thread's
+     * "HLE call in flight" (ppu_hle.cpp) for its samples */
+    ps3_hc_set_hle_table(g_hle_inflight, 64);   /* PS3_HLE_INFLIGHT_MAX */
+    ps3_hc_thread_begin(PS3_HC_PPU, 1, "main", NULL);
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
     return 0;

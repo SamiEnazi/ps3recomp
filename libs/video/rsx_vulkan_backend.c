@@ -63,6 +63,7 @@
 #include "../../include/ps3emu/ps3_toggles.h"   /* PS3_TOGGLE_FILE: PS3RECOMP_VK_BIAS_RESET live */
 #include "../../include/ps3emu/ps3_settings.h"  /* [overlay] PC settings the in-game menu changes live */
 #include "../../include/ps3emu/ps3_lightfx.h"   /* [light] the menu's Lighting page: AO, light dither */
+#include "../../include/ps3emu/ps3_hitchcatch.h" /* PS3RECOMP_HITCHCATCH: stacks of the frozen frames */
 #include "vk_overlay.h"                          /* [overlay] HUD + settings menu (vk_overlay.cpp) */
 #include "rsx_image_io.h"                        /* [fx] texture-pack PNGs */
 
@@ -9998,10 +9999,12 @@ static void vk_playlog_frame(void)
             s_aio.f[VK_AIO_PL] = s_pl.f;     /* (rsx5) the log writer owns the file from here */
             vk_aio_start();
             atexit(vk_pl_atexit);
+            ps3_hc_session(path, s_pl.t0);  /* the hitch catcher: hitches.tsv beside it, same clock */
         }
     }
     if (s_pl.state != 1) return;
     const double now = vk_pl_now();
+    ps3_hc_frame(now);                       /* the frame clock the hitch catcher's watchdog reads */
     if (s_pl.last == 0.0) { s_pl.last = s_pl.sec_start = now; vk_playlog_attr(0, 0.0); return; }
     const double dt = now - s_pl.last;
     s_pl.last = now;
