@@ -1236,7 +1236,7 @@ static struct {
     VkViewport vp; VkRect2D sc;
 } s_fdt;
 extern u64 g_eng_fd_be[10];   /* the engine's [fastdraw] counters (rsx_draw_fast.inc) */
-extern u64 g_eng_fd2[4];      /* ... and round 2's (the set memo) */
+extern u64 g_eng_fd2[8];      /* ... and round 2's (the set memo; [4]/[5] VERIFY=2's dry fast records) */
 /* the draw engine's cost counters (PS3RECOMP_ENG_DELTA_STATS=2, rsx_draw_delta.inc): VK_BST's
  * stage marks, the descriptor-set split, the sampler searches */
 extern u64 g_eng_bst_t;
@@ -8209,7 +8209,7 @@ static void vk_fd_init(void)
     const char* b = getenv("PS3RECOMP_VK_FASTDRAW");
     const char* v = getenv("PS3RECOMP_ENG_FASTDRAW_VERIFY");
     s_fdb.on = !(e && e[0] == '0') && !(b && b[0] == '0');
-    s_fdb.verify = s_fdb.on && v && v[0] && v[0] != '0';
+    s_fdb.verify = (s_fdb.on && v && v[0] && v[0] != '0') ? (atoi(v) >= 2 ? 2 : 1) : 0;   /* 2: the fast record run too */
     const char* f2 = getenv("PS3RECOMP_FASTDRAW2");
     s_fdb.two = !(f2 && f2[0] == '0');
     s_fdt.valid = 0;
@@ -8275,10 +8275,139 @@ static void vk_fd_record(u32 vb, u32 vertex_count, u32 stride, u32 ib, u32 index
     }
     s_batch.draws++;                                                      /* the pass stays open */
 }
+/* VERIFY=2: the commands a draw records, caught (s_fdcap.fwd: and recorded,
+ * else not) -- the fast record's dry run and the whole body's real one are
+ * compared command by command. Every command either can record is caught. */
+typedef struct { u64 op; u64 a[6]; } vk_fdcmd;   /* no padding: compared with memcmp */
+static struct { int fwd; u32 n; vk_fdcmd c[24]; } s_fdcap;
+/* Only the verifying thread's commands are caught: another thread recording
+ * meanwhile (the present path) goes straight through, recorded as always. */
+#ifdef _WIN32
+static __declspec(thread) int t_fdcap;
+#else
+static __thread int t_fdcap;
+#endif
+static volatile long s_fdcap_foreign;   /* commands of another thread while the catchers were in place */
+static void vk_fdcap_foreign(u32 op)
+{
+    if (__atomic_fetch_add(&s_fdcap_foreign, 1, __ATOMIC_RELAXED) < 4)
+#ifdef _WIN32
+        fprintf(stderr, "[fastdraw-verify] note: thread %lu recorded command %u while the RSX thread was inside a"
+                        " checked draw (passed through, not caught)\n", (unsigned long)GetCurrentThreadId(), op);
+#else
+        fprintf(stderr, "[fastdraw-verify] note: another thread recorded command %u while the RSX thread was inside a"
+                        " checked draw (passed through, not caught)\n", op);
+#endif
+}
+#define VK_FDMINE(op, fwd_call) do { if (!t_fdcap) { vk_fdcap_foreign(op); fwd_call; return; } } while (0)
+static void vk_fdcap_add(u32 op, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)
+{
+    if (s_fdcap.n < 24u) { vk_fdcmd* c = &s_fdcap.c[s_fdcap.n]; c->op = op;
+        c->a[0] = a0; c->a[1] = a1; c->a[2] = a2; c->a[3] = a3; c->a[4] = a4; c->a[5] = a5; }
+    s_fdcap.n++;
+}
+#define VK_FDH(x) ((u64)(uintptr_t)(x))
+static PFN_vkCmdBindDescriptorSets s_fdo_bds; static PFN_vkCmdBindVertexBuffers s_fdo_bvb;
+static PFN_vkCmdBindIndexBuffer s_fdo_bib; static PFN_vkCmdDrawIndexed s_fdo_di; static PFN_vkCmdDraw s_fdo_d;
+static PFN_vkCmdBindPipeline s_fdo_bp; static PFN_vkCmdSetViewport s_fdo_vp; static PFN_vkCmdSetScissor s_fdo_sc;
+static PFN_vkCmdSetStencilReference s_fdo_sr; static PFN_vkCmdSetDepthBias s_fdo_db; static PFN_vkCmdPipelineBarrier s_fdo_pb;
+static PFN_vkCmdBeginRenderPass s_fdo_brp; static PFN_vkCmdEndRenderPass s_fdo_erp; static PFN_vkCmdWriteTimestamp s_fdo_ts;
+static PFN_vkCmdPushConstants s_fdo_pc;
+static void VKAPI_PTR vk_fdc_bds(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t f, uint32_t n,
+                                 const VkDescriptorSet* sets, uint32_t nd, const uint32_t* d)
+{ VK_FDMINE(1, s_fdo_bds(cb, bp, l, f, n, sets, nd, d)); vk_fdcap_add(1, bp, VK_FDH(l), f | ((u64)n << 32), n ? VK_FDH(sets[0]) : 0, nd, nd ? (d[0] | ((u64)(nd > 1 ? d[1] : 0) << 32)) : 0);
+  if (s_fdcap.fwd) s_fdo_bds(cb, bp, l, f, n, sets, nd, d); }
+static void VKAPI_PTR vk_fdc_bvb(VkCommandBuffer cb, uint32_t f, uint32_t n, const VkBuffer* b, const VkDeviceSize* o)
+{ VK_FDMINE(2, s_fdo_bvb(cb, f, n, b, o)); vk_fdcap_add(2, f, n, n ? VK_FDH(b[0]) : 0, n ? o[0] : 0, 0, 0); if (s_fdcap.fwd) s_fdo_bvb(cb, f, n, b, o); }
+static void VKAPI_PTR vk_fdc_bib(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkIndexType t)
+{ VK_FDMINE(3, s_fdo_bib(cb, b, o, t)); vk_fdcap_add(3, VK_FDH(b), o, t, 0, 0, 0); if (s_fdcap.fwd) s_fdo_bib(cb, b, o, t); }
+static void VKAPI_PTR vk_fdc_di(VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, int32_t vo, uint32_t fi)
+{ VK_FDMINE(4, s_fdo_di(cb, n, i, f, vo, fi)); vk_fdcap_add(4, n, i, f, (u64)(u32)vo, fi, 0); if (s_fdcap.fwd) s_fdo_di(cb, n, i, f, vo, fi); }
+static void VKAPI_PTR vk_fdc_d(VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t f, uint32_t fi)
+{ VK_FDMINE(5, s_fdo_d(cb, n, i, f, fi)); vk_fdcap_add(5, n, i, f, fi, 0, 0); if (s_fdcap.fwd) s_fdo_d(cb, n, i, f, fi); }
+static void VKAPI_PTR vk_fdc_bp(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p)
+{ VK_FDMINE(6, s_fdo_bp(cb, bp, p)); vk_fdcap_add(6, bp, VK_FDH(p), 0, 0, 0, 0); if (s_fdcap.fwd) s_fdo_bp(cb, bp, p); }
+static void VKAPI_PTR vk_fdc_vp(VkCommandBuffer cb, uint32_t f, uint32_t n, const VkViewport* v)
+{ VK_FDMINE(7, s_fdo_vp(cb, f, n, v)); u64 h[3] = { 0, 0, 0 }; if (n) memcpy(h, v, sizeof *v < sizeof h ? sizeof *v : sizeof h);
+  vk_fdcap_add(7, f, n, h[0], h[1], h[2], 0); if (s_fdcap.fwd) s_fdo_vp(cb, f, n, v); }
+static void VKAPI_PTR vk_fdc_sc(VkCommandBuffer cb, uint32_t f, uint32_t n, const VkRect2D* r)
+{ VK_FDMINE(8, s_fdo_sc(cb, f, n, r)); u64 h[2] = { 0, 0 }; if (n) memcpy(h, r, sizeof *r < sizeof h ? sizeof *r : sizeof h);
+  vk_fdcap_add(8, f, n, h[0], h[1], 0, 0); if (s_fdcap.fwd) s_fdo_sc(cb, f, n, r); }
+static void VKAPI_PTR vk_fdc_sr(VkCommandBuffer cb, VkStencilFaceFlags m, uint32_t r)
+{ VK_FDMINE(9, s_fdo_sr(cb, m, r)); vk_fdcap_add(9, m, r, 0, 0, 0, 0); if (s_fdcap.fwd) s_fdo_sr(cb, m, r); }
+static void VKAPI_PTR vk_fdc_db(VkCommandBuffer cb, float c, float cl, float sl)
+{ VK_FDMINE(10, s_fdo_db(cb, c, cl, sl)); u32 a, b2, c2; memcpy(&a, &c, 4); memcpy(&b2, &cl, 4); memcpy(&c2, &sl, 4);
+  vk_fdcap_add(10, a, b2, c2, 0, 0, 0); if (s_fdcap.fwd) s_fdo_db(cb, c, cl, sl); }
+static void VKAPI_PTR vk_fdc_pb(VkCommandBuffer cb, VkPipelineStageFlags s0, VkPipelineStageFlags d0, VkDependencyFlags df,
+                                uint32_t nm, const VkMemoryBarrier* mb, uint32_t nb, const VkBufferMemoryBarrier* bb,
+                                uint32_t ni, const VkImageMemoryBarrier* ib)
+{ VK_FDMINE(11, s_fdo_pb(cb, s0, d0, df, nm, mb, nb, bb, ni, ib)); vk_fdcap_add(11, s0, d0, df, nm, nb, ni ? VK_FDH(ib[0].image) : 0); if (s_fdcap.fwd) s_fdo_pb(cb, s0, d0, df, nm, mb, nb, bb, ni, ib); }
+static void VKAPI_PTR vk_fdc_brp(VkCommandBuffer cb, const VkRenderPassBeginInfo* bi, VkSubpassContents sc)
+{ VK_FDMINE(12, s_fdo_brp(cb, bi, sc)); vk_fdcap_add(12, VK_FDH(bi->renderPass), VK_FDH(bi->framebuffer), sc, 0, 0, 0); if (s_fdcap.fwd) s_fdo_brp(cb, bi, sc); }
+static void VKAPI_PTR vk_fdc_erp(VkCommandBuffer cb) { VK_FDMINE(13, s_fdo_erp(cb)); vk_fdcap_add(13, 0, 0, 0, 0, 0, 0); if (s_fdcap.fwd) s_fdo_erp(cb); }
+static void VKAPI_PTR vk_fdc_ts(VkCommandBuffer cb, VkPipelineStageFlagBits st, VkQueryPool q, uint32_t i)
+{ VK_FDMINE(14, s_fdo_ts(cb, st, q, i)); vk_fdcap_add(14, st, VK_FDH(q), i, 0, 0, 0); if (s_fdcap.fwd) s_fdo_ts(cb, st, q, i); }
+static void VKAPI_PTR vk_fdc_pc(VkCommandBuffer cb, VkPipelineLayout l, VkShaderStageFlags st, uint32_t o, uint32_t n, const void* v)
+{ VK_FDMINE(15, s_fdo_pc(cb, l, st, o, n, v)); vk_fdcap_add(15, VK_FDH(l), st, o, n, 0, 0); if (s_fdcap.fwd) s_fdo_pc(cb, l, st, o, n, v); }
+/* 1: the catchers in place of the entry points (fwd: and forwarding); 0: back */
+static void vk_fdcap_set(int on, int fwd)
+{
+    s_fdcap.fwd = fwd; s_fdcap.n = 0;
+    t_fdcap = on;
+#define VK_FDSW(name, stub, save) if (on) { if (p##name != stub) save = p##name; p##name = stub; } else if (p##name == stub) p##name = save;
+    VK_FDSW(vkCmdBindDescriptorSets, vk_fdc_bds, s_fdo_bds) VK_FDSW(vkCmdBindVertexBuffers, vk_fdc_bvb, s_fdo_bvb)
+    VK_FDSW(vkCmdBindIndexBuffer, vk_fdc_bib, s_fdo_bib) VK_FDSW(vkCmdDrawIndexed, vk_fdc_di, s_fdo_di)
+    VK_FDSW(vkCmdDraw, vk_fdc_d, s_fdo_d) VK_FDSW(vkCmdBindPipeline, vk_fdc_bp, s_fdo_bp)
+    VK_FDSW(vkCmdSetViewport, vk_fdc_vp, s_fdo_vp) VK_FDSW(vkCmdSetScissor, vk_fdc_sc, s_fdo_sc)
+    VK_FDSW(vkCmdSetStencilReference, vk_fdc_sr, s_fdo_sr) VK_FDSW(vkCmdSetDepthBias, vk_fdc_db, s_fdo_db)
+    VK_FDSW(vkCmdPipelineBarrier, vk_fdc_pb, s_fdo_pb) VK_FDSW(vkCmdBeginRenderPass, vk_fdc_brp, s_fdo_brp)
+    VK_FDSW(vkCmdEndRenderPass, vk_fdc_erp, s_fdo_erp) VK_FDSW(vkCmdWriteTimestamp, vk_fdc_ts, s_fdo_ts)
+    VK_FDSW(vkCmdPushConstants, vk_fdc_pc, s_fdo_pc)
+#undef VK_FDSW
+}
+/* What a record leaves in the backend (VERIFY=2 compares the fast record's and the body's). */
+typedef struct {
+    VkDeviceSize vcur, icur, ucur; u64 merged, draws; u32 dsets;
+    int rp_open; VkFramebuffer rp_fb; VkRenderPass rp_rp;
+    __typeof__(s_ecs) ecs;
+    __typeof__(s_cm) cm;
+} vk_fdstate;
+static void vk_fdstate_get(vk_fdstate* t)
+{
+    t->vcur = s_batch.vcur; t->icur = s_batch.icur; t->ucur = s_batch.ucur;
+    t->merged = s_batch.merged; t->draws = s_batch.draws; t->dsets = s_batch.dsets;
+    t->rp_open = s_batch.rp_open; t->rp_fb = s_batch.rp_fb; t->rp_rp = s_batch.rp_rp;
+    t->ecs = s_ecs; t->cm = s_cm;
+}
+static void vk_fdstate_put(const vk_fdstate* t)
+{
+    s_batch.vcur = t->vcur; s_batch.icur = t->icur; s_batch.ucur = t->ucur;
+    s_batch.merged = t->merged; s_batch.draws = t->draws; s_batch.dsets = t->dsets;
+    s_batch.rp_open = t->rp_open; s_batch.rp_fb = t->rp_fb; s_batch.rp_rp = t->rp_rp;
+    s_ecs = t->ecs; s_cm = t->cm;
+}
+static void vk_fd_record(u32 vb, u32 vertex_count, u32 stride, u32 ib, u32 index_count, VkDeviceSize ub, VkDeviceSize lead);
+
 /* VERIFY: the whole body records the draw; what the fast record would have
- * recorded is compared with it */
+ * recorded is compared with it (VERIFY=2: the fast record itself is run first,
+ * dry, and its commands and the state it leaves are compared with the body's) */
 static void vk_fd_verify(void* user, rsx_topology topology, u32 vb, u32 vertex_count, u32 stride, u32 ib, u32 index_count)
 {
+    /* VERIFY=2: the fast record, dry (its state put back after) */
+    const int dry = s_fdb.verify >= 2 && s_mg.on <= 0;
+    vk_fdcmd fast_c[24]; u32 fast_n = 0;
+    static vk_fdstate st0, st_fast, st_full;
+    if (dry) {
+        VkDeviceSize ub = 0, lead = 0;
+        vk_eng_ub(&ub, &lead);
+        vk_fdstate_get(&st0);
+        vk_fdcap_set(1, 0);
+        vk_fd_record(vb, vertex_count, stride, ib, index_count, ub, lead);
+        fast_n = s_fdcap.n; memcpy(fast_c, s_fdcap.c, sizeof fast_c);
+        vk_fdstate_get(&st_fast);
+        vk_fdstate_put(&st0);
+        vk_fdcap_set(1, 1);   /* the body: caught and recorded */
+    }
     VkBuffer b = VK_NULL_HANDLE, ibb = VK_NULL_HANDLE; VkDeviceSize o = 0, io = 0;
     const int ok = index_count && vk_vb_get(vb, (VkDeviceSize)vertex_count * stride, &b, &o) &&
                    vk_vb_get(ib, (VkDeviceSize)index_count * 4u, &ibb, &io);
@@ -8289,6 +8418,33 @@ static void vk_fd_verify(void* user, rsx_topology topology, u32 vb, u32 vertex_c
     vk_eng_draw_vbuf_ib(user, topology, vb, vertex_count, stride, ib, index_count);
     s_fdc.on = 0;
     g_eng_fd_be[8]++;
+    if (dry) {   /* VERIFY=2: the two command streams and what each left */
+        const u32 full_n = s_fdcap.n;
+        vk_fdcap_set(0, 0);
+        vk_fdstate_get(&st_full);
+        g_eng_fd2[4]++;
+        char dw[200]; int dp = 0; dw[0] = 0;
+#define FD_DW(cond, name) do { if (cond) dp += snprintf(dw + dp, sizeof dw - (size_t)dp, "%s%s", dp ? " " : "", name); } while (0)
+        FD_DW(fast_n != full_n || fast_n > 24u || memcmp(fast_c, s_fdcap.c, (size_t)(fast_n < 24u ? fast_n : 24u) * sizeof fast_c[0]),
+              "commands");
+        FD_DW(st_fast.vcur != st_full.vcur || st_fast.icur != st_full.icur || st_fast.ucur != st_full.ucur, "arena-cursors");
+        FD_DW(st_fast.merged != st_full.merged || st_fast.draws != st_full.draws || st_fast.dsets != st_full.dsets, "batch-counts");
+        FD_DW(st_fast.rp_open != st_full.rp_open || st_fast.rp_fb != st_full.rp_fb || st_fast.rp_rp != st_full.rp_rp, "pass");
+        FD_DW(memcmp(&st_fast.ecs, &st_full.ecs, sizeof st_fast.ecs), "recorded-state");
+        FD_DW(memcmp(&st_fast.cm, &st_full.cm, sizeof st_fast.cm), "constant-windows");
+#undef FD_DW
+        if (dp) {
+            g_eng_fd2[5]++;
+            static u32 nd2;
+            if (nd2++ < 64u || !(nd2 & 1023u)) {
+                fprintf(stderr, "[fastdraw-verify] backend dry #%u: the fast record itself left something else than the whole"
+                                " body (%s; commands %u vs %u", nd2, dw, fast_n, full_n);
+                for (u32 i = 0; i < fast_n && i < 6u; i++) fprintf(stderr, "%s f%u", i ? "" : ":", (u32)fast_c[i].op);
+                for (u32 i = 0; i < full_n && i < 6u; i++) fprintf(stderr, " b%u", (u32)s_fdcap.c[i].op);
+                fprintf(stderr, ")\n");
+            }
+        }
+    }
     char w[256]; int wp = 0; w[0] = 0;
 #define FD_W(cond, name) do { if (cond) wp += snprintf(w + wp, sizeof w - (size_t)wp, "%s%s", wp ? " " : "", name); } while (0)
     FD_W(ok != s_fdc.drawn, "drawn");
