@@ -956,7 +956,7 @@ int spu_native_ea_ok(uint32_t ea, uint32_t size)
 {
     if (ea < 0x10000u || (uint64_t)ea + size > 0xFFFFFFFFull) return 0;
     jr_tls* t = t_jr;
-    if (!t || !t->replaying || !t->guest_locked) return 1;     /* in the game: as the DMA engine (no check) */
+    if (!t || !t->replaying || !t->guest_locked) return mfc_ea_range_committed(ea, size);   /* in the game: the DMA engine's own guard (commits on demand) */
     for (uint32_t c = ea >> 16; c <= (ea + (size ? size - 1 : 0)) >> 16; c++) {
         int hit = 0;
         for (unsigned i = 0; i < t_chunks_n; i++) if (t_chunks[i] == c) { hit = 1; break; }
