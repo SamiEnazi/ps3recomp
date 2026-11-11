@@ -72,6 +72,11 @@ int      spu_mfc_atomic_raw(struct spu_context* ctx, uint32_t cmd);
 void     spu_stop_raw(struct spu_context* ctx);
 void*    spu_jobrec_mfc_engine(struct spu_context* ctx);   /* this context's mfc_engine */
 
+/* Natives of a job's main function (work/rewrites/spu, agent/native204; see spu_jobrec.c). In a replay: */
+void spu_native_dead_ls(uint32_t lo, uint32_t hi);        /* LS [lo,hi) is dead after the native: the replay does not compare it */
+int  spu_native_replay_begin(struct spu_context* ctx);    /* replay: prime guest memory from the recording; 0 = not a replay */
+void spu_native_replay_end(struct spu_context* ctx, int ran);   /* ran: replace the recorded operations by checks of the native's results */
+
 #ifdef __cplusplus
 }
 #endif
