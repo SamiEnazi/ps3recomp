@@ -23,6 +23,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "pad_input_map.h"                  /* PS3_INPUT_MAP: keyboard/mouse/controller bindings */
 #include "pad_stick.h"                      /* dead zones, anti-dead zone, saturation, squircle */
+#include "pad_mouse_direct.h"               /* [mouse] direct mode's claim, PS3_MOUSE_SCRIPT */
 #include "../../include/ps3emu/ps3_pad_icons.h"   /* the last device used, for the prompt glyphs */
 
 /* ---------------------------------------------------------------------------
@@ -1307,6 +1308,19 @@ volatile uint32_t g_pad_host_keys[4];
  *                            captures the mouse and Esc/Cmd releases it,
  *                            see rsx_metal_backend.h; on Windows the
  *                            mouse counts only while captured)
+ *   PS3_MOUSE_MODE=stick     mode = "stick": the mouse is always a right
+ *                            stick, as above (the only mode before 2026-11-11).
+ *                            direct (default): when the title's camera takes
+ *                            the motion itself (cellPad_host_mouse_direct_take,
+ *                            pad_mouse_direct.h) the camera turns by how far the
+ *                            mouse moved -- no stick, no speed cap, no stick
+ *                            acceleration; whenever it does not (menus, map,
+ *                            cutscenes, a build without the title's hook) the
+ *                            mouse is the right stick as in "stick" mode
+ *   PS3_MOUSE_AIM_SENS=<f>   aim_sensitivity: direct mode while aiming (the
+ *                            title says when), a multiplier like the one above
+ *                            (default 1.0); PS3_MOUSE_SENS is the rest of the time
+ *   PS3_MOUSE_SCRIPT=...     tests: a synthetic mouse (pad_mouse_direct.h)
  * Buttons by default: left = R1 (bolt while aiming), right = L1 (aim),
  * middle = R3, button 4 = R2 (Kinetic Pulse), button 5 = L2 (Drain), wheel
  * up = D-pad up (Precision Mode); [mouse_buttons] rebinds them. */
@@ -1340,6 +1354,19 @@ static int pad_env_int(const char* var, int file, int def)
 /* File scope so the in-game menu can read and change them live. */
 static int s_mouse_on = -1, s_mouse_invert_x, s_mouse_invert_y, s_mouse_dz;
 static float s_mouse_sens;
+/* [mouse] direct mode (pad_mouse_direct.h): 1 direct, 0 stick; aiming sensitivity;
+ * the title has a camera that takes the motion; the claim (cellPad_host_mouse_direct_take). */
+static volatile int s_mouse_mode = 1, s_mouse_direct_provider;
+static volatile float s_mouse_aim_sens = 1.0f;
+static PmdClaim s_mouse_claim;
+static int pad_mouse_mode_from(const char* v, int def)
+{
+    if (!v || !*v) return def;
+    if (!strcasecmp(v, "direct") || !strcmp(v, "1")) return 1;
+    if (!strcasecmp(v, "stick") || !strcmp(v, "0")) return 0;
+    fprintf(stderr, "[cellPad] PS3_MOUSE_MODE=%s: expected direct or stick; %s\n", v, def ? "direct" : "stick");
+    return def;
+}
 static void pad_mouse_settings_load(void)
 {
     if (s_mouse_on >= 0) return;
@@ -1351,8 +1378,20 @@ static void pad_mouse_settings_load(void)
     s_mouse_invert_y = pad_env_int("PS3_MOUSE_INVERT_Y", map->mouse_invert_y, 0) != 0;
     s_mouse_dz       = pad_env_int("PS3_MOUSE_DEADZONE", map->mouse_deadzone, 30);
     if (s_mouse_dz < 0) s_mouse_dz = 0; if (s_mouse_dz > 120) s_mouse_dz = 120;
+    e = getenv("PS3_MOUSE_AIM_SENS");
+    { float a = e ? (float)atof(e) : map->mouse_aim_sens > 0.0f ? map->mouse_aim_sens : 1.0f;
+      s_mouse_aim_sens = a > 0.0f ? a : 1.0f; }
+    s_mouse_mode     = pad_mouse_mode_from(getenv("PS3_MOUSE_MODE"), map->mouse_mode >= 0 ? map->mouse_mode : 1);
     s_mouse_on       = pad_env_int("PS3_MOUSE", map->mouse_camera, 1) != 0;
 }
+/* [mouse] direct mode, for the menu (vk_overlay_mouse.inc) and the title. */
+int   cellPad_host_mouse_mode(void) { pad_mouse_settings_load(); return s_mouse_mode; }
+void  cellPad_host_set_mouse_mode(int direct) { pad_mouse_settings_load(); s_mouse_mode = direct != 0; }
+float cellPad_host_mouse_aim_sens(void) { pad_mouse_settings_load(); return s_mouse_aim_sens; }
+void  cellPad_host_set_mouse_aim_sens(float s) { pad_mouse_settings_load(); if (s > 0.0f) s_mouse_aim_sens = s; }
+/* The title: its camera can take the mouse (it calls ..._take while its camera runs). */
+void  cellPad_host_mouse_direct_provider(int on) { s_mouse_direct_provider = on != 0; }
+int   cellPad_host_mouse_direct_ready(void) { return s_mouse_direct_provider; }
 /* The in-game menu (ps3_overlay.mm): mouse camera sensitivity and inversion. */
 void cellPad_host_mouse_settings(int* on, float* sens, int* invert_x, int* invert_y)
 {
@@ -1427,6 +1466,61 @@ int cellPad_host_mouse_active(void)
     pad_mouse_settings_load();
     return s_mouse_on && cellPad_host_input_mode() != PAD_MODE_CONTROLLER;
 }
+extern volatile int g_pad_overlay_open;
+/* [mouse] direct mode: the title's camera, each time it updates. *dx, *dy = the
+ * mouse motion since the last call in raw mouse counts (inverted as set); the two
+ * sensitivities. Returns 0 and takes nothing when the mouse is not the camera's
+ * now (stick mode, the mouse camera off, controller-only input, a menu or a system
+ * dialog open): the title then leaves its camera to the game. A call that returns
+ * 1 keeps the claim: the pad poll leaves the motion to the title and moves no stick
+ * from the mouse (pad_mouse_direct.h). */
+int cellPad_host_mouse_direct_take(float* dx, float* dy, float* sens, float* aim_sens)
+{
+    *dx = *dy = 0.0f;
+    pad_mouse_settings_load();
+    *sens = s_mouse_sens; *aim_sens = s_mouse_aim_sens;
+    if (!s_mouse_on || !s_mouse_mode || cellPad_host_input_mode() == PAD_MODE_CONTROLLER || g_pad_overlay_open)
+        return 0;
+    pmd_take(&s_mouse_claim, pad_now_us());
+    const int32_t mx = __atomic_exchange_n(&g_pad_mouse_dx, 0, __ATOMIC_RELAXED);
+    const int32_t my = __atomic_exchange_n(&g_pad_mouse_dy, 0, __ATOMIC_RELAXED);
+    *dx = (float)mx / 16.0f * (s_mouse_invert_x ? -1.0f : 1.0f);
+    *dy = (float)my / 16.0f * (s_mouse_invert_y ? -1.0f : 1.0f);
+    return 1;
+}
+static int pad_watch_exists(const char* path);
+/* PS3_MOUSE_SCRIPT (tests, pad_mouse_direct.h): the synthetic mouse's counts due
+ * now go where the raw-input thread puts real motion. */
+static void pad_mouse_script_feed(void)
+{
+    static int s_init; static PmdScript s_sc; static const char* s_wait;
+    static unsigned long long s_t0, s_tw;
+    if (!s_init) {
+        s_init = 1;
+        const char* e = getenv("PS3_MOUSE_SCRIPT");
+        if (e && *e) {
+            pmd_script_parse(&s_sc, e);
+            s_wait = getenv("PAD_SCRIPT_WAIT");
+            printf("[cellPad] PS3_MOUSE_SCRIPT: %d event(s)%s\n", s_sc.n, s_wait ? ", w-times from PAD_SCRIPT_WAIT" : "");
+            fflush(stdout);
+        }
+    }
+    if (!s_sc.n) return;
+    const unsigned long long now = pad_now_us();
+    if (!s_t0) s_t0 = now;
+    if (!s_tw && s_wait && pad_watch_exists(s_wait)) s_tw = now;
+    const double tw = s_tw ? (double)(now - s_tw) / 1e6 : (s_wait ? -1.0 : (double)(now - s_t0) / 1e6);
+    int32_t ax, ay;
+    const int i = pmd_script_feed(&s_sc, tw, (double)(now - s_t0) / 1e6, &ax, &ay);
+    if (ax) __atomic_add_fetch(&g_pad_mouse_dx, ax, __ATOMIC_RELAXED);
+    if (ay) __atomic_add_fetch(&g_pad_mouse_dy, ay, __ATOMIC_RELAXED);
+    if (i >= 0) {
+        const PmdEvent* ev = &s_sc.ev[i];
+        printf("[cellPad] PS3_MOUSE_SCRIPT %s%.2fs: %+g, %+g counts over %.2f s\n", ev->world ? "w" : "",
+               ev->t, ev->dx, ev->dy, ev->dur);
+        fflush(stdout);
+    }
+}
 static void pad_poll_mouse(uint32_t* ctl, int* mrx, int* mry)
 {
     static float sx, sy; static unsigned long long last;
@@ -1437,6 +1531,7 @@ static void pad_poll_mouse(uint32_t* ctl, int* mrx, int* mry)
     const int on = s_mouse_on, invert_x = s_mouse_invert_x, invert_y = s_mouse_invert_y, dz = s_mouse_dz;
     const float sens = s_mouse_sens;
     if (!on) return;
+    pad_mouse_script_feed();
     const unsigned long long now_us = pad_now_us(), now = now_us / 1000ull;
     uint32_t b = g_pad_mouse_buttons;
     { const int32_t w = __atomic_exchange_n(&g_pad_mouse_wheel, 0, __ATOMIC_RELAXED);
@@ -1449,6 +1544,20 @@ static void pad_poll_mouse(uint32_t* ctl, int* mrx, int* mry)
     if (b)
         for (int c = 0; c < PIM_N_CONTROLS; c++)
             if (map->mouse[c] & b) *ctl |= 1u << c;
+    /* [mouse] direct mode: while the title's camera takes the motion, it is the
+     * title's (no stick from the mouse; I/J/K/L still move it). When the claim
+     * lapses, what piled up is dropped once and the mouse is a stick again. In
+     * stick mode the claim is never held and nothing here changes anything. */
+    { int drop;
+      if (pmd_poll(&s_mouse_claim, s_mouse_mode, now_us, &drop)) {
+          sx = sy = 0.0f; last = now_us;
+          return;
+      }
+      if (drop) {
+          __atomic_store_n(&g_pad_mouse_dx, 0, __ATOMIC_RELAXED);
+          __atomic_store_n(&g_pad_mouse_dy, 0, __ATOMIC_RELAXED);
+          sx = sy = 0.0f; last = now_us;
+      } }
     const int32_t dx = __atomic_exchange_n(&g_pad_mouse_dx, 0, __ATOMIC_RELAXED);
     const int32_t dy = __atomic_exchange_n(&g_pad_mouse_dy, 0, __ATOMIC_RELAXED);
     /* The time since the last read, in ms from the performance counter (it

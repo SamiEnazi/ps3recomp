@@ -1596,6 +1596,7 @@ static void pads_refresh(double now)
 }
 
 #include "vk_overlay_remap.inc"   /* [remap] remap_section: the bindings, rebinding live (issue #6) */
+#include "vk_overlay_mouse.inc"   /* [mouse] mouse_camera_block */
 
 static void tab_controls(double now)
 {
@@ -1641,6 +1642,10 @@ static void tab_controls(double now)
     }
     ImGui::EndDisabled();
     env_mark(V_RUMBLE_STRENGTH);
+
+    /* ---- [mouse] begin: the mouse camera (vk_overlay_mouse.inc) ---- */
+    mouse_camera_block();
+    /* ---- [mouse] end ---- */
 
     remap_section(now);   /* [remap] "Buttons and keys": every binding, changeable (vk_overlay_remap.inc) */
 
