@@ -9,6 +9,12 @@
  * identical re-writes -- through the engine against a backend that logs every
  * call that changes or reads GPU state (pure queries such as surface_view and
  * vbuf_prefetch are not logged: the delta path legitimately skips them).
+ * (fastdraw) The binds and sets are not logged as calls: they only change the
+ * state the backend holds, and each draw logs that whole state with its own
+ * arguments -- PS3RECOMP_ENG_FASTDRAW leaves out the binds that would send
+ * what the backend holds already, so a call log would differ while what every
+ * draw draws with is the same. Creates, uploads, releases, snapshots, clears,
+ * presents and readbacks are still logged as calls.
  *
  * Run it three times with the same arguments, under PS3RECOMP_ENG_DELTA=0,
  * =1, and =1 with PS3RECOMP_ENG_DELTA_VERIFY=1 (and PS3RECOMP_ENG_DELTA_STATS=1
@@ -105,42 +111,87 @@ static u32  r_pipeline_create(void* u, const char* vs, const char* ps, const rsx
           (unsigned long long)h64(rs, sizeof *rs), layout->mask, stride, (int)f, count);
     return hd;
 }
+/* (fastdraw) what the backend holds, as its binds and sets left it (the
+ * Vulkan backend's rules: a unit not in the mask holds no texture; a sampler
+ * is kept only for a unit in the mask), logged whole with each draw */
+static struct {
+    u32 tgt[RSX_BE_MAX_COLOR_TARGETS], ntgt, depth, pipe, gen;
+    int ranged; u32 vs_first, vs_count, vs_total, vs_n; u64 vs_h, vs_tail;
+    u32 ps_n; u64 ps_h;
+    u32 tmask, tex[RSX_BE_MAX_TEXTURES]; u64 samp[RSX_BE_MAX_TEXTURES];
+    u32 vmask, vtex[RSX_BE_MAX_VERTEX_TEXTURES]; u64 vsamp[RSX_BE_MAX_VERTEX_TEXTURES];
+    u32 vp[4], sc[4], sref, bias[2]; int clamp, hud; u32 hud_w;
+} s_st;
 static void r_bind_targets(void* u, const u32* s, u32 n, u32 d)
-{ (void)u; LOGF("targets %u:", n); for (u32 i = 0; i < n; i++) LOGF(" h%u", s[i]); LOGF(" z h%u\n", d); }
-static void r_bind_pipeline(void* u, u32 p) { (void)u; LOGF("pipeline h%u\n", p); }
-static void r_bind_vs(void* u, const void* d, u32 n) { (void)u; LOGF("vs_consts %u %016llX\n", n, (unsigned long long)h64(d, n)); }
-static void r_bind_ps(void* u, const void* d, u32 n) { (void)u; LOGF("ps_consts %u %016llX\n", n, (unsigned long long)h64(d, n)); }
+{
+    (void)u;
+    if (n > RSX_BE_MAX_COLOR_TARGETS) n = RSX_BE_MAX_COLOR_TARGETS;
+    for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++) s_st.tgt[i] = (i < n && s) ? s[i] : 0u;
+    s_st.ntgt = n; s_st.depth = d;
+}
+static void r_bind_pipeline(void* u, u32 p) { (void)u; s_st.pipe = p; }
+static void r_bind_vs(void* u, const void* d, u32 n) { (void)u; s_st.ranged = 0; s_st.vs_n = n; s_st.vs_h = h64(d, n); }
+static void r_bind_ps(void* u, const void* d, u32 n) { (void)u; s_st.ps_n = n; s_st.ps_h = h64(d, n); }
 static void r_bind_vs_range(void* u, const void* rows, u32 first, u32 count, const void* tail, u32 tb, u32 total)
-{ (void)u; LOGF("vs_range %u+%u %016llX tail %016llX total %u\n", first, count,
-                 (unsigned long long)h64((const u8*)rows + (size_t)first * 16u, (size_t)count * 16u),
-                 (unsigned long long)h64(tail, tb), total); }
-static void r_vs_gen(void* u, u32 gen) { (void)u; LOGF("vs_gen %u\n", gen); }
+{
+    (void)u;
+    s_st.ranged = 1; s_st.vs_first = first; s_st.vs_count = count; s_st.vs_total = total;
+    s_st.vs_h = h64((const u8*)rows + (size_t)first * 16u, (size_t)count * 16u); s_st.vs_tail = h64(tail, tb);
+}
+static void r_vs_gen(void* u, u32 gen) { (void)u; s_st.gen = gen; }
 static void r_bind_textures(void* u, const u32* t, const rsx_be_sampler_desc* s, u32 mask)
 {
-    (void)u; LOGF("textures %X:", mask);
-    for (u32 i = 0; i < RSX_BE_MAX_TEXTURES; i++) if (mask >> i & 1u) LOGF(" %u=h%u/%016llX", i, t[i], (unsigned long long)h64(&s[i], sizeof s[i]));
-    LOGF("\n");
+    (void)u;
+    for (u32 i = 0; i < RSX_BE_MAX_TEXTURES; i++) {
+        const int on = (mask >> i) & 1u;
+        s_st.tex[i] = on ? t[i] : 0u;
+        if (on && s) s_st.samp[i] = h64(&s[i], sizeof s[i]);
+    }
+    s_st.tmask = mask;
 }
 static void r_bind_vtextures(void* u, const u32* t, const rsx_be_sampler_desc* s, u32 mask)
 {
-    (void)u; LOGF("vtextures %X:", mask);
-    for (u32 i = 0; i < RSX_BE_MAX_VERTEX_TEXTURES; i++) if (mask >> i & 1u) LOGF(" %u=h%u/%016llX", i, t[i], (unsigned long long)h64(&s[i], sizeof s[i]));
-    LOGF("\n");
+    (void)u;
+    for (u32 i = 0; i < RSX_BE_MAX_VERTEX_TEXTURES; i++) {
+        const int on = (mask >> i) & 1u;
+        s_st.vtex[i] = (on && t) ? t[i] : 0u;
+        if (on && s) s_st.vsamp[i] = h64(&s[i], sizeof s[i]);
+    }
+    s_st.vmask = mask;
 }
-static void r_viewport(void* u, float x, float y, float w, float h) { (void)u; LOGF("viewport %08X %08X %08X %08X\n", fbits(x), fbits(y), fbits(w), fbits(h)); }
-static void r_scissor(void* u, u32 x, u32 y, u32 w, u32 h) { (void)u; LOGF("scissor %u %u %u %u\n", x, y, w, h); }
-static void r_stencil(void* u, u32 r) { (void)u; LOGF("stencil %u\n", r); }
-static void r_bias(void* u, float c, float s) { (void)u; LOGF("bias %08X %08X\n", fbits(c), fbits(s)); }
-static void r_clamp(void* u, int c) { (void)u; LOGF("clamp %d\n", c); }
-static void r_hud(void* u, int hud, u32 w) { (void)u; LOGF("hud %d %u\n", hud, w); }
+static void r_viewport(void* u, float x, float y, float w, float h)
+{ (void)u; s_st.vp[0] = fbits(x); s_st.vp[1] = fbits(y); s_st.vp[2] = fbits(w); s_st.vp[3] = fbits(h); }
+static void r_scissor(void* u, u32 x, u32 y, u32 w, u32 h) { (void)u; s_st.sc[0] = x; s_st.sc[1] = y; s_st.sc[2] = w; s_st.sc[3] = h; }
+static void r_stencil(void* u, u32 r) { (void)u; s_st.sref = r; }
+static void r_bias(void* u, float c, float s) { (void)u; s_st.bias[0] = fbits(c); s_st.bias[1] = fbits(s); }
+static void r_clamp(void* u, int c) { (void)u; s_st.clamp = c; }
+static void r_hud(void* u, int hud, u32 w) { (void)u; if (hud < 3) { s_st.hud = hud; s_st.hud_w = w; } else LOGF("hud %d %u\n", hud, w); }
+/* the state a draw draws with */
+static void log_state(void)
+{
+    if (s_bench) return;
+    LOGF("  with targets %u:", s_st.ntgt);
+    for (u32 i = 0; i < s_st.ntgt; i++) LOGF(" h%u", s_st.tgt[i]);
+    LOGF(" z h%u pipeline h%u", s_st.depth, s_st.pipe);
+    if (s_st.ranged) LOGF(" vs_range gen %u %u+%u %016llX tail %016llX total %u", s_st.gen, s_st.vs_first, s_st.vs_count,
+                          (unsigned long long)s_st.vs_h, (unsigned long long)s_st.vs_tail, s_st.vs_total);
+    else LOGF(" vs_consts %u %016llX", s_st.vs_n, (unsigned long long)s_st.vs_h);
+    LOGF(" ps %u %016llX textures %X:", s_st.ps_n, (unsigned long long)s_st.ps_h, s_st.tmask);
+    for (u32 i = 0; i < RSX_BE_MAX_TEXTURES; i++) if (s_st.tmask >> i & 1u) LOGF(" %u=h%u/%016llX", i, s_st.tex[i], (unsigned long long)s_st.samp[i]);
+    LOGF(" vtextures %X:", s_st.vmask);
+    for (u32 i = 0; i < RSX_BE_MAX_VERTEX_TEXTURES; i++) if (s_st.vmask >> i & 1u) LOGF(" %u=h%u/%016llX", i, s_st.vtex[i], (unsigned long long)s_st.vsamp[i]);
+    LOGF(" viewport %08X %08X %08X %08X scissor %u %u %u %u stencil %u bias %08X %08X clamp %d hud %d %u\n",
+         s_st.vp[0], s_st.vp[1], s_st.vp[2], s_st.vp[3], s_st.sc[0], s_st.sc[1], s_st.sc[2], s_st.sc[3], s_st.sref,
+         s_st.bias[0], s_st.bias[1], s_st.clamp, s_st.hud, s_st.hud_w);
+}
 static void r_draw(void* u, rsx_topology t, const void* v, u32 nv, u32 stride, const u32* idx, u32 ni)
 { (void)u; LOGF("draw %d %u x %u %016llX idx %u %016llX\n", (int)t, nv, stride, (unsigned long long)h64(v, (size_t)nv * stride),
-                 ni, (unsigned long long)h64(idx, (size_t)ni * 4u)); }
+                 ni, (unsigned long long)h64(idx, (size_t)ni * 4u)); log_state(); }
 static u32  r_vbuf_create(void* u, const void* d, u32 n) { (void)u; const u32 hd = s_next++; LOGF("vbuf_create h%u %u %016llX\n", hd, n, (unsigned long long)h64(d, n)); return hd; }
 static void r_draw_vbuf(void* u, rsx_topology t, u32 vb, u32 nv, u32 stride, const u32* idx, u32 ni)
-{ (void)u; LOGF("draw_vbuf %d h%u %u x %u idx %u %016llX\n", (int)t, vb, nv, stride, ni, (unsigned long long)h64(idx, (size_t)ni * 4u)); }
+{ (void)u; LOGF("draw_vbuf %d h%u %u x %u idx %u %016llX\n", (int)t, vb, nv, stride, ni, (unsigned long long)h64(idx, (size_t)ni * 4u)); log_state(); }
 static void r_draw_vbuf_ib(void* u, rsx_topology t, u32 vb, u32 nv, u32 stride, u32 ib, u32 ni)
-{ (void)u; LOGF("draw_vbuf_ib %d h%u %u x %u ib h%u %u\n", (int)t, vb, nv, stride, ib, ni); }
+{ (void)u; LOGF("draw_vbuf_ib %d h%u %u x %u ib h%u %u\n", (int)t, vb, nv, stride, ib, ni); log_state(); }
 static void r_prefetch(void* u, u32 vb) { (void)u; (void)vb; }
 static void r_clear_color(void* u, u32 s, const float c[4]) { (void)u; LOGF("clear_color h%u %08X %08X %08X %08X\n", s, fbits(c[0]), fbits(c[1]), fbits(c[2]), fbits(c[3])); }
 static void r_clear_ds(void* u, u32 d, u32 f, float z, u8 s) { (void)u; LOGF("clear_ds h%u %u %08X %u\n", d, f, fbits(z), s); }
@@ -163,6 +214,7 @@ static const rsx_draw_backend g_rec = {
     .vbuf_create = r_vbuf_create, .vbuf_release = r_release, .draw_vbuf = r_draw_vbuf,
     .set_hud = r_hud, .set_depth_bias = r_bias, .set_depth_clamp = r_clamp,
     .draw_vbuf_ib = r_draw_vbuf_ib, .vbuf_prefetch = r_prefetch, .vs_constants_gen = r_vs_gen,
+    .draw_vbuf_ib_again = r_draw_vbuf_ib,   /* (fastdraw) the same draw: logged the same */
 };
 
 /* ---- the stream ----------------------------------------------------------- */

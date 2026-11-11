@@ -4,8 +4,11 @@
 
 Builds the test with clang-cl against this toolkit's draw engine, runs every
 seed three times -- PS3RECOMP_ENG_DELTA=0, =1, and =1 with
-PS3RECOMP_ENG_DELTA_VERIFY=1 -- and checks that the three backend call logs are
-byte-identical and that verify mode reported no difference. --base also builds
+PS3RECOMP_ENG_DELTA_VERIFY=1 -- and checks that the three backend logs are
+byte-identical and that verify mode reported no difference. (fastdraw) Three
+more: =1 with PS3RECOMP_ENG_FASTDRAW=0 (the whole tail), with
+PS3RECOMP_FASTDRAW2=0 (one pair-memo way) and with
+PS3RECOMP_ENG_FASTDRAW_VERIFY=2 (no [fastdraw-verify] line allowed). --base also builds
 the test against another toolkit tree (e.g. the commit before the delta
 engine) and checks that its log equals the delta engine's. Needs the port's
 tools/vsenv.py (found by walking up from this file, or PORT_ROOT).
@@ -66,7 +69,8 @@ def build(tk, out_dir, name):
 
 def run(exe, log, seed, extra):
     env = dict(os.environ)
-    for k in ("PS3RECOMP_ENG_DELTA", "PS3RECOMP_ENG_DELTA_VERIFY"): env.pop(k, None)
+    for k in ("PS3RECOMP_ENG_DELTA", "PS3RECOMP_ENG_DELTA_VERIFY", "PS3RECOMP_ENG_FASTDRAW", "PS3RECOMP_FASTDRAW2",
+              "PS3RECOMP_ENG_FASTDRAW_VERIFY"): env.pop(k, None)
     env.update(extra)
     env["PS3RECOMP_ENG_DELTA_STATS"] = "1"
     p = subprocess.run([exe, log, str(seed)], env=env, capture_output=True, text=True, timeout=900)
@@ -93,15 +97,27 @@ def main():
                          {"PS3RECOMP_ENG_DELTA": "1", "PS3RECOMP_ENG_DELTA_VERIFY": "1"})
         diffs = [l for l in err_v.splitlines() if l.startswith("[delta-verify]")]
         stats = [l for l in err_on.splitlines() if l.startswith("[delta]")]
-        ok = on == off and ver == off and not diffs
+        # (fastdraw) the short tail off, round 2 off, the fast path verified
+        f0, _ = run(exe, os.path.join(a.out, "fast0_%s.log" % seed), seed, {"PS3RECOMP_ENG_DELTA": "1", "PS3RECOMP_ENG_FASTDRAW": "0"})
+        f2, _ = run(exe, os.path.join(a.out, "fast2off_%s.log" % seed), seed, {"PS3RECOMP_ENG_DELTA": "1", "PS3RECOMP_FASTDRAW2": "0"})
+        fv, err_fv = run(exe, os.path.join(a.out, "fastverify_%s.log" % seed), seed,
+                         {"PS3RECOMP_ENG_DELTA": "1", "PS3RECOMP_ENG_FASTDRAW_VERIFY": "2"})
+        fdiffs = [l for l in err_fv.splitlines() if l.startswith("[fastdraw-verify]")]
+        fstats = [l for l in err_on.splitlines() if l.startswith("[fastdraw]")]
+        diffs += fdiffs
+        ok = on == off and ver == off and f0 == off and f2 == off and fv == off and not diffs
         if base:
             b, _ = run(base, os.path.join(a.out, "base_%s.log" % seed), seed, {})
             ok = ok and b == on
         print("seed %s: %s (%d backend calls)%s" % (seed, "PASS" if ok else "FAIL", off.count(b"\n"),
                                                      ("\n  " + stats[-1]) if stats else ""))
         for l in diffs[:8]: print("  " + l)
+        if fstats: print("  " + fstats[-1][:300])
         if on != off: print("  delta on differs from off")
         if ver != off: print("  verify differs from off")
+        if f0 != off: print("  PS3RECOMP_ENG_FASTDRAW=0 differs from off")
+        if f2 != off: print("  PS3RECOMP_FASTDRAW2=0 differs from off")
+        if fv != off: print("  PS3RECOMP_ENG_FASTDRAW_VERIFY=2 differs from off")
         if base and b != on: print("  the base toolkit's log differs from the delta engine's")
         bad += not ok
     print("all seeds passed" if not bad else "%d seed(s) FAILED" % bad)

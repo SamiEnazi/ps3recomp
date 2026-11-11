@@ -101,16 +101,66 @@ static struct {
     u32 pipeline, fbf_applied; int pipe_fixed; const rsx_fp_constant_block* fp_constants;
     /* CONSTS */
     dl_dcs dcs;
+    /* (fastdraw) what the dynamic state the tail sends last was made from:
+     * scissor, stencil reference, polygon offset (registers outside every
+     * group) and the depth bias / clamp switches (dl_end) */
+    u32 dyn[6]; int dyn_poly, dyn_clamp;
+    /* (fastdraw, DELTA_STATS=2) texture units whose registers changed since the
+     * last completed draw: any field / image fields / sampler fields */
+    u32 tunits, timg, tsmp;
 } s_dl;
+
+/* (fastdraw) With the counters on, sink_end's time is also split by the path a
+ * draw took (whole way / part reused / all state reused / all state and the
+ * vertex + index work reused): a [delta-cost] line per path with the [delta]
+ * line. PS3RECOMP_ENG_DELTA_STATS=2 also splits each path's time by stage
+ * (DL_MARK in sink_end_body and rsx_draw_fast.inc; the backend's draw by its
+ * own marks, g_eng_bst in rsx_vulkan_backend.c) -- ~19 rdtsc marks a draw,
+ * ~8 ns each, so only for a diagnosis, never in an fps A/B. */
+static int s_dl_cost;                     /* PS3RECOMP_ENG_DELTA_STATS=2: the stage marks */
+/* paths: the whole way; part reused split by what was not (textures with the
+ * programs reused, programs, anything else); all state; all state + vertices */
+enum { DLP_WHOLE, DLP_PTEX, DLP_PPROG, DLP_POTH, DLP_STATE, DLP_SAME, DLP_N };
+#define DLP_MAX 8u                        /* g_eng_bst's rows (rsx_vulkan_backend.c declares them so) */
+#define DLM_N 12u                         /* engine stages (dl_frame_report_ex names them) */
+#define DLB_N 8u                          /* backend draw stages */
+static u32 s_dl_path;                     /* this draw's path (dl_begin) */
+static u64 s_dl_mt;                       /* the last mark */
+u64 g_eng_bst_t;                          /* the backend's last mark (0: no engine draw call open) */
+u32 g_eng_bst_on, g_eng_bst_path;
+u64 g_eng_bst[DLP_MAX][DLB_N];
+/* (fastdraw, DELTA_STATS=2) the backend's descriptor set by path: ticks in the
+ * memo check / image infos / key + table probe / allocate + write, how the set
+ * was found (memo, table, new), and the sampler searches (calls, entries
+ * passed) -- rsx_vulkan_backend.c */
+u64 g_eng_bset[DLP_MAX][4], g_eng_bsetn[DLP_MAX][3], g_eng_bsamp[DLP_MAX][2];
 
 static struct {
     u64 draws, full, partial, state, consts, used[6], why[DLW_N], vdiff;
     u64 ticks, timed;                     /* rdtsc ticks in sink_end, draws timed */
     u64 ns0, tsc0; u32 frame0;
     u32 ca_regs[8], n_ca;                 /* catch-all: the first registers that fired it */
+    u64 pt[DLP_N], pn[DLP_N], st[DLP_N][DLM_N], cal, caln;   /* (fastdraw) by path and stage; a mark's own cost */
+    /* (fastdraw, DELTA_STATS=2) part:textures -- why the textures were not
+     * reused (registers / generations / the last draw's were state-dependent),
+     * how many units' registers changed (0 1 2 3 4+), whether a sampler field
+     * (address, control0, filter, border) or only the image fields changed;
+     * by path: vertices by pair memo / vertex-cache probe / fetched, texture
+     * units bound through the memo / the probe, pipeline lookups / their
+     * texture-mask cache hits / key memo hits */
+    u64 ptw[3], ptu[5], pts, pti;
+    u64 vx[DLP_N][3], ts[DLP_N][2], pk[DLP_N][3];
 } s_dlc;
 
 static inline u64 dl_tsc(void) { return __builtin_ia32_rdtsc(); }
+static void fd_report(void);              /* (fastdraw) rsx_draw_fast.inc */
+#define DL_MARK(k) do { if (__builtin_expect(s_dl_cost != 0, 0)) { const u64 _t = dl_tsc(); \
+    s_dlc.st[s_dl_path][k] += _t - s_dl_mt; s_dl_mt = _t; } } while (0)
+/* before the backend's draw call: its marks start here */
+#define DL_MARK_DRAW0() do { if (__builtin_expect(s_dl_cost != 0, 0)) { DL_MARK(9); g_eng_bst_t = s_dl_mt; } } while (0)
+/* after it: the backend's last part (from its last mark) */
+#define DL_MARK_DRAW1() do { if (__builtin_expect(s_dl_cost != 0, 0)) { DL_MARK(10); \
+    if (g_eng_bst_t) { g_eng_bst[s_dl_path][DLB_N - 1u] += s_dl_mt - g_eng_bst_t; g_eng_bst_t = 0; } } } while (0)
 
 /* ---- the group map ------------------------------------------------------
  * Built from what sink_end's stages read (rsx_dsp_reg / the rsx_dsp_get_*
@@ -199,7 +249,8 @@ static void dl_init(void)
     const char* e = getenv("PS3RECOMP_ENG_DELTA");
     s_dl_on = !(e && *e == '0');   /* (m16) default ON: verify run nt-DV-city clean (0 lines), +2..3% in the nt-* A/B; 0 = the old path */
     { const char* l = getenv("PS3RECOMP_LIMITS");
-      s_dl_stats = (l && *l && *l != '0') || getenv("PS3RECOMP_ENG_DRAWSTATS") || getenv("PS3RECOMP_ENG_DELTA_STATS"); }
+      s_dl_stats = (l && *l && *l != '0') || getenv("PS3RECOMP_ENG_DRAWSTATS") || getenv("PS3RECOMP_ENG_DELTA_STATS");
+      const char* c = getenv("PS3RECOMP_ENG_DELTA_STATS"); s_dl_cost = c && atoi(c) >= 2; }
     /* diagnostics that log from inside a stage a reused draw skips */
     static const char* const diag[] = { "PS3RECOMP_ENG_TEXLOG", "PS3RECOMP_ENG_CSNAP_LOG", "PS3RECOMP_ENG_RES_LOG",
                                         "PS3RECOMP_ENG_TEXLOG_RT", "PS3RECOMP_ENG_ZTEX_LOG", "PS3RECOMP_ENG_SIGNLOG",
@@ -211,6 +262,8 @@ static void dl_init(void)
     memset(&s_dl, 0, sizeof s_dl);
     memset(&s_dlc, 0, sizeof s_dlc);
     memset(s_dl_dirty, 0, sizeof s_dl_dirty);
+    memset(g_eng_bst, 0, sizeof g_eng_bst);
+    g_eng_bst_on = s_dl_cost ? 1u : 0u; g_eng_bst_t = 0;
     dl_map_init();
     if (s_dl_on) {
         memcpy(s_dl_snap, g.rsx.regs, sizeof s_dl_snap);
@@ -249,6 +302,17 @@ static u32 dl_scan(void)
                     s_dl.regs[s_dl.nregs++] = ((b * 16u + i) * 4u) | (rg ? 0u : 0x80000000u);
                 if (rg) {
                     grp |= rg;
+                    if (__builtin_expect(s_dl_cost != 0, 0) && (rg & DLG_TEX)) {   /* (fastdraw) which unit, which field */
+                        const u32 reg = (b * 16u + i) * 4u;
+                        if (reg >= 0x1A00u && reg < 0x1C00u) {
+                            const u32 u = (reg - 0x1A00u) >> 5, f = reg & 0x1Fu;
+                            s_dl.tunits |= 1u << u;
+                            if (f == 0x08u || f == 0x0Cu || f == 0x14u || f == 0x1Cu) s_dl.tsmp |= 1u << u;
+                            else s_dl.timg |= 1u << u;
+                        } else if (reg >= 0x1840u && reg < 0x1880u) {
+                            s_dl.tunits |= 1u << ((reg - 0x1840u) >> 2); s_dl.timg |= 1u << ((reg - 0x1840u) >> 2);
+                        }
+                    }
                     if ((rg & DLG_ALL) && s_dlc.n_ca < 8u) s_dlc.ca_regs[s_dlc.n_ca++] = (b * 16u + i) * 4u;
                 }
                 sn[i] = c[i];
@@ -348,7 +412,19 @@ static u32 dl_begin(u32 prim, u32* chk)
         if ((use & DL_PIPE) && !(s_dl.acc & (DLG_VTX | DLG_IDX)) && dl_consts_ok(prim))
             use |= DL_CONSTS;
     }
-    if (s_dl_stats) dl_count(use, why);
+    if (s_dl_stats) {
+        dl_count(use, why);
+        s_dl_path = why >= 0 ? DLP_WHOLE
+                  : (use & DL_STATE) == DL_STATE ? ((use & DL_CONSTS) ? DLP_SAME : DLP_STATE)
+                  : !(use & DL_PROG) ? DLP_PPROG : !(use & DL_TEX) ? DLP_PTEX : DLP_POTH;
+        if (s_dl_cost && s_dl_path == DLP_PTEX) {   /* (fastdraw) why, and how much changed */
+            s_dlc.ptw[(s_dl.acc & DLG_TEX) ? 0 : !s_dl.tex_ok ? 2 : 1]++;
+            const u32 nu = (u32)__builtin_popcount(s_dl.tunits);
+            s_dlc.ptu[nu < 4u ? nu : 4u]++;
+            if (s_dl.tsmp) s_dlc.pts++; else if (s_dl.timg) s_dlc.pti++;
+        }
+        g_eng_bst_path = s_dl_path;
+    }
     if (s_dl_verify) { *chk = use; return 0; }
     *chk = 0;
     return use;
@@ -358,12 +434,19 @@ static u32 dl_begin(u32 prim, u32* chk)
  * draw's to take. */
 static void dl_end(void)
 {
-    s_dl.valid = 1; s_dl.acc = 0; s_dl.nregs = 0;
+    s_dl.valid = 1; s_dl.acc = 0; s_dl.nregs = 0; s_dl.tunits = s_dl.timg = s_dl.tsmp = 0;
     s_dl.frame = g.frames; s_dl.ev = s_dl_ev;
     s_dl.surf_gen = s_surf_gen; s_dl.zgen = s_dl_zgen;
     s_dl.tex_tgen = s_tex_tgen; s_dl.tex_gen = g_rsx_dsp_tex_gen; s_dl.misc_gen = g_rsx_dsp_misc_gen;
     s_dl.vp_gen = g.rsx.vp_gen; s_dl.icon_gen = s_icon_gen;
     memcpy(s_dl.kn, s_dl.kn_now, sizeof s_dl.kn);
+    /* (fastdraw) nothing writes a register within a draw: these are the
+     * values its scissor, stencil reference and depth bias were made from */
+    s_dl.dyn[0] = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL); s_dl.dyn[1] = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+    s_dl.dyn[2] = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF);   s_dl.dyn[3] = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_FILL);
+    s_dl.dyn[4] = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_SCALE);  s_dl.dyn[5] = rsx_dsp_reg(&g.rsx, M_POLY_OFFSET_BIAS);
+    s_dl.dyn_poly = __atomic_load_n(&s_poly_offset, __ATOMIC_RELAXED);
+    s_dl.dyn_clamp = __atomic_load_n(&s_depth_clamp, __ATOMIC_RELAXED);
 }
 
 /* ---- verify ---------------------------------------------------------------- */
@@ -565,6 +648,7 @@ static void dl_frame_report_ex(int final)
     if (!s_dlc.ns0) {   /* the first present opens the first window */
         if (final) return;
         memset(&s_dlc, 0, sizeof s_dlc);
+        memset(g_eng_bst, 0, sizeof g_eng_bst);
         s_dlc.ns0 = now; s_dlc.tsc0 = tsc; s_dlc.frame0 = g.frames;
         return;
     }
@@ -603,6 +687,77 @@ static void dl_frame_report_ex(int final)
     }
     if (k > 0 && k < (int)sizeof line - 1) { line[k++] = '\n'; line[k] = 0; }
     rsx_log_line(line, k, (int)sizeof line);
+    /* (fastdraw) [delta-cost]: per path, its share of the draws, its time per
+     * draw and that time by stage (ns per draw of the path; each stage holds
+     * about one mark's own cost, given as "mark") */
+    if (tpns > 0.0 && s_dlc.timed) {
+        static const char* const pname[DLP_N] = { "whole-way", "part:textures", "part:programs", "part:other",
+                                                  "all-state", "all-state+vertices" };
+        static const char* const sname[DLM_N] = { "begin", "layout", "vertices", "state+targets", "tex-units", "tex-rest",
+                                                  "pipeline", "diag+indices+constants", "binds", "dynamic", "draw", "tail" };
+        static const char* const bname[DLB_N] = { "entry", "targets", "pipe+pass+fb", "arenas+set", "constants",
+                                                  "pass", "records", "rest" };
+        const double mark = s_dlc.caln ? (double)s_dlc.cal / (double)s_dlc.caln / tpns : 0.0;
+        for (u32 p = 0; p < DLP_N; p++) {
+            if (!s_dlc.pn[p]) continue;
+            const double n = (double)s_dlc.pn[p];
+            char cl[900];
+            int c = snprintf(cl, sizeof cl, "[delta-cost] %s %.1f%% of draws, %.3f us/draw", pname[p],
+                             100.0 * n / (double)s_dlc.timed, (double)s_dlc.pt[p] / tpns / 1000.0 / n);
+            if (s_dl_cost && c > 0 && c < (int)sizeof cl - 40)
+                c += snprintf(cl + c, sizeof cl - (size_t)c, " (mark %.0f ns); ns/draw:", mark);
+            for (u32 s = 0; s_dl_cost && s < DLM_N && c > 0 && c < (int)sizeof cl - 40; s++)
+                c += snprintf(cl + c, sizeof cl - (size_t)c, " %s %.0f", sname[s], (double)s_dlc.st[p][s] / tpns / n);
+            if (s_dl_cost && c > 0 && c < (int)sizeof cl - 20) c += snprintf(cl + c, sizeof cl - (size_t)c, "; backend draw:");
+            for (u32 s = 0; s_dl_cost && s < DLB_N && c > 0 && c < (int)sizeof cl - 40; s++)
+                c += snprintf(cl + c, sizeof cl - (size_t)c, " %s %.0f", bname[s], (double)g_eng_bst[p][s] / tpns / n);
+            if (c > 0 && c < (int)sizeof cl - 1) { cl[c++] = '\n'; cl[c] = 0; }
+            rsx_log_line(cl, c, (int)sizeof cl);
+        }
+    }
+    if (s_dl_cost && tpns > 0.0 && s_dlc.timed) {   /* (fastdraw) [delta-part]: what the part-reused draws pay */
+        static const char* const pn2[DLP_N] = { "whole", "p:tex", "p:prog", "p:other", "state", "state+vx" };
+        char cl[2600];
+        const double pt = (double)(s_dlc.ptw[0] + s_dlc.ptw[1] + s_dlc.ptw[2]);
+        const double q = pt > 0.0 ? 100.0 / pt : 0.0;
+        int c = snprintf(cl, sizeof cl, "[delta-part] part:textures because: registers %.0f%% generations %.0f%% last draw's"
+                         " state-dependent %.0f%%; units changed 0/1/2/3/4+: %.0f/%.0f/%.0f/%.0f/%.0f%%; a sampler field %.0f%%,"
+                         " image fields only %.0f%% |", s_dlc.ptw[0] * q, s_dlc.ptw[1] * q, s_dlc.ptw[2] * q,
+                         s_dlc.ptu[0] * q, s_dlc.ptu[1] * q, s_dlc.ptu[2] * q, s_dlc.ptu[3] * q, s_dlc.ptu[4] * q,
+                         s_dlc.pts * q, s_dlc.pti * q);
+        for (u32 p = 0; p < DLP_N && c > 0 && c < (int)sizeof cl - 260; p++) {
+            if (!s_dlc.pn[p]) continue;
+            const double n = (double)s_dlc.pn[p];
+            const double sn = (double)(g_eng_bsetn[p][0] + g_eng_bsetn[p][1] + g_eng_bsetn[p][2]);
+            c += snprintf(cl + c, sizeof cl - (size_t)c, " %s: vx pair/probe/fetch %.0f/%.0f/%.0f%%, units/draw memo %.2f probe %.2f,"
+                          " pipe lookups/draw %.2f (tex-masks hit %.0f%% key hit %.0f%%), set memo/table/new %.0f/%.0f/%.0f%%"
+                          " ns/draw %.0f/%.0f/%.0f/%.0f, samplers/draw %.1f x %.0f entries |", pn2[p],
+                          100.0 * s_dlc.vx[p][0] / n, 100.0 * s_dlc.vx[p][1] / n, 100.0 * s_dlc.vx[p][2] / n,
+                          s_dlc.ts[p][0] / n, s_dlc.ts[p][1] / n, s_dlc.pk[p][0] / n,
+                          s_dlc.pk[p][0] ? 100.0 * s_dlc.pk[p][1] / s_dlc.pk[p][0] : 0.0,
+                          s_dlc.pk[p][0] ? 100.0 * s_dlc.pk[p][2] / s_dlc.pk[p][0] : 0.0,
+                          sn > 0 ? 100.0 * g_eng_bsetn[p][0] / sn : 0.0, sn > 0 ? 100.0 * g_eng_bsetn[p][1] / sn : 0.0,
+                          sn > 0 ? 100.0 * g_eng_bsetn[p][2] / sn : 0.0,
+                          g_eng_bset[p][0] / tpns / n, g_eng_bset[p][1] / tpns / n, g_eng_bset[p][2] / tpns / n,
+                          g_eng_bset[p][3] / tpns / n, g_eng_bsamp[p][0] / n,
+                          g_eng_bsamp[p][0] ? (double)g_eng_bsamp[p][1] / (double)g_eng_bsamp[p][0] : 0.0);
+        }
+        if (c > 0 && c < (int)sizeof cl - 200)
+            c += snprintf(cl + c, sizeof cl - (size_t)c, " pair memo misses: none recorded %llu, signature %llu (the one"
+                          " before last %llu), remap %llu, entry %llu, written %llu, stamp %llu; not recorded: no signature %llu,"
+                          " untracked %llu, no spans %llu, >2 spans %llu (spans %llu), mode %llu, long %llu",
+                          (unsigned long long)s_dlx_pm[0], (unsigned long long)s_dlx_pm[1], (unsigned long long)s_dlx_pm[7],
+                          (unsigned long long)s_dlx_pm[2], (unsigned long long)s_dlx_pm[3], (unsigned long long)s_dlx_pm[4],
+                          (unsigned long long)s_dlx_pm[5], (unsigned long long)s_dlx_pn[0], (unsigned long long)s_dlx_pn[1],
+                          (unsigned long long)s_dlx_pn[2], (unsigned long long)s_dlx_pn[3], (unsigned long long)s_dlx_pn[7],
+                          (unsigned long long)s_dlx_pn[4], (unsigned long long)s_dlx_pn[5]);
+        if (c > 0 && c < (int)sizeof cl - 1) { cl[c++] = '\n'; cl[c] = 0; }
+        rsx_log_line(cl, c, (int)sizeof cl);
+    }
+    memset(s_dlx_pm, 0, sizeof s_dlx_pm); memset(s_dlx_pn, 0, sizeof s_dlx_pn);
+    memset(g_eng_bset, 0, sizeof g_eng_bset); memset(g_eng_bsetn, 0, sizeof g_eng_bsetn); memset(g_eng_bsamp, 0, sizeof g_eng_bsamp);
+    fd_report();   /* (fastdraw) the [fastdraw] line (rsx_draw_fast.inc) */
+    memset(g_eng_bst, 0, sizeof g_eng_bst);
     const u32 f0 = g.frames;
     memset(&s_dlc, 0, sizeof s_dlc);
     s_dlc.ns0 = now; s_dlc.tsc0 = tsc; s_dlc.frame0 = f0;
