@@ -2067,34 +2067,60 @@ static void mods_options(int i, int n)
     int got = 0;
     for (int k = 0; k < n; k++) if (ps3_game_mods_option(i, k, &o[got])) got++;
     ImGui::Indent(S(28.0f));
-    /* toggles first, as the Manager lists them (by name) */
+    /* options of their own (no group) first: check boxes, by name as the Manager lists them */
     for (int k = 0; k < got; k++) {
-        if (o[k].dropdown) continue;
+        if (o[k].dropdown || o[k].group_id[0]) continue;
         ImGui::PushID(k);
-        char label[200];
-        if (o[k].group[0]) snprintf(label, sizeof label, "%s: %s", o[k].group, o[k].name);
-        else snprintf(label, sizeof label, "%s", o[k].name);
         bool on = o[k].picked != 0;
-        if (ImGui::Checkbox(label, &on)) ps3_game_mods_pick(i, k, on ? 1 : 0);
+        if (ImGui::Checkbox(o[k].name, &on)) ps3_game_mods_pick(i, k, on ? 1 : 0);
         ImGui::PopID();
     }
-    /* each dropdown group once: a combo of its options */
+    /* then each group once: its name as a heading, its options below it. One at a time
+     * (a dropdown group, or a toggle group whose options all change the same file): radio
+     * buttons, a drop-down list past 12 options; any number: check boxes. */
     for (int k = 0; k < got; k++) {
-        if (!o[k].dropdown) continue;
+        if (!o[k].dropdown && !o[k].group_id[0]) continue;
         bool first = true;
-        for (int j = 0; j < k; j++) if (o[j].dropdown && !strcmp(o[j].group_id, o[k].group_id)) first = false;
+        for (int j = 0; j < k; j++) if ((o[j].dropdown || o[j].group_id[0]) && !strcmp(o[j].group_id, o[k].group_id)) first = false;
         if (!first) continue;
-        int cur = k;
-        for (int j = k; j < got; j++) if (o[j].dropdown && !strcmp(o[j].group_id, o[k].group_id) && o[j].picked) cur = j;
+        const bool one = o[k].dropdown != 0;
+        int count = 0, cur = -1;
+        for (int j = k; j < got; j++)
+            if (!strcmp(o[j].group_id, o[k].group_id)) { count++; if (o[j].picked && cur < 0) cur = j; }
+        if (cur < 0) cur = k;
         ImGui::PushID(1000 + k);
-        ImGui::SetNextItemWidth(combo_w());
-        if (ImGui::BeginCombo(o[k].group[0] ? o[k].group : "Option", o[cur].name)) {
-            for (int j = k; j < got; j++) {
-                if (!o[j].dropdown || strcmp(o[j].group_id, o[k].group_id)) continue;
-                if (ImGui::Selectable(o[j].name, j == cur)) ps3_game_mods_pick(i, j, 1);
-            }
-            ImGui::EndCombo();
+        ImGui::Spacing();
+        ImGui::TextUnformatted(o[k].group[0] ? o[k].group : "Options");
+        if (one) {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, kGrey);
+            ImGui::TextUnformatted(o[k].single ? "(one at a time: they all change the same texture)" : "(pick one)");
+            ImGui::PopStyleColor();
         }
+        ImGui::Indent(S(20.0f));
+        if (one && count > 12) {
+            ImGui::SetNextItemWidth(combo_w());
+            if (ImGui::BeginCombo("##pick", o[cur].name)) {
+                for (int j = k; j < got; j++) {
+                    if (strcmp(o[j].group_id, o[k].group_id)) continue;
+                    if (ImGui::Selectable(o[j].name, j == cur)) ps3_game_mods_pick(i, j, 1);
+                }
+                ImGui::EndCombo();
+            }
+        } else {
+            for (int j = k; j < got; j++) {
+                if (strcmp(o[j].group_id, o[k].group_id)) continue;
+                ImGui::PushID(j);
+                if (one) {
+                    if (ImGui::RadioButton(o[j].name, j == cur) && j != cur) ps3_game_mods_pick(i, j, 1);
+                } else {
+                    bool on = o[j].picked != 0;
+                    if (ImGui::Checkbox(o[j].name, &on)) ps3_game_mods_pick(i, j, on ? 1 : 0);
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::Unindent(S(20.0f));
         ImGui::PopID();
     }
     ImGui::Unindent(S(28.0f));

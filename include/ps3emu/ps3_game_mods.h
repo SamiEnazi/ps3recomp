@@ -45,6 +45,8 @@ typedef struct {
     char group_id[64];
     int  dropdown;        /* one of a group's options (else a toggle) */
     int  picked;          /* chosen (saved) */
+    int  single;          /* a "toggle" group made one-at-a-time: all its options change the same
+                             file (the Karmic T-shirt's designs of one texture); dropdown is set too */
 } ps3_game_mod_option;
 
 /* a zip file the "Add a mod from a zip" list shows */

@@ -789,7 +789,7 @@ static std::set<TexKey> xp_textures(const Bytes& d)
 
 /* ---- mods ------------------------------------------------------------------ */
 
-struct Module { std::string id, name, group_id, group_name; std::vector<std::string> paths; bool dropdown = false; };
+struct Module { std::string id, name, group_id, group_name; std::vector<std::string> paths; bool dropdown = false, single = false; };
 struct Part { std::string path, target; };                         /* a mod file and the game file it changes (lower case) */
 struct Tex : Part { uint32_t off = 0; int w = 0, h = 0, mips = 0; std::string fmt, name; };
 struct Xp : Part { int index = 0; uint32_t abs = 0, choff = 0, len = 0; bool chunk = false; std::string name; };
@@ -921,7 +921,41 @@ static void read_modules(Mod& m)
             const J* os = gr.get("options");
             if (!os || os->t != 4) continue;
             int n = 0;
+            const size_t first = m.modules.size();
             for (const J& o : os->a) { n++; if (o.t == 5) parse(o, gid + "_option_" + std::to_string(n), dd, gid, gname); }
+            /* A "toggle" group whose options ALL change the same file (every two of them have
+             * a file at the same place below their folders: the Karmic T-shirt's 7 designs of
+             * one texture, the two glove colours) can only ever show one of them; ticking
+             * several just lets one win at random. Such a group is one at a time: picked like
+             * a dropdown (the saved option, else the first by name), shown as radio buttons.
+             * Groups whose options change different files (Sasha's sword, amps and outfits)
+             * stay check boxes. */
+            if (!dd && m.modules.size() - first >= 2) {
+                std::vector<std::set<std::string>> spots;
+                for (size_t q = first; q < m.modules.size(); q++) {
+                    std::set<std::string> s;
+                    for (const std::string& r : m.modules[q].paths) {
+                        const std::string root = join(m.path, r);
+                        if (!is_dir(root) || is_link(root)) continue;
+                        std::vector<std::string> v;
+                        walk(root, "", v, 0, true);
+                        for (const std::string& p : v) {
+                            const std::string key = lower(rel_to(root, p));
+                            if (key.find('/') != std::string::npos) s.insert(key);   /* a file inside a folder: not a picture beside it */
+                        }
+                    }
+                    spots.push_back(std::move(s));
+                }
+                bool all = true;
+                for (size_t a = 0; a < spots.size() && all; a++)
+                    for (size_t b = a + 1; b < spots.size() && all; b++) {
+                        bool meet = false;
+                        for (const std::string& key : spots[a]) if (spots[b].count(key)) { meet = true; break; }
+                        all = meet;
+                    }
+                if (all)
+                    for (size_t q = first; q < m.modules.size(); q++) { m.modules[q].dropdown = true; m.modules[q].single = true; }
+            }
         }
     }
     std::stable_sort(m.modules.begin(), m.modules.end(), [](const Module& a, const Module& b) { return ilt(a.name, b.name); });
@@ -2428,6 +2462,7 @@ extern "C" int ps3_game_mods_option(int i, int k, ps3_game_mod_option* o)
     snprintf(o->group, sizeof o->group, "%s", x.group_name.c_str());
     snprintf(o->group_id, sizeof o->group_id, "%s", x.group_id.c_str());
     o->dropdown = x.dropdown;
+    o->single = x.single;
     o->picked = picked_ids(m).count(lower(x.id)) ? 1 : 0;
     return 1;
 }

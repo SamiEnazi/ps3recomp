@@ -30,7 +30,11 @@ Unlocker, and your game files are never changed.
    you can:
    - turn each mod on or off,
    - pick its options, if the mod has any (`modular.json`: toggles and
-     drop-downs),
+     drop-downs), shown under their group's name. A drop-down group, and a
+     toggle group whose options all change the same file (one T-shirt
+     texture in seven designs), is one at a time: radio buttons. Other
+     toggle groups (black tar on the sword, the amp and the outfit) are
+     check boxes,
    - choose which mod wins when two clash: **Use this one instead**, on a mod
      left out by a clash, says first what the others lose ("Climbing Gloves
      and Karmic Logo Tshirt will be left out"),
