@@ -516,6 +516,9 @@ static const rsx_draw_backend* vk_bt_install(const rsx_draw_backend* real)
     BT_SET(image_load) BT_SET(image_save) BT_SET(set_hud) BT_SET(set_depth_bias) BT_SET(set_depth_clamp)
     BT_SET(draw_vbuf_ib) BT_SET(vbuf_prefetch) BT_SET(vs_constants_gen)
 #undef BT_SET
+    /* (fastdraw) the fast record reads the worker's backend state: the engine
+     * sends draw_vbuf_ib instead (through its thunk) */
+    s_bt_be.draw_vbuf_ib_again = NULL;
     /* init / shutdown stay the backend's own: they run before and after */
     s_bt_on = 1;
     g_rsx_drain_end_hook = vk_bt_quiesce;

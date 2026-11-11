@@ -6172,6 +6172,7 @@ static int s_hud_n = -1, s_hud_after;
 static u32 s_hud_frame = ~0u, s_hud_slice, s_hud_seen;
 
 #include "rsx_draw_delta.inc"   /* (rnd1) PS3RECOMP_ENG_DELTA */
+#include "rsx_draw_fast.inc"    /* (fastdraw) PS3RECOMP_ENG_FASTDRAW */
 
 static void sink_end_body(void* user, const rsx_dispatch* r)
 {
@@ -6184,6 +6185,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
     u32 dl_chk = 0;
     const int dl = s_dl_on > 0;
     const u32 dl_use = dl ? dl_begin(prim, &dl_chk) : 0u;
+    DL_MARK(0);
     if (!dc.n_packets) { eng_drop("no_packets", prim); return; }
 
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
@@ -6211,6 +6213,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
         if (dl) dl_prog_note(&layout, (dl_chk & DL_PROG) != 0);
     }
     if (ds_tl) ds.ns_layout += eng_ds_now() - ds_tl;
+    DL_MARK(1);
     if (dl_use & DL_CONSTS) dl_consts_take();
     else {
         dl_cpred dl_pred;
@@ -6225,6 +6228,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
         if (dc.vbuf) g.be->vbuf_prefetch(g.be->user, dc.vbuf);
         if (s_ic_hit && s_ic_cur && s_ic_cur->ibuf) g.be->vbuf_prefetch(g.be->user, s_ic_cur->ibuf);
     }
+    DL_MARK(2);
     const u64 ds_t0 = eng_ds_enabled() ? eng_ds_now() : 0;
     u64 ds_m = ds_t0;   /* stage marks within the rest of sink_end */
 #define DS_MARK(field) do { if (ds_t0) { const u64 _t = eng_ds_now(); ds.field += _t - ds_m; ds_m = _t; } } while (0)
@@ -6240,6 +6244,16 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
             : dc.n_source_refs - dc.n_source_refs % 3u;
     }
     if (!n_draw) { eng_drop("n_draw0", prim); return; }
+    /* (fastdraw) PS3RECOMP_ENG_FASTDRAW: a draw whose state is all the previous
+     * draw's, with resident vertices and indices, takes the short tail
+     * (rsx_draw_fast.inc); verifying, the tail below runs and is compared */
+    if ((dl_use & DL_STATE) == DL_STATE && s_fd_on > 0) {
+        s_fdn.state++;
+        if (indexed && fd_takes(n_draw)) {
+            if (!s_fd_verify) { fd_draw(prim, topology, &layout, n_draw); return; }
+            fdv_arm(topology, &layout, n_draw);
+        }
+    }
     /* The cache hands over a buffer of unique vertices for an indexed draw;
      * one that ended up non-indexed needs dc.verts after all. */
     if (dc.vbuf_hit && !indexed) {
@@ -6302,6 +6316,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
         memset(vsamplers, 0, sizeof vsamplers);
     }
     DS_MARK(ns_bind);   /* render state, targets, zeta: counted with binds */
+    DL_MARK(3);
     u32 tex_mask;
     if (dl_use & DL_TEX) dl_tex_take(textures, samplers, &tex_mask);
     else {
@@ -6363,6 +6378,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
      * program would draw the geometry in the wrong colours, which is harder to
      * see than a missing object and hides the translation failure. */
     DS_MARK(ns_tex);
+    DL_MARK(4);
     int pipeline_is_fixed = 1;
     u32 pipeline;
     if (dl_use & DL_PIPE) {
@@ -6377,6 +6393,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
     if (!pipeline) { eng_drop("pipeline", prim); return; }
     eng_fbf_fallback(textures);   /* PS3RECOMP_ENG_FBFETCH */
     DS_MARK(ns_pipe);
+    DL_MARK(5);
     /* PS3RECOMP_ENG_REGDUMP_PIPE=<p>[,<p>..]: the whole RSX register file (the
      * non-zero words) at the first draw of each listed pipeline, so two passes
      * can be diffed register by register -- which state a pass sets that the
@@ -6800,6 +6817,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
           }
       } }
 
+    DL_MARK(6);
     /* The depth attachment is cleared the first time it is bound, so a title
      * that never clears its shadow zeta still tests against something. */
     const u32 depth_handle = (zslot != ENG_INVALID) ? g.zdepths[zslot].handle : 0;
@@ -6825,6 +6843,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
+    DL_MARK(7);
     /* PS3RECOMP_ENG_HUDLOG=<sec>: DIAGNOSTIC (PS3_ASPECT). Every draw without
      * a depth test into a single target, for the first world frame <sec>
      * seconds after the first draw and the two after it (a game frame spans
@@ -7059,6 +7078,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
     DS_MARK(ns_bind);
+    DL_MARK_DRAW0();
     if (ic_buf)
         g.be->draw_vbuf_ib(g.be->user, topology, dc.vbuf, uploaded, layout.stride,
                            ic_buf, n_draw);
@@ -7068,6 +7088,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
     else
         g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                    indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    DL_MARK_DRAW1();
     DS_MARK(ns_draw);
 #undef DS_MARK
     /* Counted only when the draw ran the guest's OWN programs, which is what
@@ -7104,14 +7125,23 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
 /* (rnd1) PS3RECOMP_ENG_DELTA's counters: the time a draw takes on this thread. */
 static void sink_end(void* user, const rsx_dispatch* r)
 {
+    if (__builtin_expect(s_fd_on < 0, 0) && g.ready) fd_init();   /* (fastdraw) PS3RECOMP_ENG_FASTDRAW */
     if (__builtin_expect(s_dl_stats != 0, 0)) {
+        if (__builtin_expect(s_dl_cost != 0, 0)) {   /* (fastdraw) two marks back to back: one mark's own cost */
+            const u64 c0 = dl_tsc(), c1 = dl_tsc();
+            s_dlc.cal += c1 - c0; s_dlc.caln++;
+        }
         const u64 t0 = dl_tsc();
+        s_dl_path = DLP_WHOLE; s_dl_mt = t0;
         sink_end_body(user, r);
-        s_dlc.ticks += dl_tsc() - t0;
+        const u64 t1 = dl_tsc();
+        if (s_dl_cost) s_dlc.st[s_dl_path][DLM_N - 1u] += t1 - s_dl_mt;
+        s_dlc.pt[s_dl_path] += t1 - t0; s_dlc.pn[s_dl_path]++;
+        g_eng_bst_t = 0;
+        s_dlc.ticks += t1 - t0;
         s_dlc.timed++;
-        return;
-    }
-    sink_end_body(user, r);
+    } else sink_end_body(user, r);
+    if (__builtin_expect(s_fdv.armed != 0, 0)) fdv_check();   /* (fastdraw) VERIFY: the tail against the plan */
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)

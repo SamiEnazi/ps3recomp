@@ -400,6 +400,16 @@ typedef struct rsx_draw_backend {
      * generation means the same row contents as at an earlier bind, so a
      * backend may keep using the copy it made then (PS3RECOMP_VK_CONST_REUSE). */
     void (*vs_constants_gen)(void* user, u32 gen);
+    /* Optional (fastdraw). draw_vbuf_ib for a draw that sent, since the draw
+     * before it, only its constants (vs_constants_gen, bind_vs_constants_range,
+     * bind_ps_constants) and -- when their registers changed -- the scissor,
+     * stencil reference, depth bias or depth clamp: targets, pipeline,
+     * textures, viewport and the HUD flag are the previous draw's
+     * (PS3RECOMP_ENG_FASTDRAW, rsx_draw_fast.inc). It must draw exactly what
+     * draw_vbuf_ib would; a backend may record it with less work (the Vulkan
+     * backend's own fast path). */
+    void (*draw_vbuf_ib_again)(void* user, rsx_topology topology, u32 vbuf,
+                               u32 vertex_count, u32 stride, u32 ibuf, u32 index_count);
 } rsx_draw_backend;
 
 /* The light pass's constants, as the backend's shader reads them. */

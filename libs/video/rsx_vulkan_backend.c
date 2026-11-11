@@ -1206,12 +1206,45 @@ static void vk_gprof_collect(void)
     s_gp.t_print = now;
 }
 
+/* (fastdraw) PS3RECOMP_ENG_FASTDRAW's backend half (draw_vbuf_ib_again,
+ * vk_fd_*). The engine calls draw_vbuf_ib_again for a draw that sent nothing
+ * since the draw before it but its constants (and a scissor, stencil
+ * reference, depth bias or clamp whose registers changed). vk_eng_draw_ex_body
+ * leaves a token after each draw it recorded into the open pass that the next
+ * such draw may repeat: its pipeline, render pass, framebuffer, descriptor set
+ * and the dynamic state the pass holds (s_ecs). While the token holds -- no
+ * bind or set since (s_vk_bind_epoch), the pass still open, the set table,
+ * the objects, the uniform arena and the anisotropy as they were, the same
+ * topology and stride, room in the arenas without a flush -- the draw records
+ * only its constant windows (the body's own code, vk_eng_cwin), the descriptor
+ * set with their offsets, the vertex/index buffers when they differ, and the
+ * draw: what the body records for it, without finding again everything the
+ * previous draw found (~60 ns of ~120 a draw). Anything else: the whole body.
+ * PS3RECOMP_VK_FASTDRAW=0: always the whole body. With
+ * PS3RECOMP_ENG_FASTDRAW_VERIFY=1 the whole body records every draw and what
+ * the fast record would have been is compared with it ([fastdraw-verify]
+ * backend lines); binds then bump the epoch only when they change something,
+ * so the engine's verify (which sends every bind again) leaves the token. */
+static u32 s_vk_bind_epoch;
+static struct { int on, verify; } s_fdb = { -1, 0 };
+#define VK_FD_BUMP(changed) do { if (!s_fdb.verify || (changed)) s_vk_bind_epoch++; } while (0)
+static struct {
+    int valid;
+    u32 epoch, pid, topology, stride, dset_gen, eobj_gen, vs_bytes, ps_bytes, sref;
+    int aniso;
+    VkPipeline pipe; VkRenderPass rp; VkFramebuffer fb; VkDescriptorSet set; VkBuffer ubuf;
+    VkViewport vp; VkRect2D sc;
+} s_fdt;
+extern u64 g_eng_fd_be[10];   /* the engine's [fastdraw] counters (rsx_draw_fast.inc) */
+static void vk_fd_init(void);
+
 /* ---------------------------------------------------------------------------
  * One-shot command submission
  * -------------------------------------------------------------------------*/
 /* Open the command buffer -- or, batching, keep appending to the open one. */
 static void vk_batch_end_pass(void)
 {
+    s_fdt.valid = 0;   /* (fastdraw) the pass the token repeats into ends (or none is open) */
     if (s_batch.rp_open) {
         pvkCmdEndRenderPass(s_vk.cmd); s_batch.rp_open = 0;
         vk_gprof_stamp(GP_PASS, s_batch.rp_w, s_batch.rp_h);
@@ -5027,6 +5060,7 @@ static int vk_eng_init(void* user, u32 width, u32 height)
     ps3_setting_register("PS3RECOMP_CLARITY", vk_lfx_apply_clarity);
     memset(s_eobj, 0, sizeof s_eobj);
     memset(&s_eng_bound, 0, sizeof s_eng_bound);
+    vk_fd_init();                                   /* (fastdraw) PS3RECOMP_ENG_FASTDRAW / PS3RECOMP_VK_FASTDRAW */
     return s_vk.device ? 0 : -1;
 }
 
@@ -5194,6 +5228,12 @@ static void vk_eng_bind_targets(void* user, const u32* surfaces, u32 count, u32 
 {
     (void)user;
     if (count > RSX_BE_MAX_COLOR_TARGETS) count = RSX_BE_MAX_COLOR_TARGETS;
+    if (s_fdb.verify) {   /* (fastdraw) the epoch moves only for a change */
+        int ch = count != s_eng_bound.nrt || depth != s_eng_bound.depth;
+        for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS && !ch; i++)
+            ch = s_eng_bound.rt[i] != ((i < count && surfaces) ? surfaces[i] : 0u);
+        VK_FD_BUMP(ch);
+    } else VK_FD_BUMP(1);
     for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++)
         s_eng_bound.rt[i] = (i < count && surfaces) ? surfaces[i] : 0;
     s_eng_bound.nrt = count;
@@ -6096,6 +6136,7 @@ static void vk_eng_drop_framebuffers(void)
 {
     /* Recorded draws may use any of them: retire them with the batch. The
      * open pass is one of them, so it ends here (the next draw opens anew). */
+    s_fdt.valid = 0;   /* (fastdraw) the token's framebuffer goes too */
     if (s_e2.fb_count && s_batch.recording) vk_batch_end_pass();
     for (u32 i = 0; i < s_e2.fb_count; i++)
         if (s_e2.fb[i].fb) vk_batch_retire_fb(s_e2.fb[i].fb);
@@ -6530,6 +6571,7 @@ static void vk_eng_pipeline_release(void* user, u32 pipeline)
     if (P->fs_neg) pvkDestroyShaderModule(s_vk.device, P->fs_neg, NULL);
     memset(P, 0, sizeof *P);
     if (s_e2.pipeline == pipeline) s_e2.pipeline = 0;
+    s_vk_bind_epoch++;   /* (fastdraw) a token may name it */
 }
 
 static VkPipeline vk_eng_variant_ex(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx, int neg);
@@ -6676,7 +6718,7 @@ static VkPipeline vk_eng_variant_ex(vk_eng_pipe* P, u32 topo_idx, u32 vk_idx, in
     return *slotp;
 }
 
-static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; s_e2.pipeline = pipeline; }
+static void vk_eng_bind_pipeline(void* user, u32 pipeline) { (void)user; VK_FD_BUMP(pipeline != s_e2.pipeline); s_e2.pipeline = pipeline; }
 
 static void vk_eng2_shutdown(void* user)
 {
@@ -6811,6 +6853,15 @@ static void vk_eng_bind_textures(void* user, const u32* textures,
                                  const rsx_be_sampler_desc* samplers, u32 mask)
 {
     (void)user;
+    if (s_fdb.verify) {   /* (fastdraw) the epoch moves only for a change */
+        int ch = mask != s_e2.tex_mask;
+        for (u32 u = 0; u < RSX_BE_MAX_TEXTURES && !ch; u++) {
+            const int on = (mask >> u) & 1u;
+            ch = s_e2.tex[u] != (on ? textures[u] : 0u) ||
+                 (on && samplers && memcmp(&s_e2.samp[u], &samplers[u], sizeof samplers[u]));
+        }
+        VK_FD_BUMP(ch);
+    } else VK_FD_BUMP(1);
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         const int on = (mask >> u) & 1u;
         s_e2.tex[u] = on ? textures[u] : 0;
@@ -6827,11 +6878,13 @@ static void vk_eng_bind_vertex_textures(void* user, const u32* textures,
 static void vk_eng_set_viewport(void* user, float x, float y, float w, float h)
 {
     (void)user;
+    { const float v[4] = { x, y, w, h }; VK_FD_BUMP(!s_e2.have_vp || memcmp(s_e2.vp, v, sizeof v)); }   /* (fastdraw) */
     s_e2.vp[0] = x; s_e2.vp[1] = y; s_e2.vp[2] = w; s_e2.vp[3] = h; s_e2.have_vp = 1;
 }
 static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 {
     (void)user;
+    VK_FD_BUMP(!s_e2.have_sc || s_e2.sc[0] != x || s_e2.sc[1] != y || s_e2.sc[2] != w || s_e2.sc[3] != h);   /* (fastdraw) */
     s_e2.sc[0] = x; s_e2.sc[1] = y; s_e2.sc[2] = w; s_e2.sc[3] = h; s_e2.have_sc = 1;
 }
 /* [wide] rsx_draw_backend.set_hud, installed only while s_wide.on (the draw
@@ -6844,18 +6897,21 @@ static void vk_eng_set_hud(void* user, int hud, u32 target_w)
 {
     (void)user; (void)target_w;
     if (hud >= 3) { s_wide.bars = s_wide.on && hud == 3; return; }
+    VK_FD_BUMP(s_wide.pin != (s_wide.on && hud == 1));   /* (fastdraw) */
     s_wide.pin = s_wide.on && hud == 1;
 }
-static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_e2.stencil_ref = ref; }
+static void vk_eng_set_stencil_ref(void* user, u32 ref) { (void)user; VK_FD_BUMP(ref != s_e2.stencil_ref); s_e2.stencil_ref = ref; }
 /* POLYGON_OFFSET: `constant` in units of the guest depth's resolution
  * (2^-24, D24). The depth image is D32_SFLOAT, whose constant unit is
  * 2^(e-23) for the primitive's largest exponent e: the same 2^-24 for depths
  * in [0.5, 1), half that per octave below. */
 static void vk_eng_set_depth_bias(void* user, float constant, float slope)
-{ (void)user; s_e2.bias_const = constant; s_e2.bias_slope = slope; }
+{ (void)user;
+  VK_FD_BUMP(memcmp(&s_e2.bias_const, &constant, sizeof constant) || memcmp(&s_e2.bias_slope, &slope, sizeof slope));   /* (fastdraw) */
+  s_e2.bias_const = constant; s_e2.bias_slope = slope; }
 /* ZMIN_MAX_CONTROL: 1 = clamp depth to the viewport range instead of
  * clipping at the near/far planes (needs the depthClamp feature). */
-static void vk_eng_set_depth_clamp(void* user, int clamp) { (void)user; s_e2.depth_clamp = clamp; }
+static void vk_eng_set_depth_clamp(void* user, int clamp) { (void)user; VK_FD_BUMP(clamp != s_e2.depth_clamp); s_e2.depth_clamp = clamp; }
 
 static VkFramebuffer vk_eng_framebuffer(VkRenderPass rp, const u32* rt, u32 n, VkImageView dview,
                                         u32 dkey, u32 w, u32 h)
@@ -7494,6 +7550,14 @@ static inline u64 vk_mg_tsc(void)
     return ps3_ft_now();
 #endif
 }
+/* (fastdraw) the draw engine's counters (PS3RECOMP_ENG_DELTA_STATS, rsx_draw_delta.inc):
+ * the backend's draw split by stage, ticks since the last mark into the
+ * engine's table for the draw's path; g_eng_bst_t == 0: not an engine draw call */
+extern u64 g_eng_bst_t;
+extern u32 g_eng_bst_on, g_eng_bst_path;
+extern u64 g_eng_bst[4][8];
+#define VK_BST(k) do { if (__builtin_expect(g_eng_bst_on != 0, 0) && g_eng_bst_t) { const u64 _t = vk_mg_tsc(); \
+    g_eng_bst[g_eng_bst_path][k] += _t - g_eng_bst_t; g_eng_bst_t = _t; } } while (0)
 static int vk_mg_on(void)
 {
     if (s_mg.on < 0) {
@@ -7587,6 +7651,97 @@ static void vk_mg_frame(void)
     s_mg.on = on; s_mg.ns0 = now; s_mg.tsc0 = tsc;
 }
 
+/* (fastdraw) The uniform window a batched draw reserves: the VS file whole and
+ * the PS bytes bound (ub), and how far below the first row read it may start
+ * (lead, for a ranged VS block). Returns whether the VS block is ranged.
+ * vk_eng_draw_ex_body's own computation, shared with the fast record. */
+static int vk_eng_ub(VkDeviceSize* ub_out, VkDeviceSize* lead_out)
+{
+    VkDeviceSize ub = s_g.ps_off + ((s_e2.ps_bytes ? s_e2.ps_bytes : 16u) + 15u) / 16u * 16u;
+    if (ub > (VkDeviceSize)s_batch.shadow_size) ub = (VkDeviceSize)s_batch.shadow_size;
+    const int ranged = s_e2.vs_ranged && ub >= s_g.ps_off;
+    VkDeviceSize lead = 0;
+    if (ranged) {
+        if (!s_batch.ualign) {              /* as vk_batch_reserve reads it */
+            VkPhysicalDeviceProperties pp;
+            pvkGetPhysicalDeviceProperties(s_vk.phys, &pp);
+            s_batch.ualign = pp.limits.minUniformBufferOffsetAlignment ? pp.limits.minUniformBufferOffsetAlignment : 256;
+        }
+        lead = (VkDeviceSize)s_e2.vs_first * 16u / s_batch.ualign * s_batch.ualign;
+    }
+    *ub_out = ub; *lead_out = lead;
+    return ranged;
+}
+/* (fastdraw) A ranged VS block's constant windows in the reservation at uoff
+ * (vk_batch_reserve of ub - lead; epoch0 / ucur0: s_dset_gen and the uniform
+ * cursor before it): the rows read, the tail and the PS bytes, or the last
+ * windows when they hold the same (PS3RECOMP_VK_CONST_REUSE). Out: the two
+ * dynamic offsets. -1: no room at the arena's start (the draw is skipped). */
+static int vk_eng_cwin(VkDeviceSize uoff, VkDeviceSize lead, VkDeviceSize ub, u32 epoch0, VkDeviceSize ucur0,
+                       VkDeviceSize* ubase_out, VkDeviceSize* ps_dyn_out)
+{
+    VkDeviceSize base = uoff - lead;
+    if (uoff < lead) {                  /* the arena's start: no room below, take it whole */
+        base = uoff;
+        if (base + ub > s_batch.uarena.size) return -1;
+        if (s_batch.ucur < base + ub) s_batch.ucur = base + ub;
+    }
+    u8* u = (u8*)s_batch.uarena.ptr + base;
+    /* (rsx-vtx) PS3RECOMP_VK_CONST_REUSE: the last windows, when they
+     * hold what this draw would copy (see s_cm) */
+    const int cr = vk_creuse_on();
+    if (cr && (s_cm.epoch != s_dset_gen || s_cm.ubuf != s_batch.uarena.buf)) {
+        /* another arena (reset, slot swap, growth): its windows are gone */
+        s_cm.vs_ok = s_cm.ps_ok = 0;
+        s_cm.epoch = s_dset_gen; s_cm.ubuf = s_batch.uarena.buf;
+    }
+    const int epoch_ok = cr;
+    const VkDeviceSize ps_len = ub - s_g.ps_off;
+    const int vs_same = epoch_ok && s_cm.vs_ok && s_e2.vs_ranged == 2 && s_cm.vs_gen == s_e2.vs_gen &&
+                        s_cm.vs_rows == s_e2.vs_rows && s_cm.vs_bytes == s_e2.vs_bytes &&
+                        s_e2.vs_first >= s_cm.vs_first &&
+                        s_e2.vs_first + s_e2.vs_count <= s_cm.vs_first + s_cm.vs_count &&
+                        s_cm.vs_tail_off == s_e2.vs_tail_off && s_cm.vs_tail_bytes == s_e2.vs_tail_bytes &&
+                        !memcmp(s_cm.vs_tail, s_e2.vs_tail, s_e2.vs_tail_bytes);
+    const int ps_same = epoch_ok && s_cm.ps_ok && s_e2.ps_ver && s_cm.ps_ver == s_e2.ps_ver &&
+                        s_cm.ps_len == (u32)ps_len;
+    VkDeviceSize ps_dyn;
+    if (vs_same) {
+        uoff = s_cm.vs_base; s_cm.vs_hit++;
+    } else {
+        if (s_e2.vs_count)
+            memcpy(u + s_e2.vs_first * 16u, s_e2.vs_rows + s_e2.vs_first * 16u, s_e2.vs_count * 16u);
+        if (s_e2.vs_tail_bytes) memcpy(u + s_e2.vs_tail_off, s_e2.vs_tail, s_e2.vs_tail_bytes);
+        uoff = base;
+        if (cr) {
+            s_cm.vs_ok = s_e2.vs_ranged == 2;
+            s_cm.vs_base = base; s_cm.vs_rows = s_e2.vs_rows; s_cm.vs_gen = s_e2.vs_gen;
+            s_cm.vs_first = s_e2.vs_first; s_cm.vs_count = s_e2.vs_count; s_cm.vs_bytes = s_e2.vs_bytes;
+            s_cm.vs_tail_off = s_e2.vs_tail_off; s_cm.vs_tail_bytes = s_e2.vs_tail_bytes;
+            memcpy(s_cm.vs_tail, s_e2.vs_tail, s_e2.vs_tail_bytes);
+            s_cm.vs_miss++;
+        }
+    }
+    if (ps_same) {
+        ps_dyn = s_cm.ps_abs; s_cm.ps_hit++;
+    } else {
+        memcpy(u + s_g.ps_off, s_batch.shadow + s_g.ps_off, (size_t)ps_len);
+        ps_dyn = base + s_g.ps_off;
+        if (cr) { s_cm.ps_ok = 1; s_cm.ps_abs = ps_dyn; s_cm.ps_ver = s_e2.ps_ver; s_cm.ps_len = (u32)ps_len; s_cm.ps_miss++; }
+    }
+    /* both windows reused: this draw's reservation goes back (nothing
+     * was reserved after it, and no flush came between) */
+    if (vs_same && ps_same && s_dset_gen == epoch0 && s_batch.ucur >= ucur0) s_batch.ucur = ucur0;
+    *ubase_out = uoff; *ps_dyn_out = ps_dyn;
+    return 0;
+}
+/* (fastdraw) VERIFY: what the whole body recorded for the draw being checked */
+static struct {
+    int on, drawn, cont, known, special, rec;    /* rec: 1 pipeline, 2 viewport, 4 scissor, 8 stencil ref, 16 depth bias */
+    VkPipeline pipe; VkDescriptorSet set; VkViewport vp; VkRect2D sc; u32 sref;
+    VkBuffer vb, ib; VkDeviceSize vo, io; u32 icount;
+} s_fdc;
+
 /* One draw: vertices from host memory (staged) or from a persistent buffer
  * (pvb/pvo), indices likewise -- host, persistent (pib/pio) or none. */
 static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
@@ -7651,6 +7806,8 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
                                 u32 vertex_count, u32 stride, const u32* indices, VkBuffer pib, VkDeviceSize pio,
                                 u32 index_count)
 {
+    VK_BST(0);
+    s_fdt.valid = 0;   /* (fastdraw) a draw that records its own way leaves a token below, or none */
     if (!s_e2.pipeline || (!vertices && !pvb) || !vertex_count || !stride) return;
     if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
     vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
@@ -7685,6 +7842,7 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
     VkImageView dview = (zo && zo->w >= w && zo->h >= h) ? zo->im.view : vk_eng_scratch_depth(w, h);
     if (!dview) return;
     const u32 dkey = (zo && dview == zo->im.view) ? s_eng_bound.depth : 0xFFFFFFFFu;
+    VK_BST(1);
 
     const int use_bias = s_e2.bias_const != 0.0f || s_e2.bias_slope != 0.0f;
     const u32 vk_idx = ((s_e2.depth_clamp && s_vk_depth_clamp_ok) ? 1u : 0u) | (use_bias ? 2u : 0u);
@@ -7692,6 +7850,7 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
     VkRenderPass rp = vk_eng_render_pass(n);
     VkFramebuffer fb = vk_eng_framebuffer(rp, s_eng_bound.rt, n, dview, dkey, w, h);
     if (!pipe || !rp || !fb) return;
+    VK_BST(2);
 
     const VkDeviceSize vbytes = vertices ? (VkDeviceSize)vertex_count * stride : 0;
     const VkDeviceSize ibytes = (indices && index_count) ? (VkDeviceSize)index_count * 4u : 0;
@@ -7702,27 +7861,20 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
     VkDescriptorSet set = s_g.set;
     VkDeviceSize ubase = 0;                    /* the constant window: dynamic offsets */
     VkDeviceSize ps_dyn = s_g.ps_off;          /* (rsx-vtx) the fragment block's own offset */
+    int fd_ranged = 0;                         /* (fastdraw) the token wants the ranged constant path */
     if (batched) {
         VkDeviceSize uoff = 0;
         /* The VS file whole (programs index it freely) and the PS bytes bound
-         * -- the descriptor ranges cover exactly that much. */
-        VkDeviceSize ub = s_g.ps_off + ((s_e2.ps_bytes ? s_e2.ps_bytes : 16u) + 15u) / 16u * 16u;
-        if (ub > (VkDeviceSize)s_batch.shadow_size) ub = (VkDeviceSize)s_batch.shadow_size;
-        /* A ranged VS block (bind_vs_constants_range): the descriptor window
-         * still starts at an aligned base and spans the whole file, but only
-         * the rows read, the tail and the PS constants are written, and the
-         * reservation starts at the first row read -- the rows below it, which
-         * the program never reads, may be another draw's bytes. */
-        const int ranged = s_e2.vs_ranged && ub >= s_g.ps_off;
-        VkDeviceSize lead = 0;
-        if (ranged) {
-            if (!s_batch.ualign) {              /* as vk_batch_reserve reads it */
-                VkPhysicalDeviceProperties pp;
-                pvkGetPhysicalDeviceProperties(s_vk.phys, &pp);
-                s_batch.ualign = pp.limits.minUniformBufferOffsetAlignment ? pp.limits.minUniformBufferOffsetAlignment : 256;
-            }
-            lead = (VkDeviceSize)s_e2.vs_first * 16u / s_batch.ualign * s_batch.ualign;
-        }
+         * -- the descriptor ranges cover exactly that much. A ranged VS block
+         * (bind_vs_constants_range): the descriptor window still starts at an
+         * aligned base and spans the whole file, but only the rows read, the
+         * tail and the PS constants are written, and the reservation starts at
+         * the first row read -- the rows below it, which the program never
+         * reads, may be another draw's bytes. (fastdraw) vk_eng_ub/vk_eng_cwin:
+         * this code, shared with the fast record. */
+        VkDeviceSize ub, lead;
+        const int ranged = vk_eng_ub(&ub, &lead);
+        fd_ranged = ranged;
         const u32 epoch0 = s_dset_gen;
         const VkDeviceSize ucur0 = s_batch.ucur;
         if (vk_batch_reserve(vbytes, ibytes, ub - lead, &voff, &ioff, &uoff) ||
@@ -7730,58 +7882,9 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
             return;
         if (vertices) memcpy((u8*)s_batch.varena.ptr + voff, vertices, (size_t)vbytes);
         if (ibytes) memcpy((u8*)s_batch.iarena.ptr + ioff, indices, (size_t)ibytes);
+        VK_BST(3);
         if (ranged) {
-            VkDeviceSize base = uoff - lead;
-            if (uoff < lead) {                  /* the arena's start: no room below, take it whole */
-                base = uoff;
-                if (base + ub > s_batch.uarena.size) return;
-                if (s_batch.ucur < base + ub) s_batch.ucur = base + ub;
-            }
-            u8* u = (u8*)s_batch.uarena.ptr + base;
-            /* (rsx-vtx) PS3RECOMP_VK_CONST_REUSE: the last windows, when they
-             * hold what this draw would copy (see s_cm) */
-            const int cr = vk_creuse_on();
-            if (cr && (s_cm.epoch != s_dset_gen || s_cm.ubuf != s_batch.uarena.buf)) {
-                /* another arena (reset, slot swap, growth): its windows are gone */
-                s_cm.vs_ok = s_cm.ps_ok = 0;
-                s_cm.epoch = s_dset_gen; s_cm.ubuf = s_batch.uarena.buf;
-            }
-            const int epoch_ok = cr;
-            const VkDeviceSize ps_len = ub - s_g.ps_off;
-            const int vs_same = epoch_ok && s_cm.vs_ok && s_e2.vs_ranged == 2 && s_cm.vs_gen == s_e2.vs_gen &&
-                                s_cm.vs_rows == s_e2.vs_rows && s_cm.vs_bytes == s_e2.vs_bytes &&
-                                s_e2.vs_first >= s_cm.vs_first &&
-                                s_e2.vs_first + s_e2.vs_count <= s_cm.vs_first + s_cm.vs_count &&
-                                s_cm.vs_tail_off == s_e2.vs_tail_off && s_cm.vs_tail_bytes == s_e2.vs_tail_bytes &&
-                                !memcmp(s_cm.vs_tail, s_e2.vs_tail, s_e2.vs_tail_bytes);
-            const int ps_same = epoch_ok && s_cm.ps_ok && s_e2.ps_ver && s_cm.ps_ver == s_e2.ps_ver &&
-                                s_cm.ps_len == (u32)ps_len;
-            if (vs_same) {
-                uoff = s_cm.vs_base; s_cm.vs_hit++;
-            } else {
-                if (s_e2.vs_count)
-                    memcpy(u + s_e2.vs_first * 16u, s_e2.vs_rows + s_e2.vs_first * 16u, s_e2.vs_count * 16u);
-                if (s_e2.vs_tail_bytes) memcpy(u + s_e2.vs_tail_off, s_e2.vs_tail, s_e2.vs_tail_bytes);
-                uoff = base;
-                if (cr) {
-                    s_cm.vs_ok = s_e2.vs_ranged == 2;
-                    s_cm.vs_base = base; s_cm.vs_rows = s_e2.vs_rows; s_cm.vs_gen = s_e2.vs_gen;
-                    s_cm.vs_first = s_e2.vs_first; s_cm.vs_count = s_e2.vs_count; s_cm.vs_bytes = s_e2.vs_bytes;
-                    s_cm.vs_tail_off = s_e2.vs_tail_off; s_cm.vs_tail_bytes = s_e2.vs_tail_bytes;
-                    memcpy(s_cm.vs_tail, s_e2.vs_tail, s_e2.vs_tail_bytes);
-                    s_cm.vs_miss++;
-                }
-            }
-            if (ps_same) {
-                ps_dyn = s_cm.ps_abs; s_cm.ps_hit++;
-            } else {
-                memcpy(u + s_g.ps_off, s_batch.shadow + s_g.ps_off, (size_t)ps_len);
-                ps_dyn = base + s_g.ps_off;
-                if (cr) { s_cm.ps_ok = 1; s_cm.ps_abs = ps_dyn; s_cm.ps_ver = s_e2.ps_ver; s_cm.ps_len = (u32)ps_len; s_cm.ps_miss++; }
-            }
-            /* both windows reused: this draw's reservation goes back (nothing
-             * was reserved after it, and no flush came between) */
-            if (vs_same && ps_same && s_dset_gen == epoch0 && s_batch.ucur >= ucur0) s_batch.ucur = ucur0;
+            if (vk_eng_cwin(uoff, lead, ub, epoch0, ucur0, &uoff, &ps_dyn)) return;
         } else {
             memcpy((u8*)s_batch.uarena.ptr + uoff, s_batch.shadow, (size_t)ub);
             ps_dyn = uoff + s_g.ps_off;
@@ -7804,6 +7907,7 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
         } else if (pib) { ibuf = pib; ioff = pio; }
         vk_eng_write_descriptors();
     }
+    VK_BST(4);
 
     /* Batched, a draw into the framebuffer of the pass left open by the draw
      * before continues that pass: draws inside one pass are ordered against
@@ -7847,11 +7951,13 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
         if (batched) { s_batch.rp_open = 1; s_batch.rp_fb = fb; s_batch.rp_rp = rp; s_batch.rp_w = w; s_batch.rp_h = h; }
         s_ecs.valid = 0;
     }
+    VK_BST(5);
     const u64 mg_t0 = s_mg.on > 0 ? vk_mg_tsc() : 0;   /* PS3RECOMP_VK_MERGE_STATS */
     static int filt = -1;
     if (filt < 0) { const char* e = getenv("PS3RECOMP_VK_STATE_FILTER"); filt = !(e && e[0] == '0'); }
     const int known = filt && s_ecs.valid;
-    if (!known || s_ecs.pipe != pipe) pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    u32 rec = 0;   /* (fastdraw) VERIFY: which state this draw recorded (s_fdc.rec) */
+    if (!known || s_ecs.pipe != pipe) { pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); rec |= 1u; }
     else s_ecs_skipped++;
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     /* [wide] the title's HUD (set_hud 1) into a scaled target: its guest
@@ -7893,15 +7999,15 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
         sc.offset.x = (int32_t)x0; sc.offset.y = (int32_t)y0;
         sc.extent.width = x1 > x0 ? x1 - x0 : 0; sc.extent.height = y1 > y0 ? y1 - y0 : 0;
     }
-    if (!known || memcmp(&s_ecs.vp, &vp, sizeof vp)) pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp);
-    if (!known || memcmp(&s_ecs.sc, &sc, sizeof sc)) pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc);
+    if (!known || memcmp(&s_ecs.vp, &vp, sizeof vp)) { pvkCmdSetViewport(s_vk.cmd, 0, 1, &vp); rec |= 2u; }
+    if (!known || memcmp(&s_ecs.sc, &sc, sizeof sc)) { pvkCmdSetScissor(s_vk.cmd, 0, 1, &sc); rec |= 4u; }
     const u32 sref = s_e2.stencil_ref & 0xFFu;
-    if (!known || s_ecs.sref != sref)
-        pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, sref);
+    if (!known || s_ecs.sref != sref) {
+        pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, sref); rec |= 8u; }
     int bias_set = known && s_ecs.bias_set;
     if (use_bias && (!bias_set || s_ecs.bc != s_e2.bias_const || s_ecs.bs != s_e2.bias_slope)) {
         pvkCmdSetDepthBias(s_vk.cmd, s_e2.bias_const, 0.0f, s_e2.bias_slope);
-        bias_set = 1; s_ecs.bc = s_e2.bias_const; s_ecs.bs = s_e2.bias_slope;
+        bias_set = 1; s_ecs.bc = s_e2.bias_const; s_ecs.bs = s_e2.bias_slope; rec |= 16u;
     }
     { const u32 dyn[2] = { (u32)ubase, (u32)ps_dyn };
       pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout,
@@ -7939,6 +8045,40 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
             s_ecs.pipe = npipe;
             if (has_idx) pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
             else         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+        }
+    }
+    VK_BST(6);
+    if (__builtin_expect(s_fdc.on, 0)) {   /* (fastdraw) VERIFY: what this draw recorded */
+        s_fdc.drawn = 1; s_fdc.cont = cont; s_fdc.known = known; s_fdc.rec = rec;
+        s_fdc.special = !batched || P->sblend || P->fbf_in || P->fbf_mask;
+        s_fdc.pipe = pipe; s_fdc.set = set; s_fdc.vp = vp; s_fdc.sc = sc; s_fdc.sref = sref;
+        s_fdc.vb = vbuf; s_fdc.vo = voff; s_fdc.ib = has_idx ? ibuf : VK_NULL_HANDLE; s_fdc.io = has_idx ? ioff : 0;
+        s_fdc.icount = index_count;
+    }
+    /* (fastdraw) the token: this draw is one the next may repeat when it went
+     * into the batch's open pass from persistent buffers, through the state
+     * filter and a ranged VS block, with nothing special (signed blend, input
+     * attachments, target copies, the RT dump), and does not sample a target
+     * of its own pass (the next draw would break the pass again) */
+    if (s_fdb.on > 0 && batched && filt && fd_ranged && has_idx && !vertices && !indices && pib &&
+        !P->sblend && !P->fbf_in && !P->fbf_mask && s_rtd.phase != 1 && s_batch.rp_open &&
+        s_batch.rp_fb == fb && s_batch.rp_rp == rp) {
+        int self = 0;
+        for (u32 u = 0; !cont && u < RSX_MAX_TEXTURES && !self; u++) {   /* as the pass check above */
+            if (!((s_e2.tex_mask >> u) & 1u)) continue;
+            u32 t = s_e2.tex[u];
+            if (!t || t >= VK_ENG_MAX_OBJ) continue;
+            if (s_eobj[t].kind == VK_ENG_VIEW) t = s_eobj[t].surface;
+            if (t == s_eng_bound.depth) self = 1;
+            for (u32 i = 0; i < n; i++) if (t == s_eng_bound.rt[i]) self = 1;
+        }
+        if (!self) {
+            s_fdt.epoch = s_vk_bind_epoch; s_fdt.pid = s_e2.pipeline; s_fdt.topology = (u32)topology; s_fdt.stride = stride;
+            s_fdt.dset_gen = s_dset_gen; s_fdt.eobj_gen = s_eobj_gen; s_fdt.vs_bytes = s_e2.vs_bytes; s_fdt.ps_bytes = s_e2.ps_bytes;
+            s_fdt.sref = sref; s_fdt.aniso = vk_postfx_aniso();
+            s_fdt.pipe = pipe; s_fdt.rp = rp; s_fdt.fb = fb; s_fdt.set = set; s_fdt.ubuf = s_batch.uarena.buf;
+            s_fdt.vp = vp; s_fdt.sc = sc;
+            s_fdt.valid = 1;
         }
     }
     if (s_mg.on > 0) {   /* PS3RECOMP_VK_MERGE_STATS: counting only */
@@ -7980,6 +8120,133 @@ static void vk_eng_draw_vbuf_ib(void* user, rsx_topology topology, u32 vb, u32 v
     if (!index_count || !vk_vb_get(vb, (VkDeviceSize)vertex_count * stride, &b, &o) ||
         !vk_vb_get(ib, (VkDeviceSize)index_count * 4u, &ibb, &io)) return;
     vk_eng_draw_ex(topology, NULL, b, o, vertex_count, stride, NULL, ibb, io, index_count);
+}
+
+/* ---- (fastdraw) draw_vbuf_ib_again (see s_fdt) -------------------------------- */
+static void vk_fd_init(void)
+{
+    const char* e = getenv("PS3RECOMP_ENG_FASTDRAW");
+    const char* b = getenv("PS3RECOMP_VK_FASTDRAW");
+    const char* v = getenv("PS3RECOMP_ENG_FASTDRAW_VERIFY");
+    s_fdb.on = !(e && e[0] == '0') && !(b && b[0] == '0');
+    s_fdb.verify = s_fdb.on && v && v[0] && v[0] != '0';
+    s_fdt.valid = 0;
+}
+/* 0: the token holds for this draw (what may stop it: g_eng_fd_be's slots);
+ * ub / lead: its uniform window (vk_eng_ub) */
+static int vk_fd_check(rsx_topology topology, u32 stride, VkDeviceSize* ub_out, VkDeviceSize* lead_out)
+{
+    if (!s_fdt.valid) return 1;                                         /* the last draw was none to repeat */
+    if (s_fdt.epoch != s_vk_bind_epoch || s_e2.pipeline != s_fdt.pid) return 2;   /* a bind or set since */
+    if (!s_batch.recording || !s_batch.rp_open || s_batch.rp_fb != s_fdt.fb || s_batch.rp_rp != s_fdt.rp ||
+        !s_ecs.valid || s_ecs.pipe != s_fdt.pipe) return 3;            /* the pass ended */
+    if (s_dset_gen != s_fdt.dset_gen || s_eobj_gen != s_fdt.eobj_gen || s_batch.uarena.buf != s_fdt.ubuf) return 4;
+    if ((u32)topology != s_fdt.topology || stride != s_fdt.stride || !s_e2.vs_ranged ||
+        s_e2.vs_bytes != s_fdt.vs_bytes || s_e2.ps_bytes != s_fdt.ps_bytes || s_rtd.phase == 1 ||
+        vk_postfx_aniso() != s_fdt.aniso) return 5;
+    /* room for the uniform window without a flush (vk_batch_reserve's own
+     * test for no vertex and no index bytes): a flush would take the set */
+    VkDeviceSize ub, lead;
+    if (!vk_eng_ub(&ub, &lead) || !s_batch.ualign) return 5;
+    *ub_out = ub; *lead_out = lead;
+    const VkDeviceSize vc = (s_batch.vcur + 15u) & ~(VkDeviceSize)15u;
+    const VkDeviceSize ic = (s_batch.icur + 3u) & ~(VkDeviceSize)3u;
+    const VkDeviceSize uc = (s_batch.ucur + s_batch.ualign - 1u) / s_batch.ualign * s_batch.ualign;
+    if (!s_batch.varena.buf || !s_batch.iarena.buf || !s_batch.uarena.buf || vc > s_batch.varena.size ||
+        ic + 4u > s_batch.iarena.size || uc + (ub - lead) > s_batch.uarena.size || s_batch.dsets >= VK_BATCH_SETS)
+        return 6;
+    return 0;
+}
+/* The fast record: what vk_eng_draw_ex_body records for a draw its token
+ * describes -- the arenas' reservation and constant windows (its own code),
+ * the pass continued, the descriptor set with this draw's offsets, the
+ * buffers where they differ, the draw; pipeline, viewport, scissor, stencil
+ * reference and depth bias are the pass's already (s_ecs == the token's). */
+static void vk_fd_record(u32 vb, u32 vertex_count, u32 stride, u32 ib, u32 index_count, VkDeviceSize ub, VkDeviceSize lead)
+{
+    VkBuffer b, ibb; VkDeviceSize o, io;
+    if (!index_count || !vk_vb_get(vb, (VkDeviceSize)vertex_count * stride, &b, &o) ||
+        !vk_vb_get(ib, (VkDeviceSize)index_count * 4u, &ibb, &io)) return;   /* as draw_vbuf_ib */
+    VkDeviceSize vo, iox, uoff, ubase, ps_dyn;
+    const u32 epoch0 = s_dset_gen;
+    const VkDeviceSize ucur0 = s_batch.ucur;
+    if (vk_batch_reserve(0, 0, ub - lead, &vo, &iox, &uoff)) return;   /* vk_fd_check: cannot fail */
+    if (vk_eng_cwin(uoff, lead, ub, epoch0, ucur0, &ubase, &ps_dyn)) return;   /* as the body */
+    VK_BST(4);
+    s_batch.merged++;                                                     /* the pass continued */
+    const u64 mg_t0 = s_mg.on > 0 ? vk_mg_tsc() : 0;
+    { const u32 dyn[2] = { (u32)ubase, (u32)ps_dyn };
+      pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout, 0, 1, &s_fdt.set, 2, dyn); }
+    if (s_ecs.vb != b || s_ecs.vo != o) pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &b, &o);
+    if (s_ecs.ib != ibb || s_ecs.io != io) pvkCmdBindIndexBuffer(s_vk.cmd, ibb, io, VK_INDEX_TYPE_UINT32);
+    s_ecs.vb = b; s_ecs.vo = o; s_ecs.ib = ibb; s_ecs.io = io;
+    pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
+    VK_BST(6);
+    if (s_mg.on > 0) {   /* PS3RECOMP_VK_MERGE_STATS, as the body counts it */
+        s_mg.t_rec += vk_mg_tsc() - mg_t0;
+        const vk_mg_draw md = { .pipe = s_fdt.pipe, .vp = s_fdt.vp, .sc = s_fdt.sc, .sref = s_fdt.sref,
+                                .d0 = (u32)ubase, .d1 = (u32)ps_dyn, .stride = stride,
+                                .bias = s_e2.bias_const != 0.0f || s_e2.bias_slope != 0.0f, .idx = 1,
+                                .bc = s_e2.bias_const, .bs = s_e2.bias_slope,
+                                .set = s_fdt.set, .vb = b, .ib = ibb, .vo = o };
+        vk_mg_note(&md, 1, 0, 1);
+    }
+    s_batch.draws++;                                                      /* the pass stays open */
+}
+/* VERIFY: the whole body records the draw; what the fast record would have
+ * recorded is compared with it */
+static void vk_fd_verify(void* user, rsx_topology topology, u32 vb, u32 vertex_count, u32 stride, u32 ib, u32 index_count)
+{
+    VkBuffer b = VK_NULL_HANDLE, ibb = VK_NULL_HANDLE; VkDeviceSize o = 0, io = 0;
+    const int ok = index_count && vk_vb_get(vb, (VkDeviceSize)vertex_count * stride, &b, &o) &&
+                   vk_vb_get(ib, (VkDeviceSize)index_count * 4u, &ibb, &io);
+    const VkPipeline pipe = s_fdt.pipe; const VkDescriptorSet set = s_fdt.set;
+    const VkViewport vp = s_fdt.vp; const VkRect2D sc = s_fdt.sc; const u32 sref = s_fdt.sref;
+    memset(&s_fdc, 0, sizeof s_fdc);
+    s_fdc.on = 1;
+    vk_eng_draw_vbuf_ib(user, topology, vb, vertex_count, stride, ib, index_count);
+    s_fdc.on = 0;
+    g_eng_fd_be[8]++;
+    char w[256]; int wp = 0; w[0] = 0;
+#define FD_W(cond, name) do { if (cond) wp += snprintf(w + wp, sizeof w - (size_t)wp, "%s%s", wp ? " " : "", name); } while (0)
+    FD_W(ok != s_fdc.drawn, "drawn");
+    if (ok && s_fdc.drawn) {
+        FD_W(!s_fdc.cont, "pass-not-continued");
+        FD_W(!s_fdc.known || s_fdc.special, "special");
+        FD_W(s_fdc.rec, "dynamic-state-recorded");
+        FD_W(s_fdc.pipe != pipe, "pipeline");
+        FD_W(s_fdc.set != set, "descriptor-set");
+        FD_W(memcmp(&s_fdc.vp, &vp, sizeof vp), "viewport");
+        FD_W(memcmp(&s_fdc.sc, &sc, sizeof sc), "scissor");
+        FD_W(s_fdc.sref != sref, "stencil-ref");
+        FD_W(s_fdc.vb != b || s_fdc.vo != o || s_fdc.ib != ibb || s_fdc.io != io || s_fdc.icount != index_count, "buffers");
+    }
+#undef FD_W
+    if (!wp) return;
+    g_eng_fd_be[7]++;
+    static u32 nd;
+    if (nd++ >= 64u && (nd & 1023u)) return;
+    fprintf(stderr, "[fastdraw-verify] backend #%u: the whole draw differs from the fast record (%s; rec 0x%X)\n", nd, w, s_fdc.rec);
+}
+static void vk_eng_draw_vbuf_ib_again(void* user, rsx_topology topology, u32 vb, u32 vertex_count, u32 stride,
+                                      u32 ib, u32 index_count)
+{
+    VkDeviceSize ub = 0, lead = 0;
+    const int why = s_fdb.on > 0 ? vk_fd_check(topology, stride, &ub, &lead) : 5;
+    if (why) {
+        g_eng_fd_be[why]++;
+        vk_eng_draw_vbuf_ib(user, topology, vb, vertex_count, stride, ib, index_count);
+        return;
+    }
+    if (s_fdb.verify) { vk_fd_verify(user, topology, vb, vertex_count, stride, ib, index_count); return; }
+    g_eng_fd_be[0]++;
+    if (__builtin_expect(s_mg.on != 0, 0) && vk_mg_on()) {   /* PS3RECOMP_VK_MERGE_STATS: the backend's draw, timed */
+        const u64 t0 = vk_mg_tsc();
+        vk_fd_record(vb, vertex_count, stride, ib, index_count, ub, lead);
+        s_mg.t_be += vk_mg_tsc() - t0;
+        return;
+    }
+    vk_fd_record(vb, vertex_count, stride, ib, index_count, ub, lead);
 }
 
 /* ---- E5: the GPU light path -----------------------------------------------
@@ -9008,6 +9275,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .vbuf_release         = vk_eng_vbuf_release,
     .draw_vbuf            = vk_eng_draw_vbuf,
     .draw_vbuf_ib         = vk_eng_draw_vbuf_ib,
+    .draw_vbuf_ib_again   = vk_eng_draw_vbuf_ib_again,   /* (fastdraw) */
     .vbuf_prefetch        = vk_eng_vbuf_prefetch,
     .vs_constants_gen     = vk_eng_vs_constants_gen,
     .clear_color          = vk_eng_clear_color,
