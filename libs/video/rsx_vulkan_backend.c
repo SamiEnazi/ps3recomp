@@ -60,6 +60,7 @@
 #include "vulkan/rsx_vk_passes_glsl.h"
 #include "vk_postfx.h"                           /* [postfx] AA, sharpening, anisotropy */
 #include "../../include/ps3emu/ps3_ftrace.h"    /* PS3_FTRACE: GPU_WAIT spans at each fence wait */
+#include "../../include/ps3emu/ps3_toggles.h"   /* PS3_TOGGLE_FILE: PS3RECOMP_VK_BIAS_RESET live */
 #include "../../include/ps3emu/ps3_settings.h"  /* [overlay] PC settings the in-game menu changes live */
 #include "../../include/ps3emu/ps3_lightfx.h"   /* [light] the menu's Lighting page: AO, light dither */
 #include "vk_overlay.h"                          /* [overlay] HUD + settings menu (vk_overlay.cpp) */
@@ -7427,11 +7428,12 @@ static int vk_vb_get(u32 h, VkDeviceSize bytes, VkBuffer* buf, VkDeviceSize* off
 
 /* The state the open engine pass last recorded. Within one run of draws in a
  * pass nothing else records into it (any other operation ends the pass first,
- * vk_begin), and every engine pipeline declares viewport, scissor, stencil
- * reference and depth bias dynamic, so a bind or set that repeats the last
- * one is skipped: of the ~9 commands a draw recorded, most repeated the draw
- * before (a building's pieces share pipeline, viewport, scissor, stencil and,
- * from the vertex cache, often the buffer). Forgotten at every pass start.
+ * vk_begin), and every engine pipeline declares viewport, scissor and stencil
+ * reference dynamic (depth bias only the polygon-offset variants, vk_idx bit
+ * 2), so a bind or set that repeats the last one is skipped: of the ~9
+ * commands a draw recorded, most repeated the draw before (a building's
+ * pieces share pipeline, viewport, scissor, stencil and, from the vertex
+ * cache, often the buffer). Forgotten at every pass start.
  * PS3RECOMP_VK_STATE_FILTER=0 records everything. */
 static struct {
     int          valid;
@@ -7445,6 +7447,25 @@ static struct {
     VkDeviceSize vo, io;
 } s_ecs;
 static unsigned long long s_ecs_skipped;
+/* PS3RECOMP_VK_BIAS_RESET (live, default 1; 0 = as before): a pipeline
+ * without polygon offset (vk_idx bit 2 clear) declares the depth bias static,
+ * and binding it makes the dynamic depth bias set earlier in the pass invalid
+ * (Vulkan: dynamic state persists "until modified by another dynamic state
+ * setting command, or made invalid by another pipeline bind with that state
+ * specified as static"). The filter above kept counting it as set, so the
+ * next polygon-offset draw with the same factors skipped vkCmdSetDepthBias
+ * and drew with the static pipeline's 0. inFAMOUS 2's character shadow map
+ * (zeta 0x0F2F0000, read by the bit-7 receivers' mask FP 25f427a67ef667f7,
+ * whose own reference bias is 0) is exactly that run: second-depth world
+ * casters (cull FRONT, no offset) between the characters (no cull, polygon
+ * offset on: slope 1, 2000 units -- the game's caster draw item 0x0014287C
+ * wraps its draw in POLY_OFFSET_FILL on/off) -- only the pass's first offset
+ * draw got its bias, the characters met their own depth: the contour stripes
+ * on faces and clothes in the dock cutscene (Kuo). RPCS3 sets the bias at
+ * every draw. 1: such a bind clears the filter's flag, so the next offset draw
+ * sets its bias again. */
+static int s_bias_reset = -1;
+static void vk_bias_reset_set(int id, int v) { (void)id; __atomic_store_n(&s_bias_reset, v != 0, __ATOMIC_RELAXED); }
 
 /* One draw: vertices from host memory (staged) or from a persistent buffer
  * (pvb/pvo), indices likewise -- host, persistent (pib/pio) or none. */
@@ -7747,6 +7768,11 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
     if (use_bias && (!bias_set || s_ecs.bc != s_e2.bias_const || s_ecs.bs != s_e2.bias_slope)) {
         pvkCmdSetDepthBias(s_vk.cmd, s_e2.bias_const, 0.0f, s_e2.bias_slope);
         bias_set = 1; s_ecs.bc = s_e2.bias_const; s_ecs.bs = s_e2.bias_slope;
+    }
+    if (!use_bias) {   /* PS3RECOMP_VK_BIAS_RESET: this pipeline's depth bias is static */
+        int br = __atomic_load_n(&s_bias_reset, __ATOMIC_RELAXED);
+        if (__builtin_expect(br < 0, 0)) br = ps3_toggle_watch(PS3T_VK_BIAS_RESET, vk_bias_reset_set) != 0;
+        if (br) bias_set = 0;
     }
     { const u32 dyn[2] = { (u32)ubase, (u32)ps_dyn };
       pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_g.pipe_layout,
