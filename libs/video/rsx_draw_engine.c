@@ -2612,6 +2612,31 @@ static inline u32 eng_tkey_of(const eng_texture* e)
                     e->pitch, e->remap, e->cubemap, e->depth);
 }
 static u32 s_tex_tgen = 1;   /* (rsx-vtx) PS3RECOMP_ENG_TEX_MEMO: moves with every index change */
+/* (fastdraw, PS3RECOMP_ENG_DELTA_STATS=2) texture binds through the memo / the
+ * probe, pipeline lookups / texture-mask cache hits / key memo hits, counted
+ * here and charged to the draw's path by sink_end */
+static u64 s_dlx_ts[2], s_dlx_pk[3];
+/* ... and the pair memo's misses by reason (none recorded, signature, IO remap,
+ * entry gone, spans written, stamp; [7]: of the signature misses, the one this
+ * index entry had the draw before last) and its refusals to record (no
+ * signature, entry not tracked, no spans, more than two spans, tracking mode,
+ * span too long; [7]: spans of the refused, summed) */
+static u64 s_dlx_pm[8], s_dlx_pn[8];
+static u64 s_dlx_psig[2][16384];   /* the last two signatures noted per index entry (ENG_IC_SIZE) */
+/* (fastdraw) PS3RECOMP_FASTDRAW2 (default 1; 0 = round 1 exactly): the pair
+ * memo's ways in use (ENG_PAIR_WAYS, or 1) and the way eng_pair_try's hit came
+ * from; s_fd_verify / the counters are rsx_draw_fast.inc's (tentative here). */
+#define ENG_PAIR_WAYS 4u
+static u32 s_pair_ways = 1u, s_pair_way;
+static int s_fd_verify;
+static struct { u64 way0, wayn, miss, vchk, vdiff; } s_fd2n;
+static void fd2_pair_vfail(const char* what)
+{
+    s_fd2n.vdiff++;
+    static u32 n;
+    if (n++ >= 64u && (n & 1023u)) return;
+    fprintf(stderr, "[fastdraw-verify] pair memo #%u: a way past the first was wrong (%s)\n", n, what);
+}
 static void eng_tidx_rebuild(void)
 {
     s_tex_tgen++;
@@ -2737,6 +2762,7 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
         eng_texture* e = &g.textures[tm->index];
         if (e->handle && e->last_hash_frame == g.frames && e->ws_frame == g.frames && e->levels == levels &&
             !(e->icon_atlas && e->icon_gen != s_icon_gen)) {
+            s_dlx_ts[0]++;   /* (fastdraw) */
             e->last_use_serial = ++g.texture_use_serial;
             s_slot_hash = e->content_hash;
             return e->handle;
@@ -2746,6 +2772,7 @@ static u32 eng_texture_slot_impl(u32 location, u32 offset, u32 fmt, u32 w, u32 h
     /* The span (a mip-chain walk) is kept with the entry: the key holds
      * everything it depends on except the level count, which is checked. */
     if (__builtin_expect(s_tex_retry < 0, 0)) { const char* r = getenv("PS3RECOMP_ENG_TEX_RETRY"); s_tex_retry = !(r && *r == '0'); }
+    s_dlx_ts[1]++;   /* (fastdraw) */
     u32 retry_index = ~0u;
     for (u32 p = eng_tkey(location, offset, fmt, w, h, pitch, remap, (u32)(cube != 0), depth);
          s_tidx[p]; p = (p + 1) & (ENG_TIDX_SIZE - 1u)) {
@@ -3861,6 +3888,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                        dm.epoch == __atomic_load_n(&s_shadow_epoch, __ATOMIC_RELAXED) && dm.fp == fp &&
                        (fixed || (dm.fps == fp->structural && dm.gc == fp->gamma_cand &&
                                   dm.ec == fp->expand_cand && dm.su == fp->sampled_units));
+    s_dlx_pk[0]++; s_dlx_pk[1] += (u64)(dm_hit != 0);   /* (fastdraw) */
     u32 cube_mask, vol_mask, gamma_units = 0, expand_units = 0, shadow_mask = 0;
     u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
     u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
@@ -4011,6 +4039,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         (!s_fbf.cand || (!memcmp(kmemo.fbf_att, s_fbf.att, sizeof s_fbf.att) &&
                          !memcmp(kmemo.fbf_sel, s_fbf.sel, sizeof s_fbf.sel)))) {
         key = kmemo.key;
+        s_dlx_pk[2]++;   /* (fastdraw) */
         goto key_done;
     }
     key = 1469598103934665603ull;
@@ -4832,15 +4861,22 @@ typedef struct {
     u16 next;                    /* PS3RECOMP_ENG_PREFETCH: the entry the next draw used, index + 1 */
     u64 wt_stamp, wt_content;
     /* (rsx-vtx) PS3RECOMP_ENG_PAIR_MEMO: the vertex-cache entry an index-cache
-     * hit drew from last time, and what it took to find it (eng_pair_try). */
+     * hit drew from last time, and what it took to find it (eng_pair_try).
+     * (fastdraw) ENG_PAIR_WAYS of them with PS3RECOMP_FASTDRAW2 (one without):
+     * the same index list is drawn by more than one pass a frame -- the shadow
+     * cascades' position-only layout and the main pass's -- and with one memo
+     * each user found the other's entry and took the whole search (dock: ~2,100
+     * a frame, 61% of them the entry before last). The ways' signatures sit
+     * together, so a lookup reads one line. */
     struct {
-        u64 sig;                 /* eng_pair_sig of that draw (0: none) */
-        u64 vkey;                /* the vertex-cache entry's key */
-        const u8* host[2];       /* its merged guest spans (host pointers) */
-        u32 len[2];
-        u32 xgen;                /* g_gcm_xlate_gen then */
-        u16 vidx;                /* its slot in s_vc */
-        u8 n;                    /* spans */
+        u64 sig[ENG_PAIR_WAYS];  /* eng_pair_sig of that draw (0: none) */
+        u64 vkey[ENG_PAIR_WAYS]; /* the vertex-cache entry's key */
+        const u8* host[ENG_PAIR_WAYS][2];   /* its merged guest spans (host pointers) */
+        u32 len[ENG_PAIR_WAYS][2];
+        u32 xgen[ENG_PAIR_WAYS]; /* g_gcm_xlate_gen then */
+        u16 vidx[ENG_PAIR_WAYS]; /* its slot in s_vc */
+        u8 n[ENG_PAIR_WAYS];     /* spans */
+        u8 next;                 /* the way a new signature takes next */
     } pair;
 } __attribute__((aligned(64))) eng_ic_entry;
 #define ENG_IC_SIZE   16384u
@@ -5068,32 +5104,57 @@ static u64 eng_pair_sig(const rsx_vertex_layout_plan* layout, u32 base_index, co
 /* The remembered vertex-cache entry when it still answers this draw, else NULL. */
 static eng_vc_entry* eng_pair_try(const eng_ic_entry* e, u64 sig, const rsx_vertex_layout_plan* layout)
 {
-    if (!e->pair.sig || e->pair.sig != sig ||
-        e->pair.xgen != __atomic_load_n(&g_gcm_xlate_gen, __ATOMIC_ACQUIRE))
+    /* (fastdraw) the way holding this signature (one way: way 0, as before) */
+    u32 w = 0;
+    while (w < s_pair_ways && e->pair.sig[w] != sig) w++;
+    if (w == s_pair_ways || !e->pair.sig[w] ||
+        e->pair.xgen[w] != __atomic_load_n(&g_gcm_xlate_gen, __ATOMIC_ACQUIRE)) {
+        /* (fastdraw) PS3RECOMP_ENG_DELTA_STATS=2: why */
+        const int r = !e->pair.sig[0] ? 0 : w == s_pair_ways ? 1 : 2;
+        s_dlx_pm[r]++;
+        if (r == 1 && s_dlx_psig[1][(u32)(e - s_ic) & 16383u] == sig) s_dlx_pm[7]++;
         return NULL;
-    eng_vc_entry* ve = &s_vc[e->pair.vidx];
-    if (ve->key != e->pair.vkey || !ve->vbuf || !ve->wt_ok || ve->unhashed || ve->skip_until > g.frames ||
-        ve->n != e->span || ve->stride != layout->stride || ve->content != ve->wt_content)
+    }
+    s_pair_way = w;
+    eng_vc_entry* ve = &s_vc[e->pair.vidx[w]];
+    if (ve->key != e->pair.vkey[w] || !ve->vbuf || !ve->wt_ok || ve->unhashed || ve->skip_until > g.frames ||
+        ve->n != e->span || ve->stride != layout->stride || ve->content != ve->wt_content) {
+        s_dlx_pm[3]++;
         return NULL;
+    }
     u64 st = 0;
-    for (u32 k = 0; k < e->pair.n; k++)
-        if (!rsx_wt_query(e->pair.host[k], e->pair.len[k], &st)) return NULL;
-    return st == ve->wt_stamp ? ve : NULL;
+    for (u32 k = 0; k < e->pair.n[w]; k++)
+        if (!rsx_wt_query(e->pair.host[w][k], e->pair.len[w][k], &st)) { s_dlx_pm[4]++; return NULL; }
+    if (st != ve->wt_stamp) { s_dlx_pm[5]++; return NULL; }
+    return ve;
 }
 /* After the whole way found `ve` for an index-cache hit: remember it. */
 static void eng_pair_note(eng_ic_entry* e, const eng_vc_entry* ve, u64 sig, u32 xgen)
 {
-    e->pair.sig = 0;
-    if (!sig || !ve->wt_ok || !s_vcp_nm || s_vcp_nm > 2u || rsx_wt_mode() != 1) return;
-    for (u32 k = 0; k < s_vcp_nm; k++) {
-        if (s_vcp_mn[k] > 0xFFFFFFFFull) return;
-        e->pair.host[k] = s_vcp_ms[k]; e->pair.len[k] = (u32)s_vcp_mn[k];
+    /* (fastdraw) the way this signature has, else the next one round (one
+     * way: way 0, as before) */
+    u32 w = 0;
+    if (s_pair_ways > 1u) {
+        while (w < s_pair_ways && e->pair.sig[w] != sig) w++;
+        if (w == s_pair_ways) { w = e->pair.next % s_pair_ways; e->pair.next = (u8)((w + 1u) % s_pair_ways); }
     }
-    e->pair.n = (u8)s_vcp_nm;
-    e->pair.vkey = ve->key;
-    e->pair.vidx = (u16)(ve - s_vc);
-    e->pair.xgen = xgen;
-    e->pair.sig = sig;
+    e->pair.sig[w] = 0;
+    { const u32 ei = (u32)(e - s_ic) & 16383u;   /* (fastdraw) DELTA_STATS=2: the signatures this entry was noted with */
+      if (s_dlx_psig[0][ei] != sig) { s_dlx_psig[1][ei] = s_dlx_psig[0][ei]; s_dlx_psig[0][ei] = sig; } }
+    if (!sig || !ve->wt_ok || !s_vcp_nm || s_vcp_nm > 2u || rsx_wt_mode() != 1) {
+        s_dlx_pn[!sig ? 0 : !ve->wt_ok ? 1 : !s_vcp_nm ? 2 : s_vcp_nm > 2u ? 3 : 4]++;
+        s_dlx_pn[7] += s_vcp_nm;
+        return;
+    }
+    for (u32 k = 0; k < s_vcp_nm; k++) {
+        if (s_vcp_mn[k] > 0xFFFFFFFFull) { s_dlx_pn[5]++; return; }
+        e->pair.host[w][k] = s_vcp_ms[k]; e->pair.len[w][k] = (u32)s_vcp_mn[k];
+    }
+    e->pair.n[w] = (u8)s_vcp_nm;
+    e->pair.vkey[w] = ve->key;
+    e->pair.vidx[w] = (u16)(ve - s_vc);
+    e->pair.xgen[w] = xgen;
+    e->pair.sig[w] = sig;
 }
 
 /* (rsx-vtx) PS3RECOMP_ENG_FETCH_FAST (default 1; 0 = rsx_vertex_fetch_all
@@ -5134,12 +5195,18 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             /* (rsx-vtx) PS3RECOMP_ENG_PAIR_MEMO: the vertex entry this index
              * entry drew from last time, when nothing it was found by moved */
             u64 psig = 0; u32 pxgen = 0;
+            eng_vc_entry* pv_chk = NULL;   /* (fastdraw) VERIFY: what a later way said */
             if (eng_pair_on()) {
-                if (e->pair.sig) __builtin_prefetch(&s_vc[e->pair.vidx], 0, 3);
+                if (e->pair.sig[0]) __builtin_prefetch(&s_vc[e->pair.vidx[0]], 0, 3);
                 pxgen = __atomic_load_n(&g_gcm_xlate_gen, __ATOMIC_ACQUIRE);
                 psig = eng_pair_sig(layout, base_index, e);
                 eng_vc_entry* pv = eng_pair_try(e, psig, layout);
+                /* (fastdraw) PS3RECOMP_ENG_FASTDRAW_VERIFY: a hit from a way past
+                 * the first (what one way would have missed) takes the search
+                 * below instead, which must find the same entry */
+                if (pv && s_pair_way && s_fd_verify) { pv_chk = pv; pv = NULL; s_fd2n.vchk++; }
                 if (pv) {
+                    if (s_pair_way) s_fd2n.wayn++; else s_fd2n.way0++;   /* (fastdraw) */
                     ENG_CACHE_PREDICT(s_vc, s_vc_prev, pv);
                     dc.refs[0].vertex_id = e->lo; dc.refs[0].base_index = base_index;
                     dc.refs_lazy = e->span > 1u; dc.lazy_base = base_index;
@@ -5153,6 +5220,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                     return;
                 }
                 ds_pair_miss++;
+                if (!pv_chk) s_fd2n.miss++;   /* (fastdraw) */
             }
             eng_plan_init(layout);
             rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, NULL, 0);
@@ -5176,6 +5244,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             eng_vc_entry* ve = eng_vc_probe(layout, &vc_content);
             if (ve && ve->vbuf && ve->content == vc_content &&
                 ve->n == dc.n_refs && ve->stride == layout->stride) {
+                if (pv_chk && ve != pv_chk) fd2_pair_vfail("the search found another vertex-cache entry");   /* (fastdraw) */
                 ve->last_frame = g.frames;
                 dc.vbuf = ve->vbuf; dc.vbuf_hit = 1; dc.n_verts = dc.n_refs;
                 e->last_frame = g.frames;
@@ -5185,8 +5254,9 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                 return;
             }
             /* The vertices changed: the whole way, as if nothing were cached. */
+            if (pv_chk) fd2_pair_vfail("the search found the vertices changed");   /* (fastdraw) */
             dc.n_refs = dc.n_source_refs = 0; dc.refs_remapped = 0; dc.refs_lazy = 0;
-            dc.consecutive = 0; e->pair.sig = 0;
+            dc.consecutive = 0; memset(e->pair.sig, 0, sizeof e->pair.sig);
         }
         if (s_ic_cur) ds_ic_miss++;
     }
@@ -6228,6 +6298,8 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
         if (dc.vbuf) g.be->vbuf_prefetch(g.be->user, dc.vbuf);
         if (s_ic_hit && s_ic_cur && s_ic_cur->ibuf) g.be->vbuf_prefetch(g.be->user, s_ic_cur->ibuf);
     }
+    if (__builtin_expect(s_dl_cost != 0, 0))   /* (fastdraw) pair memo (or the delta's take) / vertex-cache probe / fetched */
+        s_dlc.vx[s_dl_path][s_dl_pv ? 0 : (s_ic_hit && dc.vbuf_hit) ? 1 : 2]++;
     DL_MARK(2);
     const u64 ds_t0 = eng_ds_enabled() ? eng_ds_now() : 0;
     u64 ds_m = ds_t0;   /* stage marks within the rest of sink_end */
@@ -6318,10 +6390,11 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
     DS_MARK(ns_bind);   /* render state, targets, zeta: counted with binds */
     DL_MARK(3);
     u32 tex_mask;
-    if (dl_use & DL_TEX) dl_tex_take(textures, samplers, &tex_mask);
+    if (dl_use & DL_TEX) { dl_tex_take(textures, samplers, &tex_mask); DL_MARK(4); }
     else {
         tex_mask = sink_bind_textures(targets, n_targets, zslot,
                                       textures, samplers);
+        DL_MARK(4);
         tex_mask = eng_depth_bounds_prepare(zslot, &rs, target, dc.n_verts, tex_mask, textures, samplers);
     }
     /* PS3RECOMP_ENG_TEXSTATE=1: for a full-screen draw (<= 4 vertices) into
@@ -6378,7 +6451,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
      * program would draw the geometry in the wrong colours, which is harder to
      * see than a missing object and hides the translation failure. */
     DS_MARK(ns_tex);
-    DL_MARK(4);
+    DL_MARK(5);
     int pipeline_is_fixed = 1;
     u32 pipeline;
     if (dl_use & DL_PIPE) {
@@ -6393,7 +6466,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
     if (!pipeline) { eng_drop("pipeline", prim); return; }
     eng_fbf_fallback(textures);   /* PS3RECOMP_ENG_FBFETCH */
     DS_MARK(ns_pipe);
-    DL_MARK(5);
+    DL_MARK(6);
     /* PS3RECOMP_ENG_REGDUMP_PIPE=<p>[,<p>..]: the whole RSX register file (the
      * non-zero words) at the first draw of each listed pipeline, so two passes
      * can be diffed register by register -- which state a pass sets that the
@@ -6817,7 +6890,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
           }
       } }
 
-    DL_MARK(6);
+    DL_MARK(7);
     /* The depth attachment is cleared the first time it is bound, so a title
      * that never clears its shadow zeta still tests against something. */
     const u32 depth_handle = (zslot != ENG_INVALID) ? g.zdepths[zslot].handle : 0;
@@ -6843,7 +6916,7 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
-    DL_MARK(7);
+    DL_MARK(8);
     /* PS3RECOMP_ENG_HUDLOG=<sec>: DIAGNOSTIC (PS3_ASPECT). Every draw without
      * a depth test into a single target, for the first world frame <sec>
      * seconds after the first draw and the two after it (a game frame spans
@@ -7131,11 +7204,18 @@ static void sink_end(void* user, const rsx_dispatch* r)
             const u64 c0 = dl_tsc(), c1 = dl_tsc();
             s_dlc.cal += c1 - c0; s_dlc.caln++;
         }
+        u64 x0[5] = { 0, 0, 0, 0, 0 };
+        if (s_dl_cost) { x0[0] = s_dlx_ts[0]; x0[1] = s_dlx_ts[1]; x0[2] = s_dlx_pk[0]; x0[3] = s_dlx_pk[1]; x0[4] = s_dlx_pk[2]; }
         const u64 t0 = dl_tsc();
         s_dl_path = DLP_WHOLE; s_dl_mt = t0;
         sink_end_body(user, r);
         const u64 t1 = dl_tsc();
-        if (s_dl_cost) s_dlc.st[s_dl_path][DLM_N - 1u] += t1 - s_dl_mt;
+        if (s_dl_cost) {
+            s_dlc.st[s_dl_path][DLM_N - 1u] += t1 - s_dl_mt;
+            s_dlc.ts[s_dl_path][0] += s_dlx_ts[0] - x0[0]; s_dlc.ts[s_dl_path][1] += s_dlx_ts[1] - x0[1];
+            s_dlc.pk[s_dl_path][0] += s_dlx_pk[0] - x0[2]; s_dlc.pk[s_dl_path][1] += s_dlx_pk[1] - x0[3];
+            s_dlc.pk[s_dl_path][2] += s_dlx_pk[2] - x0[4];
+        }
         s_dlc.pt[s_dl_path] += t1 - t0; s_dlc.pn[s_dl_path]++;
         g_eng_bst_t = 0;
         s_dlc.ticks += t1 - t0;

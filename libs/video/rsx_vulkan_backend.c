@@ -1226,7 +1226,7 @@ static void vk_gprof_collect(void)
  * backend lines); binds then bump the epoch only when they change something,
  * so the engine's verify (which sends every bind again) leaves the token. */
 static u32 s_vk_bind_epoch;
-static struct { int on, verify; } s_fdb = { -1, 0 };
+static struct { int on, verify, two; } s_fdb = { -1, 0, 0 };   /* two: PS3RECOMP_FASTDRAW2 */
 #define VK_FD_BUMP(changed) do { if (!s_fdb.verify || (changed)) s_vk_bind_epoch++; } while (0)
 static struct {
     int valid;
@@ -1236,6 +1236,18 @@ static struct {
     VkViewport vp; VkRect2D sc;
 } s_fdt;
 extern u64 g_eng_fd_be[10];   /* the engine's [fastdraw] counters (rsx_draw_fast.inc) */
+extern u64 g_eng_fd2[4];      /* ... and round 2's (the set memo) */
+/* the draw engine's cost counters (PS3RECOMP_ENG_DELTA_STATS=2, rsx_draw_delta.inc): VK_BST's
+ * stage marks, the descriptor-set split, the sampler searches */
+extern u64 g_eng_bst_t;
+extern u32 g_eng_bst_on, g_eng_bst_path;
+extern u64 g_eng_bst[8][8];
+extern u64 g_eng_bset[8][4], g_eng_bsetn[8][3], g_eng_bsamp[8][2];
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+static inline u64 vk_fd_tsc(void) { return __builtin_ia32_rdtsc(); }
+#else
+static inline u64 vk_fd_tsc(void) { return 0; }
+#endif
 static void vk_fd_init(void);
 
 /* ---------------------------------------------------------------------------
@@ -6985,6 +6997,10 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
                   | ((u64)(d->wrap_t & 0xF) << 8) | ((u64)(d->wrap_r & 0xF) << 12)
                   | ((u64)(lo >> 16) << 16) | ((u64)(hi >> 16) << 32)
                   | ((u64)aniso << 48);    /* [postfx] a new level keys new samplers */
+    if (__builtin_expect(g_eng_bst_on != 0, 0) && g_eng_bst_t) {   /* (fastdraw) DELTA_STATS=2: the search's length */
+        u32 i = 0; while (i < s_esamp_count && s_esamp[i].key != key) i++;
+        g_eng_bsamp[g_eng_bst_path][0]++; g_eng_bsamp[g_eng_bst_path][1] += i < s_esamp_count ? i + 1u : s_esamp_count;
+    }
     for (u32 i = 0; i < s_esamp_count; i++) if (s_esamp[i].key == key) return s_esamp[i].s;
     if (s_esamp_count >= VK_ENG_SAMP_CACHE) {
         rsx_lim_event(RSX_LIM_VK_SAMP, 0, "sampler table full: the default sampler (wrong filter/wrap) is used");
@@ -7166,15 +7182,30 @@ static VkDescriptorSet vk_eng_batch_set(VkBuffer ubuf)
      * ~4% of the RSX thread. */
     static int memo_on = -1;
     if (memo_on < 0) { const char* e = getenv("PS3RECOMP_VK_DSET_MEMO"); memo_on = !(e && e[0] == '0'); }
-    static struct {
+    typedef struct {
         int valid, aniso;
         u32 obj_gen, dset_gen, pipeline, tex_mask, vs, ps;
         VkBuffer ubuf;
         u32 tex[RSX_MAX_TEXTURES];
         rsx_be_sampler_desc samp[RSX_MAX_TEXTURES];
         VkDescriptorSet set;
-    } m;
+    } vk_dsm;
+    static vk_dsm m;
+    /* (fastdraw) PS3RECOMP_FASTDRAW2: the sets of recent draws by what they
+     * were made from, as m holds the last one (the same fields, the same
+     * rules): a draw that brings back a material of a few draws before --
+     * a texture change at the dock, 55% of them found the set in the table --
+     * takes its set without building the sixteen views and samplers and the
+     * table key. VERIFY builds them anyway and compares the key. */
+#define VK_DSM_N 512u
+    static vk_dsm dsm[VK_DSM_N];
+    static vk_dset_key dsm_key[VK_DSM_N];
+    static u8 dsm_key_ok[VK_DSM_N];
     const int memo = memo_on && reuse;
+    /* (fastdraw) DELTA_STATS=2: the four steps' ticks and how the set was found */
+    const int bs_on = __builtin_expect(g_eng_bst_on != 0, 0) && g_eng_bst_t;
+    u64 bs_t = bs_on ? vk_fd_tsc() : 0;
+#define VK_BSET(k) do { if (bs_on) { const u64 _t = vk_fd_tsc(); g_eng_bset[g_eng_bst_path][k] += _t - bs_t; bs_t = _t; } } while (0)
     const u32 m_vs = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, m_ps = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
     const int m_aniso = memo ? vk_postfx_aniso() : 0;
     if (memo && m.valid && m.obj_gen == s_eobj_gen && m.dset_gen == s_dset_gen && m.ubuf == ubuf &&
@@ -7183,11 +7214,40 @@ static VkDescriptorSet vk_eng_batch_set(VkBuffer ubuf)
         int same = 1;
         for (u32 u = 0; u < RSX_MAX_TEXTURES && same; u++)
             if (((s_e2.tex_mask >> u) & 1u) && memcmp(&m.samp[u], &s_e2.samp[u], sizeof m.samp[u])) same = 0;
-        if (same) { s_dset_hit++; return m.set; }
+        if (same) { s_dset_hit++; VK_BSET(0); if (bs_on) g_eng_bsetn[g_eng_bst_path][0]++; return m.set; }
     }
+    /* (fastdraw) the memo of recent sets: the slot from the units' handles */
+    const int two = memo && s_fdb.two > 0;
+    u32 dslot = 0;
+    int dsm_vchk = 0;   /* VERIFY: the slot's set is to be checked against the key built below */
+    if (two) {
+        u64 dh = 0x9E3779B97F4A7C15ull ^ ((u64)s_e2.pipeline << 32) ^ s_e2.tex_mask;
+        for (u32 u = 0; u < RSX_MAX_TEXTURES; u++)
+            if ((s_e2.tex_mask >> u) & 1u) dh = (dh ^ s_e2.tex[u]) * 0x100000001B3ull;
+        dh ^= dh >> 31;
+        dslot = (u32)dh & (VK_DSM_N - 1u);
+        g_eng_fd2[1]++;
+        const vk_dsm* d = &dsm[dslot];
+        if (d->valid && d->obj_gen == s_eobj_gen && d->dset_gen == s_dset_gen && d->ubuf == ubuf &&
+            d->vs == m_vs && d->ps == m_ps && d->pipeline == s_e2.pipeline && d->tex_mask == s_e2.tex_mask &&
+            d->aniso == m_aniso && !memcmp(d->tex, s_e2.tex, sizeof d->tex)) {
+            int same = 1;
+            for (u32 u = 0; u < RSX_MAX_TEXTURES && same; u++)
+                if (((s_e2.tex_mask >> u) & 1u) && memcmp(&d->samp[u], &s_e2.samp[u], sizeof d->samp[u])) same = 0;
+            if (same && s_fdb.verify && dsm_key_ok[dslot]) dsm_vchk = 1;
+            else if (same) {
+                m = *d;                                 /* the last set again is this one */
+                s_dset_hit++; g_eng_fd2[0]++;
+                VK_BSET(0); if (bs_on) g_eng_bsetn[g_eng_bst_path][0]++;
+                return d->set;
+            }
+        }
+    }
+    VK_BSET(0);
     m.valid = 0;
     VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], si[RSX_MAX_TEXTURES];
     vk_eng_image_infos(ii, si);
+    VK_BSET(1);
     if (memo) {   /* filled now; valid once the set below exists */
         m.obj_gen = s_eobj_gen; m.pipeline = s_e2.pipeline; m.tex_mask = s_e2.tex_mask;
         m.vs = m_vs; m.ps = m_ps; m.aniso = m_aniso; m.ubuf = ubuf;
@@ -7210,12 +7270,29 @@ static VkDescriptorSet vk_eng_batch_set(VkBuffer ubuf)
         h = (h ^ (u64)(uintptr_t)k.smp[u]) * 0x100000001B3ull;
     }
     h ^= h >> 29;
+    if (dsm_vchk) {   /* (fastdraw) VERIFY: the memo's set was made from this very key */
+        g_eng_fd2[2]++;
+        if (memcmp(&dsm_key[dslot], &k, sizeof k)) {
+            g_eng_fd2[3]++;
+            static u32 nd;
+            if (nd++ < 64u || !(nd & 1023u))
+                fprintf(stderr, "[fastdraw-verify] set memo #%u: the set of recent draws was made from other views or samplers\n", nd);
+        } else if (memo) {
+            g_eng_fd2[0]++;   /* the memo was right: what it would have handed over, by the table's path below */
+        }
+    }
     const u32 slot = (u32)h & (VK_DSET_CACHE - 1u);
     if (s_dset_tab[slot].gen == s_dset_gen && !memcmp(&s_dset_tab[slot].key, &k, sizeof k)) {
         s_dset_hit++;
         if (memo) { m.set = s_dset_tab[slot].set; m.dset_gen = s_dset_gen; m.valid = m.obj_gen == s_eobj_gen; }
+        if (two && m.valid) {   /* (fastdraw) remembered with what it was made from */
+            dsm[dslot] = m;
+            if (s_fdb.verify) { dsm_key[dslot] = k; dsm_key_ok[dslot] = 1; } else dsm_key_ok[dslot] = 0;
+        }
+        VK_BSET(2); if (bs_on) g_eng_bsetn[g_eng_bst_path][1]++;
         return s_dset_tab[slot].set;
     }
+    VK_BSET(2);
     VkDescriptorSet set = vk_batch_alloc_set();
     if (!set) return VK_NULL_HANDLE;
     vk_eng_write_set(set, ubuf, ii, si);
@@ -7224,6 +7301,12 @@ static VkDescriptorSet vk_eng_batch_set(VkBuffer ubuf)
     s_dset_tab[slot].set = set;
     s_dset_miss++;
     if (memo) { m.set = set; m.dset_gen = s_dset_gen; m.valid = m.obj_gen == s_eobj_gen; }
+    if (two && m.valid) {   /* (fastdraw) remembered with what it was made from */
+        dsm[dslot] = m;
+        if (s_fdb.verify) { dsm_key[dslot] = k; dsm_key_ok[dslot] = 1; } else dsm_key_ok[dslot] = 0;
+    }
+    VK_BSET(3); if (bs_on) g_eng_bsetn[g_eng_bst_path][2]++;
+#undef VK_BSET
     return set;
 }
 
@@ -7553,9 +7636,6 @@ static inline u64 vk_mg_tsc(void)
 /* (fastdraw) the draw engine's counters (PS3RECOMP_ENG_DELTA_STATS, rsx_draw_delta.inc):
  * the backend's draw split by stage, ticks since the last mark into the
  * engine's table for the draw's path; g_eng_bst_t == 0: not an engine draw call */
-extern u64 g_eng_bst_t;
-extern u32 g_eng_bst_on, g_eng_bst_path;
-extern u64 g_eng_bst[4][8];
 #define VK_BST(k) do { if (__builtin_expect(g_eng_bst_on != 0, 0) && g_eng_bst_t) { const u64 _t = vk_mg_tsc(); \
     g_eng_bst[g_eng_bst_path][k] += _t - g_eng_bst_t; g_eng_bst_t = _t; } } while (0)
 static int vk_mg_on(void)
@@ -8130,6 +8210,8 @@ static void vk_fd_init(void)
     const char* v = getenv("PS3RECOMP_ENG_FASTDRAW_VERIFY");
     s_fdb.on = !(e && e[0] == '0') && !(b && b[0] == '0');
     s_fdb.verify = s_fdb.on && v && v[0] && v[0] != '0';
+    const char* f2 = getenv("PS3RECOMP_FASTDRAW2");
+    s_fdb.two = !(f2 && f2[0] == '0');
     s_fdt.valid = 0;
 }
 /* 0: the token holds for this draw (what may stop it: g_eng_fd_be's slots);

@@ -45,7 +45,7 @@
  */
 
 static int s_fd_on = -1;                  /* 1 on (default), 0 off, -1 not read yet */
-static int s_fd_verify;                   /* PS3RECOMP_ENG_FASTDRAW_VERIFY */
+/* s_fd_verify (PS3RECOMP_ENG_FASTDRAW_VERIFY) is declared with the pair memo (rsx_draw_engine.c) */
 static int s_fd_skipfp;                   /* fd_skipfp_set calls (the first is the registration's own) */
 static void fd_skipfp_set(int id, int v) { (void)id; (void)v; __atomic_add_fetch(&s_fd_skipfp, 1, __ATOMIC_RELAXED); }
 static struct { u64 state, fast; } s_fdn; /* this window: DL_STATE draws, and of them through fd_draw */
@@ -53,6 +53,9 @@ static struct { u64 state, fast; } s_fdn; /* this window: DL_STATE draws, and of
  * (no token, a bind since, the pass ended, sets / objects gone, other, arena
  * full); 7 verify differences; 8 draws verified. */
 u64 g_eng_fd_be[10];
+/* (fastdraw) PS3RECOMP_FASTDRAW2's backend counters: descriptor sets found in
+ * the memo of recent sets, memo-eligible draws; verify checked, differences */
+u64 g_eng_fd2[4];
 
 /* What fd_draw sends (fd_compute; VERIFY compares it with the tail's). */
 typedef struct {
@@ -68,6 +71,12 @@ static void fdv_install(void);
 
 static void fd_init(void)
 {
+    /* (fastdraw) PS3RECOMP_FASTDRAW2: the pair memo's ways (the backend reads
+     * the switch for its set memo, vk_fd_init) */
+    { const char* f2 = getenv("PS3RECOMP_FASTDRAW2");
+      s_pair_ways = (f2 && *f2 == '0') ? 1u : ENG_PAIR_WAYS;
+      fprintf(stderr, "[rsx engine] round 2 (PS3RECOMP_FASTDRAW2): %s -- pair memo %u way(s)\n",
+              s_pair_ways > 1u ? "on" : "off", s_pair_ways); }
     const char* e = getenv("PS3RECOMP_ENG_FASTDRAW");
     int on = !(e && *e == '0');
     const char* why = NULL;
@@ -201,7 +210,7 @@ static void fd_draw(u32 prim, rsx_topology topology, const rsx_vertex_layout_pla
     }
     fd_plan p;
     fd_compute(&p, topology, layout, n_draw, g.fp_cb);
-    DL_MARK(6);
+    DL_MARK(7);
     /* the depth attachment's first clear, as the tail */
     const u32 zslot = s_dl.zslot;
     if (zslot != ENG_INVALID && !g.zdepths[zslot].cleared) {
@@ -217,7 +226,7 @@ static void fd_draw(u32 prim, rsx_topology topology, const rsx_vertex_layout_pla
     if (p.sref_send) g.be->set_stencil_ref(g.be->user, p.sref);
     if (p.bias_send) eng_apply_depth_bias(s_dl.sf.zeta_offset, &s_dl.rs);
     if (p.clamp_send) eng_apply_depth_clip(s_dl.sf.zeta_offset, &s_dl.rs, s_dl.vpt.scale[1]);
-    DL_MARK(7);
+    DL_MARK(8);
     DL_MARK_DRAW0();
     if (g.be->draw_vbuf_ib_again)
         g.be->draw_vbuf_ib_again(g.be->user, p.topology, p.vbuf, p.vcount, p.stride, p.ibuf, p.icount);
@@ -431,20 +440,31 @@ static void fd_report(void)
     u64 bn = 0;
     for (u32 i = 0; i <= 6u; i++) bn += g_eng_fd_be[i];
     const double bd = bn ? 100.0 / (double)bn : 0.0;
-    char line[800];
+    char line[1200];
     int k = snprintf(line, sizeof line, "[fastdraw] short tail %.1f%% of draws (%.1f%% of the all-state ones);"
                      " backend repeated the record for %.1f%% of them, else: no token %.1f%%, a bind since %.1f%%,"
                      " pass ended %.1f%%, sets/objects changed %.1f%%, other %.1f%%, arena full %.1f%%",
                      (double)s_fdn.fast * d, (double)s_fdn.fast * s, (double)g_eng_fd_be[0] * bd,
                      (double)g_eng_fd_be[1] * bd, (double)g_eng_fd_be[2] * bd, (double)g_eng_fd_be[3] * bd,
                      (double)g_eng_fd_be[4] * bd, (double)g_eng_fd_be[5] * bd, (double)g_eng_fd_be[6] * bd);
-    if (s_fd_verify && k > 0 && k < (int)sizeof line - 160)
+    { const double pn = (double)(s_fd2n.way0 + s_fd2n.wayn + s_fd2n.miss);   /* (fastdraw) round 2 */
+      if (k > 0 && k < (int)sizeof line - 200)
+          k += snprintf(line + k, sizeof line - (size_t)k, "; pair memo: way 0 %.1f%%, later ways %.1f%%, missed %.1f%%;"
+                        " set memo of recent sets: %.1f%% of %llu",
+                        pn > 0 ? 100.0 * s_fd2n.way0 / pn : 0.0, pn > 0 ? 100.0 * s_fd2n.wayn / pn : 0.0,
+                        pn > 0 ? 100.0 * s_fd2n.miss / pn : 0.0,
+                        g_eng_fd2[1] ? 100.0 * g_eng_fd2[0] / g_eng_fd2[1] : 0.0, (unsigned long long)g_eng_fd2[1]); }
+    if (s_fd_verify && k > 0 && k < (int)sizeof line - 200)
         k += snprintf(line + k, sizeof line - (size_t)k, "; VERIFY: %llu draws checked, %llu differences;"
-                      " backend %llu checked, %llu differences (totals)",
+                      " backend %llu checked, %llu differences; pair ways %llu checked, %llu differences;"
+                      " set memo %llu checked, %llu differences (totals)",
                       (unsigned long long)s_fdv.checked, (unsigned long long)s_fdv.diffs,
-                      (unsigned long long)g_eng_fd_be[8], (unsigned long long)g_eng_fd_be[7]);
+                      (unsigned long long)g_eng_fd_be[8], (unsigned long long)g_eng_fd_be[7],
+                      (unsigned long long)s_fd2n.vchk, (unsigned long long)s_fd2n.vdiff,
+                      (unsigned long long)g_eng_fd2[2], (unsigned long long)g_eng_fd2[3]);
     if (k > 0 && k < (int)sizeof line - 1) { line[k++] = '\n'; line[k] = 0; }
     rsx_log_line(line, k, (int)sizeof line);
     memset(&s_fdn, 0, sizeof s_fdn);
     for (u32 i = 0; i <= 6u; i++) g_eng_fd_be[i] = 0;
+    s_fd2n.way0 = s_fd2n.wayn = s_fd2n.miss = 0; g_eng_fd2[0] = g_eng_fd2[1] = 0;
 }
