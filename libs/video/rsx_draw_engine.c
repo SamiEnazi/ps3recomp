@@ -89,6 +89,19 @@ static int eng_soft_shadows_apply(const char* v)
  * against a depth map (unit, operator, map size). */
 static int s_poly_offset = -1;
 static void eng_poly_offset_set(int id, int v) { (void)id; __atomic_store_n(&s_poly_offset, v > 0 ? v : 0, __ATOMIC_RELAXED); }
+/* PS3RECOMP_ENG_SOFT_BIAS (live, default 1; 0 = as before): with the Lighting
+ * page's soft shadows (PS3RECOMP_SOFT_SHADOWS = s > 0) a caster's polygon
+ * offset slope factor is multiplied by R = s + 1. The game sizes its casters'
+ * slope-scaled offset (inFAMOUS 2: factor 1) for the RSX's 2x2 filtered
+ * compare, whose taps lie within one map texel of the receiver; the soft
+ * filter's tent reads taps up to R texels away (fp_shadow_helper), and on a
+ * surface sloped to the light such a tap's stored depth is up to R texels'
+ * worth of slope nearer the light than the receiver -- faint contour bands on
+ * the lit side of faces and clothes (the Kuo cutscene at Softer). Only a
+ * positive offset (a caster pushed away from the light) is scaled; off at
+ * s = 0, the game's own filter. */
+static int s_soft_bias = -1;
+static void eng_soft_bias_set(int id, int v) { (void)id; __atomic_store_n(&s_soft_bias, v != 0, __ATOMIC_RELAXED); }
 /* PS3RECOMP_ENG_SHADE_BACKFACE (live, after PS3T_ENG_SHADOW_D24; default 1):
  * inFAMOUS 2 draws its world sun-shadow casters "second-depth" (cull FRONT,
  * no polygon offset: the map holds the casters' back faces; game code
@@ -582,6 +595,12 @@ static void eng_apply_depth_bias(u32 zeta_offset, const rsx_be_render_state* rs)
         if (slope != slope) slope = 0.0f;
         if (constant != constant) constant = 0.0f;
         constant *= units_k * (float)mode;   /* mode > 1: diagnostic multiple */
+        if (slope > 0.0f && constant >= 0.0f) {   /* PS3RECOMP_ENG_SOFT_BIAS */
+            int sbv = __atomic_load_n(&s_soft_bias, __ATOMIC_RELAXED);
+            if (__builtin_expect(sbv < 0, 0)) sbv = ps3_toggle_watch(PS3T_ENG_SOFT_BIAS, eng_soft_bias_set) != 0;
+            const int soft = sbv ? ps3_lightfx_get(PS3_LFX_SOFT_SHADOWS) : 0;
+            if (soft > 0) slope *= (float)(soft + 1);
+        }
     }
     /* PS3RECOMP_ENG_BACKFACE_CASTER_BIAS (diagnostic, see SHADE_BACKFACE). */
     static int sb = -1000;
