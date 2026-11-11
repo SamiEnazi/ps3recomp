@@ -1640,6 +1640,7 @@ static void pads_refresh(double now)
     }
 }
 
+#include "vk_overlay_mouse.inc"   /* [mouse] mouse_camera_block */
 static void tab_controls(double now)
 {
     section("Controllers");
@@ -1684,6 +1685,10 @@ static void tab_controls(double now)
     }
     ImGui::EndDisabled();
     env_mark(V_RUMBLE_STRENGTH);
+
+    /* ---- [mouse] begin: the mouse camera (vk_overlay_mouse.inc) ---- */
+    mouse_camera_block();
+    /* ---- [mouse] end ---- */
 
     section("PS3 button layout");
     PadInputMap m;

@@ -102,7 +102,9 @@ l1 = "Right"
 
 [mouse]                     # the mouse camera
 camera      = true
+mode        = "direct"      # direct (default) / stick, see "The mouse and the window"
 sensitivity = 1.0           # speed multiplier
+aim_sensitivity = 1.0       # direct mode while aiming
 invert_y    = false
 invert_x    = false
 deadzone    = 30            # first stick step past centre (0-120): skips the game's own dead zone
@@ -210,10 +212,22 @@ what SDL sees outside the game (`--watch 10` for live input).
 - Captured = cursor hidden and kept in the window; raw mouse motion turns the camera.
   Released when the window loses focus (Alt+Tab; it comes back with the focus), when a
   menu opens, or with Esc (click again to recapture).
-- Motion becomes right-stick deflection proportional to the mouse's speed (a stick is a
-  rate), smoothed lightly, starting past the game's own dead zone. The time base is the
-  performance counter (it was `GetTickCount64`, 15.6 ms steps: the camera speed jumped
-  2x between frames).
+- Stick mode (`PS3_MOUSE_MODE=stick`, `mode = "stick"`): motion becomes right-stick
+  deflection proportional to the mouse's speed (a stick is a rate), smoothed lightly,
+  starting past the game's own dead zone. The time base is the performance counter (it
+  was `GetTickCount64`, 15.6 ms steps: the camera speed jumped 2x between frames). The
+  game's own stick response then applies: a turn-rate cap (a fast flick saturates) and
+  its acceleration.
+- Direct mode (`PS3_MOUSE_MODE=direct`, the default): a title whose camera code takes the
+  motion itself (`include/ps3emu/ps3_mouse_camera.h`; inFAMOUS 2: the port's camera hook)
+  turns the camera by how far the mouse moved, in free camera and while aiming
+  (`PS3_MOUSE_SENS` / `PS3_MOUSE_AIM_SENS`, invert as set): no cap, no acceleration. While
+  it takes the motion the mouse moves no stick (I/J/K/L and a controller still do); when
+  it stops (menus, the map, cutscenes, a build without the hook) the mouse is the stick
+  again within 150 ms (`libs/input/pad_mouse_direct.h`). F2 > Controls > Mouse camera
+  switches the mode and both sensitivities live.
+- Tests: `PS3_MOUSE_SCRIPT="w<t>:<dx>:<dy>[:<dur>],..."` adds raw mouse counts at t
+  seconds (spread over dur seconds), `w` = after the `PAD_SCRIPT_WAIT` file appears.
 - An in-game menu that wants Esc watches `g_pad_overlay_toggle` (also counted up by
   L3+R3 on a controller) and sets `g_pad_overlay_present = 1`; while it is open it sets
   `g_pad_overlay_open` (or adds its own flag to `cellPad_host_overlay_open()`), which

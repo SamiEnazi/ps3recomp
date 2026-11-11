@@ -145,6 +145,8 @@ typedef struct {
     /* [mouse]; -1 (or 0 for sens) = not in the file */
     int   mouse_camera, mouse_invert_x, mouse_invert_y, mouse_deadzone, mouse_capture;
     float mouse_sens;
+    int   mouse_mode;        /* [mouse] mode: 1 direct, 0 stick, -1 not in the file */
+    float mouse_aim_sens;    /* [mouse] aim_sensitivity; 0 = not in the file */
     /* [controller.<family>]: control c of family f is pad_fam[f][c] instead
      * of pad[c] when bit c of pad_fam_set[f] is set (pim_pad_resolve). */
     uint32_t pad_fam[PIM_N_FAM][PIM_N_CONTROLS];
@@ -358,6 +360,8 @@ static void pim_defaults(PadInputMap* m)
     for (int i = 0; i < PIM_COUNT(pad); i++) m->pad[pad[i].ctl] |= 1u << pad[i].in;
     m->mouse_camera = m->mouse_invert_x = m->mouse_invert_y = m->mouse_deadzone = m->mouse_capture = -1;
     m->mouse_sens = 0.0f;
+    m->mouse_mode = -1;
+    m->mouse_aim_sens = 0.0f;
     for (int s = 0; s < 2; s++) {
         m->stick_deadzone[s] = m->stick_anti[s] = m->stick_outer[s] = m->stick_squircle[s] = -1.0f;
         m->stick_source[s] = -1;
@@ -567,6 +571,12 @@ static void pim_mouse_setting(PadInputMap* m, const char* key, const char* v, FI
     } else if (!strcmp(key, "deadzone")) {
         char* end; long n = strtol(v, &end, 10);
         if (end != v && !*end) { m->mouse_deadzone = n < 0 ? 0 : n > 120 ? 120 : (int)n; m->n_set++; return; }
+    } else if (!strcmp(key, "mode")) {
+        if (!strcmp(v, "direct")) { m->mouse_mode = 1; m->n_set++; return; }
+        if (!strcmp(v, "stick")) { m->mouse_mode = 0; m->n_set++; return; }
+    } else if (!strcmp(key, "aim_sensitivity") || !strcmp(key, "aim_sens")) {
+        char* end; float f = strtof(v, &end);
+        if (end != v && !*end && f > 0.0f) { m->mouse_aim_sens = f; m->n_set++; return; }
     } else {
         pim_warn(m, err, src, line, "mouse setting", key);
         return;
