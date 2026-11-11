@@ -76,6 +76,8 @@ void*    spu_jobrec_mfc_engine(struct spu_context* ctx);   /* this context's mfc
 void spu_native_dead_ls(uint32_t lo, uint32_t hi);        /* LS [lo,hi) is dead after the native: the replay does not compare it */
 int  spu_native_replay_begin(struct spu_context* ctx);    /* replay: prime guest memory from the recording; 0 = not a replay */
 void spu_native_replay_end(struct spu_context* ctx, int ran);   /* ran: replace the recorded operations by checks of the native's results */
+int  spu_native_ea_ok(uint32_t ea, uint32_t size);            /* may a native read guest [ea, ea+size)? (a replay: only what the recording touched) */
+uint32_t spu_native_atomic_add32(struct spu_context* ctx, uint32_t ea, uint32_t v);   /* guest word += v atomically as the job does; returns the old value (a replay: the recorded one) */
 
 #ifdef __cplusplus
 }

@@ -223,6 +223,8 @@ typedef struct jr_tls {
     int      failed;
     int      done;        /* the job call came back */
     int      guest_locked, native_ran;   /* a guest-memory native (spu_native_replay_begin) took part */
+    uint32_t nat_atom;        /* global event index where the native's atomics are looked up from */
+    uint64_t prime_ticks;     /* host time spent priming / checking for natives: not the native's own time */
     char     why[1024];
 } jr_tls;
 
@@ -922,6 +924,9 @@ static SPU_THREAD_LOCAL struct { uint32_t lo, hi; } t_dead[JR_DEAD_MAX];
 static SPU_THREAD_LOCAL unsigned t_dead_n;
 static SPU_THREAD_LOCAL struct { uint32_t ea, size; } t_primed[4096];
 static SPU_THREAD_LOCAL unsigned t_primed_n;
+/* 64 KB chunks of guest memory committed for this job's native: what the native may read in a replay */
+static SPU_THREAD_LOCAL uint32_t t_chunks[8192];
+static SPU_THREAD_LOCAL unsigned t_chunks_n;
 
 void spu_native_dead_ls(uint32_t lo, uint32_t hi)
 {
@@ -939,17 +944,74 @@ static void jr_commit(uint32_t ea, uint32_t size)
 {
     const uint32_t lo = ea & ~0xFFFFu, hi = (ea + size + 0xFFFFu) & ~0xFFFFu;
     VirtualAlloc(vm_base + lo, (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE);
+    for (uint32_t c = lo >> 16; c < (hi >> 16) && t_chunks_n < 8192; c++) {
+        unsigned k = 0; while (k < t_chunks_n && t_chunks[k] != c) k++;
+        if (k == t_chunks_n) t_chunks[t_chunks_n++] = c;
+    }
     if (t_primed_n < 4096) { t_primed[t_primed_n].ea = ea; t_primed[t_primed_n].size = size; t_primed_n++; }
+}
+
+
+int spu_native_ea_ok(uint32_t ea, uint32_t size)
+{
+    if (ea < 0x10000u || (uint64_t)ea + size > 0xFFFFFFFFull) return 0;
+    jr_tls* t = t_jr;
+    if (!t || !t->replaying || !t->guest_locked) return 1;     /* in the game: as the DMA engine (no check) */
+    for (uint32_t c = ea >> 16; c <= (ea + (size ? size - 1 : 0)) >> 16; c++) {
+        int hit = 0;
+        for (unsigned i = 0; i < t_chunks_n; i++) if (t_chunks[i] == c) { hit = 1; break; }
+        if (!hit) return 0;
+    }
+    return 1;
+}
+
+uint32_t spu_native_atomic_add32(spu_context* ctx, uint32_t ea, uint32_t v)
+{
+    jr_tls* t = jr_on(ctx);
+    if (t && t->replaying && t->guest_locked) {
+        /* the recording's own outcome: the first GETLLAR of this line that its PUTLLC then stored */
+        const jr_file* f = t->f;
+        const uint32_t line = ea & ~127u;
+        for (uint32_t i = t->nat_atom; i < f->h->n_ev; i++) {
+            const jr_ev* g = &f->ev[i];
+            if (g->type != EV_ATOM || g->ch != MFC_GETLLAR_CMD || g->b != line) continue;
+            for (uint32_t j = i + 1; j < f->h->n_ev; j++) {
+                const jr_ev* p = &f->ev[j];
+                if (p->type != EV_ATOM || p->ch != MFC_PUTLLC_CMD || p->b != line) continue;
+                if (p->c != 0) break;               /* that attempt failed: the next GETLLAR */
+                uint32_t be; memcpy(&be, f->data + g->off + 128 + (ea & 127u), 4);
+                const uint32_t old = __builtin_bswap32(be), nw = __builtin_bswap32(old + v);
+                memcpy(vm_base + ea, &nw, 4);
+                memcpy(ctx->resv_line, f->data + p->off + 256, 128);   /* the reservation state the job's own atomic leaves */
+                { uint64_t rw; memcpy(&rw, f->data + p->off + 384, 8); ctx->resv_word = rw; }
+                ctx->atomic_stat = p->c;
+                t->nat_atom = j + 1;
+                return old;
+            }
+        }
+        jr_fail(t, "native atomic add on ea=0x%08X: the recording has no such stored atomic", ea);
+    }
+    for (;;) {   /* as the job's own 0x190D8: GETLLAR into LS 0x80, add, PUTLLC, again on failure */
+        ctx->mfc_lsa = 0x80; ctx->mfc_eal = ea & ~127u;
+        spu_mfc_atomic_raw(ctx, MFC_GETLLAR_CMD);
+        uint32_t be; memcpy(&be, ctx->ls + 0x80 + (ea & 127u), 4);
+        const uint32_t old = __builtin_bswap32(be), nw = __builtin_bswap32(old + v);
+        memcpy(ctx->ls + 0x80 + (ea & 127u), &nw, 4);
+        spu_mfc_atomic_raw(ctx, MFC_PUTLLC_CMD);
+        if (ctx->atomic_stat == 0) return old;
+    }
 }
 
 int spu_native_replay_begin(spu_context* ctx)
 {
     jr_tls* t = jr_on(ctx);
     if (!t || !t->replaying) return 0;
+    const uint64_t q0 = jr_qpc();
     if (!t->guest_locked) {
         AcquireSRWLockExclusive(&s_guest_lock); t->guest_locked = 1;
         const jr_file* f = t->f;
-        t_dead_n = 0; t_primed_n = 0;
+        t_dead_n = 0; t_primed_n = 0; t_chunks_n = 0;
+        t->nat_atom = t->cur[0] < f->ns[0] ? f->sidx[0][t->cur[0]] : 0;
         for (uint32_t i = f->h->n_ev; i-- > 0; ) {      /* last first: the earliest write wins */
             const jr_ev* e = &f->ev[i];
             if (e->type == EV_DMA && e->len) {
@@ -960,6 +1022,7 @@ int spu_native_replay_begin(spu_context* ctx)
             }
         }
     }
+    t->prime_ticks += jr_qpc() - q0;
     return 1;
 }
 
@@ -969,6 +1032,7 @@ void spu_native_replay_end(spu_context* ctx, int ran)
 {
     jr_tls* t = jr_on(ctx);
     if (!t || !t->replaying || !ran) return;
+    const uint64_t q0 = jr_qpc();
     const jr_file* f = t->f;
     t->native_ran = 1;
     /* the wrapper's record PUT = the last 32-byte PUT of stream 0; its channel writes start at the LSA write before it */
@@ -1011,6 +1075,7 @@ void spu_native_replay_end(spu_context* ctx, int ran)
         while (k < f->ns[s] && f->sidx[s][k] < g1) k++;
         t->cur[s] = k;
     }
+    t->prime_ticks += jr_qpc() - q0;
 }
 
 static void jr_guest_release(jr_tls* t)
@@ -1115,11 +1180,11 @@ static void jr_replay_one(const jr_file* f, jr_result* r, uint8_t* rec_ls, jr_sl
     t->f = f; t->cur[0] = t->cur[1] = 0; t->failed = 0; t->done = 0; t->why[0] = 0;
     AcquireSRWLockExclusive(&slot->lock); slot->ctx = ctx; slot->t0_ms = jr_ms_now(); ReleaseSRWLockExclusive(&slot->lock);
     const uint64_t q0 = jr_qpc();
-    g_spu_native_ran = 0; t_dead_n = 0; t_primed_n = 0; t->guest_locked = 0; t->native_ran = 0;
+    g_spu_native_ran = 0; t_dead_n = 0; t_primed_n = 0; t->guest_locked = 0; t->native_ran = 0; t->prime_ticks = 0; t->nat_atom = 0;
     const int halted = spu_run_with_halt(jr_replay_entry, ctx);
     if (g_spu_native_ran) __atomic_add_fetch(&s_native_jobs, 1, __ATOMIC_RELAXED);
     AcquireSRWLockExclusive(&slot->lock); slot->ctx = NULL; ReleaseSRWLockExclusive(&slot->lock);
-    r->us = jr_ns(jr_qpc() - q0) / 1e3;
+    r->us = jr_ns(jr_qpc() - q0 - t->prime_ticks) / 1e3;
     t->active = 0; t->replaying = 0;
     r->rec_us = f->h->dur_ns / 1e3;
     if (t->failed) {
