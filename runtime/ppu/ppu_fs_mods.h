@@ -68,6 +68,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <ctype.h>
 #include "ps3emu/ps3_game_mods.h"
@@ -645,6 +646,64 @@ static bool xp_layout(const Bytes& d, XpLayout& L, std::string& err)
     return true;
 }
 
+/* The textures of an XPPS/XPP file, as xpps-texture-tools 0.2's exporter finds
+ * them (the names texture patches carry come from it): (offset from the data
+ * start, width, height, format, mips fitted to the owning packed file). Used to
+ * check that a texture patch fits THIS copy of the file: a mod made from
+ * another version of it (the US digital game's cole_gold_amp.xpps has its
+ * textures 0x110 bytes further on than the EU disc's) would otherwise write
+ * beside the texture. */
+typedef std::tuple<uint32_t, int, int, std::string, int> TexKey;
+static std::set<TexKey> xp_textures(const Bytes& d)
+{
+    std::set<TexKey> out;
+    if (d.size() < 48 || memcmp(d.data(), "PACK", 4)) return out;
+    const uint32_t tab = be32(&d[24]), start = be32(&d[40]);
+    if ((uint64_t)tab + 24 > d.size()) return out;
+    const uint32_t nc = be32(&d[tab + 4]), nf = be32(&d[tab + 12]);
+    const uint64_t f0 = (uint64_t)tab + 24 + (uint64_t)nc * 28;
+    if (f0 + (uint64_t)nf * 16 > d.size()) return out;
+    struct PF { uint32_t i, off, size; };
+    std::vector<PF> files;
+    for (uint32_t i = 0; i < nf; i++) files.push_back({ i, be32(&d[(size_t)(f0 + i * 16ull + 8)]), be32(&d[(size_t)(f0 + i * 16ull + 4)]) });
+    std::vector<PF> banks;
+    for (const PF& f : files) if (f.size >= 65536) banks.push_back(f);
+    std::stable_sort(banks.begin(), banks.end(), [](const PF& a, const PF& b) { return a.size > b.size; });
+    auto pow2 = [](uint32_t v) { return v == 16 || v == 32 || v == 64 || v == 128 || v == 256 || v == 512 || v == 1024; };
+    auto bitlen = [](uint32_t v) { int n = 0; while (v) { n++; v >>= 1; } return n; };
+    std::set<TexKey> seen;
+    for (const PF& bank : banks)
+        for (const PF& f : files) {
+            if (f.i == bank.i || f.size < 82 || f.size > 65536) continue;
+            const uint64_t b = (uint64_t)start + f.off;
+            if (b + f.size > d.size()) continue;
+            const uint8_t* p = &d[(size_t)b];
+            struct C { uint32_t doff, w, h, m, fc; } cands[2];
+            int nc2 = 0;
+            cands[nc2++] = { be32(p + 32), (uint32_t)((p[56] << 8) | p[57]), (uint32_t)((p[58] << 8) | p[59]), p[80], p[81] };
+            if (f.size >= 100) cands[nc2++] = { be32(p + 64), be32(p + 36), be32(p + 40), be32(p + 44), be32(p + 48) };
+            for (int k = 0; k < nc2; k++) {
+                const C& c = cands[k];
+                const char* fmt = c.fc == 3 ? "DXT1" : c.fc == 4 ? "DXT3" : c.fc == 5 ? "DXT5" : nullptr;
+                if (!fmt || !pow2(c.w) || !pow2(c.h)) continue;
+                if (!(c.m > 0 && (int)c.m <= bitlen(c.w > c.h ? c.w : c.h)) || c.doff < bank.off) continue;
+                if (c.doff - bank.off >= bank.size) continue;
+                const TexKey key((uint32_t)c.doff, (int)c.w, (int)c.h, std::string(fmt), (int)c.m);
+                if (seen.count(key)) break;
+                seen.insert(key);
+                /* the exporter's fitted mip count (its arithmetic, kept as it is) */
+                const PF* owner = nullptr;
+                for (const PF& x : files) if (x.off <= c.doff && (uint64_t)c.doff < (uint64_t)x.off + x.size) { owner = &x; break; }
+                const int64_t avail = owner ? (int64_t)owner->size - ((int64_t)c.doff - bank.off) : (int64_t)d.size() - ((int64_t)start + c.doff);
+                int mm = (int)c.m;
+                while (mm > 1 && (int64_t)dxt_size((int)c.w, (int)c.h, fmt, mm) > avail) mm--;
+                out.insert(TexKey((uint32_t)c.doff, (int)c.w, (int)c.h, std::string(fmt), mm));
+                break;
+            }
+        }
+    return out;
+}
+
 /* ---- mods ------------------------------------------------------------------ */
 
 struct Module { std::string id, name, group_id, group_name; std::vector<std::string> paths; bool dropdown = false; };
@@ -1131,6 +1190,12 @@ static bool build(const std::string& name, const Part* base, const std::vector<c
     if (!tex.empty()) {
         if (d.size() < 48 || memcmp(d.data(), "PACK", 4)) { err = name + " is not an XPPS/XPP PACK file"; return false; }
         const uint64_t ds = be32(&d[40]);
+        const std::set<TexKey> known = xp_textures(d);
+        for (const Tex* t : tex)
+            if (!known.count(TexKey(t->off, t->w, t->h, t->fmt, t->mips))) {
+                err = t->name + " was made for another version of " + name + ": this game's copy has no such texture there";
+                return false;
+            }
         for (const Tex* t : tex) {
             Bytes pl;
             if (!read_all(t->path, pl, 128)) { err = "cannot read " + t->path; return false; }

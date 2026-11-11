@@ -41,6 +41,13 @@ Downloaded mods are treated as untrusted:
 
 - every patch is bounds-checked, and a packed-file patch that would replace
   part of a file's own tables is refused;
+- a texture patch is written only where this game's copy of the file has a
+  texture of exactly that size, format and mip count (found as
+  xpps-texture-tools' exporter finds them). A mod made from another version of
+  a file is refused rather than written beside the texture: the US digital
+  game's `cole_gold_amp.xpps` has its textures 0x110 bytes further on than the
+  EU disc's, so Sasha's Black Tar's Solid Gold Amp option does not fit the EU
+  disc (untick that option and the rest of the mod works);
 - a mod file over 512 MB, or a `mod.json`/`modular.json` over 1 MB, is
   refused;
 - junctions and symbolic links inside a mod folder are ignored;
