@@ -4396,8 +4396,10 @@ static void vk_present_async(void)
 /* The present records through postfx's and the overlay's own entry points (and
  * RenderDoc brackets it): with threaded recording, drain the worker and record
  * directly until it is done. */
+static void vk_mg_frame(void);   /* PS3RECOMP_VK_MERGE_STATS */
 static void vk_present_window(void)
 {
+    vk_mg_frame();
 #ifndef VK_TQ_NO_ASYNC_PRESENT
     if (vk_present_async_ok()) { vk_present_async(); return; }
 #endif
@@ -7446,6 +7448,145 @@ static struct {
 } s_ecs;
 static unsigned long long s_ecs_skipped;
 
+/* PS3RECOMP_VK_MERGE_STATS=1 (measurement only: nothing recorded changes): could
+ * neighbouring draws be one Vulkan multi-draw? Each recorded draw is compared
+ * with the draw before it. It joins that draw's run when both are in the same
+ * render pass (the pass left open, s_batch.rp_*), neither is special (the
+ * signed-blend pair, input attachments, unbatched), and they have the same
+ * pipeline, the same dynamic state (viewport, scissor, stencil reference, depth
+ * bias) and the same vertex/index buffer handles (offsets may differ: a
+ * multi-draw names each draw's first index and vertex). How it joins:
+ *   1 plain     same descriptor set and constant windows: a multi-draw as is
+ *   2 constants the constant windows differ: needs the constants by draw number
+ *   3 textures  the set differs (textures, samplers): needs a texture table too
+ * A tier's runs are the draws that join at that level or a lower one; its
+ * number of runs is the Vulkan draws a frame would record. Also timed, on this
+ * thread: the backend's draws (vk_eng_draw_ex) and the Vulkan calls in them
+ * (the binds and draws -- with PS3RECOMP_VK_THREADED, copies into the
+ * recording ring: the driver's cost is on the recording worker). One line per
+ * PS3RECOMP_LIMITS_S (default 5) s, at the present. */
+typedef struct {
+    VkPipeline   pipe;
+    VkViewport   vp;
+    VkRect2D     sc;
+    u32          sref, d0, d1, stride;
+    int          bias, idx;
+    float        bc, bs;
+    VkDescriptorSet set;
+    VkBuffer     vb, ib;
+    VkDeviceSize vo;
+} vk_mg_draw;
+static struct {
+    int on;                                  /* -1: not read yet */
+    int have, prev_special;
+    vk_mg_draw prev;
+    VkDeviceSize vo_first;                   /* the textures-tier run's first vertex offset */
+    u64 run[3];                              /* open run per tier */
+    u64 draws, calls[3], hist[3][6], brk[5], joins, vmis, pvb;
+    u64 t_be, t_rec;                         /* TSC ticks */
+    u64 frames, ns0, tsc0;
+} s_mg = { -1 };
+static inline u64 vk_mg_tsc(void)
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+    return __builtin_ia32_rdtsc();
+#else
+    return ps3_ft_now();
+#endif
+}
+static int vk_mg_on(void)
+{
+    if (s_mg.on < 0) {
+        const char* e = getenv("PS3RECOMP_VK_MERGE_STATS");
+        s_mg.on = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (s_mg.on) fprintf(stderr, "[merge] counting neighbouring draws a multi-draw could take (PS3RECOMP_VK_MERGE_STATS)\n");
+    }
+    return s_mg.on;
+}
+static void vk_mg_close(int t)
+{
+    const u64 r = s_mg.run[t];
+    if (!r) return;
+    const int b = r >= 64 ? 5 : r >= 16 ? 4 : r >= 8 ? 3 : r >= 4 ? 2 : r >= 2 ? 1 : 0;
+    s_mg.calls[t]++;
+    s_mg.hist[t][b] += r;
+    s_mg.run[t] = 0;
+}
+/* cont: this draw continues the render pass the draw before it left open */
+static void vk_mg_note(const vk_mg_draw* d, int cont, int special, int persistent)
+{
+    const vk_mg_draw* p = &s_mg.prev;
+    int why = -1, lvl = 0;
+    if (!s_mg.have || !cont) why = 0;
+    else if (special || s_mg.prev_special) why = 4;
+    else if (d->pipe != p->pipe) why = 1;
+    else if (memcmp(&d->vp, &p->vp, sizeof d->vp) || memcmp(&d->sc, &p->sc, sizeof d->sc) || d->sref != p->sref ||
+             d->bias != p->bias || (d->bias && (d->bc != p->bc || d->bs != p->bs))) why = 2;
+    else if (d->vb != p->vb || d->idx != p->idx || (d->idx && d->ib != p->ib)) why = 3;
+    if (why < 0) lvl = d->set != p->set ? 3 : (d->d0 != p->d0 || d->d1 != p->d1) ? 2 : 1;
+    else if (s_mg.have) s_mg.brk[why]++;
+    for (int t = 0; t < 3; t++) {
+        if (lvl && lvl <= t + 1) s_mg.run[t]++;
+        else { vk_mg_close(t); s_mg.run[t] = 1; }
+    }
+    if (lvl) {
+        s_mg.joins++;
+        const VkDeviceSize dv = d->vo > s_mg.vo_first ? d->vo - s_mg.vo_first : s_mg.vo_first - d->vo;
+        if (d->stride && dv % d->stride) s_mg.vmis++;   /* its first vertex is not a whole vertex away */
+    } else {
+        s_mg.vo_first = d->vo;
+    }
+    s_mg.draws++;
+    if (persistent) s_mg.pvb++;
+    s_mg.prev = *d;
+    s_mg.prev_special = special;
+    s_mg.have = 1;
+}
+/* Once a frame (vk_present_window, the RSX thread). */
+static void vk_mg_frame(void)
+{
+    if (!vk_mg_on()) return;
+    const u64 now = ps3_ft_now(), tsc = vk_mg_tsc();
+    if (!s_mg.ns0) { s_mg.ns0 = now; s_mg.tsc0 = tsc; return; }
+    s_mg.frames++;
+    static u64 period;
+    if (!period) { const char* e = getenv("PS3RECOMP_LIMITS_S"); const double v = e ? atof(e) : 0.0;
+                   period = v >= 1.0 ? (u64)(v * 1e9) : 5000000000ull; }
+    if (now - s_mg.ns0 < period) return;
+    for (int t = 0; t < 3; t++) vk_mg_close(t);
+    const double f = s_mg.frames ? (double)s_mg.frames : 1.0;
+    const double tpms = (double)(tsc - s_mg.tsc0) / ((double)(now - s_mg.ns0) / 1e6);   /* ticks per ms */
+    const double dr = s_mg.draws ? (double)s_mg.draws : 1.0;
+    double big[3];
+    for (int t = 0; t < 3; t++) big[t] = 100.0 * (double)(s_mg.hist[t][3] + s_mg.hist[t][4] + s_mg.hist[t][5]) / dr;
+    fprintf(stderr,
+            "[merge] %.1f s, %llu frames: %.0f draws/frame; Vulkan draws/frame if neighbours merge: plain %.0f (%.2fx),"
+            " +constants by draw %.0f (%.2fx), +texture table %.0f (%.2fx); draws in runs of 8+: %.0f%% / %.0f%% / %.0f%%;"
+            " per frame: pass starts %.0f, pipeline changes %.0f, dynamic state %.0f, buffers %.0f, special %.0f;"
+            " joins with an off-stride first vertex %.1f%%; persistent vertex buffers %.0f%% of draws;"
+            " this thread: backend draws %.3f ms/frame, Vulkan calls in them %.3f ms/frame\n",
+            (double)(now - s_mg.ns0) / 1e9, (unsigned long long)s_mg.frames, (double)s_mg.draws / f,
+            (double)s_mg.calls[0] / f, s_mg.calls[0] ? dr / (double)s_mg.calls[0] : 0.0,
+            (double)s_mg.calls[1] / f, s_mg.calls[1] ? dr / (double)s_mg.calls[1] : 0.0,
+            (double)s_mg.calls[2] / f, s_mg.calls[2] ? dr / (double)s_mg.calls[2] : 0.0,
+            big[0], big[1], big[2],
+            (double)s_mg.brk[0] / f, (double)s_mg.brk[1] / f, (double)s_mg.brk[2] / f, (double)s_mg.brk[3] / f,
+            (double)s_mg.brk[4] / f,
+            s_mg.joins ? 100.0 * (double)s_mg.vmis / (double)s_mg.joins : 0.0, 100.0 * (double)s_mg.pvb / dr,
+            tpms > 0.0 ? (double)s_mg.t_be / tpms / f : 0.0, tpms > 0.0 ? (double)s_mg.t_rec / tpms / f : 0.0);
+    static const char* const tier[3] = { "plain", "+constants", "+textures" };
+    char line[512]; int k = snprintf(line, sizeof line, "[merge]   share of draws by run size (1 / 2-3 / 4-7 / 8-15 / 16-63 / 64+):");
+    for (int t = 0; t < 3 && k > 0 && k < (int)sizeof line - 80; t++)
+        k += snprintf(line + k, sizeof line - (size_t)k, " %s %.0f/%.0f/%.0f/%.0f/%.0f/%.0f%s", tier[t],
+                      100.0 * s_mg.hist[t][0] / dr, 100.0 * s_mg.hist[t][1] / dr, 100.0 * s_mg.hist[t][2] / dr,
+                      100.0 * s_mg.hist[t][3] / dr, 100.0 * s_mg.hist[t][4] / dr, 100.0 * s_mg.hist[t][5] / dr,
+                      t < 2 ? ";" : "");
+    fprintf(stderr, "%s\n", line);
+    const int on = s_mg.on;
+    memset(&s_mg, 0, sizeof s_mg);
+    s_mg.on = on; s_mg.ns0 = now; s_mg.tsc0 = tsc;
+}
+
 /* One draw: vertices from host memory (staged) or from a persistent buffer
  * (pvb/pvo), indices likewise -- host, persistent (pib/pio) or none. */
 static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
@@ -7455,11 +7596,11 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface);
 static VkDescriptorSet s_fbfin_cur;   /* [res] the input-attachment set of the draw being recorded */
 /* [res] a pipeline whose units read their own target (vk_res_fbf_rewrite):
  * each gets a copy of its attachment, taken before this draw, for the draw. */
-static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
-                           u32 vertex_count, u32 stride, const u32* indices, VkBuffer pib, VkDeviceSize pio,
-                           u32 index_count)
+static void vk_eng_draw_ex_inner(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
+                                 u32 vertex_count, u32 stride, const u32* indices, VkBuffer pib, VkDeviceSize pio,
+                                 u32 index_count)
 {
-    const vk_eng_pipe* P = (s_e2.pipeline && s_e2.pipeline <= VK_ENG_MAX_PIPE) ? &s_epipe[s_e2.pipeline - 1] : NULL;
+    const vk_eng_pipe* P =(s_e2.pipeline && s_e2.pipeline <= VK_ENG_MAX_PIPE) ? &s_epipe[s_e2.pipeline - 1] : NULL;
     if (P && P->used && P->fbf_in) {
         /* [res] input attachments: the set naming the bound targets, found
          * (or made) here, outside any render pass; the body binds it and puts
@@ -7492,6 +7633,19 @@ static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer
     else if (!(s_res.warned & 1u)) { s_res.warned |= 1u; VK_LOG("engine: no copy of a target its draw reads: draw skipped\n"); }
     memcpy(s_e2.tex, saved, sizeof saved);
     s_e2.tex_mask = saved_mask;
+}
+/* PS3RECOMP_VK_MERGE_STATS: the backend's whole draw, timed */
+static void vk_eng_draw_ex(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
+                           u32 vertex_count, u32 stride, const u32* indices, VkBuffer pib, VkDeviceSize pio,
+                           u32 index_count)
+{
+    if (__builtin_expect(s_mg.on != 0, 0) && vk_mg_on()) {
+        const u64 t0 = vk_mg_tsc();
+        vk_eng_draw_ex_inner(topology, vertices, pvb, pvo, vertex_count, stride, indices, pib, pio, index_count);
+        s_mg.t_be += vk_mg_tsc() - t0;
+        return;
+    }
+    vk_eng_draw_ex_inner(topology, vertices, pvb, pvo, vertex_count, stride, indices, pib, pio, index_count);
 }
 static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkBuffer pvb, VkDeviceSize pvo,
                                 u32 vertex_count, u32 stride, const u32* indices, VkBuffer pib, VkDeviceSize pio,
@@ -7693,6 +7847,7 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
         if (batched) { s_batch.rp_open = 1; s_batch.rp_fb = fb; s_batch.rp_rp = rp; s_batch.rp_w = w; s_batch.rp_h = h; }
         s_ecs.valid = 0;
     }
+    const u64 mg_t0 = s_mg.on > 0 ? vk_mg_tsc() : 0;   /* PS3RECOMP_VK_MERGE_STATS */
     static int filt = -1;
     if (filt < 0) { const char* e = getenv("PS3RECOMP_VK_STATE_FILTER"); filt = !(e && e[0] == '0'); }
     const int known = filt && s_ecs.valid;
@@ -7785,6 +7940,14 @@ static void vk_eng_draw_ex_body(rsx_topology topology, const void* vertices, VkB
             if (has_idx) pvkCmdDrawIndexed(s_vk.cmd, index_count, 1, 0, 0, 0);
             else         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
         }
+    }
+    if (s_mg.on > 0) {   /* PS3RECOMP_VK_MERGE_STATS: counting only */
+        s_mg.t_rec += vk_mg_tsc() - mg_t0;
+        const vk_mg_draw md = { .pipe = pipe, .vp = vp, .sc = sc, .sref = sref,
+                                .d0 = (u32)ubase, .d1 = (u32)ps_dyn, .stride = stride,
+                                .bias = use_bias, .idx = has_idx, .bc = s_e2.bias_const, .bs = s_e2.bias_slope,
+                                .set = set, .vb = vbuf, .ib = has_idx ? ibuf : VK_NULL_HANDLE, .vo = voff };
+        vk_mg_note(&md, cont, !batched || P->sblend || P->fbf_in, !vertices);
     }
     if (batched) {
         s_batch.draws++;                        /* the pass stays open in the batch */
