@@ -60,6 +60,10 @@ extern "C" const char* ppu_vfs_root = ".";
  * (redirected language archives, see the header). */
 #include "ppu_fs_lang.h"
 
+/* PS3_GAME_MODS_DIR: mods in the inFAMOUS Mod Manager's format, served as the
+ * loose files the game falls back to (see the header). */
+#include "ppu_fs_mods.h"
+
 /* CELL_FS return / mode / flag constants. */
 #define CELL_OK              0
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
@@ -164,11 +168,13 @@ static void host_path_mount(char* out, size_t cap, const char* guest)
 }
 
 /* The host file the guest gets: its translated path, then a language archive
- * swapped for the chosen language's (ppu_fs_lang.h; open and stat agree). */
+ * swapped for the chosen language's (ppu_fs_lang.h; open and stat agree), or
+ * a game mod's file (ppu_fs_mods.h). */
 static void host_path(char* out, size_t cap, const char* guest)
 {
     host_path_mount(out, cap, guest);
     lang_redirect_host(out, cap);
+    gmods::redirect(guest, out, cap);   /* a loose USRDIR file a mod changes */
 }
 
 /* ---- fd / dir handle tables ---- */
@@ -258,6 +264,7 @@ static void cellFsOpen(ppu_context* ctx)
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     lang_on_open(fd, hpath);   /* a language's archive TOC / movie tracks to patch on read */
+    gmods::on_open(fd, hpath);  /* an archive: the files mods change hidden from its TOC */
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
      * streaming layer opens a file and never reads it (You Don't Know Jack's
      * movies) is diagnosed from the opener: its sibling read path is the one

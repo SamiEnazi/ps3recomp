@@ -25,6 +25,7 @@
 
 #include "../../include/ps3emu/ps3_settings.h"
 #include "../../include/ps3emu/ps3_lightfx.h"   /* [light] the Lighting page (vk_overlay_light.inc) */
+#include "../../include/ps3emu/ps3_game_mods.h" /* [mods] the Mods page: runtime/ppu/ppu_fs_mods.h */
 #include "vk_postfx.h"
 #include "vk_overlay_theme.h"   /* the inFAMOUS look: Hero (blue) / Infamous (red) */
 #include "../../include/ps3emu/ps3_pad_icons.h"
@@ -146,6 +147,7 @@ enum {
     V_THEME,
     V_LANG, V_VOICE_LANG, V_TEXT_LANG,
     V_ASPECT,                 /* [wide] */
+    V_GAME_MODS,              /* [mods] */
     V_N
 };
 static const char* const kVar[V_N] = {
@@ -159,6 +161,7 @@ static const char* const kVar[V_N] = {
     "PS3_OVERLAY_THEME",
     "PS3_LANG", "PS3_VOICE_LANG", "PS3_TEXT_LANG",   /* the game reads them once, at start */
     "PS3RECOMP_ASPECT",                               /* [wide] read once, at start */
+    "PS3_GAME_MODS",                                  /* [mods] read once, at start */
 };
 /* Plain arrays: filled during this file's dynamic initialisation, before
  * main (zero-initialised storage exists before any of it runs). */
@@ -520,12 +523,12 @@ static void toggle_fullscreen(void)
 /* The menu's pages: the settings pages, then Cheats (always the last one) when the title
  * has any. A new settings page goes before it: TAB_CHEATS is the number of settings pages
  * ([light] Lighting = 5, [fx] Effects = 6). */
-enum { TAB_CHEATS = 7, MENU_TABS = TAB_CHEATS };
+enum { TAB_MODS = 7, TAB_CHEATS = 8, MENU_TABS = TAB_CHEATS };   /* [mods] Mods before Cheats */
 static int tab_count(void) { return TAB_CHEATS + (vk_overlay_cheats_count() > 0 ? 1 : 0); }
 
 static int tab_from_name(const char* e)
 {
-    static const char* const names[TAB_CHEATS + 1] = { "display", "graphics", "audio", "controls", "hud", "lighting", "effects", "cheats" };
+    static const char* const names[TAB_CHEATS + 1] = { "display", "graphics", "audio", "controls", "hud", "lighting", "effects", "mods", "cheats" };
     if (!e || !*e) return -1;
     if (e[0] >= '0' && e[0] <= '9') { const int t = atoi(e); return t >= 0 && t < tab_count() ? t : 0; }
     for (int i = 0; i < tab_count(); i++) if (!SDL_strcasecmp(e, names[i])) return i;
@@ -1784,7 +1787,7 @@ static void tab_hud(void)
          "The faint line in the graph is the frame-rate cap's frame time.");
 }
 
-/* ---- Effects page (fx): effects resolution and texture packs --------------
+/* ---- Effects page (fx): effects resolution (texture packs: the Mods page) --
  * A page of its own. Its settings are not in the V_ table: fx_set applies
  * one live (ps3_setting_apply: rsx_draw_engine.c registers the appliers) and
  * keeps it as one of the file's other lines, which preload() exports at the
@@ -1853,6 +1856,119 @@ static void tab_effects(void)
              "stretches it over the frame: that is the blocky edge round flames and smoke. High and Full draw "
              "them at a higher resolution, same art, sharper. Costs some GPU time where there is a lot of smoke "
              "(see the HUD).");
+    }
+
+}
+
+/* ---- Mods page [mods]: game mods and texture packs ------------------------
+ * Game mods are the community's inFAMOUS Mod Manager mods (mod.json, files/,
+ * texture_patches/, xpps_patches/, modular.json), served by the file layer
+ * (runtime/ppu/ppu_fs_mods.h) from the mods folder (PS3_GAME_MODS_DIR, the
+ * launcher's "mods" folder). Which mods are on and their options are saved
+ * at once in mods.ini (beside settings.ini) and apply at the next start;
+ * "Use mods" is PS3_GAME_MODS in settings.ini. */
+static void mods_status_line(const ps3_game_mod& m)
+{
+    const bool bad = !strncmp(m.status, "Not used", 8) || !strncmp(m.status, "Made for", 8);
+    const ImVec4 col = (m.active && m.on) ? ImVec4(0.45f, 0.85f, 0.45f, 1.0f) : bad ? kOrange : kGrey;
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(m.status);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+}
+
+static void mods_options(int i, int n)
+{
+    ps3_game_mod_option o[64];
+    if (n > 64) n = 64;
+    int got = 0;
+    for (int k = 0; k < n; k++) if (ps3_game_mods_option(i, k, &o[got])) got++;
+    ImGui::Indent(S(28.0f));
+    /* toggles first, as the Manager lists them (by name) */
+    for (int k = 0; k < got; k++) {
+        if (o[k].dropdown) continue;
+        ImGui::PushID(k);
+        char label[200];
+        if (o[k].group[0]) snprintf(label, sizeof label, "%s: %s", o[k].group, o[k].name);
+        else snprintf(label, sizeof label, "%s", o[k].name);
+        bool on = o[k].picked != 0;
+        if (ImGui::Checkbox(label, &on)) ps3_game_mods_pick(i, k, on ? 1 : 0);
+        ImGui::PopID();
+    }
+    /* each dropdown group once: a combo of its options */
+    for (int k = 0; k < got; k++) {
+        if (!o[k].dropdown) continue;
+        bool first = true;
+        for (int j = 0; j < k; j++) if (o[j].dropdown && !strcmp(o[j].group_id, o[k].group_id)) first = false;
+        if (!first) continue;
+        int cur = k;
+        for (int j = k; j < got; j++) if (o[j].dropdown && !strcmp(o[j].group_id, o[k].group_id) && o[j].picked) cur = j;
+        ImGui::PushID(1000 + k);
+        ImGui::SetNextItemWidth(combo_w());
+        if (ImGui::BeginCombo(o[k].group[0] ? o[k].group : "Option", o[cur].name)) {
+            for (int j = k; j < got; j++) {
+                if (!o[j].dropdown || strcmp(o[j].group_id, o[k].group_id)) continue;
+                if (ImGui::Selectable(o[j].name, j == cur)) ps3_game_mods_pick(i, j, 1);
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PopID();
+    }
+    ImGui::Unindent(S(28.0f));
+}
+
+static void tab_mods(void)
+{
+    section("Game mods");
+    const char* dir = ps3_game_mods_dir();
+    if (!dir || !*dir) {
+        hint("No mods folder: start the game with \"Play inFAMOUS 2\" (it uses the \"mods\" folder beside it), "
+             "or set PS3_GAME_MODS_DIR.");
+    } else {
+        const char* e = getenv(kVar[V_GAME_MODS]);
+        bool use = !(e && e[0] == '0' && !e[1]);
+        if (ImGui::Checkbox("Use mods", &use)) apply_setting(V_GAME_MODS, use ? "1" : "0");
+        { const char* now = getenv(kVar[V_GAME_MODS]); restart_mark(V_GAME_MODS, strcmp(now ? now : "", s_start[V_GAME_MODS]) != 0); }
+        env_mark(V_GAME_MODS, false);
+#ifdef _WIN32
+        if (ImGui::Button("Open the mods folder")) ps3_game_mods_open_folder();
+        ImGui::SameLine();
+#endif
+        if (ImGui::Button("Look for new mods")) ps3_game_mods_rescan();
+        { char b[720]; snprintf(b, sizeof b, "Mods folder: %s", dir); hint(b); }
+        const int n = ps3_game_mods_count();
+        if (!n)
+            hint("No mods yet. Unzip a mod into the mods folder (each mod is a folder with a mod.json in it), "
+                 "then \"Look for new mods\".");
+        for (int i = 0; i < n; i++) {
+            ps3_game_mod m;
+            if (!ps3_game_mods_get(i, &m)) continue;
+            ImGui::PushID(i);
+            ImGui::Separator();
+            bool on = m.on != 0;
+            if (!m.for_game) ImGui::BeginDisabled();
+            if (ImGui::Checkbox("##on", &on)) ps3_game_mods_set_on(i, on ? 1 : 0);
+            if (!m.for_game) ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::PushFont(vk_ov_theme_bold(), 0.0f);
+            ImGui::TextUnformatted(m.name);
+            ImGui::PopFont();
+            ImGui::SameLine();
+            const bool ver = m.version[0] && strcmp(m.version, "unknown");
+            const bool who = m.author[0] && strcmp(m.author, "unknown");
+            ImGui::TextColored(kGrey, "%s%s%s%s", ver ? "v" : "", ver ? m.version : "", who ? (ver ? "  by " : "by ") : "", who ? m.author : "");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+                ImGui::SetTooltip("%s\n%d whole file(s), %d texture patch(es), %d xpps patch(es)", m.folder, m.n_files, m.n_tex, m.n_xpps);
+            mods_status_line(m);
+            if (m.n_modules && m.for_game) mods_options(i, m.n_modules);
+            ImGui::PopID();
+        }
+        if (n) ImGui::Separator();
+        hint("Mods made for the inFAMOUS Mod Manager work as they are, with no Unlocker: the game's own files are "
+             "never changed, the port hands the game the mod's files in their place. Turning a mod on or off, "
+             "or changing its options, applies the next time the game starts. When two mods change the same "
+             "file, the first one (by folder name) is used.");
     }
 
     section("Texture packs");
@@ -1942,7 +2058,7 @@ static void draw_menu(double now)
                                                               ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
         ImGui::End(); return;
     }
-    static const char* const names[TAB_CHEATS + 1] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Lighting", "Effects", "Cheats" };
+    static const char* const names[TAB_CHEATS + 1] = { "Display", "Graphics", "Audio", "Controls", "HUD", "Lighting", "Effects", "Mods", "Cheats" };
     s_ntabs = tab_count();
     if (ImGui::BeginTabBar("tabs")) {
         for (int i = 0; i < tab_count(); i++) {
@@ -1956,6 +2072,7 @@ static void draw_menu(double now)
                 switch (i) { case 0: tab_display(); break; case 1: tab_graphics(); break; case 2: tab_audio(); break;
                              case 3: tab_controls(now); break; case 4: tab_hud(); break;
                              case 5: tab_lighting(); break; case 6: tab_effects(); break;
+                             case TAB_MODS: tab_mods(); break;
                              case TAB_CHEATS: vk_overlay_cheats_page(combo_w()); break; default: break; }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
