@@ -2301,6 +2301,12 @@ static void test_log_plan(const char* when)
                 m.prefer[0] ? " | Use this one instead: " : "", m.prefer);
         char img[600];
         if (ps3_game_mods_image(i, img, sizeof img)) fprintf(stderr, "[mods] test: %s: picture %s\n", m.name, img);
+        for (int k = 0; k < m.n_modules; k++) {   /* the options as the page shows them */
+            ps3_game_mod_option o;
+            if (!ps3_game_mods_option(i, k, &o)) continue;
+            fprintf(stderr, "[mods] test: %s: option %s%s%s [%s] %s\n", when, o.group, o.group[0] ? " / " : "", o.name,
+                    o.single ? "one at a time" : o.dropdown ? "dropdown" : "check box", o.picked ? "ON" : "off");
+        }
     }
     fprintf(stderr, "[mods] test: %s: restart needed: %s\n", when, ps3_game_mods_restart_needed() ? "yes" : "no");
 }
