@@ -145,8 +145,33 @@ RightShift Ctrl RightCtrl Alt RightAlt CapsLock PrintScreen ScrollLock Pause App
 NumLock`. (Enter and keypad Enter are one key on Windows.) The Mac names (`Option`,
 `KeypadEnter`, ...) and raw macOS key codes `0x00-0x7F` still work.
 
-The in-game menu, when present, writes rebinds back to the same file (bindings
-sections in full; every other section kept as it was).
+### Rebinding in the game (F2 > Controls)
+
+The "Buttons and keys" table lists every PS3 control with two key cells, a mouse cell
+and a controller cell. Click a cell (Cross on a controller) and press the new input;
+right-click (Square) clears a cell; "Reset to defaults" puts every binding back. The
+rules are `libs/input/pad_remap.h`:
+
+- One input drives one PS3 control. Taking one another control has asks first:
+  **Swap** (that control gets what the cell had; with nothing to give it just loses
+  the input) or **Cancel**. A file written by hand may still bind one key to two
+  controls (a chord); the menu never makes one.
+- Kept for the window and the menu: F1 (HUD), F2 (menu), F3 (lighting A/B), F9
+  (play-log mark), F11 and Alt+Enter (fullscreen), Esc (cancels a change), Alt, the
+  Windows keys, Print Screen. The PS / Xbox / Home button is the system's.
+- Enter and keypad Enter are one key (both are VK_RETURN to Windows): they bind,
+  clear and swap together, and the file lists both.
+- Controller cells take buttons and triggers by position (bottom = Cross), written to
+  `[controller]`; a `[controller.<family>]` line still wins for its family.
+- A change applies at once (the next poll and the next prompt glyphs) and is written
+  into the same file: `PS3_INPUT_MAP`, else `input.toml` next to the exe (`""` = this
+  session only). The file stays as it was -- comments, blank lines, other sections,
+  line endings -- only binding values change, and each binding section ends up listing
+  every control. It is written to `<file>.tmp` and moved over the old one in one step.
+- Tests: the menu's timed script (`PS3RECOMP_OVERLAY_MENU_AT`) takes
+  `<s>:bind=<control>=<input>` (`key:F17`, `mouse:Right`, `pad:b`; the control's keys
+  become that one key, a mouse or controller input replaces that column) and
+  `<s>:bind=reset`.
 
 ## Environment variables
 

@@ -92,9 +92,10 @@
  * as aliases (Ctrl, Alt, LeftShift, Delete = the Del key, Insert, PrintScreen,
  * ScrollLock, Pause, CapsLock, Numpad0-9, ...).
  *
- * The in-game menu rebinds controls live and writes them back with
- * pim_save_file (all three binding sections in full, every other section
- * kept as it was).
+ * The in-game menu (F2 > Controls; its rules are pad_remap.h) rebinds
+ * controls live and writes them back with pim_save_file: the file stays as it
+ * was, comments and other sections included; only binding values change and
+ * every control ends up listed in each of the three binding sections.
  *
  * This header is the parser and writer only (no SDL, no AppKit), so it
  * builds into a standalone test: libs/input/tests/test_pad_input_map.c.
@@ -685,11 +686,16 @@ static int pim_load_file(PadInputMap* m, const char* path, FILE* err)
 }
 
 /* ---- writing ---------------------------------------------------------- */
-/* The in-game menu saves what it rebinds to the same file, in the form the
- * launcher's Controls screen writes (launcher/src-tauri/src/input_map.rs in
- * the inFAMOUS 2 port): every control of every device listed, with the
- * canonical spelling of each name, and every other section ([mouse], ...)
- * kept as it was. */
+/* The in-game menu saves what it rebinds to the same file. The file is kept
+ * line for line -- comments, blank lines, the order, other sections ([mouse],
+ * [controller.xbox], ...), its line endings -- and only the VALUES of the
+ * binding lines change: each line of [keyboard], [mouse_buttons] and
+ * [controller] that names a PS3 control gets that control's inputs, in the
+ * canonical spelling (the launcher's, launcher/src-tauri/src/input_map.rs in
+ * the inFAMOUS 2 port), its trailing comment kept. A control a section does
+ * not list yet is added after the section's last line (its first block), a
+ * binding section the file lacks is appended, so the file always reads back
+ * as exactly the map. A new file gets a header and the three sections. */
 
 /* PS3 controls in the order the file lists them. */
 static const int pim_write_order[PIM_N_CONTROLS] = {
@@ -787,96 +793,213 @@ static void pim_inputs_text(const PadInputMap* m, int sec, int ctl, char* out, s
 #undef PIM_ADD
 }
 
-/* The file's text for map `m`, keeping the sections of `old` (the file as
- * it is, or NULL) that are not bindings. malloc'd; NULL if out of memory. */
+/* A growing text buffer for the writer. */
+typedef struct { char* p; size_t len, cap; int oom; } PimBuf;
+static void pim_buf_add(PimBuf* b, const char* s, size_t n)
+{
+    if (b->oom) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t c = b->cap ? b->cap : 4096;
+        while (b->len + n + 1 > c) c *= 2;
+        char* t = (char*)realloc(b->p, c);
+        if (!t) { b->oom = 1; return; }
+        b->p = t; b->cap = c;
+    }
+    if (n) memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = 0;
+}
+static void pim_buf_str(PimBuf* b, const char* s) { pim_buf_add(b, s, strlen(s)); }
+/* `s` (not inside b) put at offset `at`. */
+static void pim_buf_insert(PimBuf* b, size_t at, const char* s, size_t n)
+{
+    const size_t tail = b->len - at;
+    pim_buf_add(b, s, n);                    /* room (and the terminator) */
+    if (b->oom || !n) return;
+    memmove(b->p + at + n, b->p + at, tail);
+    memcpy(b->p + at, s, n);
+}
+/* The text ends with an empty line (or is empty). */
+static int pim_buf_ends_blank(const PimBuf* b)
+{
+    size_t e = b->len;
+    if (e && b->p[e - 1] == '\n') e--;
+    if (e && b->p[e - 1] == '\r') e--;
+    return e == 0 || b->p[e - 1] == '\n';
+}
+
+/* The writer's binding sections: 0 [keyboard], 1 [mouse_buttons], 2
+ * [controller] (with the parser's other spellings); -1 any other. */
+static int pim_binding_section(const char* name)
+{
+    if (!strcmp(name, "keyboard") || !strcmp(name, "keys")) return 0;
+    if (!strcmp(name, "mouse_buttons") || !strcmp(name, "mouse.buttons")) return 1;
+    if (!strcmp(name, "controller") || !strcmp(name, "gamepad") || !strcmp(name, "pad")) return 2;
+    return -1;
+}
+static const int pim_binding_secs[3] = { PIM_SEC_KEYBOARD, PIM_SEC_MOUSE_BUTTONS, PIM_SEC_CONTROLLER };
+
+/* "cross    = \"Space\"" + eol for every control not in *done, in the
+ * file's order, put at offset `at`; then every control counts as done. */
+static void pim_add_missing(PimBuf* b, size_t at, const PadInputMap* m, int s, uint32_t* done, const char* eol)
+{
+    PimBuf t = { NULL, 0, 0, 0 };
+    char list[512], line[640];
+    for (int i = 0; i < PIM_N_CONTROLS; i++) {
+        const int c = pim_write_order[i];
+        if (*done >> c & 1u) continue;
+        pim_inputs_text(m, pim_binding_secs[s], c, list, sizeof list);
+        snprintf(line, sizeof line, "%-8s = \"%s\"%s", pim_control_name(c), list, eol);
+        pim_buf_str(&t, line);
+    }
+    if (t.oom) b->oom = 1;
+    else if (t.len) pim_buf_insert(b, at, t.p, t.len);
+    free(t.p);
+    *done = (1u << PIM_N_CONTROLS) - 1u;
+}
+
+/* The file's text for map `m`, written into `old` (the file as it is, or
+ * NULL): see above. malloc'd; NULL if out of memory. */
 static char* pim_render(const PadInputMap* m, const char* old)
 {
-    size_t cap = 16384 + (old ? strlen(old) : 0), len = 0;
-    char* out = (char*)malloc(cap);
-    if (!out) return NULL;
-#define PIM_PUT(...) do { int w_ = snprintf(out + len, cap - len, __VA_ARGS__); \
-        if (w_ > 0) len += (size_t)w_; if (len >= cap) len = cap - 1; } while (0)
-    PIM_PUT("# Controls, read by the game through PS3_INPUT_MAP (format: the toolkit's\n"
-            "# libs/input/pad_input_map.h). Written by the in-game menu (Controls) or the\n"
-            "# launcher; hand edits are fine, but comments in [keyboard], [mouse_buttons]\n"
-            "# and [controller] are not kept. \"\" unbinds a control.\n");
-    static const struct { int sec; const char* title; } secs[] = {
-        { PIM_SEC_KEYBOARD, "keyboard" }, { PIM_SEC_MOUSE_BUTTONS, "mouse_buttons" },
-        { PIM_SEC_CONTROLLER, "controller" },
-    };
+    static const char* const titles[3] = { "keyboard", "mouse_buttons", "controller" };
+    PimBuf b = { NULL, 0, 0, 0 };
     char list[512];
-    for (int s = 0; s < 3; s++) {
-        PIM_PUT("\n[%s]\n", secs[s].title);
-        for (int i = 0; i < PIM_N_CONTROLS; i++) {
-            const int c = pim_write_order[i];
-            pim_inputs_text(m, secs[s].sec, c, list, sizeof list);
-            PIM_PUT("%-8s = \"%s\"\n", pim_control_name(c), list);
-        }
-    }
-    /* Every other section of the old file, verbatim. */
-    if (old) {
-        int keep = 0;
+    pim_buf_add(&b, "", 0);                  /* "" even when nothing follows */
+    int fresh = 1;
+    if (old) for (const char* q = old; *q; q++) if (!isspace((unsigned char)*q)) { fresh = 0; break; }
+    const char* eol = "\n";
+    if (!fresh) { const char* nl = strchr(old, '\n'); if (nl && nl > old && nl[-1] == '\r') eol = "\r\n"; }
+    int seen[3] = { 0, 0, 0 };
+    if (fresh) {
+        pim_buf_str(&b, "# Controls, read by the game through PS3_INPUT_MAP (format: the toolkit's\n"
+                        "# libs/input/pad_input_map.h). Written by the in-game menu (F2 > Controls);\n"
+                        "# hand edits and comments are kept. \"\" unbinds a control.\n");
+    } else {
+        uint32_t done[3] = { 0, 0, 0 };
+        int sec = -1, first = 0;             /* the binding section of this block; its first block */
+        size_t ins_at = 0;                   /* after the block's last line (missing controls go there) */
         for (const char* p = old; *p; ) {
             const char* nl = strchr(p, '\n');
             const size_t ln = nl ? (size_t)(nl - p) : strlen(p);
-            const char* q = p;
-            while (q < p + ln && (*q == ' ' || *q == '\t')) q++;
-            if (q < p + ln && *q == '[') {
+            const int cr = ln && p[ln - 1] == '\r';
+            const size_t n = cr ? ln - 1 : ln;          /* the line without its end */
+            const char* le = cr ? "\r\n" : nl ? "\n" : eol;
+            size_t i = 0;
+            while (i < n && (p[i] == ' ' || p[i] == '\t')) i++;
+            if (i < n && p[i] == '[') {
+                if (sec >= 0 && first) pim_add_missing(&b, ins_at, m, sec, &done[sec], eol);
                 char name[64]; size_t k = 0;
-                for (q++; q < p + ln && *q != ']' && k + 1 < sizeof name; q++)
-                    if (*q != ' ' && *q != '\t') name[k++] = (char)tolower((unsigned char)*q);
+                for (size_t j = i + 1; j < n && p[j] != ']' && k + 1 < sizeof name; j++)
+                    if (p[j] != ' ' && p[j] != '\t') name[k++] = (char)tolower((unsigned char)p[j]);
                 name[k] = 0;
-                keep = strcmp(name, "keyboard") && strcmp(name, "keys") && strcmp(name, "mouse_buttons") &&
-                       strcmp(name, "mouse.buttons") && strcmp(name, "controller") &&
-                       strcmp(name, "gamepad") && strcmp(name, "pad");
-                if (keep) PIM_PUT("\n");
-            }
-            if (keep) {   /* blank lines go: one is put before each section */
-                size_t e = ln;
-                while (e > 0 && (p[e - 1] == '\r' || p[e - 1] == ' ' || p[e - 1] == '\t')) e--;
-                if (e) PIM_PUT("%.*s\n", (int)e, p);
+                sec = pim_binding_section(name);
+                first = sec >= 0 && !seen[sec];
+                if (sec >= 0) seen[sec] = 1;
+                pim_buf_add(&b, p, n); pim_buf_str(&b, le);
+                ins_at = b.len;
+            } else if (sec >= 0 && i < n && p[i] != '#' && p[i] != ';') {
+                /* the comment, as the parser cuts it ('#' or ';' outside quotes) */
+                size_t cpos = n; char q = 0;
+                for (size_t j = i; j < n; j++) {
+                    if (q) { if (p[j] == q) q = 0; continue; }
+                    if (p[j] == '"' || p[j] == '\'') q = p[j];
+                    else if (p[j] == '#' || p[j] == ';') { cpos = j; break; }
+                }
+                const char* eq = (const char*)memchr(p + i, '=', cpos - i);
+                int ctl = -1;
+                if (eq) {                    /* the key as the parser reads it */
+                    char key[64]; size_t k = 0;
+                    for (const char* r = p + i; r < eq && k + 1 < sizeof key; r++)
+                        if (*r != '"' && *r != '\'' && *r != '[' && *r != ']') key[k++] = (char)tolower((unsigned char)*r);
+                    while (k && (key[k - 1] == ' ' || key[k - 1] == '\t')) k--;
+                    key[k] = 0;
+                    ctl = pim_lookup(pim_controls, PIM_COUNT(pim_controls), key);
+                }
+                if (ctl >= 0) {
+                    const size_t pre = (size_t)(eq - p) + 1;     /* "cross    =" as written */
+                    size_t ve = cpos;                            /* the old value's end */
+                    while (ve > pre && (p[ve - 1] == ' ' || p[ve - 1] == '\t')) ve--;
+                    pim_inputs_text(m, pim_binding_secs[sec], ctl, list, sizeof list);
+                    pim_buf_add(&b, p, pre);
+                    pim_buf_str(&b, " \""); pim_buf_str(&b, list); pim_buf_str(&b, "\"");
+                    if (cpos < n) {
+                        if (ve < cpos) pim_buf_add(&b, p + ve, cpos - ve); else pim_buf_str(&b, " ");
+                        pim_buf_add(&b, p + cpos, n - cpos);
+                    }
+                    done[sec] |= 1u << ctl;
+                } else {
+                    pim_buf_add(&b, p, n);   /* not a control: as it was */
+                }
+                pim_buf_str(&b, le);
+                ins_at = b.len;
+            } else {
+                pim_buf_add(&b, p, n); pim_buf_str(&b, le);
             }
             p = nl ? nl + 1 : p + ln;
         }
-        while (len >= 2 && out[len - 1] == '\n' && out[len - 2] == '\n') out[--len] = 0;
+        if (sec >= 0 && first) pim_add_missing(&b, ins_at, m, sec, &done[sec], eol);
     }
-#undef PIM_PUT
-    return out;
+    for (int s = 0; s < 3; s++) {
+        if (seen[s]) continue;
+        if (!pim_buf_ends_blank(&b)) pim_buf_str(&b, eol);
+        pim_buf_str(&b, "["); pim_buf_str(&b, titles[s]); pim_buf_str(&b, "]"); pim_buf_str(&b, eol);
+        uint32_t none = 0;
+        pim_add_missing(&b, b.len, m, s, &none, eol);
+    }
+    if (b.oom) { free(b.p); return NULL; }
+    return b.p;
 }
 
 #ifdef _WIN32
 #include <direct.h>
 #define PIM_MKDIR(d) _mkdir(d)
+/* The temporary file over the old one in one step (MoveFileEx; declared here
+ * so this header needs no <windows.h>; the same prototype as winbase.h's). */
+#ifdef __cplusplus
+extern "C"
+#endif
+__declspec(dllimport) int __stdcall MoveFileExA(const char* existing, const char* replacement, unsigned long flags);
+#define PIM_REPLACE(tmp, path) (MoveFileExA((tmp), (path), 0x1u /* REPLACE_EXISTING */ | 0x8u /* WRITE_THROUGH */) != 0)
 #else
 #include <sys/stat.h>
 #define PIM_MKDIR(d) mkdir(d, 0755)
+#define PIM_REPLACE(tmp, path) (rename((tmp), (path)) == 0)
 #endif
 
-/* Write map `m` to `path` (through a temporary file, so a reader never sees
- * half of it), keeping the file's other sections. 1 = written. */
+/* Write map `m` to `path` (a temporary file next to it, then moved over it in
+ * one step, so a reader -- or a crash -- never sees half of it), keeping the
+ * file's comments and other sections. 1 = written. */
 static int pim_save_file(const PadInputMap* m, const char* path)
 {
     char* old = NULL;
+    int whole = 1;                            /* the old file read to its end */
     { FILE* f = fopen(path, "rb");
       if (f) {
           size_t cap = 4096, n = 0;
           old = (char*)malloc(cap);
           while (old) {
-              if (n + 1025 > cap) { if (cap >= (1u << 20)) break; char* t = (char*)realloc(old, cap * 2); if (!t) break; old = t; cap *= 2; }
+              if (n + 1025 > cap) {
+                  char* t = cap >= (1u << 20) ? NULL : (char*)realloc(old, cap * 2);
+                  if (!t) { whole = 0; break; }
+                  old = t; cap *= 2;
+              }
               const size_t r = fread(old + n, 1, 1024, f);
               n += r;
               if (r < 1024) break;
           }
-          if (old) old[n] = 0;
+          if (!old) whole = 0;
+          else old[n] = 0;
           fclose(f);
       } }
+    if (!whole) { free(old); return 0; }      /* over 1 MB, or no memory: never write half of it back */
     char* text = pim_render(m, old);
     free(old);
     if (!text) return 0;
     char dir[1024];
     snprintf(dir, sizeof dir, "%s", path);
     for (char* q = dir + 1; *q; q++)          /* mkdir -p of the folder */
-        if (*q == '/') { *q = 0; PIM_MKDIR(dir); *q = '/'; }
+        if (*q == '/' || *q == '\\') { const char sep = *q; *q = 0; PIM_MKDIR(dir); *q = sep; }
     char tmp[1100];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE* f = fopen(tmp, "wb");
@@ -885,10 +1008,7 @@ static int pim_save_file(const PadInputMap* m, const char* path)
         const size_t n = strlen(text);
         ok = fwrite(text, 1, n, f) == n;
         ok = (fclose(f) == 0) && ok;
-#ifdef _WIN32
-        if (ok) remove(path);
-#endif
-        ok = ok && rename(tmp, path) == 0;
+        ok = ok && PIM_REPLACE(tmp, path);
         if (!ok) remove(tmp);
     }
     free(text);
